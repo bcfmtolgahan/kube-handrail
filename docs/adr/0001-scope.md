@@ -1,7 +1,10 @@
 # ADR 0001: Scope - a guarded remediation layer, not an AI SRE agent
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-27
+- Amended by: [ADR 0002](0002-server-verified-approval.md)
+
+> **Amended by ADR 0002.** The scope below is unchanged. The approval model is amended: every write is covered by a human approval pinned to its exact arguments and verified by the server, instead of relying on approval in the client alone. See [ADR 0002](0002-server-verified-approval.md).
 
 ## Context
 
@@ -61,9 +64,9 @@ Rejected for self-hosted Prometheus because it targets Amazon Managed Service fo
 
 ## Consequences
 
-- The project's value depends on the write path being usable from DevOps Agent end to end. This is not yet demonstrated; Milestone 0 in the [roadmap](../roadmap.md) tests it first.
+- The project's value depends on the write path being usable from DevOps Agent end to end. Milestone 0 demonstrated it on a test cluster ([Milestone 0](../milestone-0.md)); its findings led to [ADR 0002](0002-server-verified-approval.md).
 - Read and write tools must be separate tools on separate gateway targets and Lambdas, because DevOps Agent classifies per tool and Cedar argument conditions need per-action policies.
 - Safety cannot rely on client classification alone. The server must reject writes without a valid plan, regardless of how the tool is classified.
 - Several integration details are unverified (inbound SigV4 to the gateway, `toolDetails` drift after IaC updates, how input-conditional Cedar policies affect `tools/list`, interceptor ordering). They are listed as open questions in the [roadmap](../roadmap.md) and may change the design.
 - The project inherits a dependency on recently released AWS features (AgentCore Policy, DevOps Agent directed actions) and on the hosted EKS MCP server, which is explicitly in preview. Breaking changes there are an accepted risk.
-- Scope stays deliberately narrow: no CloudWatch tools, no generic Kubernetes reads, no delete-class actions, no autonomous writes.
+- Scope stays deliberately narrow: no CloudWatch tools, no generic Kubernetes reads, no delete-class actions. Every write is covered by a human approval pinned to its exact arguments and verified by the server ([ADR 0002](0002-server-verified-approval.md)).
