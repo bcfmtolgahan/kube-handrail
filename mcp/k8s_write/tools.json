@@ -1,0 +1,16 @@
+[
+  {
+    "name": "apply_scale_deployment",
+    "description": "Apply a replica change previously returned by plan_scale_deployment. Arguments must match the plan exactly. The plan is single-use, expires after a few minutes, and is rejected if the Deployment changed since planning.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "plan_id": { "type": "string", "description": "plan_id returned by plan_scale_deployment." },
+        "namespace": { "type": "string", "description": "Kubernetes namespace." },
+        "name": { "type": "string", "description": "Deployment name." },
+        "replicas": { "type": "integer", "description": "Desired replica count; must equal the planned value." }
+      },
+      "required": ["plan_id", "namespace", "name", "replicas"]
+    }
+  }
+]

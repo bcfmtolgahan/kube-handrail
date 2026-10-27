@@ -1,0 +1,4 @@
+# Runtime dependencies bundled into each Lambda package. boto3 is provided by the Lambda runtime.
+kubernetes==35.0.0
+# The zip is first on sys.path in Lambda and would shadow the runtime's copy; its botocore needs <3.
+python-dateutil<3

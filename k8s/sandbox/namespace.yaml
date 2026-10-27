@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kube-handrail-sandbox
+  labels:
+    app.kubernetes.io/part-of: kube-handrail-sandbox
+    pod-security.kubernetes.io/enforce: restricted

@@ -15,7 +15,7 @@ Nothing below is implemented. This is the planned order of work; it will change 
 - In chat, "scale web to 5" produces a plan, then an approval prompt showing the real arguments, then the apply.
 - The apply fails during an autonomous investigation.
 - A reused plan, an expired plan, or a changed object is rejected.
-- Even if the write tool is wrongly classified `READ_ONLY`, an apply without a valid plan is rejected.
+- If the write tool is wrongly classified `READ_ONLY`, the agent can apply without approval, but only within the server-side limits; an apply without a valid plan is rejected.
 
 ## Milestone 1: Safe read-only integration
 

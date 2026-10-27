@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and adjust.
+
+cluster_name      = "my-cluster"
+region            = "eu-central-1"
+name_prefix       = "kube-handrail"
+sandbox_namespace = "kube-handrail-sandbox"
+
+min_replicas     = 0
+max_replicas     = 5
+plan_ttl_seconds = 300
+
+# The kill switch parameter is created with the value "true" and Terraform
+# ignores later changes to it, so it can be flipped without being reset:
+#   aws ssm put-parameter --overwrite --name <kill_switch_parameter> --value false
+
+# build/ is gitignored. On a fresh checkout with existing state, rebuild before planning:
+#   terraform apply -replace='terraform_data.build["k8s_read"]' -replace='terraform_data.build["k8s_write"]'

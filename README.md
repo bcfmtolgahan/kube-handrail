@@ -70,7 +70,7 @@ A remediation follows this sequence:
 
 - **Plan/apply split.** Every write is two tools: a `READ_ONLY` `plan_*` and a `MUTATIVE` `apply_*` with identical arguments, so policy and the human approver see real values.
 - **Single-use, short-lived plans.** A plan can be applied once, within minutes, against the exact `resourceVersion` it was computed from. Concurrent changes return a conflict.
-- **Fail-safe without classification.** `apply_*` does nothing without a valid plan, so a tool that is accidentally left `READ_ONLY` still cannot write in one step.
+- **Misclassification loses the approval, not the limits.** If the write tool is accidentally left `READ_ONLY`, DevOps Agent can plan and apply on its own without asking anyone (observed in testing). The server-side limits still hold: allowed namespaces, replica bounds, GitOps and HPA checks, single-use plans and the kill switch. Classification is therefore checked after every registration change, and should be monitored for drift.
 - **Defense in depth.** Each layer assumes the others may fail:
   - `guard.py` in the write Lambda (authoritative check)
   - Cedar policy at the gateway ([AgentCore Policy examples](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html))
