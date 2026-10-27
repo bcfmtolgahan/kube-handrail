@@ -37,7 +37,7 @@ def dispatch(handlers: Mapping[str, Handler], event: Any, context: Any) -> Envel
     try:
         return handler(args)
     except GuardError as exc:
-        return err(exc.code, exc.message)
+        return err(exc.code, exc.message, exc.details)
     except Exception:
         logger.exception("tool %s failed", name)
         return err(INTERNAL, "internal error")

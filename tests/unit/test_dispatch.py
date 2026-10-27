@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from handrail_common.dispatch import dispatch, tool_name
-from handrail_common.envelope import FORBIDDEN_NAMESPACE, INTERNAL, UNKNOWN_TOOL, ok
+from handrail_common.envelope import CONFLICT, FORBIDDEN_NAMESPACE, INTERNAL, UNKNOWN_TOOL, err, ok
 from handrail_common.validation import GuardError
 
 
@@ -54,6 +54,22 @@ def test_guard_error_maps_to_code():
 
     result = dispatch({"x": handler}, {}, ctx("t___x"))
     assert result["error"] == {"code": FORBIDDEN_NAMESPACE, "message": "no"}
+
+
+def test_guard_error_details_pass_through():
+    details = {"generation": {"planned": 4, "current": 5}}
+
+    def handler(args):
+        raise GuardError(CONFLICT, "changed", details)
+
+    result = dispatch({"x": handler}, {}, ctx("t___x"))
+    assert result["error"] == {"code": CONFLICT, "message": "changed", "details": details}
+
+
+def test_err_includes_details_only_when_given():
+    assert err(CONFLICT, "changed")["error"] == {"code": CONFLICT, "message": "changed"}
+    assert err(CONFLICT, "changed", {})["error"] == {"code": CONFLICT, "message": "changed"}
+    assert err(CONFLICT, "changed", {"a": 1})["error"]["details"] == {"a": 1}
 
 
 def test_exception_is_internal_without_details(caplog):

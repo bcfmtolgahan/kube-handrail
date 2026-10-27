@@ -43,12 +43,10 @@ def ok(data: Any, truncated: bool = False) -> Envelope:
     return {"ok": True, "data": data, "error": None, "truncated": truncated}
 
 
-def err(code: str, message: str) -> Envelope:
+def err(code: str, message: str, details: dict[str, Any] | None = None) -> Envelope:
     if code not in ERROR_CODES:
         raise ValueError(f"unknown error code: {code}")
-    return {
-        "ok": False,
-        "data": None,
-        "error": {"code": code, "message": message},
-        "truncated": False,
-    }
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details:
+        error["details"] = details
+    return {"ok": False, "data": None, "error": error, "truncated": False}

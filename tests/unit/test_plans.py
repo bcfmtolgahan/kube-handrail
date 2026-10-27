@@ -51,6 +51,8 @@ def make_plan(expires_at: int = NOW + 300) -> Plan:
         replicas_to=3,
         args_hash=scale_args_hash("sandbox", "web", 3),
         resource_version="12345",
+        generation=4,
+        uid="8f7c1a2e-0000-4000-8000-000000000001",
         created_at=NOW,
         expires_at=expires_at,
     )
@@ -68,6 +70,8 @@ def test_consume_success_then_used(store):
     consumed = store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW)
     assert consumed.used is True
     assert consumed.resource_version == "12345"
+    assert consumed.generation == 4
+    assert consumed.uid == "8f7c1a2e-0000-4000-8000-000000000001"
     assert consumed.replicas_to == 3
     assert consume_code(store, plan.plan_id, plan.args_hash) == PLAN_USED
 
@@ -112,3 +116,12 @@ def test_record_result(store):
         Key={"plan_id": plan.plan_id}
     )["Item"]
     assert item["result"] == "applied" and item["applied_at"] == NOW + 1
+
+
+def test_from_item_without_generation_or_uid_never_matches():
+    item = make_plan().to_item()
+    del item["generation"]
+    del item["uid"]
+    plan = Plan.from_item(item)
+    assert plan.generation == -1
+    assert plan.uid == ""

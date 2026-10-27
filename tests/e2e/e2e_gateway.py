@@ -11,7 +11,9 @@ KUBECONFIG, and the usual AWS variables. Pass --with-expiry to also wait out a
 plan TTL (PLAN_TTL_SECONDS, default 300).
 
 The test applies tests/e2e/fixtures/argo-managed.yaml and creates and deletes
-a temporary HPA, both in kube-handrail-sandbox. It leaves `web` at 1 replica.
+a temporary HPA, both in kube-handrail-sandbox. It briefly labels `web`, sets the
+E2E_TOUCH environment variable on it and scales it by hand, and leaves it at
+1 replica without the labels or the variable.
 """
 
 import argparse
@@ -122,6 +124,20 @@ async def expect(gw: Gateway, name: str, tool: str, arguments: dict[str, Any], e
     report(name, code(envelope) == expected, code(envelope) or "ok")
 
 
+async def expect_conflict(gw: Gateway, name: str, plan_id: str, changed: str) -> None:
+    envelope = await gw.call(APPLY, {"plan_id": plan_id, **WEB, "replicas": 2})
+    details = (envelope.get("error") or {}).get("details") or {}
+    entry = details.get(changed) or {}
+    planned = entry.get("planned", entry.get("planned_from"))
+    passed = entry.get("current") is not None and entry.get("current") != planned
+    report(name, code(envelope) == "conflict" and passed, code(envelope) or "ok")
+
+
+def reset_web() -> None:
+    kubectl("scale", "deploy/web", "--replicas=1")
+    kubectl("rollout", "status", "deploy/web", "--timeout=120s")
+
+
 async def validation_tests(gw: Gateway) -> None:
     await expect(gw, "namespace outside allowlist", PLAN, {"namespace": "kube-system", "name": "coredns", "replicas": 2}, "forbidden_namespace")
     await expect(gw, "replicas above maximum", PLAN, {**WEB, "replicas": 1000}, "out_of_bounds")
@@ -160,16 +176,46 @@ async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
 
     plan_id = await gw.plan(2)
     await expect(gw, "apply with arguments that differ from the plan", APPLY, {"plan_id": plan_id, **WEB, "replicas": 3}, "plan_mismatch")
-    kubectl("annotate", "deploy/web", "kube-handrail.io/e2e-touch=1", "--overwrite")
-    await expect(gw, "apply after the deployment changed", APPLY, {"plan_id": plan_id, **WEB, "replicas": 2}, "conflict")
-    kubectl("annotate", "deploy/web", "kube-handrail.io/e2e-touch-")
+    try:
+        # Label-only change: resourceVersion moves, generation and spec.replicas do not.
+        # (An annotation change would bump a Deployment's generation.)
+        kubectl("label", "deploy/web", "kube-handrail.io/e2e-touch=1", "--overwrite")
+        envelope = await gw.call(APPLY, {"plan_id": plan_id, **WEB, "replicas": 2})
+        report("apply after a label-only change succeeds", envelope.get("ok") is True, code(envelope) or "ok")
+    finally:
+        kubectl("label", "deploy/web", "kube-handrail.io/e2e-touch-")
+        reset_web()
+
+    plan_id = await gw.plan(2)
+    try:
+        # A pod template change bumps metadata.generation.
+        kubectl("set", "env", "deploy/web", f"E2E_TOUCH={int(time.time())}")
+        await expect_conflict(gw, "apply after a spec change", plan_id, "generation")
+    finally:
+        kubectl("set", "env", "deploy/web", "E2E_TOUCH-")
+        reset_web()
+
+    plan_id = await gw.plan(2)
+    try:
+        # The GitOps marker is a label, so only the re-check at apply time catches it.
+        kubectl("label", "deploy/web", "app.kubernetes.io/instance=e2e", "--overwrite")
+        await expect(gw, "apply after a GitOps label was added", APPLY, {"plan_id": plan_id, **WEB, "replicas": 2}, "gitops_managed")
+    finally:
+        kubectl("label", "deploy/web", "app.kubernetes.io/instance-")
+        reset_web()
+
+    plan_id = await gw.plan(2)
+    try:
+        kubectl("scale", "deploy/web", "--replicas=3")
+        await expect_conflict(gw, "apply after a manual scale", plan_id, "replicas")
+    finally:
+        reset_web()
 
     plan_id = await gw.plan(2)
     first, second = await asyncio.gather(*(gw.call(APPLY, {"plan_id": plan_id, **WEB, "replicas": 2}) for _ in range(2)))
     outcomes = sorted([code(first) or "ok", code(second) or "ok"])
     report("concurrent applies of one plan: exactly one succeeds", outcomes == ["ok", "plan_used"], outcomes)
-    kubectl("scale", "deploy/web", "--replicas=1")
-    kubectl("rollout", "status", "deploy/web", "--timeout=120s")
+    reset_web()
 
     plan_id = await gw.plan(2)
     set_kill_switch("false")

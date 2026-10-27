@@ -55,10 +55,38 @@ def aws(monkeypatch):
         yield
 
 
+UID = "8f7c1a2e-0000-4000-8000-000000000001"
+
+
+def deployment(
+    generation: int = 4,
+    replicas: int | None = 1,
+    resource_version: str = "12345",
+    uid: str = UID,
+    labels: dict[str, str] | None = None,
+    annotations: dict[str, str] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            generation=generation,
+            resource_version=resource_version,
+            uid=uid,
+            labels=labels,
+            annotations=annotations,
+        ),
+        spec=SimpleNamespace(replicas=replicas),
+    )
+
+
+def conflict() -> ApiException:
+    return ApiException(status=409, reason="Conflict")
+
+
 def runtime(enabled: str = "true") -> tuple[handler.Runtime, MagicMock]:
     ssm = boto3.client("ssm", region_name=REGION)
     ssm.put_parameter(Name=PARAM, Value=enabled, Type="String", Overwrite=True)
     apps = MagicMock()
+    apps.read_namespaced_deployment.return_value = deployment()
     apps.patch_namespaced_deployment.return_value = SimpleNamespace(
         metadata=SimpleNamespace(resource_version="12346")
     )
@@ -89,6 +117,8 @@ def create_plan(store: PlanStore, replicas: int = 3, expires_at: int = NOW + 300
         replicas_to=replicas,
         args_hash=scale_args_hash("sandbox", "web", replicas),
         resource_version="12345",
+        generation=4,
+        uid=UID,
         created_at=NOW,
         expires_at=expires_at,
     )
@@ -111,6 +141,11 @@ def error_code(response: dict) -> str:
     return response["error"]["code"]
 
 
+def patched_versions(apps: MagicMock) -> list[str]:
+    calls = apps.patch_namespaced_deployment.call_args_list
+    return [c.args[2]["metadata"]["resourceVersion"] for c in calls]
+
+
 def test_apply_success_dry_run_then_real(rt):
     runtime_, apps = rt
     plan = create_plan(runtime_.store)
@@ -126,6 +161,7 @@ def test_apply_success_dry_run_then_real(rt):
         "replicas_to": 3,
         "resource_version": "12346",
     }
+    apps.read_namespaced_deployment.assert_called_once_with("web", "sandbox")
     dry, real = apps.patch_namespaced_deployment.call_args_list
     assert dry.kwargs == {"dry_run": "All"}
     assert real.kwargs == {}
@@ -147,6 +183,7 @@ def test_kill_switch_off(aws, monkeypatch):
     plan = create_plan(runtime_.store)
 
     assert error_code(apply(plan.plan_id)) == "remediation_disabled"
+    apps.read_namespaced_deployment.assert_not_called()
     apps.patch_namespaced_deployment.assert_not_called()
     assert item(plan.plan_id)["used"] is False
 
@@ -207,37 +244,227 @@ def test_arguments_rechecked(rt, overrides, code):
     assert item(plan.plan_id)["used"] is False
 
 
-def test_conflict_on_dry_run(rt):
+def test_status_only_change_applies_with_current_resource_version(rt):
     runtime_, apps = rt
-    apps.patch_namespaced_deployment.side_effect = ApiException(status=409, reason="Conflict")
+    # A rollout updated status: resourceVersion moved on, generation and replicas did not.
+    apps.read_namespaced_deployment.return_value = deployment(resource_version="12399")
     plan = create_plan(runtime_.store)
 
-    assert error_code(apply(plan.plan_id)) == "conflict"
-    assert apps.patch_namespaced_deployment.call_count == 1
+    assert apply(plan.plan_id)["ok"] is True
+    assert patched_versions(apps) == ["12399", "12399"]
+    assert item(plan.plan_id)["result"] == "applied"
+
+
+def test_missing_replicas_counts_as_one(rt):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.return_value = deployment(replicas=None)
+    plan = create_plan(runtime_.store)
+
+    assert apply(plan.plan_id)["ok"] is True
+
+
+def test_generation_changed_is_conflict(rt):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.return_value = deployment(generation=5)
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"] == {
+        "generation": {"planned": 4, "current": 5},
+        "replicas": {"planned_from": 1, "current": 1},
+    }
+    apps.patch_namespaced_deployment.assert_not_called()
     record = item(plan.plan_id)
     assert record["used"] is True
     assert record["result"] == "conflict"
 
 
-def test_conflict_on_real_patch(rt):
+def test_replicas_changed_is_conflict(rt):
     runtime_, apps = rt
+    # Someone scaled the Deployment directly after the plan was made.
+    apps.read_namespaced_deployment.return_value = deployment(generation=5, replicas=2)
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"]["replicas"] == {"planned_from": 1, "current": 2}
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "conflict"
+
+
+def test_plan_without_generation_is_conflict(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+    table.update_item(Key={"plan_id": plan.plan_id}, UpdateExpression="REMOVE generation")
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"]["generation"] == {"planned": -1, "current": 4}
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_plan_without_uid_is_conflict(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+    table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="REMOVE #uid",
+        ExpressionAttributeNames={"#uid": "uid"},
+    )
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"] == {"uid": {"planned": "", "current": UID}}
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_recreated_deployment_is_conflict(rt):
+    runtime_, apps = rt
+    # Deleted and recreated with the same name: generation and replicas match the plan again.
+    other = "8f7c1a2e-0000-4000-8000-000000000002"
+    apps.read_namespaced_deployment.return_value = deployment(generation=4, replicas=1, uid=other)
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"] == {"uid": {"planned": UID, "current": other}}
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "conflict"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"labels": {"app.kubernetes.io/instance": "web"}},
+        {"annotations": {"argocd.argoproj.io/tracking-id": "x:apps/Deployment:sandbox/web"}},
+    ],
+)
+def test_gitops_marker_added_after_plan_is_rejected(rt, marker):
+    runtime_, apps = rt
+    # A label change leaves generation untouched, so only a fresh GitOps check catches it.
+    apps.read_namespaced_deployment.return_value = deployment(**marker)
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "gitops_managed"
+    apps.patch_namespaced_deployment.assert_not_called()
+    record = item(plan.plan_id)
+    assert record["used"] is True
+    assert record["result"] == "gitops_managed"
+
+
+def test_gitops_marker_detected_on_retry(rt):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.side_effect = [
+        deployment(),
+        deployment(labels={"app.kubernetes.io/instance": "web"}),
+    ]
+    apps.patch_namespaced_deployment.side_effect = conflict()
+    plan = create_plan(runtime_.store)
+
+    assert error_code(apply(plan.plan_id)) == "gitops_managed"
+    assert apps.patch_namespaced_deployment.call_count == 1
+
+
+def test_conflict_on_dry_run_is_retried(rt):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.side_effect = [
+        deployment(resource_version="12346"),
+        deployment(resource_version="12347"),
+    ]
     apps.patch_namespaced_deployment.side_effect = [
-        SimpleNamespace(metadata=SimpleNamespace(resource_version="12345")),
-        ApiException(status=409, reason="Conflict"),
+        conflict(),
+        SimpleNamespace(metadata=SimpleNamespace(resource_version="12347")),
+        SimpleNamespace(metadata=SimpleNamespace(resource_version="12348")),
     ]
     plan = create_plan(runtime_.store)
 
-    assert error_code(apply(plan.plan_id)) == "conflict"
+    response = apply(plan.plan_id)
+
+    assert response["ok"] is True
+    assert response["data"]["resource_version"] == "12348"
+    assert apps.read_namespaced_deployment.call_count == 2
+    assert patched_versions(apps) == ["12346", "12347", "12347"]
+    assert item(plan.plan_id)["result"] == "applied"
+
+
+def test_conflict_on_real_patch_is_retried(rt):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.side_effect = [
+        deployment(resource_version="12346"),
+        deployment(resource_version="12347"),
+    ]
+    apps.patch_namespaced_deployment.side_effect = [
+        SimpleNamespace(metadata=SimpleNamespace(resource_version="12346")),
+        conflict(),
+        SimpleNamespace(metadata=SimpleNamespace(resource_version="12347")),
+        SimpleNamespace(metadata=SimpleNamespace(resource_version="12348")),
+    ]
+    plan = create_plan(runtime_.store)
+
+    assert apply(plan.plan_id)["ok"] is True
+    assert patched_versions(apps) == ["12346", "12346", "12347", "12347"]
+
+
+def test_conflict_on_every_attempt(rt):
+    runtime_, apps = rt
+    apps.patch_namespaced_deployment.side_effect = conflict()
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "conflict"
+    assert "details" not in response["error"]
+    assert apps.read_namespaced_deployment.call_count == handler.PATCH_ATTEMPTS
+    assert apps.patch_namespaced_deployment.call_count == handler.PATCH_ATTEMPTS
+    record = item(plan.plan_id)
+    assert record["used"] is True
+    assert record["result"] == "conflict"
+
+
+def test_spec_change_detected_on_retry(rt):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.side_effect = [deployment(), deployment(generation=5)]
+    apps.patch_namespaced_deployment.side_effect = conflict()
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"]["generation"] == {"planned": 4, "current": 5}
+    assert apps.read_namespaced_deployment.call_count == 2
+    assert apps.patch_namespaced_deployment.call_count == 1
     assert item(plan.plan_id)["result"] == "conflict"
 
 
 @pytest.mark.parametrize("status, code", [(404, "not_found"), (403, "kubernetes_error")])
-def test_other_api_errors(rt, status, code):
+def test_read_api_errors(rt, status, code):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.side_effect = ApiException(status=status)
+    plan = create_plan(runtime_.store)
+
+    assert error_code(apply(plan.plan_id)) == code
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == code
+
+
+@pytest.mark.parametrize("status, code", [(404, "not_found"), (403, "kubernetes_error")])
+def test_patch_api_errors(rt, status, code):
     runtime_, apps = rt
     apps.patch_namespaced_deployment.side_effect = ApiException(status=status)
     plan = create_plan(runtime_.store)
 
     assert error_code(apply(plan.plan_id)) == code
+    assert apps.patch_namespaced_deployment.call_count == 1
     assert item(plan.plan_id)["result"] == code
 
 

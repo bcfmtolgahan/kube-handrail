@@ -151,6 +151,8 @@ def plan_scale_deployment(
         replicas_to=replicas,
         args_hash=scale_args_hash(namespace, name, replicas),
         resource_version=str(deployment.metadata.resource_version),
+        generation=int(deployment.metadata.generation),
+        uid=str(deployment.metadata.uid),
         created_at=now,
         expires_at=now + settings.plan_ttl_seconds,
     )

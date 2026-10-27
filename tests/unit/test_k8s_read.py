@@ -53,6 +53,8 @@ def deployment(
             namespace="sandbox",
             name="web",
             resource_version="4242",
+            generation=7,
+            uid="8f7c1a2e-0000-4000-8000-000000000001",
             annotations={"deployment.kubernetes.io/revision": "7", **(annotations or {})},
             labels=labels,
         ),
@@ -137,6 +139,8 @@ def test_plan_stores_record_and_returns_diff(clients, table):
     assert item["action"] == "scale_deployment"
     assert item["args_hash"] == scale_args_hash("sandbox", "web", 3)
     assert item["resource_version"] == "4242"
+    assert item["generation"] == 7
+    assert item["uid"] == "8f7c1a2e-0000-4000-8000-000000000001"
     assert (item["replicas_from"], item["replicas_to"]) == (2, 3)
     assert (item["created_at"], item["expires_at"]) == (NOW, NOW + 300)
     assert item["used"] is False

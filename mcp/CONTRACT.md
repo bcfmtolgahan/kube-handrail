@@ -24,6 +24,21 @@ Every handler returns a JSON object (not wrapped in `statusCode`/`body`):
 { "ok": false, "data": null, "error": { "code": "plan_expired", "message": "..." }, "truncated": false }
 ```
 
+`error` may also contain an optional `details` object with structured context. It is omitted when there is nothing to add. For `conflict` caused by a spec change since the plan was made:
+
+```json
+{
+  "code": "conflict",
+  "message": "Deployment spec changed since the plan was made",
+  "details": {
+    "generation": { "planned": 4, "current": 5 },
+    "replicas": { "planned_from": 1, "current": 3 }
+  }
+}
+```
+
+`replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. A `conflict` from a 409 that persists after all patch attempts has no `details`.
+
 Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `kubernetes_error`, `internal`.
 
 ## Plan record (DynamoDB)
@@ -35,7 +50,9 @@ Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespa
 | `namespace`, `name` | S | target |
 | `replicas_from`, `replicas_to` | N | |
 | `args_hash` | S | SHA-256 of `json.dumps({action, namespace, name, replicas}, sort_keys=True, separators=(",", ":"))` |
-| `resource_version` | S | Deployment `metadata.resourceVersion` at plan time |
+| `resource_version` | S | Deployment `metadata.resourceVersion` at plan time (informational) |
+| `generation` | N | Deployment `metadata.generation` at plan time; a record without it is treated as `-1` and never matches |
+| `uid` | S | Deployment `metadata.uid` at plan time; a record without it is treated as `""` and never matches |
 | `created_at` | N | epoch seconds |
 | `expires_at` | N | epoch seconds, plan TTL (default 300 s); also the table TTL attribute |
 | `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a` |
@@ -52,10 +69,10 @@ Plan (`k8s_read`):
 
 Apply (`k8s_write`), all re-checked independently of the plan step:
 1. Kill switch: SSM parameter `REMEDIATION_ENABLED_PARAM` must equal `true`.
-2. Checks 1-3 above.
+2. Checks 1-3 above (check 4 is re-run in step 4; check 5 is not, because the writer identity cannot list HPAs).
 3. Plan exists, `action` matches, `args_hash` matches, not expired, not used. Mark used with a conditional update before patching.
-4. Patch `spec.replicas` with a `metadata.resourceVersion` precondition equal to the planned one; a mismatch returns `conflict`.
-5. Server-side dry run (`dryRun=All`) before the real patch. A plan is consumed before the dry run, so any failure after step 3 requires a new plan.
+4. Read the Deployment. Its `metadata.uid` must equal the planned `uid` (a Deployment deleted and recreated under the same name starts again at generation 1), it must not be GitOps-managed (check 4 above, re-run because a label-only change does not bump `generation`), and its `metadata.generation` must equal the planned `generation` and its `spec.replicas` (unset counts as 1) must equal `replicas_from`; otherwise return `conflict` with `details`, or `gitops_managed`. The API server bumps a Deployment's `generation` on spec and annotation changes but not on status or label updates, so a rollout in progress does not block the apply. Patch `spec.replicas` with a `metadata.resourceVersion` precondition taken from that read. On 409, read again, re-run these checks and patch again, up to 3 attempts in total; a change found on a retry returns the error immediately, and a 409 on the last attempt returns `conflict`.
+5. Server-side dry run (`dryRun=All`) before each real patch. A plan is consumed before the dry run, so any failure after step 3 requires a new plan.
 6. The patch also sets the annotation `kube-handrail.io/last-plan-id` to the applied `plan_id`.
 
 The kill switch is read on every apply (no caching), so turning it off takes effect immediately.

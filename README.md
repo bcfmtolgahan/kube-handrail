@@ -62,16 +62,16 @@ This is the target design. Implemented today (Milestone 0): the `k8sr` and `k8sw
 
 A remediation follows this sequence:
 
-1. **Plan.** The agent calls a read-only tool such as `plan_scale_deployment`. It reads current state, runs preflight checks (HPA and GitOps ownership today; PodDisruptionBudget and revision history are planned), computes the diff locally, and stores a plan with `plan_id`, `args_hash`, `resourceVersion` and a short expiry.
+1. **Plan.** The agent calls a read-only tool such as `plan_scale_deployment`. It reads current state, runs preflight checks (HPA and GitOps ownership today; PodDisruptionBudget and revision history are planned), computes the diff locally, and stores a plan with `plan_id`, `args_hash`, the object's `uid`, `generation` and current replica count, and a short expiry.
 2. **Policy.** The matching `apply_*` call passes through Cedar at the gateway, which checks tool arguments (namespace allowlist, replica bounds). Planned; today the same limits are enforced only by the write Lambda.
 3. **Approve.** The client shows the exact arguments to a human. In DevOps Agent this is the chat approval for a `MUTATIVE` tool.
-4. **Apply.** The write Lambda's guard re-validates everything: plan exists, is unexpired and unused (single-use, conditional write), arguments match, `resourceVersion` is unchanged, kill switch is on. Cooldown and hourly budget are planned. It then runs a server-side dry run and the real patch.
+4. **Apply.** The write Lambda's guard re-validates everything: plan exists, is unexpired and unused (single-use, conditional write), arguments match, the object is the same one with an unchanged spec and no GitOps marker, kill switch is on. Cooldown and hourly budget are planned. It then runs a server-side dry run and the real patch, with a `resourceVersion` precondition so nothing can change in between.
 5. **Audit.** The result is written to DynamoDB with a correlation ID that is also annotated on the target object and traceable through gateway and Kubernetes audit logs.
 
 ## Design principles
 
 - **Plan/apply split.** Every write is two tools: a `READ_ONLY` `plan_*` and a `MUTATIVE` `apply_*` with identical arguments, so policy and the human approver see real values.
-- **Single-use, short-lived plans.** A plan can be applied once, within minutes, against the exact `resourceVersion` it was computed from. Concurrent changes return a conflict.
+- **Single-use, short-lived plans.** A plan can be applied once, within minutes, and only to the object it was computed from (same `uid`) with its spec unchanged (same `generation` and replica count). Concurrent spec changes return a conflict; status churn during a rollout does not.
 - **Misclassification loses the approval, not the limits.** If the write tool is accidentally left `READ_ONLY`, DevOps Agent can plan and apply on its own without asking anyone (observed in testing). The server-side limits still hold: allowed namespaces, replica bounds, GitOps and HPA checks, single-use plans and the kill switch. Classification is therefore checked after every registration change, and should be monitored for drift.
 - **Defense in depth (target design; Cedar and admission policy are planned).** Each layer assumes the others may fail:
   - `guard.py` in the write Lambda (authoritative check)
