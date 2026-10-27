@@ -69,7 +69,7 @@ The test:
 3. plans and applies a scale to 2, then checks that reusing the same `plan_id` returns `plan_used`;
 4. waits for 2 ready replicas, then plans and applies the scale back to 1.
 
-The Deployment controller keeps updating `resourceVersion` while pods start, so an apply right after a rollout may return `conflict`. The test then plans again, up to 3 times. If it fails part-way, `web` may be left at 2 replicas; scale it back with `kubectl` or rerun the test after fixing the cause.
+The Deployment controller keeps updating status, and with it `resourceVersion`, while pods start. Apply compares `metadata.uid`, `metadata.generation` and `spec.replicas` with the plan rather than `resourceVersion` (status and label changes leave `generation` alone; spec and annotation changes bump it), re-runs the GitOps check, and retries a 409 caused by a status update, so this churn alone no longer produces `conflict`. The test still plans again on `conflict`, up to 3 times; the retry is harmless. If it fails part-way, `web` may be left at 2 replicas; scale it back with `kubectl` or rerun the test after fixing the cause.
 
 ### Guard tests
 
@@ -81,7 +81,7 @@ export KILL_SWITCH_PARAM=$(terraform -chdir=terraform output -raw kill_switch_pa
 .venv/bin/python tests/e2e/e2e_gateway.py --with-expiry # also waits out one plan TTL
 ```
 
-They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, and the kill switch. The test turns the kill switch off briefly and restores it, applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas), and leaves `web` at 1 replica.
+They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, and the kill switch. The test turns the kill switch off briefly and restores it, applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas), briefly labels `web`, sets an environment variable on it and scales it by hand, and leaves it at 1 replica without those changes.
 
 ## 4. Register with AWS DevOps Agent
 

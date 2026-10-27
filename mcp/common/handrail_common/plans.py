@@ -37,6 +37,8 @@ class Plan:
     replicas_to: int
     args_hash: str
     resource_version: str
+    generation: int
+    uid: str
     created_at: int
     expires_at: int
     used: bool = False
@@ -51,6 +53,8 @@ class Plan:
             "replicas_to": self.replicas_to,
             "args_hash": self.args_hash,
             "resource_version": self.resource_version,
+            "generation": self.generation,
+            "uid": self.uid,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "used": self.used,
@@ -67,6 +71,9 @@ class Plan:
             replicas_to=int(item["replicas_to"]),
             args_hash=item["args_hash"],
             resource_version=item["resource_version"],
+            # Plans written before generation and uid were recorded can never match a live object.
+            generation=int(item.get("generation", -1)),
+            uid=str(item.get("uid", "")),
             created_at=int(item["created_at"]),
             expires_at=int(item["expires_at"]),
             used=bool(item["used"]),
