@@ -175,7 +175,11 @@ def id_flag(parser: argparse.ArgumentParser, flag: str, env_name: str, required:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--region", default=None, help="defaults to the AWS environment")
+    parser.add_argument(
+        "--region",
+        default=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"),
+        help="defaults to AWS_REGION or AWS_DEFAULT_REGION",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("create-space")

@@ -34,11 +34,11 @@ Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespa
 | `action` | S | `scale_deployment` |
 | `namespace`, `name` | S | target |
 | `replicas_from`, `replicas_to` | N | |
-| `args_hash` | S | SHA-256 of canonical JSON of `{action, namespace, name, replicas}` |
+| `args_hash` | S | SHA-256 of `json.dumps({action, namespace, name, replicas}, sort_keys=True, separators=(",", ":"))` |
 | `resource_version` | S | Deployment `metadata.resourceVersion` at plan time |
 | `created_at` | N | epoch seconds |
 | `expires_at` | N | epoch seconds, plan TTL (default 300 s); also the table TTL attribute |
-| `used` | BOOL | apply sets it with a conditional update (`used = false AND expires_at > now`) |
+| `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a` |
 | `applied_at`, `result` | N, S | written by apply |
 
 ## Guard checks
@@ -55,7 +55,10 @@ Apply (`k8s_write`), all re-checked independently of the plan step:
 2. Checks 1-3 above.
 3. Plan exists, `action` matches, `args_hash` matches, not expired, not used. Mark used with a conditional update before patching.
 4. Patch `spec.replicas` with a `metadata.resourceVersion` precondition equal to the planned one; a mismatch returns `conflict`.
-5. Server-side dry run (`dryRun=All`) before the real patch.
+5. Server-side dry run (`dryRun=All`) before the real patch. A plan is consumed before the dry run, so any failure after step 3 requires a new plan.
+6. The patch also sets the annotation `kube-handrail.io/last-plan-id` to the applied `plan_id`.
+
+The kill switch is read on every apply (no caching), so turning it off takes effect immediately.
 
 ## Runtime and packaging
 

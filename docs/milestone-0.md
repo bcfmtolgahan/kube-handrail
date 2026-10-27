@@ -94,7 +94,23 @@ export ASSOCIATION_ID=...
 
 `enable-write` adds `k8sw___apply_scale_deployment` and classifies it `MUTATIVE` in the same `UpdateAssociation` call, because a tool registered without a classification is treated as `READ_ONLY` and runs without approval. It then turns on `elevatedActionsEnabled` on the agent space while keeping its other preferences, and reads both back, exiting non-zero if the tool is not `MUTATIVE` or the preference is not set.
 
-Then, in DevOps Agent chat, ask it to scale `web` in `kube-handrail-sandbox` to 2. You should see a plan, an approval prompt showing the real arguments, and then the apply.
+Then start a **new** chat and ask the agent to scale `web` in `kube-handrail-sandbox` to 2. A chat keeps the tool list it was created with, so a chat opened before `enable-write` cannot see the apply tool. You can use the console, or the chat script:
+
+```sh
+C=scripts/devops_agent_chat.py
+.venv/bin/python $C ask "Scale the Deployment 'web' in namespace 'kube-handrail-sandbox' to 2 replicas using the kube-handrail tools: plan it, then apply the plan."
+.venv/bin/python $C approve --execution-id <id printed by ask>     # or: reject --reason "..."
+```
+
+Expected behavior, observed on a test cluster:
+
+- The agent calls `plan_scale_deployment`, then `apply_scale_deployment`. Instead of running the apply, DevOps Agent returns an approval request with a risk assessment, blast radius, rollback notes and `argument_pins` (the exact `plan_id`, namespace, name and replica count).
+- `approve` records a single-use decision with `UpdateApprovalAction`, pinned to exactly those arguments, then resumes the chat with `SendMessage`. The resume context must include `userActionResponse: APPROVAL_ACTION` and the option's `buttonText`; without them DevOps Agent reports the approval as malformed and does not run the tool.
+- After approval the apply runs and the Deployment carries `kube-handrail.io/last-plan-id` with the approved plan ID. Replaying the same approval does not run the tool again. A rejected request changes nothing.
+
+### Tool names inside DevOps Agent
+
+DevOps Agent prefixes each tool with the MCP server's registered name and an underscore, for example `kube-handrail_k8sw___apply_scale_deployment`. The 64-character name limit applies to this full name, so keep the server name short. `toolDetails` classifications still use the unprefixed names (`k8sw___apply_scale_deployment`).
 
 ## 5. Clean up
 
