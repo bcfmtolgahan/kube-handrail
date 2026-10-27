@@ -1,0 +1,59 @@
+# Bound to the kubernetes_groups of the two EKS access entries (mcp/CONTRACT.md, Identity).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-handrail-reader
+  namespace: kube-handrail-sandbox
+  labels:
+    app.kubernetes.io/part-of: kube-handrail-sandbox
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kube-handrail-reader
+  namespace: kube-handrail-sandbox
+  labels:
+    app.kubernetes.io/part-of: kube-handrail-sandbox
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kube-handrail-reader
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: kube-handrail-reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-handrail-writer
+  namespace: kube-handrail-sandbox
+  labels:
+    app.kubernetes.io/part-of: kube-handrail-sandbox
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kube-handrail-writer
+  namespace: kube-handrail-sandbox
+  labels:
+    app.kubernetes.io/part-of: kube-handrail-sandbox
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kube-handrail-writer
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: kube-handrail-writer

@@ -1,0 +1,11 @@
+[project]
+name = "kube-handrail"
+version = "0.0.0"
+description = "Guarded Kubernetes remediation tools exposed over MCP."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["mcp/common", "mcp/k8s_read", "mcp/k8s_write"]
+testpaths = ["tests"]

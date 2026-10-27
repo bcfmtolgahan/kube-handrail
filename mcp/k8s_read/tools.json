@@ -1,0 +1,27 @@
+[
+  {
+    "name": "get_workload_status",
+    "description": "Summarize a Deployment: desired, ready, updated and available replicas, conditions, current revision, and whether it is managed by GitOps. Read-only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "namespace": { "type": "string", "description": "Kubernetes namespace." },
+        "name": { "type": "string", "description": "Deployment name." }
+      },
+      "required": ["namespace", "name"]
+    }
+  },
+  {
+    "name": "plan_scale_deployment",
+    "description": "Plan a replica change for a Deployment without changing anything. Runs preflight checks and returns a single-use plan_id, the diff and an expiry. The change is only made by apply_scale_deployment with the same arguments and plan_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "namespace": { "type": "string", "description": "Kubernetes namespace." },
+        "name": { "type": "string", "description": "Deployment name." },
+        "replicas": { "type": "integer", "description": "Desired replica count." }
+      },
+      "required": ["namespace", "name", "replicas"]
+    }
+  }
+]
