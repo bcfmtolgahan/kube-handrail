@@ -54,15 +54,11 @@ class FakeSSM:
         return {"Parameter": {"Value": self.value}}
 
 
-def test_killswitch_cache_and_refresh():
-    now = [0.0]
+def test_killswitch_reads_every_time():
     ssm = FakeSSM("true")
-    switch = KillSwitch(ssm, "/p", ttl=30, clock=lambda: now[0])
+    switch = KillSwitch(ssm, "/p")
     assert switch.enabled()
     ssm.value = "false"
-    now[0] = 10
-    assert switch.enabled() and ssm.calls == 1
-    now[0] = 31
     assert not switch.enabled() and ssm.calls == 2
 
 
