@@ -71,6 +71,18 @@ The test:
 
 The Deployment controller keeps updating `resourceVersion` while pods start, so an apply right after a rollout may return `conflict`. The test then plans again, up to 3 times. If it fails part-way, `web` may be left at 2 replicas; scale it back with `kubectl` or rerun the test after fixing the cause.
 
+### Guard tests
+
+After the smoke test passes, run the end-to-end guard tests against the same deployment:
+
+```sh
+export KILL_SWITCH_PARAM=$(terraform -chdir=terraform output -raw kill_switch_parameter)
+.venv/bin/python tests/e2e/e2e_gateway.py               # about 1 minute
+.venv/bin/python tests/e2e/e2e_gateway.py --with-expiry # also waits out one plan TTL
+```
+
+They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, and the kill switch. The test turns the kill switch off briefly and restores it, applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas), and leaves `web` at 1 replica.
+
 ## 4. Register with AWS DevOps Agent
 
 Each step prints the IDs the next step needs as JSON. Client credentials are read from the environment and never printed.
@@ -107,6 +119,8 @@ Expected behavior, observed on a test cluster:
 - The agent calls `plan_scale_deployment`, then `apply_scale_deployment`. Instead of running the apply, DevOps Agent returns an approval request with a risk assessment, blast radius, rollback notes and `argument_pins` (the exact `plan_id`, namespace, name and replica count).
 - `approve` records a single-use decision with `UpdateApprovalAction`, pinned to exactly those arguments, then resumes the chat with `SendMessage`. The resume context must include `userActionResponse: APPROVAL_ACTION` and the option's `buttonText`; without them DevOps Agent reports the approval as malformed and does not run the tool.
 - After approval the apply runs and the Deployment carries `kube-handrail.io/last-plan-id` with the approved plan ID. Replaying the same approval does not run the tool again. A rejected request changes nothing.
+- Outside chat, for example in an investigation started from the backlog, DevOps Agent cancels the `MUTATIVE` call before it reaches the gateway ("an approval-ref header is required") and reports the change as a mitigation step for an operator.
+- If the write tool is classified `READ_ONLY` by mistake, the agent plans and applies without asking for approval. The server-side limits still apply. Re-run `enable-write` (it verifies the classification) after any change to the association.
 
 ### Tool names inside DevOps Agent
 
