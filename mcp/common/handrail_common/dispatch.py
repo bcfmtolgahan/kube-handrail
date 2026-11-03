@@ -1,6 +1,7 @@
 """Route a Gateway Lambda invocation to a tool handler."""
 
 import logging
+import os
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -8,9 +9,15 @@ from handrail_common.envelope import INTERNAL, UNKNOWN_TOOL, Envelope, err
 from handrail_common.validation import GuardError
 
 logger = logging.getLogger(__name__)
+# The Lambda runtime's root logger is at WARNING; the caller line is an audit record.
+logger.setLevel(logging.INFO)
 
 TOOL_NAME_KEY = "bedrockAgentCoreToolName"
 TARGET_DELIMITER = "___"
+# Reserved argument the gateway request interceptor sets to the verified caller (CONTRACT.md,
+# Caller identity). It is trusted only when CALLER_INTERCEPTOR is "true"; otherwise a client
+# could have sent it.
+CALLER_ARGUMENT = "_kube_handrail_caller"
 
 Handler = Callable[[dict[str, Any]], Envelope]
 
@@ -28,12 +35,23 @@ def tool_name(context: Any) -> str | None:
     return name or None
 
 
+def pop_caller(args: dict[str, Any], env: Mapping[str, str] | None = None) -> str | None:
+    """Remove the reserved caller argument; return it only when the interceptor is enabled."""
+    env = os.environ if env is None else env
+    value = args.pop(CALLER_ARGUMENT, None)
+    if env.get("CALLER_INTERCEPTOR") != "true":
+        return None
+    return value if isinstance(value, str) and value else None
+
+
 def dispatch(handlers: Mapping[str, Handler], event: Any, context: Any) -> Envelope:
     name = tool_name(context)
     handler = handlers.get(name) if name else None
     if handler is None:
         return err(UNKNOWN_TOOL, f"unknown tool: {name!r}")
-    args = event if isinstance(event, dict) else {}
+    args = dict(event) if isinstance(event, dict) else {}
+    caller = pop_caller(args)
+    logger.info("tool %s caller %s", name, caller or "unverified")
     try:
         return handler(args)
     except GuardError as exc:

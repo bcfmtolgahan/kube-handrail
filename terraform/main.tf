@@ -71,6 +71,7 @@ locals {
     { for fn in keys(local.functions) : fn => "requirements.txt" },
     var.sentinel_enabled ? { sentinel = "mcp/sentinel/requirements.txt" } : {},
     { approver = "mcp/approver/requirements.txt" },
+    var.caller_interceptor_enabled ? { interceptor = "mcp/interceptor/requirements.txt" } : {},
   )
 
   # Tolerates a function directory that has no Python sources yet.
@@ -250,6 +251,7 @@ resource "aws_lambda_function" "this" {
     variables = merge(
       local.common_env,
       each.value.kill_switch ? { REMEDIATION_ENABLED_PARAM = aws_ssm_parameter.kill_switch.name } : {},
+      { CALLER_INTERCEPTOR = tostring(var.caller_interceptor_enabled) },
       each.value.approval_requests ? {
         APPROVAL_TOPIC_ARN = aws_sns_topic.approvals.arn
         APPROVAL_URL       = aws_lambda_function_url.approver.function_url
@@ -397,7 +399,7 @@ resource "aws_iam_role" "gateway" {
 data "aws_iam_policy_document" "gateway" {
   statement {
     actions   = ["lambda:InvokeFunction"]
-    resources = [for fn in aws_lambda_function.this : fn.arn]
+    resources = concat([for fn in aws_lambda_function.this : fn.arn], aws_lambda_function.interceptor[*].arn)
   }
 }
 
@@ -419,6 +421,24 @@ resource "aws_bedrockagentcore_gateway" "this" {
       allowed_clients = [for c in aws_cognito_user_pool_client.this : c.id]
     }
   }
+
+  dynamic "interceptor_configuration" {
+    for_each = aws_lambda_function.interceptor
+    content {
+      interception_points = ["REQUEST"]
+      interceptor {
+        lambda {
+          arn = interceptor_configuration.value.arn
+        }
+      }
+      input_configuration {
+        pass_request_headers = true
+      }
+    }
+  }
+
+  # The gateway role must be allowed to invoke the interceptor before the gateway uses it.
+  depends_on = [aws_iam_role_policy.gateway]
 }
 
 resource "aws_bedrockagentcore_gateway_target" "this" {
