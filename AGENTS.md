@@ -53,7 +53,7 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 | `plan_not_found`, `plan_expired` | Plan unknown or expired. | Re-plan. |
 | `plan_used` | Plan already consumed, possibly by the approval's own apply. | Check `get_workload_status`; do not re-plan unless the human asks. |
 | `plan_mismatch` | Apply arguments differ from the plan. | Apply again with exactly the plan's arguments, or re-plan. |
-| `conflict` | On apply: the Deployment changed since the plan (`details` shows what, when the server knows it). On plan, without `details`: a HorizontalPodAutoscaler owns the replica count. | Apply: read status, then re-plan if the change is still wanted. Plan: stop; change the autoscaler, not the Deployment. |
+| `conflict` | On apply: the Deployment changed since the plan (`details` shows what, when the server knows it). On plan, without `details`: a HorizontalPodAutoscaler owns the replica count. On `request_approval`: the plan record changed concurrently. | Apply: read status, then re-plan if the change is still wanted. Plan: stop; change the autoscaler, not the Deployment. `request_approval`: call it once more. |
 | `remediation_disabled` | Kill switch is off. | Stop. Do not retry. |
 | `manual_change` | Someone changed replicas outside kube-handrail (`details.last_applied_to`, `current`). | Stop and ask the human; see Never. |
 | `cooldown` | Too soon after the last apply. | Wait until `details.retry_after` (epoch seconds), then re-plan. |

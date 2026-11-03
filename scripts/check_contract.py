@@ -67,7 +67,10 @@ def contract_error_codes(contract: str) -> list[str]:
 
 def check_agents_md(root: Path) -> list[str]:
     """AGENTS.md tells agents what to do on each error, so it must not miss one."""
-    agents_md = (root / "AGENTS.md").read_text()
+    path = root / "AGENTS.md"
+    if not path.is_file():
+        return ["AGENTS.md is missing"]
+    agents_md = path.read_text()
     codes = contract_error_codes((root / "mcp/CONTRACT.md").read_text())
     if not codes:
         return ["mcp/CONTRACT.md has no 'Error codes:' line"]

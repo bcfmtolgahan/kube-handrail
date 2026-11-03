@@ -2,6 +2,7 @@
 name: kube-handrail-scale
 description: Procedure for changing the replica count of a Kubernetes Deployment through the kube-handrail MCP tools (get_workload_status, plan_scale_deployment, request_approval, apply_scale_deployment). Use this skill when a mitigation or a user request calls for scaling a Deployment up or down, when a kube-handrail plan or apply returns an error, or when a scale change is waiting for human approval.
 ---
+<!-- kube-handrail:skill -->
 
 # Scale a Deployment with kube-handrail
 
@@ -39,12 +40,13 @@ Call `request_approval(plan_id)`:
 - `approval_mode: both`: wait for a human to say the plan was approved, then go to Step 5.
 - `invalid_argument` ("approval is handled by the client in client mode"): go to Step 5; your client asks the human for approval of the apply call.
 - `notified: false`: approvers already have the request; do not ask again before `retry_after`.
+- `conflict` ("plan changed concurrently"): call `request_approval` once more.
 
 If a human rejects the plan, or the approval expires, stop. Do not plan the same change again unless a human asks for it.
 
 ## Step 5: Apply
 
-Call `apply_scale_deployment` with the same `plan_id`, `namespace`, `name`, `replicas` and `override_manual_change` as the plan (omit the flag if the plan did). Do not change any value. On `conflict`, `plan_expired` or `plan_not_found`, re-plan once and go back to Step 3 (the new plan needs its own approval). On `plan_used`, check status instead: the plan was already applied.
+Call `apply_scale_deployment` with the same `plan_id`, `namespace`, `name`, `replicas` and `override_manual_change` as the plan (omit the flag if the plan did). Do not change any value. On `conflict`, read the status first: the Deployment changed since the plan, possibly by a human; re-plan only if the change is still wanted. On `plan_expired` or `plan_not_found`, re-plan. Re-plan at most once, then go back to Step 3 (the new plan needs its own approval). On `plan_used`, check status instead: the plan was already applied.
 
 ## Step 6: Verify
 

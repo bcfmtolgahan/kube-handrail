@@ -48,6 +48,8 @@ SKILL_PATH = "SKILL.md"
 # The first line of AGENTS.md. An agents_md asset that does not start with it was not
 # installed from this repository, and install-guidance refuses to overwrite it.
 AGENTS_MD_MARKER = "<!-- kube-handrail:agents-md -->"
+# The line right after a SKILL.md's frontmatter, with the same purpose for skills.
+SKILL_MARKER = "<!-- kube-handrail:skill -->"
 # Limits from the DevOps Agent asset documentation.
 AGENTS_MD_MAX_BYTES = 25_000
 SKILL_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
@@ -172,14 +174,28 @@ class Skill:
     text: str
 
 
+def frontmatter_end(lines: list[str]) -> int | None:
+    """Index of the line that closes the frontmatter, or None without frontmatter."""
+    if not lines or lines[0] != "---" or "---" not in lines[1:]:
+        return None
+    return lines.index("---", 1)
+
+
+def skill_marked(text: str) -> bool:
+    lines = text.splitlines()
+    end = frontmatter_end(lines)
+    return end is not None and lines[end + 1 : end + 2] == [SKILL_MARKER]
+
+
 def parse_skill(path: Path) -> Skill:
     """Read a SKILL.md whose frontmatter has exactly a one-line name and description."""
     text = path.read_text()
     lines = text.splitlines()
-    if not lines or lines[0] != "---" or "---" not in lines[1:]:
+    end = frontmatter_end(lines)
+    if end is None:
         sys.exit(f"{path}: must start with frontmatter between --- lines")
     fields: dict[str, str] = {}
-    for line in lines[1 : lines.index("---", 1)]:
+    for line in lines[1:end]:
         key, sep, value = line.partition(": ")
         if not sep or key in fields or key not in ("name", "description") or not value.strip():
             sys.exit(f"{path}: frontmatter must be one-line 'name: ...' and 'description: ...', got {line!r}")
@@ -191,14 +207,23 @@ def parse_skill(path: Path) -> Skill:
         sys.exit(f"{path}: name must match {SKILL_NAME.pattern} and the directory name")
     if len(description) > SKILL_DESCRIPTION_MAX:
         sys.exit(f"{path}: description must be at most {SKILL_DESCRIPTION_MAX} characters")
+    if not skill_marked(text):
+        sys.exit(f"{path}: the line after the frontmatter must be {SKILL_MARKER}")
     return Skill(name, description, text)
+
+
+def hidden(path: Path, root: Path) -> bool:
+    """Dotfiles such as .DS_Store are never uploaded, so they are ignored."""
+    return any(part.startswith(".") for part in path.relative_to(root).parts)
 
 
 def load_skills(directory: Path) -> list[Skill]:
     skills = []
-    for skill_dir in sorted(p for p in directory.iterdir() if p.is_dir()):
+    for skill_dir in sorted(p for p in directory.iterdir() if p.is_dir() and not hidden(p, directory)):
         # Only SKILL.md is uploaded, so any other file would silently be missing.
-        files = sorted(str(p.relative_to(skill_dir)) for p in skill_dir.rglob("*") if p.is_file())
+        files = sorted(
+            str(p.relative_to(skill_dir)) for p in skill_dir.rglob("*") if p.is_file() and not hidden(p, skill_dir)
+        )
         if files != [SKILL_PATH]:
             sys.exit(f"{skill_dir}: must contain only {SKILL_PATH}, found {files}")
         skills.append(parse_skill(skill_dir / SKILL_PATH))
@@ -231,12 +256,15 @@ def file_content(text: str, path: str) -> dict[str, Any]:
     return {"file": {"path": path, "body": {"text": text}}}
 
 
-def installed_from_repo(client: Any, space_id: str, asset_id: str) -> bool:
+def installed_from_repo(client: Any, space_id: str, asset_id: str, path: str = AGENTS_MD_PATH) -> bool:
+    """Whether the asset's file carries this repository's marker (path is AGENTS.md or SKILL.md)."""
     try:
-        file = client.get_asset_file(agentSpaceId=space_id, assetId=asset_id, path=AGENTS_MD_PATH)["file"]
+        file = client.get_asset_file(agentSpaceId=space_id, assetId=asset_id, path=path)["file"]
     except client.exceptions.ResourceNotFoundException:
         return False
-    return file["content"].get("text", "").startswith(AGENTS_MD_MARKER)
+    # Content without text (bytes) was not written by install-guidance.
+    text = file["content"].get("text", "")
+    return skill_marked(text) if path == SKILL_PATH else text.startswith(AGENTS_MD_MARKER)
 
 
 def single(matches: list[dict[str, Any]], what: str) -> dict[str, Any] | None:
@@ -288,6 +316,21 @@ def install_guidance(client: Any, args: argparse.Namespace) -> None:
             "repository; merge AGENTS.md into it by hand, choose another --agent-type, "
             "or pass --replace-instructions to overwrite it"
         )
+    # Skills are checked the same way, before anything is written.
+    installed = list_assets(client, space_id, SKILL_TYPE)
+    existing_skills = {}
+    for skill in skills:
+        found = single([a for a in installed if a["metadata"].get("name") == skill.name], f"skill {skill.name}")
+        if (
+            found
+            and not args.replace_instructions
+            and not installed_from_repo(client, space_id, found["assetId"], SKILL_PATH)
+        ):
+            sys.exit(
+                f"the skill {skill.name} ({found['assetId']}) was not installed from this repository; "
+                "rename or remove it, or pass --replace-instructions to overwrite it"
+            )
+        existing_skills[skill.name] = found
     payload: dict[str, Any] = {
         "agentsMd": {
             "agentType": agent_type,
@@ -303,12 +346,12 @@ def install_guidance(client: Any, args: argparse.Namespace) -> None:
         "skills": [],
     }
 
-    installed = list_assets(client, space_id, SKILL_TYPE)
     for skill in skills:
-        existing = single([a for a in installed if a["metadata"].get("name") == skill.name], f"skill {skill.name}")
         # Skills load only when relevant, so every agent type gets them, whatever --agent-type says.
         metadata = {"name": skill.name, "description": skill.description, "agent_types": [GENERIC]}
-        result = put_asset(client, space_id, SKILL_TYPE, existing, metadata, file_content(skill.text, SKILL_PATH))
+        result = put_asset(
+            client, space_id, SKILL_TYPE, existing_skills[skill.name], metadata, file_content(skill.text, SKILL_PATH)
+        )
         payload["skills"].append({"name": skill.name, **result})
     emit(payload)
 
@@ -322,14 +365,16 @@ def remove_guidance(client: Any, args: argparse.Namespace) -> None:
             removed.append({"assetId": asset["assetId"], "agentType": asset["metadata"].get("agent_type")})
     names = skill_names()
     for asset in list_assets(client, space_id, SKILL_TYPE):
-        if asset["metadata"].get("name") in names:
+        if asset["metadata"].get("name") in names and installed_from_repo(
+            client, space_id, asset["assetId"], SKILL_PATH
+        ):
             client.delete_asset(agentSpaceId=space_id, assetId=asset["assetId"])
             removed.append({"assetId": asset["assetId"], "name": asset["metadata"]["name"]})
     emit({"removed": removed})
 
 
 def skill_names() -> set[str]:
-    return {p.parent.name for p in SKILLS_DIR.glob(f"*/{SKILL_PATH}")}
+    return {p.parent.name for p in SKILLS_DIR.glob(f"*/{SKILL_PATH}") if not hidden(p, SKILLS_DIR)}
 
 
 def guidance_status(client: Any, space_id: str) -> dict[str, Any]:
@@ -375,7 +420,11 @@ def status(client: Any, args: argparse.Namespace) -> None:
     }
     if args.association_id:
         payload["tools"] = current_classifications(client, args.agent_space_id, args.association_id)
-    payload["guidance"] = guidance_status(client, args.agent_space_id)
+    try:
+        payload["guidance"] = guidance_status(client, args.agent_space_id)
+    except client.exceptions.AccessDeniedException as exc:
+        # Credentials from before install-guidance may lack aidevops:ListAssets; show the rest anyway.
+        payload["guidance"] = {"error": str(exc)}
     emit(payload)
 
 
@@ -440,7 +489,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--replace-instructions",
         action="store_true",
-        help="overwrite an AGENTS.md for this agent type that was not installed from this repository",
+        help="overwrite an AGENTS.md for this agent type, or a skill of the same name, "
+        "that was not installed from this repository",
     )
     p.set_defaults(func=install_guidance)
 

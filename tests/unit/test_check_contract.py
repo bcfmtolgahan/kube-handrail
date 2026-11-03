@@ -106,3 +106,8 @@ def test_contract_error_codes_match_envelope():
 
     codes = check_contract.contract_error_codes((REPO / "mcp/CONTRACT.md").read_text())
     assert sorted(codes) == sorted(ERROR_CODES)
+
+
+def test_agents_md_absent_fails_without_traceback(repo):
+    (repo / "AGENTS.md").unlink()
+    assert "AGENTS.md is missing" in check_contract.check(repo)
