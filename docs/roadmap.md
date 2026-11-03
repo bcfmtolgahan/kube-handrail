@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster; everything else is planned and not yet implemented, and the order will change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. The work listed under "Later in this milestone" and the later milestones is planned and not yet implemented, and the order may change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -70,7 +70,18 @@ See [Server-side approval](../mcp/CONTRACT.md#server-side-approval). Implemented
 
 **Done when:** in `server` mode an apply without an approval is rejected with `approval_required`, an approval attempt with a machine token is rejected, a plan approved through the approval API is applied and its record names the approver; in `client` mode the DevOps Agent chat flow works unchanged with a single approval; and an autonomous investigation can plan and request approval but still cannot call the write tool itself. That last point is DevOps Agent behavior observed in Milestone 0 (it cancels `MUTATIVE` calls outside chat), not something this repository enforces; the server's part is that `request_approval` is `READ_ONLY` and that in `server` mode the approval channel runs the apply.
 
-### 6. Caller identity spike (parallel)
+### 6. Caller identity spike (done)
+
+Verified on a test deployment with the experimental interceptor in `mcp/interceptor/` (off by default; see [Caller identity](../mcp/CONTRACT.md#caller-identity-experimental)):
+
+- A request interceptor with `passRequestHeaders` receives the validated bearer token and can rewrite `tools/call` arguments. The tool Lambda received the token's `client_id`.
+- A client that sent the reserved argument itself (`attacker`) still arrived as its real `client_id`, because the interceptor overwrites the argument unconditionally.
+- DevOps Agent's calls arrived under its own Cognito client and the test client's under its own, so callers can be told apart per OAuth client.
+- An argument outside a tool's `inputSchema` was not rejected by the gateway.
+- Per the AWS documentation, a gateway has at most one REQUEST and one RESPONSE interceptor. Policy (Cedar) evaluates the request after the REQUEST interceptor has transformed it ([AWS blog](https://aws.amazon.com/blogs/machine-learning/secure-ai-agents-with-policy-and-lambda-interceptors-in-amazon-bedrock-agentcore-gateway/)); Policy is not deployed here, so that order was not observed.
+- Fallback if interceptors are unavailable: one OAuth client per agent identity, with one gateway per client. Identity is then known from which gateway was called, at the cost of more gateways.
+
+The identity is per OAuth client, not per agent session: two agents sharing a client are indistinguishable.
 
 **Goal:** find out whether per-agent identity can reach the write path, as a prerequisite for per-agent budgets and attribution in Milestone 2.
 
@@ -95,7 +106,7 @@ See [Server-side approval](../mcp/CONTRACT.md#server-side-approval). Implemented
 
 - **Verify and revert.** A `READ_ONLY` tool reports the outcome of an applied plan (`healthy`, `degraded`, `unknown`) from an asynchronous check. Optionally, revert-on-failure and the verification window are part of the approved arguments, so the human approves the change and its revert together. Reverts use the spec-level precondition; `unknown` never triggers a revert; a revert is never reverted; the kill switch also stops reverts.
 - **Rollback by exact revision, and restart.** Rollback targets a specific revision, pins the pod template and image of that revision, and shows the image change per container. Restart follows the same plan/apply pattern.
-- **Per-agent identity, budgets and kill switch.** Plans record the requesting agent; per-agent hourly budgets and a per-agent kill switch. Depends on the outcome of the caller identity spike.
+- **Per-agent identity, budgets and kill switch.** Plans record the requesting agent; per-agent hourly budgets and a per-agent kill switch. Builds on the caller identity interceptor (Milestone 1, item 6), which identifies callers per OAuth client.
 - **Tamper-evident audit ledger and evidence export.** Append-only audit records, hash-chained and signed, linking requesting agent, approving human and executing role; per-plan evidence export. The executor cannot rewrite its own records.
 - **Single-source policy.** One policy file compiled to Cedar at the gateway, ValidatingAdmissionPolicy in the cluster, and guard configuration, with a CI check that all three agree on the same test cases. Cedar rolls out in log-only mode and admission policy in audit mode before enforcement ([Policy enforcement modes](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-enforcement-modes.html), [ValidatingAdmissionPolicy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/)). Includes change-freeze windows enforced by the guard and a break-glass path that requires a ticket reference and a second approver.
 
@@ -138,7 +149,8 @@ These are unverified and may change the design.
 - **Conditional Cedar policies and tool listing.** How argument-conditioned `permit` and `forbid` policies affect which tools appear in `tools/list`. ([Action-scoped policies](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html))
 - **DevOps Agent tool limits.** The per-call timeout and response size limit for custom MCP tools, which determine output and time budgets.
 - **Flux ownership detection.** Which labels or annotations reliably identify Flux-managed objects, so they can be blocked like Argo CD-managed ones.
-- **Gateway interceptors.** Whether a gateway supports more than one request or response interceptor, whether interceptors run before or after policy evaluation, and whether a request interceptor can add verified caller claims to the tool payload. ([Interceptor types](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html))
 - **DevOps Agent approval reference.** Whether the approval reference that DevOps Agent requires for `MUTATIVE` calls reaches the gateway. If it does, it could be recorded as evidence; it would not be used as a gate ([ADR 0002](adr/0002-server-verified-approval.md)).
+
+Answered by Milestone 1, item 6: a gateway REQUEST interceptor can pass verified caller claims (the OAuth `client_id`) to the tool Lambdas, and a client cannot spoof them. A gateway has one REQUEST and one RESPONSE interceptor at most ([Interceptor types](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html)).
 
 Answered by Milestone 0: how DevOps Agent treats tool classification. A `MUTATIVE` tool requires a chat approval pinned to the exact arguments and is cancelled outside chat; a write tool classified `READ_ONLY` runs without approval, within the server-side limits.

@@ -24,6 +24,14 @@ The classification of every tool is in `mcp/classification.json`, a map from ful
 
 The tool name is the part after `___` in `context.client_context.custom["bedrockAgentCoreToolName"]`. The event is the tool arguments object. There is no `tool_name` argument and no fallback. An unknown tool returns error code `unknown_tool`.
 
+## Caller identity (experimental)
+
+Without an interceptor, a tool Lambda learns nothing about the caller: `client_context.custom` carries the gateway, target, tool name and request IDs only. With `caller_interceptor_enabled = true`, Terraform attaches a gateway REQUEST interceptor (`mcp/interceptor/`) with `passRequestHeaders`. The gateway runs it after validating the inbound JWT. For `tools/call` it sets the reserved argument `_kube_handrail_caller` to the token's `client_id` (`unknown` if the token cannot be read), overwriting whatever the client sent under that name. It never logs or forwards the token.
+
+Before any handler runs, dispatch removes `_kube_handrail_caller` from the arguments. It trusts the value only when the Lambda's `CALLER_INTERCEPTOR` is `true` (without the interceptor, a client could have sent it) and logs `tool <name> caller <client_id>`. It is not yet used for any decision: plans still record `requested_by = "mcp-gateway"`. Per-agent attribution and budgets are Milestone 2.
+
+The reserved name is not in any tool's `inputSchema`. The gateway passed it through to the interceptor and on to the target without rejecting it.
+
 ## Response envelope
 
 Every handler returns a JSON object (not wrapped in `statusCode`/`body`):
