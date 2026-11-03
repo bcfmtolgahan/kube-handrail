@@ -1,9 +1,11 @@
-"""k8s_read Lambda: Deployment status and scale planning. Never mutates the cluster."""
+"""k8s_read Lambda: Deployment status and events, and scale planning. Never mutates the cluster."""
 
 import json
+import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from functools import cache, partial
 from typing import Any
 
@@ -46,6 +48,7 @@ from handrail_common.plans import (
     object_key,
     scale_args_hash,
 )
+from handrail_common.untrusted import fit_list, untrusted_text
 from handrail_common.validation import (
     GuardError,
     check_namespace_allowed,
@@ -53,6 +56,7 @@ from handrail_common.validation import (
     require_name,
     require_namespace,
     require_override_flag,
+    require_int,
     require_plan_id,
     validate_scale_args,
 )
@@ -61,6 +65,15 @@ REVISION_ANNOTATION = "deployment.kubernetes.io/revision"
 APPROVAL_SUBJECT = "kube-handrail: approval requested"
 # The API server defaults spec.replicas to 1 when it is omitted.
 DEFAULT_REPLICAS = 1
+DEFAULT_EVENT_LIMIT = 20
+MAX_EVENT_LIMIT = 50
+# Generated names: the API server cuts generateName to 58 characters and appends 5 random
+# lower-case letters or digits (k8s.io/apiserver names.SimpleNameGenerator).
+GENERATED_PREFIX_MAX = 58
+_GENERATED_SUFFIX = re.compile(r"^[a-z0-9]{5}$")
+_TIMESTAMP = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$"
+)
 
 
 def _kubernetes_error(exc: ApiException, what: str) -> GuardError:
@@ -149,17 +162,23 @@ def _desired_replicas(deployment: Any) -> int:
     return DEFAULT_REPLICAS if replicas is None else replicas
 
 
-def _conditions(status: Any) -> list[dict[str, Any]]:
-    return [
-        {"type": c.type, "status": c.status, "reason": c.reason, "message": c.message}
-        for c in (status.conditions if status else None) or []
-    ]
+def _conditions(status: Any) -> tuple[list[dict[str, Any]], bool]:
+    """Conditions with reason and message as untrusted text, and whether any was cut."""
+    conditions = []
+    truncated = False
+    for c in (status.conditions if status else None) or []:
+        reason, reason_cut = untrusted_text(c.reason)
+        message, message_cut = untrusted_text(c.message)
+        truncated = truncated or reason_cut or message_cut
+        conditions.append({"type": c.type, "status": c.status, "reason": reason, "message": message})
+    return conditions, truncated
 
 
-def _summary(deployment: Any) -> dict[str, Any]:
+def _summary(deployment: Any) -> tuple[dict[str, Any], bool]:
     meta = deployment.metadata
     status = deployment.status
-    return {
+    conditions, truncated = _conditions(status)
+    summary = {
         "namespace": meta.namespace,
         "name": meta.name,
         "replicas": {
@@ -168,11 +187,134 @@ def _summary(deployment: Any) -> dict[str, Any]:
             "updated": (status.updated_replicas if status else None) or 0,
             "available": (status.available_replicas if status else None) or 0,
         },
-        "conditions": _conditions(status),
+        "conditions": conditions,
         "revision": (meta.annotations or {}).get(REVISION_ANNOTATION),
         "resource_version": meta.resource_version,
         "gitops_managed": is_gitops_managed(deployment),
     }
+    return summary, truncated
+
+
+def _owned_replica_sets(replica_sets: list[dict[str, Any]], owner_uid: str) -> dict[str, str]:
+    """Name => uid of the ReplicaSets with an owner reference to `owner_uid`."""
+    owned = {}
+    for rs in replica_sets:
+        meta = rs.get("metadata") or {}
+        owners = meta.get("ownerReferences") or []
+        if isinstance(meta.get("name"), str) and any(
+            isinstance(o, Mapping) and o.get("uid") == owner_uid for o in owners
+        ):
+            owned[meta["name"]] = str(meta.get("uid") or "")
+    return owned
+
+
+def _is_generated_from(name: str, base: str) -> bool:
+    prefix = f"{base}-"[:GENERATED_PREFIX_MAX]
+    return name.startswith(prefix) and bool(_GENERATED_SUFFIX.match(name[len(prefix) :]))
+
+
+def _is_name(value: Any) -> bool:
+    try:
+        require_name(value)
+    except GuardError:
+        return False
+    return True
+
+
+def _involved(
+    event: dict[str, Any],
+    namespace: str,
+    deployment: tuple[str, str],
+    replica_sets: Mapping[str, str],
+) -> dict[str, str] | None:
+    """The matched object {kind, name}, or None when the event is about something else.
+    Everything in involvedObject is set by whoever wrote the event, so it must match
+    names kube-handrail derived itself."""
+    involved = event.get("involvedObject") or {}
+    kind, name, uid = involved.get("kind"), involved.get("name"), involved.get("uid")
+    if involved.get("namespace") not in (None, namespace) or not _is_name(name):
+        return None
+    uid_unset = uid in (None, "")
+    if kind == "Deployment" and name == deployment[0] and (uid_unset or uid == deployment[1]):
+        return {"kind": kind, "name": name}
+    if kind == "ReplicaSet" and name in replica_sets and (uid_unset or uid == replica_sets[name]):
+        return {"kind": kind, "name": name}
+    if kind == "Pod" and any(_is_generated_from(name, rs) for rs in replica_sets):
+        return {"kind": kind, "name": name}
+    return None
+
+
+def _timestamp(value: Any) -> tuple[float, str] | None:
+    """(epoch seconds, the original string) for an RFC 3339 timestamp, else None."""
+    match = _TIMESTAMP.match(value) if isinstance(value, str) else None
+    if match is None:
+        return None
+    seconds, fraction, zone = match.groups()
+    # fromisoformat takes at most 6 fractional digits; MicroTime has 6, but be lenient.
+    text = seconds + (f".{fraction[:6]}" if fraction else "") + ("+00:00" if zone == "Z" else zone)
+    try:
+        return datetime.fromisoformat(text).timestamp(), value
+    except ValueError:
+        return None
+
+
+def _first_timestamp(*values: Any) -> tuple[float, str] | None:
+    for value in values:
+        parsed = _timestamp(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _count(event: dict[str, Any]) -> int:
+    for value in (event.get("count"), (event.get("series") or {}).get("count")):
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return 1
+
+
+def _sort_timestamp(event: dict[str, Any]) -> tuple[float, str] | None:
+    return _first_timestamp(
+        event.get("lastTimestamp"),
+        (event.get("series") or {}).get("lastObservedTime"),
+        event.get("eventTime"),
+        event.get("firstTimestamp"),
+        (event.get("metadata") or {}).get("creationTimestamp"),
+    )
+
+
+def _event_view(event: dict[str, Any], obj: dict[str, str]) -> tuple[dict[str, Any], bool]:
+    type_, type_cut = untrusted_text(event.get("type"))
+    reason, reason_cut = untrusted_text(event.get("reason"))
+    message, message_cut = untrusted_text(event.get("message"))
+    first = _first_timestamp(event.get("firstTimestamp"), event.get("eventTime"))
+    last = _sort_timestamp(event)
+    view = {
+        "type": type_,
+        "reason": reason,
+        "message": message,
+        "object": obj,
+        "count": _count(event),
+        "first_timestamp": first[1] if first else None,
+        "last_timestamp": last[1] if last else None,
+    }
+    return view, type_cut or reason_cut or message_cut
+
+
+def _newest_first(event: dict[str, Any]) -> tuple[bool, float, str]:
+    stamp = _sort_timestamp(event)
+    name = str((event.get("metadata") or {}).get("name") or "")
+    return (stamp is None, -stamp[0] if stamp else 0.0, name)
+
+
+def _event_limit(args: Mapping[str, Any]) -> int:
+    value = args.get("limit")
+    if value is None:
+        return DEFAULT_EVENT_LIMIT
+    limit = require_int(value, "limit")
+    if not 1 <= limit <= MAX_EVENT_LIMIT:
+        raise GuardError(INVALID_ARGUMENT, f"limit must be between 1 and {MAX_EVENT_LIMIT}")
+    return limit
 
 
 class Clients:
@@ -224,7 +366,44 @@ def get_workload_status(args: dict[str, Any], settings: Settings, clients: Clien
     namespace = require_namespace(args.get("namespace"))
     name = require_name(args.get("name"))
     check_namespace_allowed(namespace, settings.allowed_namespaces)
-    return ok(_summary(_read_deployment(clients.apps, namespace, name)))
+    summary, truncated = _summary(_read_deployment(clients.apps, namespace, name))
+    return ok(summary, truncated=truncated)
+
+
+def get_workload_events(args: dict[str, Any], settings: Settings, clients: Clients) -> Envelope:
+    """Events about a Deployment, its ReplicaSets and their Pods, newest first, as
+    untrusted text. Pods are matched by name; the reader cannot read them."""
+    namespace = require_namespace(args.get("namespace"))
+    name = require_name(args.get("name"))
+    limit = _event_limit(args)
+    check_namespace_allowed(namespace, settings.allowed_namespaces)
+    deployment = _read_deployment(clients.apps, namespace, name)
+    uid = str(deployment.metadata.uid)
+    replica_sets = _owned_replica_sets(
+        _list("ReplicaSets", partial(clients.apps.list_namespaced_replica_set, namespace=namespace)),
+        uid,
+    )
+    events = _list("Events", partial(clients.core.list_namespaced_event, namespace=namespace))
+    matched = []
+    for event in events:
+        obj = _involved(event, namespace, (name, uid), replica_sets)
+        if obj is not None:
+            matched.append((event, obj))
+    matched.sort(key=lambda pair: _newest_first(pair[0]))
+    views = [_event_view(event, obj) for event, obj in matched[:limit]]
+    data, dropped = fit_list(
+        {
+            "namespace": namespace,
+            "name": name,
+            "events": [view for view, _ in views],
+            "matched": len(matched),
+            "truncated": False,
+        },
+        "events",
+    )
+    data["truncated"] = dropped
+    field_cut = any(cut for _, cut in views[: len(data["events"])])
+    return ok(data, truncated=dropped or field_cut)
 
 
 def plan_scale_deployment(
@@ -367,6 +546,9 @@ def _settings() -> Settings:
 
 HANDLERS = {
     "get_workload_status": lambda args: get_workload_status(
+        args, _settings(), Clients(_settings())
+    ),
+    "get_workload_events": lambda args: get_workload_events(
         args, _settings(), Clients(_settings())
     ),
     "plan_scale_deployment": lambda args: plan_scale_deployment(

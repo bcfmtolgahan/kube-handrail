@@ -1,5 +1,6 @@
 {
   "k8sr___get_workload_status": "READ_ONLY",
+  "k8sr___get_workload_events": "READ_ONLY",
   "k8sr___plan_scale_deployment": "READ_ONLY",
   "k8sr___request_approval": "READ_ONLY",
   "k8sw___apply_scale_deployment": "MUTATIVE"
