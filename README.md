@@ -2,7 +2,7 @@
 
 Guarded remediation layer for AI agents on Kubernetes: **plan → policy → approve → apply → audit**. MCP tools for Amazon EKS, intended to work with AWS DevOps Agent and other MCP clients.
 
-> **Status: Milestone 0 implemented; Milestone 1 in progress.** A vertical slice (one read tool and one guarded plan/apply pair) is implemented and tested on a test cluster, and server-verified approval is implemented and unit-tested. Much of what is described below is planned, not built. See [Status](#status).
+> **Status: Milestone 0 done; the core of Milestone 1 is implemented and tested on a test cluster.** That covers one read tool and one guarded plan/apply pair for scaling, server-verified approval, the oscillation breaker, the impact preview and the drift sentinel. Restart, rollback, the Cedar and admission policy layers and the later milestones are planned, not built. See [Status](#status).
 
 ## Why
 
@@ -97,7 +97,7 @@ A remediation follows this sequence:
 
 Milestone 0 is implemented and tested on a test cluster: `get_workload_status` and a guarded `plan_scale_deployment` / `apply_scale_deployment` pair behind an AgentCore Gateway, with Terraform, namespace-scoped RBAC, end-to-end guard tests and AWS DevOps Agent registration. Setup, tests and observed behavior are in [Milestone 0](docs/milestone-0.md). There is no release.
 
-Milestone 1 (server-verified write path) is in progress; the [roadmap](docs/roadmap.md) lists which items are implemented. Integration details that are still unverified are listed there under "Open questions".
+Milestone 1 (server-verified write path): items 1-5 are implemented and tested on a test cluster, and the caller identity spike (item 6) is done, with an experimental interceptor that is off by default. The remaining Milestone 1 work is listed under "Later in this milestone" in the [roadmap](docs/roadmap.md). Integration details that are still unverified are listed there under "Open questions".
 
 ## Planned layout
 

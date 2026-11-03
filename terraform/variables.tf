@@ -174,6 +174,12 @@ variable "alert_email" {
   default     = ""
 }
 
+variable "caller_interceptor_enabled" {
+  description = "Experimental: attach a gateway request interceptor that passes the verified OAuth client_id to the tool Lambdas (mcp/CONTRACT.md, Caller identity)."
+  type        = bool
+  default     = false
+}
+
 variable "approval_mode" {
   description = "client: the MCP client approves (DevOps Agent chat), the server requires no approval record. server: every apply requires a server approval. both: as server on the server side; the client approves as well."
   type        = string
