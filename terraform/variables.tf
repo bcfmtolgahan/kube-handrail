@@ -287,24 +287,13 @@ variable "lambda_security_group_ids" {
 }
 
 variable "allow_lambda_to_cluster_endpoint" {
-  description = "Add an inbound HTTPS rule from the tool Lambdas' security groups to the cluster security group. Off by default because it changes a security group of the cluster."
+  description = "Add an inbound HTTPS rule from the tool Lambdas' security groups to the cluster security group. Off by default because it changes a security group of the cluster. Needs private endpoint access on the cluster."
   type        = bool
   default     = false
 }
 
 variable "create_vpc_endpoints" {
-  description = "Create the VPC endpoints the tool Lambdas need without a NAT gateway: interface endpoints for EKS, SSM and SNS, and a DynamoDB gateway endpoint. Leave off if the VPC already has endpoints for these services."
+  description = "Create the VPC endpoints the tool Lambdas need without a NAT gateway: interface endpoints for EKS, SSM and SNS, and a DynamoDB gateway endpoint on the route tables of lambda_subnet_ids. Needs private endpoint access on the cluster. Leave off if the VPC already has endpoints for these services."
   type        = bool
   default     = false
-}
-
-variable "vpc_endpoint_route_table_ids" {
-  description = "Route tables of lambda_subnet_ids for the DynamoDB gateway endpoint. Required with create_vpc_endpoints."
-  type        = list(string)
-  default     = []
-
-  validation {
-    condition     = alltrue([for id in var.vpc_endpoint_route_table_ids : can(regex("^rtb-[0-9a-f]+$", id))])
-    error_message = "vpc_endpoint_route_table_ids must be route table IDs."
-  }
 }

@@ -28,6 +28,11 @@ locals {
   interface_endpoints    = toset(["eks", "ssm", "sns"])
   cluster_https_sources  = local.lambda_in_vpc && var.allow_lambda_to_cluster_endpoint ? local.lambda_security_group_ids : []
   endpoint_https_sources = local.create_vpc_endpoints ? local.lambda_security_group_ids : []
+
+  # A subnet without an explicit association uses the VPC's main route table.
+  endpoint_route_table_ids = local.create_vpc_endpoints ? sort(distinct(flatten([
+    for id in var.lambda_subnet_ids : coalescelist(data.aws_route_tables.lambda_subnet[id].ids, data.aws_route_tables.main[0].ids)
+  ]))) : []
 }
 
 data "aws_subnet" "lambda" {
@@ -48,6 +53,10 @@ resource "aws_security_group" "lambda" {
   name        = "${var.name_prefix}-lambda"
   description = "kube-handrail tool Lambdas: outbound HTTPS to the EKS API and AWS APIs."
   vpc_id      = local.lambda_vpc_id
+
+  # Lambda deletes its network interfaces with the role's permissions, and the provider
+  # deletes leftover ones before the group. Keep the role policy until the group is gone.
+  depends_on = [aws_iam_role_policy.lambda]
 }
 
 # Every call the tool Lambdas make is HTTPS. Terraform removes the default allow-all rule.
@@ -88,6 +97,26 @@ data "aws_vpc_endpoint_service" "dynamodb" {
 
   service      = "dynamodb"
   service_type = "Gateway"
+}
+
+data "aws_route_tables" "lambda_subnet" {
+  for_each = local.create_vpc_endpoints ? toset(var.lambda_subnet_ids) : toset([])
+
+  filter {
+    name   = "association.subnet-id"
+    values = [each.value]
+  }
+}
+
+data "aws_route_tables" "main" {
+  count = local.create_vpc_endpoints ? 1 : 0
+
+  vpc_id = local.lambda_vpc_id
+
+  filter {
+    name   = "association.main"
+    values = ["true"]
+  }
 }
 
 resource "aws_security_group" "endpoints" {
@@ -133,7 +162,7 @@ resource "aws_vpc_endpoint" "dynamodb" {
   vpc_id            = local.lambda_vpc_id
   service_name      = data.aws_vpc_endpoint_service.dynamodb[0].service_name
   vpc_endpoint_type = "Gateway"
-  route_table_ids   = var.vpc_endpoint_route_table_ids
+  route_table_ids   = local.endpoint_route_table_ids
 }
 
 # Warnings, not errors: these setups can work with extra configuration outside this module.
@@ -151,5 +180,10 @@ check "lambda_network" {
   assert {
     condition     = local.lambda_in_vpc && local.cluster_vpc_config.endpoint_private_access ? data.aws_vpc.lambda[0].enable_dns_support && data.aws_vpc.lambda[0].enable_dns_hostnames : true
     error_message = "The cluster's private endpoint resolves inside the VPC only with enableDnsSupport and enableDnsHostnames on."
+  }
+
+  assert {
+    condition     = !local.lambda_in_vpc || local.cluster_vpc_config.endpoint_private_access
+    error_message = "The cluster has no private endpoint access, so the Lambdas in lambda_subnet_ids reach its public endpoint through a NAT gateway. The NAT gateway's address must be in public_access_cidrs."
   }
 }

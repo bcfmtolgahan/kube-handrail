@@ -209,6 +209,32 @@ data "aws_iam_policy_document" "lambda" {
     }
   }
 
+  # Lambda grants the role's network interface actions to the function's code as well. Only
+  # the Lambda service needs them; requests from the code carry lambda:SourceFunctionArn.
+  # The ARN is built from the name: referencing aws_lambda_function.this would be a cycle.
+  dynamic "statement" {
+    for_each = local.lambda_in_vpc ? [1] : []
+    content {
+      sid    = "VpcNetworkInterfacesNotFromCode"
+      effect = "Deny"
+      actions = [
+        "ec2:CreateNetworkInterface",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSubnets",
+        "ec2:DetachNetworkInterface",
+        "ec2:DeleteNetworkInterface",
+        "ec2:AssignPrivateIpAddresses",
+        "ec2:UnassignPrivateIpAddresses",
+      ]
+      resources = ["*"]
+      condition {
+        test     = "ArnEquals"
+        variable = "lambda:SourceFunctionArn"
+        values   = ["arn:${local.partition}:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-${replace(each.key, "_", "-")}"]
+      }
+    }
+  }
+
   dynamic "statement" {
     for_each = each.value.kill_switch ? [1] : []
     content {
@@ -301,9 +327,15 @@ resource "aws_lambda_function" "this" {
       condition     = local.lambda_in_vpc || (length(var.lambda_security_group_ids) == 0 && !var.allow_lambda_to_cluster_endpoint && !var.create_vpc_endpoints)
       error_message = "lambda_security_group_ids, allow_lambda_to_cluster_endpoint and create_vpc_endpoints need lambda_subnet_ids."
     }
+    # Without private access, requests from the VPC go to the public endpoint, which the
+    # cluster security group does not filter and no VPC endpoint carries.
     precondition {
-      condition     = !var.create_vpc_endpoints || length(var.vpc_endpoint_route_table_ids) > 0
-      error_message = "create_vpc_endpoints needs vpc_endpoint_route_table_ids for the DynamoDB gateway endpoint."
+      condition     = !var.allow_lambda_to_cluster_endpoint || local.cluster_vpc_config.endpoint_private_access
+      error_message = "allow_lambda_to_cluster_endpoint needs private endpoint access on the cluster: the cluster security group does not filter the public endpoint."
+    }
+    precondition {
+      condition     = !var.create_vpc_endpoints || local.cluster_vpc_config.endpoint_private_access
+      error_message = "create_vpc_endpoints needs private endpoint access on the cluster: no VPC endpoint carries Kubernetes API traffic, so the Lambdas could not reach the public endpoint without a NAT gateway."
     }
   }
 }
