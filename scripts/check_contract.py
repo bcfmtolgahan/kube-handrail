@@ -2,8 +2,9 @@
 """Check that tool schemas, mcp/classification.json and Terraform agree.
 
 Fails if a tool has no classification, the classification names a tool that does
-not exist, a write tool is not MUTATIVE, a full tool name is invalid, or
-terraform/main.tf does not load each target's tools.json under that target name.
+not exist, a write tool is not MUTATIVE, a full tool name is invalid,
+terraform/main.tf does not load each target's tools.json under that target name,
+or AGENTS.md does not name every error code listed in mcp/CONTRACT.md.
 Standard library only, so it runs before any dependency is installed.
 """
 
@@ -21,6 +22,8 @@ WRITE_DIR = "k8s_write"
 CLASSIFICATIONS = {"READ_ONLY", "MUTATIVE"}
 NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
 MAX_NAME_LENGTH = 64
+ERROR_CODES_LINE = re.compile(r"^Error codes: (.*)$", re.MULTILINE)
+CODE = re.compile(r"`([a-z_]+)`")
 
 # An entry of the `functions` map in terraform/main.tf looks like
 #   k8s_read = {
@@ -57,6 +60,21 @@ def schema_tools(root: Path, directory: str) -> list[str]:
     return [tool["name"] for tool in json.loads((root / "mcp" / directory / "tools.json").read_text())]
 
 
+def contract_error_codes(contract: str) -> list[str]:
+    line = ERROR_CODES_LINE.search(contract)
+    return CODE.findall(line.group(1)) if line else []
+
+
+def check_agents_md(root: Path) -> list[str]:
+    """AGENTS.md tells agents what to do on each error, so it must not miss one."""
+    agents_md = (root / "AGENTS.md").read_text()
+    codes = contract_error_codes((root / "mcp/CONTRACT.md").read_text())
+    if not codes:
+        return ["mcp/CONTRACT.md has no 'Error codes:' line"]
+    named = set(CODE.findall(agents_md))
+    return [f"AGENTS.md does not mention {code}" for code in codes if code not in named]
+
+
 def check(root: Path) -> list[str]:
     errors: list[str] = []
     classification = json.loads((root / "mcp/classification.json").read_text())
@@ -91,7 +109,7 @@ def check(root: Path) -> list[str]:
             errors.append(f"{full}: target {target} is not loaded by terraform/main.tf")
         elif full not in tools:
             errors.append(f"{full}: classified but not in mcp/{targets[target]}/tools.json")
-    return errors
+    return errors + check_agents_md(root)
 
 
 def main() -> None:

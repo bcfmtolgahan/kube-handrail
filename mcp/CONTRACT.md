@@ -222,7 +222,7 @@ Plan (`k8s_read`):
 2. Namespace in `ALLOWED_NAMESPACES`.
 3. `MIN_REPLICAS <= replicas <= MAX_REPLICAS`.
 4. Deployment exists and is not GitOps-managed. Fail closed: treat it as managed if it has the Argo CD `argocd.argoproj.io/tracking-id` annotation or the `app.kubernetes.io/instance` label (Argo CD label tracking; may also match Helm releases, which is acceptable).
-5. Deployment has no HorizontalPodAutoscaler targeting it.
+5. Deployment has no HorizontalPodAutoscaler targeting it; otherwise `conflict` without `details`.
 6. Blast-radius budget: `|replicas - current| <= max(1, ceil(current * MAX_REPLICA_STEP_PERCENT / 100))`, where `current` is `spec.replicas` (unset counts as 1); otherwise `blast_radius_exceeded`. It is enforced whatever the approval says.
 7. History checks: manual change, cooldown, flapping, object budget, then plan rate limit (below).
 8. Global budget: the current hour's counter, read consistently, must be below `GLOBAL_HOURLY_APPLY_BUDGET`. Planning only reads it.
@@ -461,6 +461,20 @@ Known limits:
 - Separation of duties is between principal classes: every plan is requested by `mcp-gateway` and only listed human principals approve. Per-agent `requested_by` needs caller identity on the server (Milestone 1, item 6).
 - The apply triggered by the approval channel does not pass through the gateway, so gateway policy (Cedar, once added) does not see it; the write guard and RBAC do.
 - Slack is not an approval channel yet; the implemented channel is this IAM-authenticated API and its CLI.
+
+## Agent guidance
+
+Instructions for agents, derived from this contract; where they disagree, this contract is right.
+
+- `AGENTS.md` (repository root): the tools, the plan, approval and apply flow, what to do on each error code, and the handling of untrusted text in tool output. Its first line is `<!-- kube-handrail:agents-md -->`. `scripts/check_contract.py` fails unless it names every code in the `Error codes` list above.
+- `agent/skills/<name>/SKILL.md`: one directory per skill, holding only `SKILL.md`, with frontmatter of exactly a one-line `name` (the directory name, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, at most 64 characters) and a one-line `description` (at most 1024 characters). Today: `kube-handrail-scale`.
+
+`scripts/devops_agent_register.py install-guidance` installs them as DevOps Agent assets in an agent space, after validating every file locally:
+
+- the `agents_md` asset for `--agent-type` (default `GENERIC`, every agent), with metadata `{"agent_type": ...}` and the single file `AGENTS.md` (at most 25 000 bytes). An agent space holds one per agent type; an existing one is updated only if its `AGENTS.md` starts with the marker line, or with `--replace-instructions`, so standing instructions written by an operator are never overwritten silently;
+- one `skill` asset per skill, found by `metadata.name`, with metadata `name`, `description` and `agent_types: ["GENERIC"]` (skills load only when relevant, so every agent type gets them whatever `--agent-type` says) and the single file `SKILL.md`. An update merges metadata, so a skill's `status` set by an operator is kept; `agent_types` is set back to `GENERIC`.
+
+Existing assets are found with `ListAssets` and updated with `UpdateAsset`; more than one match is an error. `status` lists the `agents_md` assets and the skills named in `agent/skills/`; `remove-guidance` deletes the `agents_md` assets that start with the marker and those skills. Agents load the instructions when a session starts, so a session that was already open keeps the old text.
 
 ## Runtime and packaging
 

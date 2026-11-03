@@ -14,7 +14,14 @@ _SPEC.loader.exec_module(check_contract)
 @pytest.fixture
 def repo(tmp_path):
     """A copy of the files the check reads, to break one at a time."""
-    for rel in ["mcp/classification.json", "mcp/k8s_read/tools.json", "mcp/k8s_write/tools.json", "terraform/main.tf"]:
+    for rel in [
+        "mcp/classification.json",
+        "mcp/k8s_read/tools.json",
+        "mcp/k8s_write/tools.json",
+        "terraform/main.tf",
+        "mcp/CONTRACT.md",
+        "AGENTS.md",
+    ]:
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO / rel, tmp_path / rel)
     return tmp_path
@@ -86,3 +93,16 @@ def test_apply_tool_on_the_read_target_must_be_mutative(repo):
     edit_json(repo / "mcp/k8s_read/tools.json", add_tool("apply_restart"))
     edit_json(repo / "mcp/classification.json", lambda c: c.update({"k8sr___apply_restart": "READ_ONLY"}))
     assert check_contract.check(repo) == ["k8sr___apply_restart: write tool must be MUTATIVE, not READ_ONLY"]
+
+
+def test_agents_md_missing_error_code_fails(repo):
+    agents_md = repo / "AGENTS.md"
+    agents_md.write_text(agents_md.read_text().replace("`flapping`", "flapping"))
+    assert check_contract.check(repo) == ["AGENTS.md does not mention flapping"]
+
+
+def test_contract_error_codes_match_envelope():
+    from handrail_common.envelope import ERROR_CODES
+
+    codes = check_contract.contract_error_codes((REPO / "mcp/CONTRACT.md").read_text())
+    assert sorted(codes) == sorted(ERROR_CODES)

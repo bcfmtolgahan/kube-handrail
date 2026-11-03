@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Tear down the Milestone 0 slice in reverse order of setup:
+#   0. remove the agent guidance (AGENTS.md and skills)  (AGENT_SPACE_ID)
 #   1. disassociate the MCP server from the agent space  (AGENT_SPACE_ID, ASSOCIATION_ID)
 #   2. deregister the MCP server                         (SERVICE_ID)
 #   3. delete the agent space                            (only with --delete-space)
@@ -40,6 +41,14 @@ confirm() {
   read -r -p "$1 [y/N] " answer
   [[ "$answer" == "y" || "$answer" == "Y" ]]
 }
+
+if [[ -n "${AGENT_SPACE_ID:-}" ]]; then
+  if confirm "Remove the kube-handrail AGENTS.md and skills from agent space ${AGENT_SPACE_ID}?"; then
+    "${register[@]}" remove-guidance --agent-space-id "$AGENT_SPACE_ID"
+  fi
+else
+  echo "skip: remove agent guidance (AGENT_SPACE_ID not set)"
+fi
 
 if [[ -n "${AGENT_SPACE_ID:-}" && -n "${ASSOCIATION_ID:-}" ]]; then
   if confirm "Disassociate MCP server association ${ASSOCIATION_ID}?"; then
