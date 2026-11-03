@@ -39,10 +39,9 @@ The reserved name is not in any tool's `inputSchema`. The gateway passed it thro
 Dispatch takes each invocation's correlation ID from `context.client_context.custom`, using the first of these that is a string (or integer) matching `^[A-Za-z0-9._:-]{1,128}$`:
 
 1. `bedrockAgentCoreAwsRequestId`, the gateway's ID for the request;
-2. `bedrockAgentCoreMcpMessageId`, the JSON-RPC message ID (chosen by the client, hence the pattern);
-3. `kubeHandrailCorrelationId`, set only by the approver when it runs an apply (see [Approval API](#approval-api));
+2. `kubeHandrailCorrelationId`, set only by the approver when it runs an apply (see [Approval API](#approval-api));
 
-and otherwise the Lambda's own `aws_request_id`. A value that does not match is skipped, never logged. The approver is not behind the gateway; its correlation ID is its own Lambda request ID.
+and otherwise the Lambda's own `aws_request_id`. A value that does not match is skipped, never logged. The gateway's `bedrockAgentCoreMcpMessageId` is not used: the client chooses the JSON-RPC message ID, so it is not unique across sessions. The approver is not behind the gateway; its correlation ID is its own Lambda request ID.
 
 The ID is carried to:
 
@@ -77,11 +76,14 @@ Every tool invocation, including `unknown_tool`, prints exactly one JSON line wh
 - `caller`: the verified caller ([Caller identity](#caller-identity-experimental)), otherwise `null`.
 - `plan_id`: the `plan_id` of a successful response's `data`, otherwise the `plan_id` argument, and only if it is a UUID; otherwise `null`.
 - `outcome`: `ok` or the error code.
-- `ToolCalls` is 1. `ToolErrors` is 1 only for `internal`. Any other error code is a guard rejection: the record then has `Code` and `GuardRejections = 1` and the second metric entry; an `ok` or `internal` record has neither. The empty dimension set gives `ToolCalls` and `ToolErrors` across all tools.
+- `ToolCalls` is 1. `ToolErrors` is 1 for `internal` and `kubernetes_error` (the tool could not do its job, for example the Kubernetes API refused its credentials or returned a server error). Any other error code is a guard rejection: the record then has `Code` and `GuardRejections = 1` and the second metric entry; an `ok`, `internal` or `kubernetes_error` record has neither. The empty dimension set gives `ToolCalls` and `ToolErrors` across all tools.
 
 The record has only these fields. Argument values, tokens and error messages are never in it. An internal error additionally logs its stack trace through the Lambda logger, in a line that names the correlation ID.
 
-Terraform creates the alarm `<name_prefix>-tool-errors` (`ToolErrors` across all tools, sum over 5 minutes greater than 0, missing data not breaching) on the drift sentinel's alert topic; it exists only with `sentinel_enabled`, which creates the topic.
+Terraform creates these alarms on the drift sentinel's alert topic; they exist only with `sentinel_enabled`, which creates the topic:
+
+- `<name_prefix>-tool-errors`: `ToolErrors` across all tools, sum over 5 minutes greater than 0, missing data not breaching.
+- `<name_prefix>-k8s-read-errors` and `<name_prefix>-k8s-write-errors`: `AWS/Lambda` `Errors` of each tool Lambda, sum over 5 minutes at least 1. An invocation that times out, runs out of memory or fails to start prints no tool record, so only this alarm sees it.
 
 The approver prints one JSON line per decision: `{"event": "decision", "plan_id", "decision", "approver", "correlation_id", "apply_outcome"}`, where `apply_outcome` is `ok`, the apply's error code, or `null` when no apply ran. The rejection reason is not logged.
 
@@ -370,7 +372,7 @@ Requests (responses are the JSON envelope in the body):
   - Response `data`: `plan` (the view above, read again after the apply), `apply` (the write Lambda's envelope, or `null` when no apply ran, as always in `client` and `both` mode) and `approval_mode`. If the write Lambda cannot be invoked at all, `apply` is `internal` with the message `approval recorded; apply could not be started: <error code>`. A failed apply does not undo the approval: an approval whose apply was refused before the consume (for example `remediation_disabled`) can still be applied through the gateway until it expires.
 - Any other method: `invalid_argument`.
 
-HTTP status: 200 for `ok` (also when the triggered apply failed; see `data.apply`), 400 `invalid_argument`, 403 `forbidden`, 404 `plan_not_found`, 409 `plan_used`, `plan_expired`, `plan_decided`, `conflict`, 500 otherwise. Each decision is logged as one JSON line with the caller ARN, `plan_id` and correlation ID ([Observability](#observability)); each refusal is logged with the caller ARN.
+HTTP status: 200 for `ok` (also when the triggered apply failed; see `data.apply`), 400 `invalid_argument`, 403 `forbidden`, 404 `plan_not_found`, 409 `plan_used`, `plan_expired`, `plan_decided`, `conflict`, 500 otherwise. Each decision is logged as one JSON line with the caller ARN, `plan_id` and correlation ID ([Observability](#observability)); each `forbidden` refusal is logged with the caller ARN.
 
 `scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and asks for confirmation unless `--yes`. When an approval ran no apply, it says that the client must now apply the plan.
 

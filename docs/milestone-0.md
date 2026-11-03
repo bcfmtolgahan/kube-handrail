@@ -189,9 +189,9 @@ In `server` (default) and `both` mode an apply needs an approval recorded by the
 
 ## Logs, metrics and correlation
 
-Every tool call prints one JSON record in its Lambda's log group (`/aws/lambda/<name_prefix>-k8s-read` or `-k8s-write`), with `tool`, `correlation_id`, `caller`, `plan_id`, `outcome` and `duration_ms`, which is also a CloudWatch metric in the namespace `<name_prefix>/tools`: `ToolCalls` and `ToolErrors` by `Tool` and across all tools, and `GuardRejections` by `Tool` and `Code`. The approver (`/aws/lambda/<name_prefix>-approver`) prints one record per decision. The correlation ID is the gateway's request ID; the plan record stores one per step, and the Deployment carries the last apply's in the annotation `kube-handrail.io/correlation-id`. See [Observability](../mcp/CONTRACT.md#observability).
+Every tool call prints one JSON record in its Lambda's log group (`/aws/lambda/<name_prefix>-k8s-read` or `-k8s-write`), with `tool`, `correlation_id`, `caller`, `plan_id`, `outcome` and `duration_ms`, which is also a CloudWatch metric in the namespace `<name_prefix>/tools`: `ToolCalls` and `ToolErrors` by `Tool` and across all tools, and `GuardRejections` by `Tool` and `Code`. The approver (`/aws/lambda/<name_prefix>-approver`) prints one record per decision. The correlation ID is the gateway's request ID, or the approver's for an apply it triggered; the plan record stores one per step, and the Deployment carries the last apply's in the annotation `kube-handrail.io/correlation-id`. See [Observability](../mcp/CONTRACT.md#observability).
 
-With `sentinel_enabled`, the alarm `<name_prefix>-tool-errors` notifies the alert topic when any tool returns `internal` within 5 minutes.
+With `sentinel_enabled`, the alarm `<name_prefix>-tool-errors` notifies the alert topic when any tool returns `internal` or `kubernetes_error` within 5 minutes, and `<name_prefix>-k8s-read-errors` and `<name_prefix>-k8s-write-errors` when a tool Lambda invocation fails outright (timeout, out of memory, failed start), which leaves no tool record.
 
 CloudWatch Logs Insights queries; select the three log groups above. Everything for one plan, in order (the `like` clause also finds the approver's text lines, such as a failed invocation of the apply):
 
@@ -209,7 +209,7 @@ fields @timestamp, @log, tool, event, outcome, plan_id, @message
 | sort @timestamp asc
 ```
 
-Internal errors and guard rejections by tool:
+Errors and guard rejections by tool:
 
 ```
 filter ispresent(outcome) and outcome != "ok"

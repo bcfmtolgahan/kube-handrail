@@ -93,7 +93,7 @@ The identity is per OAuth client, not per agent session: two agents sharing a cl
 ### Later in this milestone
 
 - CI: linting and policy validation on every change (unit tests, the contract check and Terraform formatting and validation run since item 3).
-- Correlation ID across gateway, Lambda, DynamoDB and Kubernetes, with basic self-observability (implemented and unit-tested). See [Observability](../mcp/CONTRACT.md#observability): the gateway's request ID is recorded per step in the plan record and set as an annotation by the apply, every tool call logs one record that is also a CloudWatch metric (`ToolCalls`, `ToolErrors`, `GuardRejections`), and an alarm notifies the alert topic on internal errors. Not yet tested on a cluster.
+- Correlation ID across gateway, Lambda, DynamoDB and Kubernetes, with basic self-observability (implemented and unit-tested). See [Observability](../mcp/CONTRACT.md#observability): the gateway's request ID is recorded per step in the plan record and set as an annotation by the apply, every tool call logs one record that is also a CloudWatch metric (`ToolCalls`, `ToolErrors`, `GuardRejections`), and alarms notify the alert topic on internal and Kubernetes API errors and on failed tool Lambda invocations. Not yet tested on a cluster.
 - Tool output hygiene for future log and event tools: size limits, control-character stripping, secret redaction, untrusted-content delimiters.
 - DevOps Agent skills and an `AGENTS.md` describing the tool contract.
 - Infrastructure as code that deploys cleanly to a new account, including clusters with a private endpoint.

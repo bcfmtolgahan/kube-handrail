@@ -5,7 +5,15 @@ from types import SimpleNamespace
 import pytest
 
 from handrail_common.dispatch import dispatch, tool_name
-from handrail_common.envelope import CONFLICT, FORBIDDEN_NAMESPACE, INTERNAL, UNKNOWN_TOOL, err, ok
+from handrail_common.envelope import (
+    CONFLICT,
+    FORBIDDEN_NAMESPACE,
+    INTERNAL,
+    KUBERNETES_ERROR,
+    UNKNOWN_TOOL,
+    err,
+    ok,
+)
 from handrail_common.observability import correlation_id, current_correlation_id
 from handrail_common.validation import GuardError
 
@@ -107,15 +115,16 @@ def full_ctx(custom: dict | None = None, request_id: str | None = "lambda-req") 
             "lambda-req",
             "gw-req",
         ),
-        ({"bedrockAgentCoreMcpMessageId": "msg-1"}, "lambda-req", "msg-1"),
-        ({"bedrockAgentCoreMcpMessageId": 7}, "lambda-req", "7"),
+        ({"bedrockAgentCoreAwsRequestId": 7}, "lambda-req", "7"),
+        # The client-chosen MCP message id is never the correlation id.
+        ({"bedrockAgentCoreMcpMessageId": "msg-1"}, "lambda-req", "lambda-req"),
         ({"kubeHandrailCorrelationId": "approver-req"}, "lambda-req", "approver-req"),
         ({}, "lambda-req", "lambda-req"),
         ({}, None, None),
         # Values that are not short tokens are skipped, never logged or annotated.
-        ({"bedrockAgentCoreMcpMessageId": "two\nlines"}, "lambda-req", "lambda-req"),
+        ({"bedrockAgentCoreAwsRequestId": "two\nlines"}, "lambda-req", "lambda-req"),
         ({"bedrockAgentCoreAwsRequestId": "x" * 129}, "lambda-req", "lambda-req"),
-        ({"bedrockAgentCoreMcpMessageId": True}, "lambda-req", "lambda-req"),
+        ({"bedrockAgentCoreAwsRequestId": True}, "lambda-req", "lambda-req"),
     ],
 )
 def test_correlation_id_fallbacks(custom, request_id, expected):
@@ -190,15 +199,21 @@ def test_guard_rejection_is_counted_per_code(capsys):
 
 
 @pytest.mark.parametrize(
-    "error", [RuntimeError("boom"), GuardError(INTERNAL, "history unavailable")]
+    "error, outcome",
+    [
+        (RuntimeError("boom"), INTERNAL),
+        (GuardError(INTERNAL, "history unavailable"), INTERNAL),
+        # A failing Kubernetes API (RBAC, access entry, 5xx) must reach the alarm.
+        (GuardError(KUBERNETES_ERROR, "Kubernetes API error (403)"), KUBERNETES_ERROR),
+    ],
 )
-def test_internal_errors_are_tool_errors_not_rejections(capsys, error):
+def test_errors_are_tool_errors_not_rejections(capsys, error, outcome):
     def handler(args):
         raise error
 
     dispatch({"x": handler}, {}, full_ctx(), {})
     (record,) = records(capsys)
-    assert (record["outcome"], record["ToolErrors"]) == (INTERNAL, 1)
+    assert (record["outcome"], record["ToolErrors"]) == (outcome, 1)
     assert "GuardRejections" not in record and "Code" not in record
     assert len(record["_aws"]["CloudWatchMetrics"]) == 1
 
@@ -216,7 +231,7 @@ def test_record_never_carries_argument_text(capsys):
         raise GuardError(FORBIDDEN_NAMESPACE, "no")
 
     event = {"namespace": marker, "name": marker, "plan_id": marker, "reason": marker}
-    custom = {"bedrockAgentCoreMcpMessageId": marker + " with spaces"}
+    custom = {"bedrockAgentCoreAwsRequestId": marker + " with spaces"}
     dispatch({"x": handler}, event, full_ctx(custom), {})
     out = capsys.readouterr().out
     assert marker not in out

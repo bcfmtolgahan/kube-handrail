@@ -7,21 +7,24 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from typing import Any
 
-from handrail_common.envelope import INTERNAL
+from handrail_common.envelope import INTERNAL, KUBERNETES_ERROR
 
-# Tried in this order. The gateway sets the first two in client_context.custom; the
-# approver sets the third when it runs an apply, so the apply shares its id.
+# Tried in this order. The gateway sets the first in client_context.custom; the approver
+# sets the second when it runs an apply, so the apply shares its id. The gateway's MCP
+# message id is not used: the client chooses it, so it is not unique across sessions.
 GATEWAY_REQUEST_ID_KEY = "bedrockAgentCoreAwsRequestId"
-MCP_MESSAGE_ID_KEY = "bedrockAgentCoreMcpMessageId"
 APPROVER_CORRELATION_KEY = "kubeHandrailCorrelationId"
-CORRELATION_KEYS = (GATEWAY_REQUEST_ID_KEY, MCP_MESSAGE_ID_KEY, APPROVER_CORRELATION_KEY)
+CORRELATION_KEYS = (GATEWAY_REQUEST_ID_KEY, APPROVER_CORRELATION_KEY)
 CORRELATION_ANNOTATION = "kube-handrail.io/correlation-id"
 DEFAULT_METRIC_NAMESPACE = "kube-handrail/tools"
 UNKNOWN_TOOL_DIMENSION = "unknown"
 OK = "ok"
+# Outcomes counted as ToolErrors (the alarm) instead of GuardRejections: the tool could not
+# do its job, as opposed to a guard refusing the request.
+ERROR_OUTCOMES = (INTERNAL, KUBERNETES_ERROR)
 
-# The MCP message id is chosen by the client, so only a short token is accepted: the value
-# goes into logs, the plan record and a Kubernetes annotation.
+# Only a short token is accepted: the value goes into logs, the plan record and a
+# Kubernetes annotation.
 _CORRELATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 _correlation_id: ContextVar[str | None] = ContextVar("correlation_id", default=None)
@@ -73,10 +76,11 @@ def tool_record(
 ) -> dict[str, Any]:
     """One log line per tool invocation, also a CloudWatch embedded metric format record.
 
-    Only these fixed fields are logged, never the arguments. `internal` counts as an error;
-    every other error code is a guard rejection, counted per code.
+    Only these fixed fields are logged, never the arguments. `internal` and
+    `kubernetes_error` count as errors; every other error code is a guard rejection,
+    counted per code.
     """
-    rejected = outcome not in (OK, INTERNAL)
+    rejected = outcome != OK and outcome not in ERROR_OUTCOMES
     metrics: list[dict[str, Any]] = [
         {
             "Namespace": namespace,
@@ -91,7 +95,7 @@ def tool_record(
     record: dict[str, Any] = {
         "Tool": tool or UNKNOWN_TOOL_DIMENSION,
         "ToolCalls": 1,
-        "ToolErrors": int(outcome == INTERNAL),
+        "ToolErrors": int(outcome in ERROR_OUTCOMES),
     }
     if rejected:
         metrics.append(
