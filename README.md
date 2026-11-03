@@ -22,7 +22,7 @@ Whether a `MUTATIVE` custom MCP tool is a workable path for in-cluster writes fr
 
 ## How it is intended to work
 
-This is the target design. Implemented today: the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the blast-radius budget, the measured impact preview, the kill switch, namespace-scoped RBAC, client-side approval in DevOps Agent, and [server-side approval](mcp/CONTRACT.md#server-side-approval) (`request_approval`, an IAM-authenticated approval API and CLI, and an apply that consumes only an approved plan). Everything else shown below is planned.
+This is the target design. Implemented today: the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the blast-radius budget, the measured impact preview, the kill switch, namespace-scoped RBAC, client-side approval in DevOps Agent, and [server-side approval](mcp/CONTRACT.md#server-side-approval) (`request_approval`, an IAM-authenticated approval API and CLI, and an apply that consumes only an approved plan), and correlation IDs with a structured record and metrics per tool call (implemented and unit-tested). Everything else shown below is planned.
 
 ```
   MCP client
@@ -66,7 +66,7 @@ A remediation follows this sequence:
 2. **Policy.** The matching `apply_*` call passes through Cedar at the gateway, which checks tool arguments (namespace allowlist, replica bounds). Planned; today the same limits are enforced only by the write Lambda.
 3. **Approve.** In `client` mode the client shows the exact arguments to a human; in DevOps Agent this is the chat approval for a `MUTATIVE` tool. In `server` mode (the default) the agent calls the `READ_ONLY` tool `request_approval`, approvers are notified with the plan as the server recorded it, and a listed human approves through an IAM-authenticated API outside MCP (`scripts/approve.py`); the approval is pinned to the plan's arguments and also triggers the apply.
 4. **Apply.** The write Lambda's guard re-validates everything: plan exists, is unexpired and unused (single-use, conditional write), arguments match, in `server` mode an unexpired approval by someone other than the requester covers exactly these arguments (in the same conditional write), the object is the same one with an unchanged spec and no GitOps marker, kill switch is on, the change is within the blast-radius budget, and the [oscillation breaker](docs/guards.md) (manual-change override, per-object cooldown, flapping, per-object and global hourly apply budgets) still allows the change. It then runs a server-side dry run and the real patch, with a `resourceVersion` precondition so nothing can change in between.
-5. **Audit.** The result is written to DynamoDB with a correlation ID that is also annotated on the target object and traceable through gateway and Kubernetes audit logs.
+5. **Audit.** The result is written to the plan record in DynamoDB with the apply's correlation ID (the gateway's request ID), which is also set as the `kube-handrail.io/correlation-id` annotation on the target object. The plan, approval request, decision and apply each record their own correlation ID, and every tool call logs one structured record that is also a CloudWatch metric ([Observability](mcp/CONTRACT.md#observability)). Implemented and unit-tested; not yet tested on a cluster. Joining with the gateway's own logs and Kubernetes audit logs is not set up here.
 
 ## Design principles
 
@@ -131,6 +131,7 @@ AGENTS.md        tool contract for MCP clients
 - [Guards](docs/guards.md) - blast-radius budget, impact preview, and the oscillation breaker: flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks
 - [Drift sentinel](mcp/CONTRACT.md#drift-sentinel) - what it checks, outcomes, and how to restore remediation after drift
 - [Server-side approval](mcp/CONTRACT.md#server-side-approval) - approval modes, `request_approval`, the approval API and who can approve
+- [Observability](mcp/CONTRACT.md#observability) - correlation IDs, the per-call tool record and its metrics, and the internal error alarm
 - [Roadmap](docs/roadmap.md) - milestones and open questions
 
 ## Contributing

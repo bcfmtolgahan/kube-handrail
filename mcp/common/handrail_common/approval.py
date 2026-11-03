@@ -15,6 +15,8 @@ STATUS_APPLIED = "applied"
 STATUS_EXPIRED = "expired"
 REASON_MAX_LENGTH = 500
 APPROVE_SCRIPT = "scripts/approve.py"
+# Plan record attributes <step>_correlation_id, shown so an operator can find each step's logs.
+CORRELATION_STEPS = ("plan", "approval_request", "decision", "apply")
 
 
 def plain(value: Any) -> Any:
@@ -68,6 +70,13 @@ def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
         }
     if "result" in record:
         view["result"] = {"result": record.get("result"), "applied_at": record.get("applied_at")}
+    correlation = {
+        step: record[f"{step}_correlation_id"]
+        for step in CORRELATION_STEPS
+        if f"{step}_correlation_id" in record
+    }
+    if correlation:
+        view["correlation_ids"] = correlation
     return view
 
 

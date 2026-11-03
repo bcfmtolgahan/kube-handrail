@@ -155,8 +155,11 @@ def event(caller: str | None, method: str = "POST", body=None, query=None, b64=F
     }
 
 
+APPROVER_REQUEST_ID = "3f2a7c10-5b9e-4c3d-8e1f-0a2b4c6d8e9f"
+
+
 def call(rt, *args, **kwargs) -> tuple[int, dict]:
-    response = handler.run(rt, event(*args, **kwargs))
+    response = handler.run(rt, event(*args, **kwargs), APPROVER_REQUEST_ID)
     assert response["headers"] == {"content-type": "application/json"}
     return response["statusCode"], json.loads(response["body"])
 
@@ -229,7 +232,12 @@ def test_approve_triggers_the_apply_with_the_plans_own_arguments(env):
     assert invoke["FunctionName"] == "kube-handrail-k8s-write"
     assert invoke["InvocationType"] == "RequestResponse"
     context = json.loads(base64.b64decode(invoke["ClientContext"]))
-    assert context == {"custom": {"bedrockAgentCoreToolName": "k8sw___apply_scale_deployment"}}
+    assert context == {
+        "custom": {
+            "bedrockAgentCoreToolName": "k8sw___apply_scale_deployment",
+            "kubeHandrailCorrelationId": APPROVER_REQUEST_ID,
+        }
+    }
     assert json.loads(invoke["Payload"]) == {
         "plan_id": plan.plan_id,
         "namespace": "sandbox",
@@ -246,6 +254,43 @@ def test_approve_triggers_the_apply_with_the_plans_own_arguments(env):
     assert view["result"]["result"] == "applied"
     record = env.store.get(plan.plan_id)
     assert record["approved_by"] == ALICE and record["used"] is True
+
+
+def test_the_decision_and_its_apply_share_one_correlation_id(env, capsys):
+    plan = make_plan(env.store)
+    status, body = approve(env, plan)
+
+    assert status == 200
+    assert body["data"]["apply"]["data"]["correlation_id"] == APPROVER_REQUEST_ID
+    assert body["data"]["plan"]["correlation_ids"] == {
+        "decision": APPROVER_REQUEST_ID,
+        "apply": APPROVER_REQUEST_ID,
+    }
+    annotations = env.apps.patch_namespaced_deployment.call_args.args[2]["metadata"]["annotations"]
+    assert annotations["kube-handrail.io/correlation-id"] == APPROVER_REQUEST_ID
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    tool, decision = lines
+    assert tool["tool"] == "apply_scale_deployment"
+    assert tool["correlation_id"] == APPROVER_REQUEST_ID and tool["outcome"] == "ok"
+    assert decision == {
+        "event": "decision",
+        "plan_id": plan.plan_id,
+        "decision": "approve",
+        "approver": ALICE,
+        "correlation_id": APPROVER_REQUEST_ID,
+        "apply_outcome": "ok",
+    }
+
+
+def test_a_rejection_logs_no_reason(env, capsys):
+    plan = make_plan(env.store)
+    body = {"plan_id": plan.plan_id, "decision": "reject", "reason": "SECRET-REASON"}
+    call(env.rt, ALICE, body=body)
+    out = capsys.readouterr().out
+    assert "SECRET-REASON" not in out
+    (decision,) = [json.loads(line) for line in out.splitlines()]
+    assert decision["decision"] == "reject" and decision["apply_outcome"] is None
+    assert env.store.get(plan.plan_id)["decision_correlation_id"] == APPROVER_REQUEST_ID
 
 
 def test_apply_payload_omits_a_false_override(env):

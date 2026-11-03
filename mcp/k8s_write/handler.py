@@ -32,6 +32,7 @@ from handrail_common.envelope import (
 )
 from handrail_common.gitops import is_gitops_managed
 from handrail_common.killswitch import KillSwitch
+from handrail_common.observability import CORRELATION_ANNOTATION, current_correlation_id
 from handrail_common.plans import (
     RESULT_APPLIED,
     SCALE_DEPLOYMENT,
@@ -84,14 +85,16 @@ def get_runtime() -> Runtime:
     return _runtime
 
 
-def scale_patch(replicas: int, resource_version: str, plan_id: str) -> dict[str, Any]:
+def scale_patch(
+    replicas: int, resource_version: str, plan_id: str, correlation_id: str | None = None
+) -> dict[str, Any]:
     # resourceVersion in the patch body makes the API server reject it with 409 if the
     # object changed between the spec check and the patch.
+    annotations = {LAST_PLAN_ANNOTATION: plan_id}
+    if correlation_id is not None:
+        annotations[CORRELATION_ANNOTATION] = correlation_id
     return {
-        "metadata": {
-            "resourceVersion": resource_version,
-            "annotations": {LAST_PLAN_ANNOTATION: plan_id},
-        },
+        "metadata": {"resourceVersion": resource_version, "annotations": annotations},
         "spec": {"replicas": replicas},
     }
 
@@ -190,7 +193,11 @@ def check_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now:
 
 
 def _patch(
-    apps: k8s.AppsV1Api, plan: Plan, replicas: int, after_first_check: Callable[[Any], None]
+    apps: k8s.AppsV1Api,
+    plan: Plan,
+    replicas: int,
+    correlation_id: str | None,
+    after_first_check: Callable[[Any], None],
 ) -> Any:
     for attempt in range(1, PATCH_ATTEMPTS + 1):
         deployment = _read(apps, plan.namespace, plan.name)
@@ -198,7 +205,9 @@ def _patch(
         if attempt == 1:
             # A retry only follows a 409 on an unchanged spec, so history is checked once.
             after_first_check(deployment)
-        body = scale_patch(replicas, deployment.metadata.resource_version, plan.plan_id)
+        body = scale_patch(
+            replicas, deployment.metadata.resource_version, plan.plan_id, correlation_id
+        )
         try:
             apps.patch_namespaced_deployment(plan.name, plan.namespace, body, dry_run="All")
             return apps.patch_namespaced_deployment(plan.name, plan.namespace, body)
@@ -209,10 +218,10 @@ def _patch(
     raise AssertionError("unreachable")
 
 
-def _record(rt: Runtime, plan_id: str, result: str) -> None:
+def _record(rt: Runtime, plan_id: str, result: str, correlation_id: str | None) -> None:
     # Best effort: the change itself has already succeeded or failed.
     try:
-        rt.store.record_result(plan_id, int(rt.clock()), result)
+        rt.store.record_result(plan_id, int(rt.clock()), result, correlation_id)
     except Exception:
         logger.exception("cannot record result for plan %s", plan_id)
 
@@ -230,6 +239,7 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
     plan_id = require_plan_id(args.get("plan_id"))
 
     now = int(rt.clock())
+    correlation_id = current_correlation_id()
     plan = rt.store.consume(
         plan_id,
         scale_args_hash(namespace, name, replicas, override),
@@ -246,15 +256,16 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
             rt.apps(),
             plan,
             replicas,
+            correlation_id,
             lambda deployment: check_breaker(rt, plan, deployment, override, now),
         )
     except GuardError as exc:
-        _record(rt, plan_id, exc.code)
+        _record(rt, plan_id, exc.code, correlation_id)
         raise
     except Exception:
-        _record(rt, plan_id, INTERNAL)
+        _record(rt, plan_id, INTERNAL, correlation_id)
         raise
-    _record(rt, plan_id, RESULT_APPLIED)
+    _record(rt, plan_id, RESULT_APPLIED, correlation_id)
 
     return ok(
         {
@@ -266,6 +277,7 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
             "resource_version": updated.metadata.resource_version,
             # The approver's identity stays in the plan record and the logs.
             "approved": plan.approved_by is not None,
+            "correlation_id": correlation_id,
         }
     )
 

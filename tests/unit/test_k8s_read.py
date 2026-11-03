@@ -332,6 +332,33 @@ def test_lambda_handler_plans_through_dispatch(wired):
     assert result["data"]["diff"] == {"replicas": {"from": 2, "to": 3}}
 
 
+def test_plan_and_request_approval_record_their_correlation_ids(monkeypatch, approvals, table):
+    monkeypatch.setattr(handler, "_settings", lambda: APPROVAL_SETTINGS)
+    monkeypatch.setattr(handler, "Clients", lambda settings: approvals)
+
+    def call(tool: str, event: dict, request_id: str) -> dict:
+        ctx = context(tool)
+        ctx.client_context.custom["bedrockAgentCoreAwsRequestId"] = request_id
+        return handler.lambda_handler(event, ctx)
+
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3}
+    planned = call("plan_scale_deployment", args, "req-plan")
+    plan_id = planned["data"]["plan_id"]
+    assert planned["data"]["correlation_id"] == "req-plan"
+    requested = call("request_approval", {"plan_id": plan_id}, "req-approval")
+    assert requested["data"]["correlation_id"] == "req-approval"
+
+    item = table.get_item(Key={"plan_id": plan_id})["Item"]
+    assert item["plan_correlation_id"] == "req-plan"
+    assert item["approval_request_correlation_id"] == "req-approval"
+
+
+def test_plan_outside_dispatch_has_no_correlation_id(clients, table):
+    data = plan(clients)["data"]
+    assert data["correlation_id"] is None
+    assert "plan_correlation_id" not in table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+
+
 def test_lambda_handler_maps_guard_errors(wired):
     wired.apps.read_namespaced_deployment.side_effect = ApiException(status=404)
     result = handler.lambda_handler(
@@ -778,6 +805,7 @@ def test_request_approval_notifies_from_the_record(approvals, table):
         "expires_at": NOW + 900,
         "notified": True,
         "approval_mode": "server",
+        "correlation_id": None,
     }
     (message,) = approvals.sns.messages
     # The destination is the server's; the agent's extra arguments are ignored.

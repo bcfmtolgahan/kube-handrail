@@ -4,7 +4,7 @@
 Covers authentication, argument validation, namespace and replica limits,
 GitOps and HPA checks, single-use and expiring plans, conflicts, concurrent
 applies, the kill switch, the oscillation breaker (flapping and manual
-change), the blast-radius budget and the impact preview. Run it after the smoke test, against a disposable cluster only.
+change), the blast-radius budget, the impact preview and the correlation id. Run it after the smoke test, against a disposable cluster only.
 
 Environment: GATEWAY_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET, KILL_SWITCH_PARAM,
 KUBECONFIG, the usual AWS variables, and APPROVAL_URL with --approval-mode server.
@@ -61,6 +61,7 @@ FLAP = {"namespace": NAMESPACE, "name": "e2e-flap"}
 MANUAL = {"namespace": NAMESPACE, "name": "e2e-manual"}
 FIXTURES = (TARGET["name"], FLAP["name"], MANUAL["name"])
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
+CORRELATION_ANNOTATION = "kube-handrail.io/correlation-id"
 # The plan history index is eventually consistent; give a just-recorded apply time to show up.
 HISTORY_SETTLE_SECONDS = 3
 # Must match the deployed APPLY_COOLDOWN_SECONDS; a lower value here makes cases fail.
@@ -291,7 +292,10 @@ async def ownership_tests(gw: Gateway) -> None:
 async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
     await expect(gw, "apply with unknown plan", APPLY, {"plan_id": UNKNOWN_PLAN, **TARGET, "replicas": 2}, "plan_not_found")
 
-    plan_id = await gw.plan(TARGET, 2)
+    planned = await gw.call(PLAN, {**TARGET, "replicas": 2})
+    if not planned.get("ok"):
+        raise RuntimeError(f"plan failed: {planned}")
+    plan_id = planned["data"]["plan_id"]
     await expect(gw, "apply with arguments that differ from the plan", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 3}, "plan_mismatch")
     try:
         # Label-only change: resourceVersion moves, generation and spec.replicas do not.
@@ -299,6 +303,13 @@ async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
         kubectl("label", "deploy/e2e-target", "kube-handrail.io/e2e-touch=1", "--overwrite")
         envelope = await gw.apply(TARGET, plan_id, 2)
         report("apply after a label-only change succeeds", envelope.get("ok") is True, code(envelope) or "ok")
+        applied_id = (envelope.get("data") or {}).get("correlation_id")
+        planned_id = planned["data"].get("correlation_id")
+        report(
+            "correlation: the Deployment carries the apply's correlation id, which differs from the plan's",
+            bool(applied_id) and annotation(TARGET["name"], CORRELATION_ANNOTATION) == applied_id and bool(planned_id) and planned_id != applied_id,
+            f"plan {planned_id}, apply {applied_id}",
+        )
     finally:
         kubectl("label", "deploy/e2e-target", "kube-handrail.io/e2e-touch-")
         reset_target()
@@ -486,8 +497,13 @@ def operator_arn() -> str:
     return boto3.client("sts").get_caller_identity()["Arn"]
 
 
+def annotation(name: str, key: str) -> str:
+    escaped = key.replace(".", "\\.")
+    return kubectl("get", f"deploy/{name}", "-o", f"jsonpath={{.metadata.annotations.{escaped}}}")
+
+
 def last_plan_id(name: str) -> str:
-    return kubectl("get", f"deploy/{name}", "-o", f"jsonpath={{.metadata.annotations.kube-handrail\\.io/last-plan-id}}")
+    return annotation(name, LAST_PLAN_ANNOTATION)
 
 
 async def approval_tests(gw: Gateway, token: str) -> None:
@@ -529,6 +545,13 @@ async def approval_tests(gw: Gateway, token: str) -> None:
     view = envelope.get("data") or {}
     approver = (view.get("approval") or {}).get("approved_by")
     report("approval: the record is applied and names the approver", view.get("status") == "applied" and approver == operator_arn(), approver)
+    ids = view.get("correlation_ids") or {}
+    report(
+        "correlation: the record holds each step's id, and the decision, its apply and the annotation share one",
+        all(ids.get(step) for step in ("plan", "approval_request", "decision", "apply"))
+        and ids["decision"] == ids["apply"] == annotation(TARGET["name"], CORRELATION_ANNOTATION),
+        ids,
+    )
 
     status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
     report("approval: an applied plan cannot be approved again", status == 409 and code(envelope) == "plan_used", code(envelope))

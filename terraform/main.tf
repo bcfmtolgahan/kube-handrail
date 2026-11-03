@@ -63,6 +63,8 @@ locals {
     APPLY_AFTER_APPROVAL_TTL_SECONDS  = tostring(var.apply_after_approval_ttl_seconds)
     APPROVAL_REQUEST_COOLDOWN_SECONDS = tostring(var.approval_request_cooldown_seconds)
     APPROVAL_REQUEST_LIMIT            = tostring(var.approval_request_limit)
+
+    METRIC_NAMESPACE = local.tools_metric_namespace
   }
 
   # Every packaged Lambda => its requirements file. The sentinel and the approver are packaged

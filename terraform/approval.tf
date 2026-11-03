@@ -31,6 +31,7 @@ locals {
     "rejected_by",
     "rejected_at",
     "reject_reason",
+    "decision_correlation_id",
   ]
 
   # Statement IDs allow only [A-Za-z0-9_-]; ARNs do not fit.

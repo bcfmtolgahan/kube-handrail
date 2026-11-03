@@ -33,6 +33,7 @@ from handrail_common.envelope import (
     err,
     ok,
 )
+from handrail_common.observability import APPROVER_CORRELATION_KEY, emit
 from handrail_common.plans import PlanStore
 from handrail_common.validation import GuardError, require_plan_id
 
@@ -176,9 +177,15 @@ def apply_arguments(item: Mapping[str, Any]) -> dict[str, Any]:
     return args
 
 
-def trigger_apply(rt: Runtime, item: Mapping[str, Any]) -> Envelope:
-    """Run the apply through the write Lambda, as the gateway would call it."""
-    context = {"custom": {"bedrockAgentCoreToolName": APPLY_TOOL}}
+def trigger_apply(
+    rt: Runtime, item: Mapping[str, Any], correlation_id: str | None = None
+) -> Envelope:
+    """Run the apply through the write Lambda, as the gateway would call it. The apply
+    takes this request's correlation id, so the decision and the apply share one."""
+    custom = {"bedrockAgentCoreToolName": APPLY_TOOL}
+    if correlation_id is not None:
+        custom[APPROVER_CORRELATION_KEY] = correlation_id
+    context = {"custom": custom}
     try:
         response = rt.lambda_client.invoke(
             FunctionName=rt.settings.write_function,
@@ -214,7 +221,9 @@ def show(rt: Runtime, event: Mapping[str, Any]) -> Envelope:
     return ok(plan_view(item, int(rt.clock())))
 
 
-def decide(rt: Runtime, event: Mapping[str, Any], approver: str) -> Envelope:
+def decide(
+    rt: Runtime, event: Mapping[str, Any], approver: str, correlation_id: str | None = None
+) -> Envelope:
     body = _body(event)
     plan_id = require_plan_id(body.get("plan_id"))
     decision = body.get("decision")
@@ -228,29 +237,53 @@ def decide(rt: Runtime, event: Mapping[str, Any], approver: str) -> Envelope:
     now = int(rt.clock())
     s = rt.settings
     if decision == APPROVE:
-        item = rt.store.approve(plan_id, approver, now, s.apply_after_approval_ttl_seconds)
+        item = rt.store.approve(
+            plan_id, approver, now, s.apply_after_approval_ttl_seconds, correlation_id
+        )
     else:
-        item = rt.store.reject(plan_id, approver, now, reason)
-    logger.info("plan %s: %s by %s", plan_id, decision, approver)
+        item = rt.store.reject(plan_id, approver, now, reason, correlation_id)
 
     applied: Envelope | None = None
     if decision == APPROVE and apply and s.applies_after_approval:
-        applied = trigger_apply(rt, item)
-        logger.info("apply of plan %s: ok=%s", plan_id, applied.get("ok"))
+        applied = trigger_apply(rt, item, correlation_id)
         refreshed = rt.store.get(plan_id)
         item = refreshed if refreshed is not None else item
+    emit(decision_record(plan_id, decision, approver, correlation_id, applied))
     return ok(
         {"plan": plan_view(item, int(rt.clock())), "apply": applied, "approval_mode": s.approval_mode}
     )
 
 
-def handle(rt: Runtime, event: Mapping[str, Any]) -> Envelope:
+def decision_record(
+    plan_id: str,
+    decision: str,
+    approver: str,
+    correlation_id: str | None,
+    applied: Envelope | None,
+) -> dict[str, Any]:
+    """One JSON log line per decision. The reason is free text and is not logged."""
+    apply_outcome = None
+    if applied is not None:
+        apply_outcome = "ok" if applied.get("ok") else (applied.get("error") or {}).get("code")
+    return {
+        "event": "decision",
+        "plan_id": plan_id,
+        "decision": decision,
+        "approver": approver,
+        "correlation_id": correlation_id,
+        "apply_outcome": apply_outcome,
+    }
+
+
+def handle(
+    rt: Runtime, event: Mapping[str, Any], correlation_id: str | None = None
+) -> Envelope:
     approver = check_approver(rt.settings, caller_arn(event))
     method = ((event.get("requestContext") or {}).get("http") or {}).get("method")
     if method == "GET":
         return show(rt, event)
     if method == "POST":
-        return decide(rt, event, approver)
+        return decide(rt, event, approver, correlation_id)
     raise GuardError(INVALID_ARGUMENT, "use GET to show a plan or POST to decide")
 
 
@@ -264,10 +297,10 @@ def response(envelope: Envelope) -> dict[str, Any]:
     }
 
 
-def run(rt: Runtime, event: Any) -> dict[str, Any]:
+def run(rt: Runtime, event: Any, correlation_id: str | None = None) -> dict[str, Any]:
     event = event if isinstance(event, Mapping) else {}
     try:
-        envelope = handle(rt, event)
+        envelope = handle(rt, event, correlation_id)
     except GuardError as exc:
         if exc.code == FORBIDDEN:
             logger.warning("refused %s: %s", caller_arn(event), exc.message)
@@ -290,4 +323,5 @@ def lambda_handler(event: Any, context: Any) -> dict[str, Any]:
             store=PlanStore.from_name(settings.plans_table, settings.region),
             lambda_client=boto3.client("lambda", region_name=settings.region),
         )
-    return run(_runtime, event)
+    # The approver is not behind the gateway: its correlation id is its own request id.
+    return run(_runtime, event, getattr(context, "aws_request_id", None))
