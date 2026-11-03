@@ -110,19 +110,37 @@ def deployed_tools(
     return actual, sorted(set(target_ids) - expected)
 
 
-def check(rt: Runtime) -> list[Finding]:
+def check(rt: Runtime) -> tuple[list[Finding], list[str]]:
+    """Findings and errors. Each check runs on its own, so drift seen by one check is
+    acted on even when another check's API call fails."""
     s = rt.settings
     expected = tools_by_target(s.classification)
-    actual, others = deployed_tools(rt.gateway, s.gateway_id, set(expected))
-    findings = compare_gateway(expected, actual, others)
-    if rt.devops is not None:
-        association = rt.devops.get_association(
+
+    def gateway() -> list[Finding]:
+        actual, others = deployed_tools(rt.gateway, s.gateway_id, set(expected))
+        return compare_gateway(expected, actual, others)
+
+    def association() -> list[Finding]:
+        response = rt.devops.get_association(
             agentSpaceId=s.agent_space_id, associationId=s.association_id
         )
+        return compare_association(s.classification, association_classifications(response))
+
+    def elevated() -> list[Finding]:
         space = rt.devops.get_agent_space(agentSpaceId=s.agent_space_id)
-        findings += compare_association(s.classification, association_classifications(association))
-        findings += compare_elevated(s.expect_elevated_actions, elevated_actions(space))
-    return findings
+        return compare_elevated(s.expect_elevated_actions, elevated_actions(space))
+
+    checks = [gateway] if rt.devops is None else [gateway, association, elevated]
+    findings: list[Finding] = []
+    errors: list[str] = []
+    for one in checks:
+        try:
+            findings += one()
+        except Exception as exc:
+            # Throttling, outages and unreadable responses are not evidence of drift.
+            logger.warning("%s check failed: %s", one.__name__, describe_error(exc))
+            errors.append(describe_error(exc))
+    return findings, errors
 
 
 def describe_error(exc: Exception) -> str:
@@ -184,7 +202,7 @@ def emit(result: dict[str, Any], namespace: str) -> None:
     print(json.dumps(record, default=str))
 
 
-def respond_to_drift(rt: Runtime, findings: list[Finding]) -> dict[str, Any]:
+def respond_to_drift(rt: Runtime, findings: list[Finding], errors: list[str]) -> dict[str, Any]:
     s = rt.settings
     failed: list[str] = []
     try:
@@ -201,7 +219,13 @@ def respond_to_drift(rt: Runtime, findings: list[Finding]) -> dict[str, Any]:
     except Exception:
         logger.exception("cannot publish the drift alert")
         failed.append("alert")
-    result = {"status": DRIFT, "findings": findings, "kill_switch": kill_switch, "failed": failed}
+    result = {
+        "status": DRIFT,
+        "findings": findings,
+        "kill_switch": kill_switch,
+        "failed": failed,
+        "errors": errors,
+    }
     emit(result, s.metric_namespace)
     if failed:
         # Fail the invocation so it is retried and the function's error alarm fires.
@@ -210,16 +234,14 @@ def respond_to_drift(rt: Runtime, findings: list[Finding]) -> dict[str, Any]:
 
 
 def run(rt: Runtime) -> dict[str, Any]:
-    try:
-        findings = check(rt)
-    except Exception as exc:
-        # Throttling, outages and unreadable responses are not evidence of drift.
-        logger.warning("drift check failed: %s", describe_error(exc), exc_info=True)
-        result = {"status": UNKNOWN, "findings": [], "error": describe_error(exc)}
+    findings, errors = check(rt)
+    if findings:
+        # Acting on partial evidence is safe: the only action is turning remediation off.
+        return respond_to_drift(rt, findings, errors)
+    if errors:
+        result = {"status": UNKNOWN, "findings": [], "errors": errors}
         emit(result, rt.settings.metric_namespace)
         return result
-    if findings:
-        return respond_to_drift(rt, findings)
     result: dict[str, Any] = {"status": OK, "findings": []}
     emit(result, rt.settings.metric_namespace)
     return result

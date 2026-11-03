@@ -15,6 +15,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DELIMITER = "___"
 WRITE_TARGET = "k8sw"
+# An apply_* tool is a write tool wherever it is placed.
+WRITE_TOOL_PREFIX = "apply_"
 WRITE_DIR = "k8s_write"
 CLASSIFICATIONS = {"READ_ONLY", "MUTATIVE"}
 NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
@@ -76,7 +78,9 @@ def check(root: Path) -> list[str]:
                 errors.append(f"{full}: must be at most {MAX_NAME_LENGTH} characters of [a-z0-9_]")
             if full not in classification:
                 errors.append(f"{full}: no classification in mcp/classification.json")
-            elif target == WRITE_TARGET and classification[full] != "MUTATIVE":
+            elif (target == WRITE_TARGET or name.startswith(WRITE_TOOL_PREFIX)) and classification[
+                full
+            ] != "MUTATIVE":
                 errors.append(f"{full}: write tool must be MUTATIVE, not {classification[full]}")
 
     for full, value in sorted(classification.items()):

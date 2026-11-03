@@ -165,8 +165,8 @@ resource "aws_lambda_permission" "sentinel" {
   source_arn    = aws_cloudwatch_event_rule.sentinel[0].arn
 }
 
-# Unknown results are not drift and never touch the kill switch, but repeated ones mean
-# the sentinel is blind. Assumes a schedule of at most 5 minutes.
+# Unknown results are not drift and never touch the kill switch, but repeated ones, or no
+# runs at all, mean the sentinel is blind. Assumes a schedule of at most 5 minutes.
 resource "aws_cloudwatch_metric_alarm" "sentinel_unknown" {
   count = local.sentinel_count
 
@@ -180,9 +180,10 @@ resource "aws_cloudwatch_metric_alarm" "sentinel_unknown" {
   datapoints_to_alarm = 3
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = [aws_sns_topic.alerts[0].arn]
-  ok_actions          = [aws_sns_topic.alerts[0].arn]
+  # Every run emits Unknown (0 or 1), so no data means the sentinel is not running at all.
+  treat_missing_data = "breaching"
+  alarm_actions      = [aws_sns_topic.alerts[0].arn]
+  ok_actions         = [aws_sns_topic.alerts[0].arn]
 }
 
 # Invocation errors: the sentinel crashed, timed out, or could not complete its response to drift.

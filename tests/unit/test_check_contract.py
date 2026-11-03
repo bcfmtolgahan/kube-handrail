@@ -80,3 +80,9 @@ def test_tools_json_not_loaded_by_terraform_fails(repo):
     main_tf.write_text(main_tf.read_text().replace("mcp/k8s_read/tools.json", "mcp/other/tools.json"))
     errors = check_contract.check(repo)
     assert "terraform/main.tf does not load mcp/k8s_read/tools.json" in errors
+
+
+def test_apply_tool_on_the_read_target_must_be_mutative(repo):
+    edit_json(repo / "mcp/k8s_read/tools.json", add_tool("apply_restart"))
+    edit_json(repo / "mcp/classification.json", lambda c: c.update({"k8sr___apply_restart": "READ_ONLY"}))
+    assert check_contract.check(repo) == ["k8sr___apply_restart: write tool must be MUTATIVE, not READ_ONLY"]

@@ -241,7 +241,7 @@ def test_elevated_actions_on_when_expected_off(ssm):
 
 
 @pytest.mark.parametrize("where", ["gateway", "devops"])
-def test_api_error_is_unknown(ssm, capsys, where):
+def test_api_error_without_findings_is_unknown(ssm, capsys, where):
     devops = FakeDevOps()
     rt = runtime(ssm, devops)
     error = throttled("ListGatewayTargets" if where == "gateway" else "GetAssociation")
@@ -249,15 +249,34 @@ def test_api_error_is_unknown(ssm, capsys, where):
         rt.gateway.error = error
     else:
         devops.error = error
-    # Drift that would otherwise be reported must not be acted on when a call fails.
-    devops.classifications[WRITE_TOOL] = "READ_ONLY"
     result = handler.run(rt)
     assert result["status"] == "unknown"
-    assert result["error"].endswith("ThrottlingException")
+    assert result["errors"][0].endswith("ThrottlingException")
     assert kill_switch(ssm) == ("true", 1)
     assert rt.sns.messages == []
     record = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert (record["Drift"], record["Unknown"]) == (0, 1)
+
+
+def test_drift_seen_by_one_check_is_acted_on_when_another_check_fails(ssm):
+    devops = FakeDevOps()
+    devops.classifications[WRITE_TOOL] = "READ_ONLY"
+    rt = runtime(ssm, devops)
+    rt.gateway.error = throttled("ListGatewayTargets")
+    result = handler.run(rt)
+    assert result["status"] == "drift"
+    assert result["errors"] == ["ListGatewayTargets: ThrottlingException"]
+    assert kill_switch(ssm)[0] == "false"
+    assert len(rt.sns.messages) == 1
+
+
+def test_association_drift_is_acted_on_when_the_agent_space_cannot_be_read(ssm):
+    devops = FakeDevOps()
+    devops.classifications[WRITE_TOOL] = "READ_ONLY"
+    devops.get_agent_space = lambda **kw: (_ for _ in ()).throw(throttled("GetAgentSpace"))
+    result = handler.run(runtime(ssm, devops))
+    assert result["status"] == "drift"
+    assert kill_switch(ssm)[0] == "false"
 
 
 @pytest.mark.parametrize(

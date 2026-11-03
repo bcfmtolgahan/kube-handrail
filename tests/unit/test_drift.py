@@ -33,7 +33,19 @@ def test_repository_classification():
     }
 
 
-@pytest.mark.parametrize("raw", [{}, [], {"no_delimiter": READ_ONLY}, {"a___b": "DESTRUCTIVE"}])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {},
+        [],
+        {"no_delimiter": READ_ONLY},
+        {"a___b": "DESTRUCTIVE"},
+        # A write tool can never be READ_ONLY, so a tampered expectation is refused.
+        {"k8sw___apply_scale_deployment": READ_ONLY},
+        {"k8sw___anything": READ_ONLY},
+        {"k8sr___apply_restart": READ_ONLY},
+    ],
+)
 def test_invalid_classification(raw):
     with pytest.raises(ValueError):
         parse_classification(raw)

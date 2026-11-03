@@ -108,10 +108,8 @@ def associate_read(client: Any, args: argparse.Namespace) -> None:
 
 def enable_write(client: Any, args: argparse.Namespace) -> None:
     space_id, association_id = args.agent_space_id, args.association_id
-    classifications = current_classifications(client, space_id, association_id)
-    for tool in classified(READ_ONLY):
-        classifications.setdefault(tool, READ_ONLY)
-    classifications.update(classified(MUTATIVE))
+    # Exactly the tools in mcp/classification.json, so a tool added by hand is removed too.
+    classifications = {**classified(READ_ONLY), **classified(MUTATIVE)}
     # The write tool is added and classified in one update; configuration is replaced wholesale.
     client.update_association(
         agentSpaceId=space_id,

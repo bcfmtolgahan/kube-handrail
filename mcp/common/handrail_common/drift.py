@@ -16,6 +16,9 @@ MUTATIVE = "MUTATIVE"
 # DevOps Agent never invokes DESTRUCTIVE tools, so no kube-handrail tool uses it.
 CLASSIFICATIONS = frozenset({READ_ONLY, MUTATIVE})
 ELEVATED_PREFERENCE = "elevatedActionsEnabled"
+# Every tool of the write target, and every apply_* tool wherever it is, must be MUTATIVE.
+WRITE_TARGET = "k8sw"
+WRITE_TOOL_PREFIX = "apply_"
 READY = "READY"
 
 Finding = dict[str, Any]
@@ -33,7 +36,14 @@ def parse_classification(raw: Any) -> dict[str, str]:
             raise ValueError(f"tool name must be <target>___<tool>: {tool!r}")
         if value not in CLASSIFICATIONS:
             raise ValueError(f"{tool}: classification must be one of {sorted(CLASSIFICATIONS)}")
+        if is_write_tool(tool) and value != MUTATIVE:
+            raise ValueError(f"{tool}: a write tool must be {MUTATIVE}")
     return dict(raw)
+
+
+def is_write_tool(tool: str) -> bool:
+    target, _, name = tool.partition(TARGET_DELIMITER)
+    return target == WRITE_TARGET or name.startswith(WRITE_TOOL_PREFIX)
 
 
 def load_classification(path: Path) -> dict[str, str]:
