@@ -2,11 +2,13 @@
 
 This deploys one read tool and one guarded plan/apply pair to your own EKS test cluster and connects them to AWS DevOps Agent. The tool contract is in [`mcp/CONTRACT.md`](../mcp/CONTRACT.md).
 
+For a deployment to a new account, or to a cluster with a private endpoint, read [Deploying to a new account](deploy.md) first: it lists the prerequisites, the network settings and the order of the steps below.
+
 Use a disposable test cluster. The slice only touches the `kube-handrail-sandbox` namespace, but it does create IAM roles, EKS access entries and a DevOps Agent registration in your account.
 
 ## Prerequisites
 
-- An EKS cluster whose authentication mode includes `API` (access entries), and a kubeconfig with cluster-admin rights for the setup steps.
+- An EKS cluster whose authentication mode includes `API` (access entries; Terraform checks this), and a kubeconfig with cluster-admin rights for the setup steps. For a cluster without a public endpoint, see [Network](deploy.md#network).
 - AWS credentials for the target account, selected through the usual `AWS_PROFILE` / `AWS_REGION` variables, in a Region where AWS DevOps Agent and Amazon Bedrock AgentCore are available.
 - Python 3.12, Terraform, `kubectl`.
 
@@ -49,6 +51,8 @@ terraform -chdir=terraform init
 terraform -chdir=terraform plan -out=tfplan
 terraform -chdir=terraform apply tfplan
 ```
+
+For a cluster with a private endpoint, or a public endpoint limited to `public_access_cidrs`, set the network variables first ([Network](deploy.md#network)); the plan stops if the cluster has no public endpoint and `lambda_subnet_ids` is empty.
 
 Note these outputs for the next steps:
 

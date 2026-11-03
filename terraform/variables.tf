@@ -18,6 +18,12 @@ variable "name_prefix" {
     condition     = can(regex("^[a-z][a-z0-9-]{1,30}[a-z0-9]$", var.name_prefix))
     error_message = "name_prefix must be 3-32 lowercase letters, digits or hyphens."
   }
+
+  # It starts the Cognito domain prefix, which may not contain these words.
+  validation {
+    condition     = !can(regex("aws|amazon|cognito", var.name_prefix))
+    error_message = "name_prefix must not contain aws, amazon or cognito (reserved in Cognito domain names)."
+  }
 }
 
 variable "sandbox_namespace" {
@@ -256,4 +262,38 @@ variable "approval_email" {
   description = "Email address subscribed to the approval topic. Empty adds no subscription."
   type        = string
   default     = ""
+}
+
+variable "lambda_subnet_ids" {
+  description = "Subnets for the two tool Lambdas, which call the EKS API. Required for a cluster with a private endpoint only. Empty runs them outside any VPC. See docs/deploy.md, Network."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.lambda_subnet_ids : can(regex("^subnet-[0-9a-f]+$", id))])
+    error_message = "lambda_subnet_ids must be subnet IDs."
+  }
+}
+
+variable "lambda_security_group_ids" {
+  description = "Security groups for the tool Lambdas in lambda_subnet_ids. Empty creates one that allows outbound HTTPS only."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.lambda_security_group_ids : can(regex("^sg-[0-9a-f]+$", id))])
+    error_message = "lambda_security_group_ids must be security group IDs."
+  }
+}
+
+variable "allow_lambda_to_cluster_endpoint" {
+  description = "Add an inbound HTTPS rule from the tool Lambdas' security groups to the cluster security group. Off by default because it changes a security group of the cluster. Needs private endpoint access on the cluster."
+  type        = bool
+  default     = false
+}
+
+variable "create_vpc_endpoints" {
+  description = "Create the VPC endpoints the tool Lambdas need without a NAT gateway: interface endpoints for EKS, SSM and SNS, and a DynamoDB gateway endpoint on the route tables of lambda_subnet_ids. Needs private endpoint access on the cluster. Leave off if the VPC already has endpoints for these services."
+  type        = bool
+  default     = false
 }
