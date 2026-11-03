@@ -22,9 +22,9 @@ JWT = "eyJ" + "hbGciOiJIUzI1NiJ9" + ".eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0" + ".dozj
 GITHUB_TOKENS = ["ghp_" + "A1b2" * 9, "gho_" + "Z9" * 18, "github_pat_" + "11AB" * 6 + "_x"]
 SLACK_TOKEN = "xoxb-" + "123456789012-abcdefABCDEF"
 PEM = (
-    "-----BEGIN RSA PRIVATE KEY-----\n"
+    "-----BEGIN " + "RSA PRIVATE KEY-----\n"
     "MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7MhgHcTz6sE2I2yPB\n"
-    "-----END RSA PRIVATE KEY-----"
+    "-----END " + "RSA PRIVATE KEY-----"
 )
 
 K8S_MESSAGES = [

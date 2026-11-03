@@ -132,7 +132,7 @@ Text that anyone with write access to the cluster can set, such as condition and
    | `credential` | the value in `<key>=<value>`, `<key>:<value>` (no space after the colon) or `"<key>": <value>`, where the key name ends in `password`, `passwd`, `secret`, `token` or `api_key` / `apikey` / `api-key` (case-insensitive); the key name is kept. The value is a quoted string or runs to the next space, quote, `,`, `;` or `&` |
 
    A `credential` value that is already a complete `[redacted:<kind>]` or `[truncated N chars]` marker is left as it is. Redaction is pattern-based and cannot find every secret; it is a backstop, not a reason to let secrets into events or logs. Redaction comes before truncation, so a secret cut in half at the limit is still recognised.
-3. **Delimiters.** Each `<` followed by optional spaces, an optional `/`, optional spaces and the word `untrusted` (case-insensitive), such as `</untrusted>` or `< UNTRUSTED >`, is replaced by `&lt;`, so the text cannot close its own wrapper or open a new one.
+3. **Delimiters.** Each `<` followed by optional whitespace (including newlines), an optional `/`, optional whitespace and the word `untrusted` (case-insensitive), such as `</untrusted>` or `< UNTRUSTED >`, is replaced by `&lt;`, so the text cannot close its own wrapper or open a new one.
 4. **Field limit.** A field longer than 1024 characters keeps its first characters and ends with the marker `[truncated N chars]`, where `N` is the number of characters removed; the result, marker included, is at most 1024 characters. The cut never falls inside a `[redacted:<kind>]` marker; it moves to the start of the marker instead.
 5. **Wrapper.** The result is returned as the string `<untrusted>` + text + `</untrusted>`. A field that is `null` stays `null`.
 
@@ -154,6 +154,8 @@ The delimiters tell a model which text did not come from kube-handrail; they are
    - a Pod of one of them: `kind` `Pod` and a name that is the ReplicaSet's name plus `-`, cut to 58 characters as the API server does for generated names, followed by exactly 5 lower-case letters or digits. Pods are matched by name only; the reader cannot read Pods.
 
    When `involvedObject.uid` is set for a Deployment or ReplicaSet, it must be that object's `uid`, so the events of a deleted object with the same name are left out.
+
+   Only ReplicaSets that still exist are matched. Events about a ReplicaSet already removed by the Deployment's `revisionHistoryLimit`, and about its Pods, are left out although `kubectl get events` still shows them, so an empty list does not mean no failure.
 4. Sort newest first by the first set of `lastTimestamp`, `series.lastObservedTime`, `eventTime`, `firstTimestamp` and `metadata.creationTimestamp`; events without any valid timestamp go last; ties are broken by event name. Keep the first `limit`, then apply the response limit from [Untrusted output](#untrusted-output).
 
 Both lists are read as raw JSON (`_preload_content=False`), like the impact preview. A failed read of either is `kubernetes_error`, never an empty list.

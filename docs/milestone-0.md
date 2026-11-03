@@ -136,7 +136,7 @@ export ASSOCIATION_ID=...
 
 `enable-write` adds `k8sw___apply_scale_deployment` and classifies it `MUTATIVE` in the same `UpdateAssociation` call, because a tool registered without a classification is treated as `READ_ONLY` and runs without approval. It then turns on `elevatedActionsEnabled` on the agent space while keeping its other preferences, and reads both back, exiting non-zero if the tool is not `MUTATIVE` or the preference is not set.
 
-**Adding a tool to an existing deployment.** A deploy that adds a tool, such as `get_workload_events`, changes the tool set. Apply `k8s/sandbox/rbac.yaml` before using it, so its reads are allowed. With the DevOps Agent IDs configured, the drift sentinel reports the new tool as `missing_tool` drift for the association and turns the kill switch off until the association matches: run `enable-write` right after `terraform apply`, wait for a sentinel run to report `ok`, then set the kill switch back to `true`, and start a new chat so it sees the tool.
+**Adding a tool to an existing deployment.** A deploy that adds a tool, such as `get_workload_events`, changes the tool set. Apply `k8s/sandbox/rbac.yaml` before using it, so its reads are allowed. With the DevOps Agent IDs configured, the drift sentinel reports the new tool as `missing_tool` drift for the association and turns the kill switch off until the association matches: run `enable-write` right after `terraform apply` (or `associate-read` on a deployment that has only the read association), wait for a sentinel run to report `ok`, then set the kill switch back to `true`, and start a new chat so it sees the tool.
 
 Once `enable-write` has passed, let the drift sentinel watch the association too: set `devops_agent_space_id` and `devops_agent_association_id` in `terraform.tfvars` and apply again. From then on a write tool that is no longer `MUTATIVE`, an unexpected tool, or `elevatedActionsEnabled` turned off turns the kill switch off within one schedule interval. To restore after a drift, follow [Drift sentinel](../mcp/CONTRACT.md#drift-sentinel): fix the cause, re-run `enable-write`, then set the kill switch back to `true` by hand.
 
@@ -158,7 +158,7 @@ Expected behavior, observed on a test cluster:
 
 ### Untrusted event text in DevOps Agent
 
-The end-to-end test shows that the server returns injected text cleaned and wrapped; whether an agent then proposes a change is model behavior, checked by hand. With the read association in place (`associate-read` or `enable-write`), plant an Event about `web` and start a new chat:
+The end-to-end test shows that the server returns injected text cleaned and wrapped; whether an agent then proposes a change is model behavior, checked by hand. With the read association in place (`associate-read` or `enable-write`), plant an Event about `web` and start a new chat. Leave `eventTime` unset: with it, the API server also limits `message` to 1024 characters on `core/v1`.
 
 ```sh
 kubectl -n kube-handrail-sandbox create -f - <<'JSON'

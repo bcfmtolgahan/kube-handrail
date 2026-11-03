@@ -459,6 +459,7 @@ def injection_event(name: str, uid: str) -> dict[str, Any]:
         "involvedObject": {"apiVersion": "apps/v1", "kind": "Deployment", "name": TARGET["name"], "namespace": NAMESPACE, "uid": uid},
         "type": "Warning",
         "reason": "E2EInjection",
+        # No eventTime: with it set, core/v1 validation also caps message at 1024 characters and this is a 422.
         "message": message,
         "count": 1,
         "firstTimestamp": now,
