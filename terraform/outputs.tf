@@ -32,3 +32,13 @@ output "lambda_role_arns" {
   description = "IAM role ARNs of the Lambda functions, by function."
   value       = { for k, r in aws_iam_role.lambda : k => r.arn }
 }
+
+output "sentinel_function_name" {
+  description = "Name of the drift sentinel Lambda, or null when it is disabled."
+  value       = one(aws_lambda_function.sentinel[*].function_name)
+}
+
+output "alert_topic_arn" {
+  description = "SNS topic for drift alerts and sentinel alarms, or null when the sentinel is disabled."
+  value       = one(aws_sns_topic.alerts[*].arn)
+}

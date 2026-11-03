@@ -53,10 +53,16 @@ locals {
     GLOBAL_HOURLY_APPLY_BUDGET = tostring(var.global_hourly_apply_budget)
   }
 
+  # Every packaged Lambda => its requirements file. The sentinel is packaged but is not a gateway target.
+  packages = merge(
+    { for fn in keys(local.functions) : fn => "requirements.txt" },
+    var.sentinel_enabled ? { sentinel = "mcp/sentinel/requirements.txt" } : {},
+  )
+
   # Tolerates a function directory that has no Python sources yet.
   source_hashes = {
-    for fn in keys(local.functions) : fn => sha256(join("", concat(
-      [filesha256("${local.repo_root}/requirements.txt")],
+    for fn, requirements in local.packages : fn => sha256(join("", concat(
+      [filesha256("${local.repo_root}/${requirements}")],
       [for f in sort(fileset(local.common_dir, "**/*.py")) : filesha256("${local.common_dir}/${f}")],
       [for f in sort(fileset("${local.repo_root}/mcp/${fn}", "**/*.py")) : filesha256("${local.repo_root}/mcp/${fn}/${f}")],
     )))
@@ -71,7 +77,7 @@ locals {
 # --- Build and package ---------------------------------------------------------
 
 resource "terraform_data" "build" {
-  for_each = local.functions
+  for_each = local.packages
 
   triggers_replace = {
     sources = local.source_hashes[each.key]
@@ -82,9 +88,10 @@ resource "terraform_data" "build" {
     interpreter = ["/bin/bash", "-c"]
     working_dir = local.repo_root
     environment = {
-      OUT    = "build/${each.key}"
-      FN     = each.key
-      PYTHON = var.python
+      OUT          = "build/${each.key}"
+      FN           = each.key
+      PYTHON       = var.python
+      REQUIREMENTS = each.value
     }
     command = <<-EOT
       set -euo pipefail
@@ -96,7 +103,7 @@ resource "terraform_data" "build" {
         --implementation cp \
         --only-binary=:all: \
         --python-version 3.12 \
-        -r requirements.txt
+        -r "$REQUIREMENTS"
       cp -R mcp/common/handrail_common "$OUT/"
       find "mcp/$FN" -maxdepth 1 -name '*.py' -exec cp {} "$OUT/" \;
       find "$OUT" -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -105,7 +112,7 @@ resource "terraform_data" "build" {
 }
 
 data "archive_file" "lambda" {
-  for_each = local.functions
+  for_each = local.packages
 
   type        = "zip"
   source_dir  = "${local.repo_root}/build/${each.key}"

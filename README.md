@@ -72,7 +72,7 @@ A remediation follows this sequence:
 
 - **Plan/apply split.** Every write is two tools: a `READ_ONLY` `plan_*` and a `MUTATIVE` `apply_*` with identical arguments, so policy and the human approver see real values.
 - **Single-use, short-lived plans.** A plan can be applied once, within minutes, and only to the object it was computed from (same `uid`) with its spec unchanged (same `generation` and replica count). Concurrent spec changes return a conflict; status churn during a rollout does not.
-- **Misclassification loses the approval, not the limits.** If the write tool is accidentally left `READ_ONLY`, DevOps Agent can plan and apply on its own without asking anyone (observed in testing). The server-side limits still hold: allowed namespaces, replica bounds, GitOps and HPA checks, single-use plans and the kill switch. Classification is therefore checked after every registration change, and should be monitored for drift.
+- **Misclassification loses the approval, not the limits.** If the write tool is accidentally left `READ_ONLY`, DevOps Agent can plan and apply on its own without asking anyone (observed in testing). The server-side limits still hold: allowed namespaces, replica bounds, GitOps and HPA checks, single-use plans and the kill switch. Classification is therefore checked after every registration change, and a scheduled [drift sentinel](mcp/CONTRACT.md#drift-sentinel) turns the kill switch off and alerts when a write tool is no longer `MUTATIVE` or the tool set changes.
 - **Defense in depth (target design; Cedar and admission policy are planned).** Each layer assumes the others may fail:
   - `guard.py` in the write Lambda (authoritative check)
   - Cedar policy at the gateway ([AgentCore Policy examples](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html))
@@ -83,6 +83,7 @@ A remediation follows this sequence:
 - **No delete-class tools.** No delete, no generic `apply_yaml`. The first action is scale; restart and rollback of Deployments are planned.
 - **Tool output is untrusted (planned).** Logs, events and alert annotations are size-limited, stripped of control characters, redacted for secret patterns and wrapped in explicit untrusted-content delimiters. ([OWASP LLM01](https://genai.owasp.org/llmrisk/llm01-prompt-injection/))
 - **Bounded blast radius.** A kill switch in SSM Parameter Store, a per-object cooldown, and per-object and global hourly apply budgets.
+- **One classification source.** Every tool's `READ_ONLY` / `MUTATIVE` classification is in `mcp/classification.json`; registration, the drift sentinel and a CI check all read it, and CI fails if a write tool is not `MUTATIVE`.
 
 ## Non-goals
 
@@ -95,7 +96,7 @@ A remediation follows this sequence:
 
 Milestone 0 is implemented and tested on a test cluster: `get_workload_status` and a guarded `plan_scale_deployment` / `apply_scale_deployment` pair behind an AgentCore Gateway, with Terraform, namespace-scoped RBAC, end-to-end guard tests and AWS DevOps Agent registration. Setup, tests and observed behavior are in [Milestone 0](docs/milestone-0.md). There is no release.
 
-Milestone 1 (server-verified write path) is next; see the [roadmap](docs/roadmap.md). Integration details that are still unverified are listed there under "Open questions".
+Milestone 1 (server-verified write path) is in progress: spec-level conflict detection and the oscillation breaker are implemented, and the classification drift sentinel with its CI checks is implemented and unit-tested; see the [roadmap](docs/roadmap.md). Integration details that are still unverified are listed there under "Open questions".
 
 ## Planned layout
 
@@ -127,6 +128,7 @@ AGENTS.md        tool contract for MCP clients
 - [ADR 0002: Server-verified approval](docs/adr/0002-server-verified-approval.md) - approvals pinned to exact arguments and verified by the server
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
 - [Oscillation breaker](docs/guards.md) - flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks
+- [Drift sentinel](mcp/CONTRACT.md#drift-sentinel) - what it checks, outcomes, and how to restore remediation after drift
 - [Roadmap](docs/roadmap.md) - milestones and open questions
 
 ## Contributing

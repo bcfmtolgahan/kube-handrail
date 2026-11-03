@@ -15,6 +15,14 @@ python3.12 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 ```
 
+The offline checks that CI runs on every push (`.github/workflows/ci.yml`):
+
+```sh
+.venv/bin/python scripts/check_contract.py   # tools.json, mcp/classification.json and Terraform agree
+.venv/bin/python -m pytest -q tests/unit
+terraform -chdir=terraform fmt -check -recursive
+```
+
 ## 1. Sandbox namespace, RBAC and target workload
 
 ```sh
@@ -50,6 +58,8 @@ Note these outputs for the next steps:
 - `cognito_client_ids`: the app client IDs (`CLIENT_ID`). Secrets are not output; read the client secret (`CLIENT_SECRET`) from Cognito.
 
 The kill switch is the SSM parameter in the `kill_switch_parameter` output (passed to the write Lambda as `REMEDIATION_ENABLED_PARAM`). It is created as `true`. Applies fail with `remediation_disabled` unless its value is exactly `true`.
+
+Terraform also deploys the [drift sentinel](../mcp/CONTRACT.md#drift-sentinel) (`sentinel_enabled`, default `true`), which checks every 5 minutes that the gateway serves exactly the tools in `mcp/classification.json` and otherwise sets the kill switch to `false` and publishes to the `alert_topic_arn` output (subscribe an address with `alert_email`). Until the DevOps Agent IDs are set (step 4), it checks only the gateway.
 
 Upgrading a deployment made before the [oscillation breaker](guards.md): the plan table gains the `object-history` index and its TTL attribute moves from `expires_at` to `retain_until`. DynamoDB cannot switch the TTL attribute of a table in one step, so replace the table; it only holds short-lived plans, and any plan open at that moment has to be made again:
 
@@ -121,6 +131,8 @@ export ASSOCIATION_ID=...
 
 `enable-write` adds `k8sw___apply_scale_deployment` and classifies it `MUTATIVE` in the same `UpdateAssociation` call, because a tool registered without a classification is treated as `READ_ONLY` and runs without approval. It then turns on `elevatedActionsEnabled` on the agent space while keeping its other preferences, and reads both back, exiting non-zero if the tool is not `MUTATIVE` or the preference is not set.
 
+Once `enable-write` has passed, let the drift sentinel watch the association too: set `devops_agent_space_id` and `devops_agent_association_id` in `terraform.tfvars` and apply again. From then on a write tool that is no longer `MUTATIVE`, an unexpected tool, or `elevatedActionsEnabled` turned off turns the kill switch off within one schedule interval. To restore after a drift, follow [Drift sentinel](../mcp/CONTRACT.md#drift-sentinel): fix the cause, re-run `enable-write`, then set the kill switch back to `true` by hand.
+
 Then start a **new** chat and ask the agent to scale `web` in `kube-handrail-sandbox` to 2. A chat keeps the tool list it was created with, so a chat opened before `enable-write` cannot see the apply tool. You can use the console, or the chat script:
 
 ```sh
@@ -135,7 +147,7 @@ Expected behavior, observed on a test cluster:
 - `approve` records a single-use decision with `UpdateApprovalAction`, pinned to exactly those arguments, then resumes the chat with `SendMessage`. The resume context must include `userActionResponse: APPROVAL_ACTION` and the option's `buttonText`; without them DevOps Agent reports the approval as malformed and does not run the tool.
 - After approval the apply runs and the Deployment carries `kube-handrail.io/last-plan-id` with the approved plan ID. Replaying the same approval does not run the tool again. A rejected request changes nothing.
 - Outside chat, for example in an investigation started from the backlog, DevOps Agent cancels the `MUTATIVE` call before it reaches the gateway ("an approval-ref header is required") and reports the change as a mitigation step for an operator.
-- If the write tool is classified `READ_ONLY` by mistake, the agent plans and applies without asking for approval. The server-side limits still apply. Re-run `enable-write` (it verifies the classification) after any change to the association.
+- If the write tool is classified `READ_ONLY` by mistake, the agent plans and applies without asking for approval. The server-side limits still apply. Re-run `enable-write` (it verifies the classification) after any change to the association; with the DevOps Agent IDs configured, the drift sentinel also turns the kill switch off when this happens.
 
 ### Tool names inside DevOps Agent
 

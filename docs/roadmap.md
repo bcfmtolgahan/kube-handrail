@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection) and 2 (per-object oscillation breaker) are implemented; everything else is planned and not yet implemented, and the order will change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection) and 2 (per-object oscillation breaker) are implemented, and item 3 (classification drift sentinel and CI checks) is implemented and unit-tested but not yet verified on a live deployment; everything else is planned and not yet implemented, and the order will change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -28,7 +28,9 @@ See [Oscillation breaker](guards.md).
 
 **Done when:** a scale-up followed shortly by a scale-down of the same Deployment is rejected, a manual change is not reverted without the override, and each rejection explains the recent history.
 
-### 3. Classification drift sentinel and CI checks
+### 3. Classification drift sentinel and CI checks (implemented, unit-tested)
+
+See [Drift sentinel](../mcp/CONTRACT.md#drift-sentinel). Implemented: `mcp/classification.json` as the single classification source, `scripts/check_contract.py` and the GitHub Actions workflow, and the scheduled sentinel with its alert topic and alarms. The "Done when" criteria are covered by unit tests with stubbed AWS APIs; a downgrade and a simulated outage against a live deployment have not been run yet.
 
 **Goal:** a write tool that loses its `MUTATIVE` classification must stop working, not start running without approval.
 
@@ -70,7 +72,7 @@ See [Oscillation breaker](guards.md).
 
 ### Later in this milestone
 
-- CI: formatting, linting, unit tests and policy validation on every change.
+- CI: linting and policy validation on every change (unit tests, the contract check and Terraform formatting and validation run since item 3).
 - Correlation ID across gateway, Lambda, DynamoDB and Kubernetes, with basic self-observability.
 - Tool output hygiene for future log and event tools: size limits, control-character stripping, secret redaction, untrusted-content delimiters.
 - DevOps Agent skills and an `AGENTS.md` describing the tool contract.
