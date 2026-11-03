@@ -34,6 +34,7 @@ from mcp.client.streamable_http import create_mcp_http_client, streamable_http_c
 
 EXPECTED_TOOLS = {
     "k8sr___get_workload_status",
+    "k8sr___get_workload_events",
     "k8sr___plan_scale_deployment",
     "k8sr___request_approval",
     "k8sw___apply_scale_deployment",
