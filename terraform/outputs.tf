@@ -57,3 +57,8 @@ output "approver_policy_arn" {
   description = "IAM policy granting access to the approval URL (with MFA when approval_require_mfa). Attach it to each approver when approval_require_mfa is true."
   value       = aws_iam_policy.approver_invoke.arn
 }
+
+output "lambda_security_group_ids" {
+  description = "Security groups of the tool Lambdas, created or given; empty when they run outside a VPC. Allow inbound 443 from these on the cluster's API server."
+  value       = local.lambda_security_group_ids
+}
