@@ -21,8 +21,9 @@ _KEPT_CONTROLS = frozenset("\n\t")
 _REMOVED_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 
 _CREDENTIAL_KEY = r"[A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key)"
-# (pattern, replacement), applied in order. Replacements never match any pattern again,
-# except the credential value, which is replaced by the same marker: redaction is idempotent.
+# A value that is already a marker is left alone, so cleaning is idempotent.
+_MARKER_VALUE = r"(?!\[redacted:[a-z_]+\]|\[truncated \d+ chars\])"
+# (pattern, replacement), applied in order. No replacement matches any pattern again.
 _SECRETS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         # An unterminated block (for example cut by the writer) is redacted to the end.
@@ -56,13 +57,14 @@ _SECRETS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(
             rf"(?<![A-Za-z0-9_.-])({_CREDENTIAL_KEY})(?![A-Za-z0-9_.-])"
             r"(\s*=\s*|:(?=[^\s:])|[\"']\s*:\s*)"
-            r"(?:\"[^\"]*\"|'[^']*'|[^\s\"',;&]+)",
+            rf"{_MARKER_VALUE}(?:\"[^\"]*\"|'[^']*'|[^\s\"',;&]+)",
             re.IGNORECASE,
         ),
         r"\1\2[redacted:credential]",
     ),
 )
 
+_REDACTED = "[redacted:"
 _DELIMITER = re.compile(r"<(?=\s*/?\s*untrusted\b)", re.IGNORECASE)
 
 
@@ -94,6 +96,10 @@ def truncate(text: str, limit: int = FIELD_MAX_CHARS) -> tuple[str, bool]:
     # The marker for the most characters that can be removed is at least as long as the
     # one actually used, so the result never exceeds the limit.
     keep = max(0, limit - len(_marker(len(text))))
+    # Never cut a redaction marker in half: a partial marker would be redacted again.
+    start = text.rfind("[", 0, keep)
+    if start != -1 and text.startswith(_REDACTED, start) and text.find("]", start) >= keep:
+        keep = start
     return text[:keep] + _marker(len(text) - keep), True
 
 

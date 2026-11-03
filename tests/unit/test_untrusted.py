@@ -239,6 +239,25 @@ def test_clean_is_idempotent(text):
     assert clean(once) == (once, False)
 
 
+@pytest.mark.parametrize("offset", range(950, 1030))
+@pytest.mark.parametrize("secret", ["password=hunter2 ", "Bearer abcdefghijkl ", AWS_KEY_ID + " "])
+def test_clean_is_idempotent_whatever_the_cut(offset, secret):
+    once, truncated = clean("a" * offset + secret + "b c " * 300)
+    assert truncated and len(once) <= FIELD_MAX_CHARS
+    assert clean(once) == (once, False)
+
+
+def test_truncation_never_cuts_a_redaction_marker():
+    text, _ = truncate("a" * 1000 + "[redacted:credential]" + "b" * 100, 1024)
+    assert text == "a" * 1000 + "[truncated 121 chars]"
+
+
+def test_markers_are_not_redacted_again():
+    for text in ("password=[redacted:credential]", "token=[truncated 5 chars]"):
+        assert redact_secrets(text) == text
+    assert redact_secrets("password=[redacted:hunter2") == "password=[redacted:credential]"
+
+
 def test_untrusted_text_of_an_injection():
     value, truncated = untrusted_text(INJECTION)
     inner = value[len(OPEN) : -len(CLOSE)]

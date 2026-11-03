@@ -483,6 +483,9 @@ def plans_since(object_key: str, since: int) -> int:
 
 async def event_tests(gw: Gateway) -> None:
     """Read-only: the event text comes back cleaned, and reading it creates no plan."""
+    if not os.environ.get("PLANS_TABLE"):
+        report("events: PLANS_TABLE is set", False, "export the plans_table_name output")
+        return
     uid = kubectl("get", f"deploy/{TARGET['name']}", "-o", "jsonpath={.metadata.uid}")
     object_key = f"{NAMESPACE}/{TARGET['name']}/{uid}"
     name = f"e2e-injection-{int(time.time())}"

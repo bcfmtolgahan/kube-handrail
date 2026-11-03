@@ -131,9 +131,9 @@ Text that anyone with write access to the cluster can set, such as condition and
    | `slack_token` | `xoxa-`, `xoxb-`, `xoxp-` or `xoxr-` followed by at least 10 letters, digits or dashes |
    | `credential` | the value in `<key>=<value>`, `<key>:<value>` (no space after the colon) or `"<key>": <value>`, where the key name ends in `password`, `passwd`, `secret`, `token` or `api_key` / `apikey` / `api-key` (case-insensitive); the key name is kept. The value is a quoted string or runs to the next space, quote, `,`, `;` or `&` |
 
-   Redaction is pattern-based and cannot find every secret; it is a backstop, not a reason to let secrets into events or logs. Redaction comes before truncation, so a secret cut in half at the limit is still recognised.
+   A `credential` value that is already a complete `[redacted:<kind>]` or `[truncated N chars]` marker is left as it is. Redaction is pattern-based and cannot find every secret; it is a backstop, not a reason to let secrets into events or logs. Redaction comes before truncation, so a secret cut in half at the limit is still recognised.
 3. **Delimiters.** Each `<` followed by optional spaces, an optional `/`, optional spaces and the word `untrusted` (case-insensitive), such as `</untrusted>` or `< UNTRUSTED >`, is replaced by `&lt;`, so the text cannot close its own wrapper or open a new one.
-4. **Field limit.** A field longer than 1024 characters keeps its first characters and ends with the marker `[truncated N chars]`, where `N` is the number of characters removed; the result, marker included, is at most 1024 characters.
+4. **Field limit.** A field longer than 1024 characters keeps its first characters and ends with the marker `[truncated N chars]`, where `N` is the number of characters removed; the result, marker included, is at most 1024 characters. The cut never falls inside a `[redacted:<kind>]` marker; it moves to the start of the marker instead.
 5. **Wrapper.** The result is returned as the string `<untrusted>` + text + `</untrusted>`. A field that is `null` stays `null`.
 
 Steps 1-4 are idempotent: applying them to their own output changes nothing. Step 5 is not, and is not meant to be: text shaped like a wrapped value is neutralized and wrapped again, never passed through.
