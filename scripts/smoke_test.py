@@ -193,6 +193,12 @@ async def run(args: argparse.Namespace, token: str) -> None:
             await wait_ready(gw, args.namespace, args.name, 1)
 
 
+def leaves(exc: BaseException) -> list[BaseException]:
+    if isinstance(exc, BaseExceptionGroup):
+        return [leaf for inner in exc.exceptions for leaf in leaves(inner)]
+    return [exc]
+
+
 def main() -> int:
     args = parse_args()
     failures: list[BaseException] = []
@@ -200,8 +206,8 @@ def main() -> int:
         token = fetch_token(args.token_url, args.client_id, args.client_secret, args.scope)
         asyncio.run(run(args, token))
     except* SmokeTestError as group:
-        # The MCP client runs in a task group, so failures may arrive wrapped.
-        failures.extend(group.exceptions)
+        # The MCP client runs in task groups, so failures may arrive wrapped more than once.
+        failures.extend(leaves(group))
     for exc in failures:
         print(f"FAIL: {exc}", file=sys.stderr)
     if failures:
