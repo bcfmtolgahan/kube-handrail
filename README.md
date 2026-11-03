@@ -2,7 +2,7 @@
 
 Guarded remediation layer for AI agents on Kubernetes: **plan → policy → approve → apply → audit**. MCP tools for Amazon EKS, intended to work with AWS DevOps Agent and other MCP clients.
 
-> **Status: Milestone 0 done; the core of Milestone 1 is implemented and tested on a test cluster.** That covers one read tool and one guarded plan/apply pair for scaling, server-verified approval, the oscillation breaker, the impact preview and the drift sentinel. Restart, rollback, the Cedar and admission policy layers and the later milestones are planned, not built. See [Status](#status).
+> **Status: Milestone 0 done; the core of Milestone 1 is implemented and tested on a test cluster.** That covers a workload status tool and one guarded plan/apply pair for scaling, server-verified approval, the oscillation breaker, the impact preview and the drift sentinel. Tool output hygiene and a workload events tool are implemented and unit-tested. Restart, rollback, the Cedar and admission policy layers and the later milestones are planned, not built. See [Status](#status).
 
 ## Why
 
@@ -22,7 +22,7 @@ Whether a `MUTATIVE` custom MCP tool is a workable path for in-cluster writes fr
 
 ## How it is intended to work
 
-This is the target design. Implemented today: the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the blast-radius budget, the measured impact preview, the kill switch, namespace-scoped RBAC, client-side approval in DevOps Agent, and [server-side approval](mcp/CONTRACT.md#server-side-approval) (`request_approval`, an IAM-authenticated approval API and CLI, and an apply that consumes only an approved plan), and correlation IDs with a structured record and metrics per tool call (implemented and unit-tested). Everything else shown below is planned.
+This is the target design. Implemented today: the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the blast-radius budget, the measured impact preview, the kill switch, namespace-scoped RBAC, client-side approval in DevOps Agent, [server-side approval](mcp/CONTRACT.md#server-side-approval) (`request_approval`, an IAM-authenticated approval API and CLI, and an apply that consumes only an approved plan), correlation IDs with a structured record and metrics per tool call (implemented and unit-tested), and [untrusted output](mcp/CONTRACT.md#untrusted-output) handling for cluster-sourced text, used by `get_workload_status` and `get_workload_events`. Everything else shown below is planned.
 
 ```
   MCP client
@@ -36,9 +36,9 @@ This is the target design. Implemented today: the `k8sr` and `k8sw` targets, the
 │   Interceptors: caller identity, output sanitization       │
 ├───────────────────────────┬──────────────┬─────────────────┤
 │ k8sr (READ_ONLY)          │ k8sw         │ prom (READ_ONLY)│
-│ workload status, plan_*,  │ (MUTATIVE)   │ SLO / burn rate,│
-│ node triage, changes      │ apply_*      │ golden signals, │
-│                           │              │ firing alerts   │
+│ workload status, events,  │ (MUTATIVE)   │ SLO / burn rate,│
+│ plan_*, node triage,      │ apply_*      │ golden signals, │
+│ changes                   │              │ firing alerts   │
 └────────────┬──────────────┴──────┬───────┴────────┬────────┘
              ▼                     ▼                ▼
       read/plan Lambda       write Lambda       Prometheus Lambda
@@ -82,7 +82,7 @@ A remediation follows this sequence:
   - Client-side approval (DevOps Agent directed actions)
 - **GitOps-aware.** Resources managed by Argo CD (and Flux, once its ownership markers are validated) are not modified; the plan returns the error `gitops_managed`. ([Argo CD resource tracking](https://argo-cd.readthedocs.io/en/stable/user-guide/resource_tracking/))
 - **No delete-class tools.** No delete, no generic `apply_yaml`. The first action is scale; restart and rollback of Deployments are planned.
-- **Tool output is untrusted (planned).** Logs, events and alert annotations are size-limited, stripped of control characters, redacted for secret patterns and wrapped in explicit untrusted-content delimiters. ([OWASP LLM01](https://genai.owasp.org/llmrisk/llm01-prompt-injection/))
+- **Tool output is untrusted.** Text from the cluster that anyone with write access can set (condition and event reasons and messages today; logs and alert annotations once there are tools for them) is stripped of control and format characters, redacted for common secret patterns, cut to a field limit with an explicit marker, and wrapped in `<untrusted>...</untrusted>`; list responses have a size limit. The delimiters are a hint to the model, not a security boundary: the boundary is that read tools change nothing and every change needs a human approval pinned to its arguments. See [Untrusted output](mcp/CONTRACT.md#untrusted-output). ([OWASP LLM01](https://genai.owasp.org/llmrisk/llm01-prompt-injection/))
 - **Bounded blast radius.** A kill switch in SSM Parameter Store, a maximum step per change (`MAX_REPLICA_STEP_PERCENT` of the current replica count, enforced whatever the approval says), a per-object cooldown, and per-object and global hourly apply budgets.
 - **One classification source.** Every tool's `READ_ONLY` / `MUTATIVE` classification is in `mcp/classification.json`; registration, the drift sentinel and a CI check all read it, and CI fails if a write tool is not `MUTATIVE`.
 
@@ -97,7 +97,7 @@ A remediation follows this sequence:
 
 Milestone 0 is implemented and tested on a test cluster: `get_workload_status` and a guarded `plan_scale_deployment` / `apply_scale_deployment` pair behind an AgentCore Gateway, with Terraform, namespace-scoped RBAC, end-to-end guard tests and AWS DevOps Agent registration. Setup, tests and observed behavior are in [Milestone 0](docs/milestone-0.md). There is no release.
 
-Milestone 1 (server-verified write path): items 1-5 are implemented and tested on a test cluster, and the caller identity spike (item 6) is done, with an experimental interceptor that is off by default. The remaining Milestone 1 work is listed under "Later in this milestone" in the [roadmap](docs/roadmap.md). Integration details that are still unverified are listed there under "Open questions".
+Milestone 1 (server-verified write path): items 1-5 are implemented and tested on a test cluster, and the caller identity spike (item 6) is done, with an experimental interceptor that is off by default. Tool output hygiene, with the `get_workload_events` tool, is implemented and unit-tested. The remaining Milestone 1 work is listed under "Later in this milestone" in the [roadmap](docs/roadmap.md). Integration details that are still unverified are listed there under "Open questions".
 
 ## Planned layout
 
@@ -132,6 +132,7 @@ AGENTS.md        tool contract for MCP clients
 - [Drift sentinel](mcp/CONTRACT.md#drift-sentinel) - what it checks, outcomes, and how to restore remediation after drift
 - [Server-side approval](mcp/CONTRACT.md#server-side-approval) - approval modes, `request_approval`, the approval API and who can approve
 - [Observability](mcp/CONTRACT.md#observability) - correlation IDs, the per-call tool record and its metrics, and the internal error alarm
+- [Untrusted output](mcp/CONTRACT.md#untrusted-output) - how text from the cluster is cleaned and wrapped before an agent sees it, and why that is a hint rather than a boundary
 - [Roadmap](docs/roadmap.md) - milestones and open questions
 
 ## Contributing
