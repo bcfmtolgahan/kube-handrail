@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks) and 4 (measured impact preview and blast-radius budget) are implemented and tested on a test cluster; item 5 (server-side approval) is implemented and unit-tested but not yet tested on a live deployment; everything else is planned and not yet implemented, and the order will change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster; everything else is planned and not yet implemented, and the order will change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -52,9 +52,14 @@ See [Guards](guards.md) and [Impact preview](../mcp/CONTRACT.md#impact-preview).
 
 **Done when:** a plan that would violate a PDB or empty a Service says so in its output, and a plan over the budget is rejected even if a human would approve it.
 
-### 5. Server-side approval (implemented, unit-tested)
+### 5. Server-side approval (implemented)
 
-See [Server-side approval](../mcp/CONTRACT.md#server-side-approval). Implemented and unit-tested: `APPROVAL_MODE`, the extended consume condition, `request_approval` with an SNS notification and per-plan and global limits, split TTLs, and the approver Lambda behind an IAM-authenticated Function URL with `scripts/approve.py`. The server-mode cases in `tests/e2e/e2e_gateway.py --approval-mode server` have not yet been run on a live deployment.
+See [Server-side approval](../mcp/CONTRACT.md#server-side-approval). Implemented and unit-tested: `APPROVAL_MODE`, the extended consume condition, `request_approval` with an SNS notification and per-plan and global limits, split TTLs, and the approver Lambda behind an IAM-authenticated Function URL with `scripts/approve.py`. On a test deployment:
+
+- In `server` mode (`tests/e2e/e2e_gateway.py --approval-mode server`), an apply without approval returned `approval_required`. A second `request_approval` within the cooldown notified nobody. The approval URL refused a Cognito token and an unsigned request with 403. A SigV4-signed approval by the listed approver applied the plan and the record names the approver. The applied plan could not be approved again, and a rejected plan could not be applied.
+- A DevOps Agent investigation started from a backlog task planned the change and called `request_approval`; the write Lambda was not invoked. The plan was rejected through `scripts/approve.py`.
+- In `client` mode, the DevOps Agent chat flow (plan, chat approval, apply) worked unchanged with a single approval.
+- `both` mode with a DevOps Agent chat was not tested.
 
 **Goal:** implement [ADR 0002](adr/0002-server-verified-approval.md).
 

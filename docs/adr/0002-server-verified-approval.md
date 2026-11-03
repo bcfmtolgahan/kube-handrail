@@ -4,7 +4,7 @@
 - Date: 2026-10-27
 - Amends: [ADR 0001](0001-scope.md)
 
-Accepted as the design for the write path, implemented in [Milestone 1](../roadmap.md#milestone-1-server-verified-write-path) (item 5) and unit-tested; see [Server-side approval](../../mcp/CONTRACT.md#server-side-approval) for the exact rules.
+Accepted as the design for the write path, implemented in [Milestone 1](../roadmap.md#milestone-1-server-verified-write-path) (item 5) and tested on a test cluster in `server` and `client` mode; see [Server-side approval](../../mcp/CONTRACT.md#server-side-approval) for the exact rules.
 
 Implementation notes:
 
