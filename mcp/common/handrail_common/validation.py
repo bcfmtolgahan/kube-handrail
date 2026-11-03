@@ -5,7 +5,12 @@ import uuid
 from collections.abc import Collection, Mapping
 from typing import Any
 
-from handrail_common.envelope import FORBIDDEN_NAMESPACE, INVALID_ARGUMENT, OUT_OF_BOUNDS
+from handrail_common.envelope import (
+    BLAST_RADIUS_EXCEEDED,
+    FORBIDDEN_NAMESPACE,
+    INVALID_ARGUMENT,
+    OUT_OF_BOUNDS,
+)
 
 # Namespaces are DNS-1123 labels; Deployment names are DNS-1123 subdomains.
 _DNS1123_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
@@ -56,6 +61,28 @@ def check_namespace_allowed(namespace: str, allowed: Collection[str]) -> None:
 def check_replica_bounds(replicas: int, minimum: int, maximum: int) -> None:
     if not minimum <= replicas <= maximum:
         raise GuardError(OUT_OF_BOUNDS, f"replicas must be between {minimum} and {maximum}")
+
+
+def max_replica_step(replicas_from: int, percent: int) -> int:
+    """Largest allowed change: `percent` of the current count, rounded up, and at least 1."""
+    return max(1, -(-replicas_from * percent // 100))
+
+
+def check_replica_step(replicas_from: int, replicas_to: int, percent: int) -> None:
+    """Blast-radius budget, enforced whatever the approval says."""
+    step = max_replica_step(replicas_from, percent)
+    if abs(replicas_to - replicas_from) > step:
+        raise GuardError(
+            BLAST_RADIUS_EXCEEDED,
+            f"a change from {replicas_from} to {replicas_to} replicas exceeds the maximum step "
+            f"of {step} ({percent}% of the current count); change it in smaller steps",
+            {
+                "from": replicas_from,
+                "to": replicas_to,
+                "max_step": step,
+                "max_step_percent": percent,
+            },
+        )
 
 
 def validate_scale_args(

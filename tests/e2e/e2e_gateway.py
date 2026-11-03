@@ -3,23 +3,27 @@
 
 Covers authentication, argument validation, namespace and replica limits,
 GitOps and HPA checks, single-use and expiring plans, conflicts, concurrent
-applies, the kill switch and the oscillation breaker (flapping and manual
-change). Run it after the smoke test, against a disposable cluster only.
+applies, the kill switch, the oscillation breaker (flapping and manual
+change), the blast-radius budget and the impact preview. Run it after the smoke test, against a disposable cluster only.
 
 Environment: GATEWAY_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET, KILL_SWITCH_PARAM,
 KUBECONFIG, and the usual AWS variables. Pass --with-expiry to also wait out a
 plan TTL (PLAN_TTL_SECONDS, default 300). APPLY_COOLDOWN_SECONDS (default 60) must
-match the deployment: the test waits it out after each apply.
+match the deployment: the test waits it out after each apply. The blast-radius
+case expects MAX_REPLICA_STEP_PERCENT=100 (the default) and MAX_REPLICAS >= 3.
 
 The test never changes `web`, which belongs to the smoke test; it only plans
 against it for validation cases that are refused before apply. Every case that
 applies or edits a Deployment uses fixture Deployments created for this run in
-kube-handrail-sandbox (e2e-target, e2e-flap, e2e-manual) and deleted at the
-end, so each run starts with an empty history. It also applies
+kube-handrail-sandbox (e2e-target, e2e-flap, e2e-manual, plus a Service and a
+PodDisruptionBudget for e2e-target) and deleted at the end, so each run starts
+with an empty history. It also applies
 tests/e2e/fixtures/argo-managed.yaml and creates and deletes a temporary HPA.
 
 The per-object and global hourly budgets and the plan rate limit are covered by
-unit tests only: reaching them here takes 6 or 30 applies or 20 plans.
+unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
+scale_to_zero and service_without_endpoints warnings: they need a plan to 0
+replicas, which a sandbox with MIN_REPLICAS=1 refuses as out_of_bounds.
 """
 
 import argparse
@@ -103,7 +107,31 @@ def fixture(name: str) -> dict[str, Any]:
     }
 
 
+def target_labels() -> dict[str, str]:
+    return fixture(TARGET["name"])["spec"]["selector"]["matchLabels"]
+
+
+def target_service() -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": TARGET["name"], "namespace": NAMESPACE, "labels": {"app.kubernetes.io/part-of": NAMESPACE}},
+        "spec": {"selector": target_labels(), "ports": [{"name": "http", "port": 80, "targetPort": 8080}]},
+    }
+
+
+def target_pdb(min_available: int) -> dict[str, Any]:
+    return {
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": {"name": TARGET["name"], "namespace": NAMESPACE, "labels": {"app.kubernetes.io/part-of": NAMESPACE}},
+        "spec": {"minAvailable": min_available, "selector": {"matchLabels": target_labels()}},
+    }
+
+
 def delete_fixtures() -> None:
+    kubectl("delete", "service", TARGET["name"], "--ignore-not-found")
+    kubectl("delete", "pdb", TARGET["name"], "--ignore-not-found")
     kubectl("delete", "deployment", *FIXTURES, "--ignore-not-found", "--wait=true")
 
 
@@ -112,6 +140,8 @@ def create_fixtures() -> None:
     delete_fixtures()
     for name in FIXTURES:
         kubectl("create", "-f", "-", stdin=json.dumps(fixture(name)))
+    kubectl("create", "-f", "-", stdin=json.dumps(target_service()))
+    kubectl("create", "-f", "-", stdin=json.dumps(target_pdb(1)))
     for name in FIXTURES:
         kubectl("rollout", "status", f"deploy/{name}", "--timeout=120s")
 
@@ -309,6 +339,79 @@ async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
         await expect(gw, "apply after the plan expired", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 2}, "plan_expired")
 
 
+def wait_for(name: str, condition: Any, timeout: int = 120) -> None:
+    """Poll until condition() is true: controllers update EndpointSlices and PDB status
+    shortly after the pods change."""
+    deadline = time.time() + timeout
+    while not condition():
+        if time.time() > deadline:
+            raise RuntimeError(f"timed out waiting for {name}")
+        time.sleep(2)
+
+
+def ready_endpoints() -> int:
+    out = kubectl("get", "endpointslices", "-l", f"kubernetes.io/service-name={TARGET['name']}", "-o", "json")
+    return sum(
+        1
+        for item in json.loads(out)["items"]
+        for endpoint in item.get("endpoints") or []
+        if (endpoint.get("conditions") or {}).get("ready") is True
+    )
+
+
+def pdb_status() -> tuple[int, int]:
+    status = json.loads(kubectl("get", "pdb", TARGET["name"], "-o", "json")).get("status") or {}
+    return status.get("currentHealthy", -1), status.get("disruptionsAllowed", -1)
+
+
+async def impact_tests(gw: Gateway) -> None:
+    """Plans only, never applied, so no cooldown is needed between them. Runs after the
+    plan tests have waited out the cooldown of e2e-target's last apply; that apply was a
+    scale-up, so the 2 -> 1 plan below is a single revert, not flapping."""
+    wait_for("one ready endpoint of e2e-target", lambda: ready_endpoints() == 1)
+    wait_for("PDB status of e2e-target", lambda: pdb_status() == (1, 0))
+    envelope = await gw.call(PLAN, {**TARGET, "replicas": 2})
+    impact = (envelope.get("data") or {}).get("impact") or {}
+    services = impact.get("services") or []
+    pdbs = impact.get("pod_disruption_budgets") or []
+    report(
+        "impact: plan 1 -> 2 reports the Service with its ready endpoints",
+        services == [{"name": TARGET["name"], "ready_endpoints_now": 1, "projected_ready_endpoints": 2}],
+        code(envelope) or services,
+    )
+    report(
+        "impact: plan 1 -> 2 reports the PodDisruptionBudget, no warnings",
+        [(p.get("name"), p.get("min_available"), p.get("disruptions_allowed")) for p in pdbs] == [(TARGET["name"], 1, 0)]
+        and impact.get("pods", {}).get("added") == 1
+        and impact.get("warnings") == [],
+        code(envelope) or pdbs,
+    )
+
+    envelope = await gw.call(PLAN, {**TARGET, "replicas": 3})
+    details = (envelope.get("error") or {}).get("details") or {}
+    report(
+        "blast radius: plan 1 -> 3 is refused",
+        code(envelope) == "blast_radius_exceeded" and details == {"from": 1, "to": 3, "max_step": 1, "max_step_percent": 100},
+        code(envelope) or "ok",
+    )
+
+    try:
+        kubectl("scale", "deploy/e2e-target", "--replicas=2")
+        kubectl("rollout", "status", "deploy/e2e-target", "--timeout=120s")
+        kubectl("apply", "-f", "-", stdin=json.dumps(target_pdb(2)))
+        wait_for("PDB of e2e-target with no headroom", lambda: pdb_status() == (2, 0))
+        envelope = await gw.call(PLAN, {**TARGET, "replicas": 1})
+        warnings = ((envelope.get("data") or {}).get("impact") or {}).get("warnings") or []
+        report(
+            "impact: plan 2 -> 1 past the PDB headroom warns pdb_headroom and is not refused",
+            envelope.get("ok") is True and [w.get("code") for w in warnings] == ["pdb_headroom"],
+            code(envelope) or warnings,
+        )
+    finally:
+        kubectl("apply", "-f", "-", stdin=json.dumps(target_pdb(1)))
+        reset_target()
+
+
 async def plan_and_apply(gw: Gateway, name: str, target: dict[str, str], replicas: int, **extra: Any) -> None:
     envelope = await gw.apply(target, await gw.plan(target, replicas, **extra), replicas, **extra)
     report(name, envelope.get("ok") is True, code(envelope) or "ok")
@@ -362,6 +465,7 @@ async def run(with_expiry: bool) -> None:
             await validation_tests(gw)
             await ownership_tests(gw)
             await plan_tests(gw, with_expiry)
+            await impact_tests(gw)
             await breaker_tests(gw)
 
 

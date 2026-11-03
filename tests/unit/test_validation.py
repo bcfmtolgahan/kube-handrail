@@ -1,8 +1,15 @@
 import pytest
 
-from handrail_common.envelope import FORBIDDEN_NAMESPACE, INVALID_ARGUMENT, OUT_OF_BOUNDS
+from handrail_common.envelope import (
+    BLAST_RADIUS_EXCEEDED,
+    FORBIDDEN_NAMESPACE,
+    INVALID_ARGUMENT,
+    OUT_OF_BOUNDS,
+)
 from handrail_common.validation import (
     GuardError,
+    check_replica_step,
+    max_replica_step,
     require_int,
     require_name,
     require_namespace,
@@ -81,3 +88,49 @@ def test_plan_id():
     for bad in [pid.upper(), "not-a-uuid", "", None, 1]:
         with pytest.raises(GuardError):
             require_plan_id(bad)
+
+
+@pytest.mark.parametrize(
+    ("replicas_from", "percent", "step"),
+    [
+        (0, 50, 1),
+        (0, 100, 1),
+        (0, 200, 1),
+        (1, 50, 1),
+        (1, 100, 1),
+        (1, 200, 2),
+        (3, 50, 2),
+        (3, 100, 3),
+        (3, 200, 6),
+        (10, 25, 3),
+    ],
+)
+def test_max_replica_step(replicas_from, percent, step):
+    assert max_replica_step(replicas_from, percent) == step
+
+
+@pytest.mark.parametrize(
+    ("replicas_from", "percent", "allowed", "refused"),
+    [
+        (0, 100, [0, 1], [2]),
+        (1, 50, [0, 1, 2], [3]),
+        (1, 100, [0, 1, 2], [3]),
+        (1, 200, [0, 3], [4]),
+        (3, 50, [1, 5], [0, 6]),
+        (3, 100, [0, 6], [7]),
+        (3, 200, [0, 9], [10]),
+    ],
+)
+def test_replica_step_at_the_limits(replicas_from, percent, allowed, refused):
+    for replicas_to in allowed:
+        check_replica_step(replicas_from, replicas_to, percent)
+    for replicas_to in refused:
+        with pytest.raises(GuardError) as exc:
+            check_replica_step(replicas_from, replicas_to, percent)
+        assert exc.value.code == BLAST_RADIUS_EXCEEDED
+
+
+def test_replica_step_details():
+    with pytest.raises(GuardError) as exc:
+        check_replica_step(3, 10, 100)
+    assert exc.value.details == {"from": 3, "to": 10, "max_step": 3, "max_step_percent": 100}

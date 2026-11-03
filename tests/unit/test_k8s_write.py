@@ -1,3 +1,4 @@
+import dataclasses
 import importlib.util
 import uuid
 from pathlib import Path
@@ -32,6 +33,8 @@ ENV = {
     "MAX_REPLICAS": "5",
     "REMEDIATION_ENABLED_PARAM": PARAM,
     "AWS_REGION": REGION,
+    # Most plans here go from 1 to 3; the blast-radius budget has its own tests.
+    "MAX_REPLICA_STEP_PERCENT": "200",
 }
 CONTEXT = SimpleNamespace(
     client_context=SimpleNamespace(
@@ -748,6 +751,34 @@ def test_apply_refused_by_another_check_does_not_use_the_global_budget(rt):
         seed(1, 3, NOW - 3000 + i)
     assert error_code(apply(create_plan(runtime_.store).plan_id)) == "object_budget_exceeded"
     assert runtime_.store.global_applies(NOW) == 0
+
+
+def test_apply_rechecks_the_blast_radius_with_the_current_setting(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)  # 1 -> 3, within 200 % when it was planned
+    runtime_.settings = dataclasses.replace(runtime_.settings, max_replica_step_percent=100)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "blast_radius_exceeded"
+    assert response["error"]["details"] == {
+        "from": 1,
+        "to": 3,
+        "max_step": 1,
+        "max_step_percent": 100,
+    }
+    apps.read_namespaced_deployment.assert_not_called()
+    apps.patch_namespaced_deployment.assert_not_called()
+    record = item(plan.plan_id)
+    assert record["used"] is True
+    assert record["result"] == "blast_radius_exceeded"
+    assert runtime_.store.global_applies(NOW) == 0
+
+
+def test_apply_allows_a_step_at_the_budget(rt):
+    runtime_, _ = rt
+    runtime_.settings = dataclasses.replace(runtime_.settings, max_replica_step_percent=100)
+    assert apply(create_plan(runtime_.store, replicas=2).plan_id, replicas=2)["ok"] is True
 
 
 def test_apply_rejects_a_change_within_the_cooldown(rt):

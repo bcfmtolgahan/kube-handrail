@@ -17,6 +17,10 @@ plan_rate_window_seconds   = 600
 apply_cooldown_seconds     = 60
 global_hourly_apply_budget = 30
 
+# Blast-radius budget (mcp/CONTRACT.md, Guard checks): the largest change in
+# replicas per plan, as a percentage of the current count, rounded up, at least 1.
+max_replica_step_percent = 100
+
 # The kill switch parameter is created with the value "true" and Terraform
 # ignores later changes to it, so it can be flipped without being reset:
 #   aws ssm put-parameter --overwrite --name <kill_switch_parameter> --value false

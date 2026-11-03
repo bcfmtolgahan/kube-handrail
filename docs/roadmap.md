@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker) and 3 (classification drift sentinel and CI checks) are implemented and tested on a test cluster; everything else is planned and not yet implemented, and the order will change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks) and 4 (measured impact preview and blast-radius budget) are implemented and tested on a test cluster; everything else is planned and not yet implemented, and the order will change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -18,7 +18,7 @@ One read tool and a guarded `plan_scale_deployment` / `apply_scale_deployment` p
 
 ### 2. Per-object oscillation breaker (implemented)
 
-See [Oscillation breaker](guards.md).
+See [Oscillation breaker](guards.md#oscillation-breaker).
 
 **Goal:** prevent ping-pong between agents and humans on the same object.
 
@@ -40,13 +40,15 @@ See [Drift sentinel](../mcp/CONTRACT.md#drift-sentinel). Implemented: `mcp/class
 
 **Done when:** downgrading a write tool to `READ_ONLY` turns the kill switch off within minutes and raises an alert, a simulated API outage does not, and CI fails on a write tool marked `READ_ONLY`.
 
-### 4. Measured impact preview and blast-radius budget
+### 4. Measured impact preview and blast-radius budget (implemented)
+
+See [Guards](guards.md) and [Impact preview](../mcp/CONTRACT.md#impact-preview). On a test deployment, a plan reported the Service selecting the target with its ready and projected endpoints and the matching PodDisruptionBudget, a scale-down past the budget's headroom was planned with a `pdb_headroom` warning, and a 1 -> 3 plan was refused with `blast_radius_exceeded`. `scale_to_zero` and `service_without_endpoints` are covered by unit tests only, because the test deployment's minimum is 1 replica.
 
 **Goal:** show the approver measured facts, not prose, and cap the size of any single change regardless of approval.
 
 - Plans include the number of affected pods, PodDisruptionBudget headroom, the projected endpoint count of Services selecting the target (flagging any that would drop to zero), and warnings.
-- A blast-radius budget (for example, maximum relative change in replicas) is enforced by the guard independently of approval.
-- The reader identity gains read access to pods, PDBs, Services and EndpointSlices, in allowed namespaces only.
+- A blast-radius budget (`MAX_REPLICA_STEP_PERCENT`, the maximum change in replicas relative to the current count) is enforced by the guard on plan and apply, independently of approval.
+- The reader identity gains read access to PDBs, Services and EndpointSlices, in allowed namespaces only. It needs no access to pods: ready counts come from the Deployment status and EndpointSlices.
 
 **Done when:** a plan that would violate a PDB or empty a Service says so in its output, and a plan over the budget is rejected even if a human would approve it.
 

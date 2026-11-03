@@ -115,6 +115,17 @@ variable "global_hourly_apply_budget" {
   }
 }
 
+variable "max_replica_step_percent" {
+  description = "Blast-radius budget: largest change in replicas per plan, as a percentage of the current count (rounded up, at least 1)."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.max_replica_step_percent > 0 && floor(var.max_replica_step_percent) == var.max_replica_step_percent
+    error_message = "max_replica_step_percent must be a positive integer."
+  }
+}
+
 variable "log_retention_days" {
   description = "CloudWatch Logs retention for the Lambda functions."
   type        = number

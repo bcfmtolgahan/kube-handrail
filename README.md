@@ -22,7 +22,7 @@ Whether a `MUTATIVE` custom MCP tool is a workable path for in-cluster writes fr
 
 ## How it is intended to work
 
-This is the target design. Implemented today (Milestone 0): the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the kill switch, namespace-scoped RBAC and client-side approval in DevOps Agent. Everything else shown below is planned.
+This is the target design. Implemented today: the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the blast-radius budget, the measured impact preview, the kill switch, namespace-scoped RBAC and client-side approval in DevOps Agent. Everything else shown below is planned.
 
 ```
   MCP client
@@ -62,17 +62,17 @@ This is the target design. Implemented today (Milestone 0): the `k8sr` and `k8sw
 
 A remediation follows this sequence:
 
-1. **Plan.** The agent calls a read-only tool such as `plan_scale_deployment`. It reads current state, runs preflight checks (HPA and GitOps ownership, and the [oscillation breaker](docs/guards.md) today; PodDisruptionBudget and revision history are planned), computes the diff locally, and stores a plan with `plan_id`, `args_hash`, the object's `uid`, `generation` and current replica count, and a short expiry.
+1. **Plan.** The agent calls a read-only tool such as `plan_scale_deployment`. It reads current state, runs preflight checks (HPA and GitOps ownership, the blast-radius budget and the [oscillation breaker](docs/guards.md) today; revision history is planned), computes the diff locally, previews the measured impact for the approver (pods added or removed, PodDisruptionBudget headroom, ready and projected endpoints of the Services in front of it, and warnings such as a Service left without endpoints), and stores a plan with `plan_id`, `args_hash`, the object's `uid`, `generation` and current replica count, and a short expiry.
 2. **Policy.** The matching `apply_*` call passes through Cedar at the gateway, which checks tool arguments (namespace allowlist, replica bounds). Planned; today the same limits are enforced only by the write Lambda.
 3. **Approve.** The client shows the exact arguments to a human. In DevOps Agent this is the chat approval for a `MUTATIVE` tool.
-4. **Apply.** The write Lambda's guard re-validates everything: plan exists, is unexpired and unused (single-use, conditional write), arguments match, the object is the same one with an unchanged spec and no GitOps marker, kill switch is on, and the [oscillation breaker](docs/guards.md) (manual-change override, per-object cooldown, flapping, per-object and global hourly apply budgets) still allows the change. It then runs a server-side dry run and the real patch, with a `resourceVersion` precondition so nothing can change in between.
+4. **Apply.** The write Lambda's guard re-validates everything: plan exists, is unexpired and unused (single-use, conditional write), arguments match, the object is the same one with an unchanged spec and no GitOps marker, kill switch is on, the change is within the blast-radius budget, and the [oscillation breaker](docs/guards.md) (manual-change override, per-object cooldown, flapping, per-object and global hourly apply budgets) still allows the change. It then runs a server-side dry run and the real patch, with a `resourceVersion` precondition so nothing can change in between.
 5. **Audit.** The result is written to DynamoDB with a correlation ID that is also annotated on the target object and traceable through gateway and Kubernetes audit logs.
 
 ## Design principles
 
 - **Plan/apply split.** Every write is two tools: a `READ_ONLY` `plan_*` and a `MUTATIVE` `apply_*` with identical arguments, so policy and the human approver see real values.
 - **Single-use, short-lived plans.** A plan can be applied once, within minutes, and only to the object it was computed from (same `uid`) with its spec unchanged (same `generation` and replica count). Concurrent spec changes return a conflict; status churn during a rollout does not.
-- **Misclassification loses the approval, not the limits.** If the write tool is accidentally left `READ_ONLY`, DevOps Agent can plan and apply on its own without asking anyone (observed in testing). The server-side limits still hold: allowed namespaces, replica bounds, GitOps and HPA checks, single-use plans and the kill switch. Classification is therefore checked after every registration change, and a scheduled [drift sentinel](mcp/CONTRACT.md#drift-sentinel) turns the kill switch off and alerts when a write tool is no longer `MUTATIVE` or the tool set changes.
+- **Misclassification loses the approval, not the limits.** If the write tool is accidentally left `READ_ONLY`, DevOps Agent can plan and apply on its own without asking anyone (observed in testing). The server-side limits still hold: allowed namespaces, replica bounds, the blast-radius budget, GitOps and HPA checks, single-use plans and the kill switch. Classification is therefore checked after every registration change, and a scheduled [drift sentinel](mcp/CONTRACT.md#drift-sentinel) turns the kill switch off and alerts when a write tool is no longer `MUTATIVE` or the tool set changes.
 - **Defense in depth (target design; Cedar and admission policy are planned).** Each layer assumes the others may fail:
   - `guard.py` in the write Lambda (authoritative check)
   - Cedar policy at the gateway ([AgentCore Policy examples](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html))
@@ -82,7 +82,7 @@ A remediation follows this sequence:
 - **GitOps-aware.** Resources managed by Argo CD (and Flux, once its ownership markers are validated) are not modified; the plan returns the error `gitops_managed`. ([Argo CD resource tracking](https://argo-cd.readthedocs.io/en/stable/user-guide/resource_tracking/))
 - **No delete-class tools.** No delete, no generic `apply_yaml`. The first action is scale; restart and rollback of Deployments are planned.
 - **Tool output is untrusted (planned).** Logs, events and alert annotations are size-limited, stripped of control characters, redacted for secret patterns and wrapped in explicit untrusted-content delimiters. ([OWASP LLM01](https://genai.owasp.org/llmrisk/llm01-prompt-injection/))
-- **Bounded blast radius.** A kill switch in SSM Parameter Store, a per-object cooldown, and per-object and global hourly apply budgets.
+- **Bounded blast radius.** A kill switch in SSM Parameter Store, a maximum step per change (`MAX_REPLICA_STEP_PERCENT` of the current replica count, enforced whatever the approval says), a per-object cooldown, and per-object and global hourly apply budgets.
 - **One classification source.** Every tool's `READ_ONLY` / `MUTATIVE` classification is in `mcp/classification.json`; registration, the drift sentinel and a CI check all read it, and CI fails if a write tool is not `MUTATIVE`.
 
 ## Non-goals
@@ -96,7 +96,7 @@ A remediation follows this sequence:
 
 Milestone 0 is implemented and tested on a test cluster: `get_workload_status` and a guarded `plan_scale_deployment` / `apply_scale_deployment` pair behind an AgentCore Gateway, with Terraform, namespace-scoped RBAC, end-to-end guard tests and AWS DevOps Agent registration. Setup, tests and observed behavior are in [Milestone 0](docs/milestone-0.md). There is no release.
 
-Milestone 1 (server-verified write path) is in progress: spec-level conflict detection and the oscillation breaker are implemented, and the classification drift sentinel with its CI checks is implemented and unit-tested; see the [roadmap](docs/roadmap.md). Integration details that are still unverified are listed there under "Open questions".
+Milestone 1 (server-verified write path) is in progress; the [roadmap](docs/roadmap.md) lists which items are implemented. Integration details that are still unverified are listed there under "Open questions".
 
 ## Planned layout
 
@@ -127,7 +127,7 @@ AGENTS.md        tool contract for MCP clients
 - [ADR 0001: Scope](docs/adr/0001-scope.md) - why a complement layer and not another AI SRE agent
 - [ADR 0002: Server-verified approval](docs/adr/0002-server-verified-approval.md) - approvals pinned to exact arguments and verified by the server
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
-- [Oscillation breaker](docs/guards.md) - flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks
+- [Guards](docs/guards.md) - blast-radius budget, impact preview, and the oscillation breaker: flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks
 - [Drift sentinel](mcp/CONTRACT.md#drift-sentinel) - what it checks, outcomes, and how to restore remediation after drift
 - [Roadmap](docs/roadmap.md) - milestones and open questions
 

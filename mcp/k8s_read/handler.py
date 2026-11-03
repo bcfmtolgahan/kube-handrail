@@ -1,8 +1,10 @@
 """k8s_read Lambda: Deployment status and scale planning. Never mutates the cluster."""
 
+import json
 import time
 import uuid
-from functools import cache
+from collections.abc import Callable
+from functools import cache, partial
 from typing import Any
 
 from kubernetes import client as k8s
@@ -26,6 +28,7 @@ from handrail_common.envelope import (
     ok,
 )
 from handrail_common.gitops import is_gitops_managed
+from handrail_common.impact import scale_impact
 from handrail_common.plans import (
     GLOBAL_BUDGET_WINDOW_SECONDS,
     SCALE_DEPLOYMENT,
@@ -38,6 +41,7 @@ from handrail_common.plans import (
 from handrail_common.validation import (
     GuardError,
     check_namespace_allowed,
+    check_replica_step,
     require_name,
     require_namespace,
     require_override_flag,
@@ -78,6 +82,56 @@ def _targeting_hpas(autoscaling: k8s.AutoscalingV2Api, namespace: str, name: str
         and hpa.spec.scale_target_ref.kind == "Deployment"
         and hpa.spec.scale_target_ref.name == name
     ]
+
+
+def _list(what: str, call: Callable[..., Any]) -> list[dict[str, Any]]:
+    """List objects as raw JSON. The client's models refuse some objects the API server
+    returns, such as an EndpointSlice with `endpoints: null` (a Service with no pods)."""
+    try:
+        response = call(_preload_content=False)
+    except ApiException as exc:
+        # Never not_found: a failed read must not look like an empty list.
+        reason = exc.reason or "unknown"
+        raise GuardError(
+            KUBERNETES_ERROR, f"cannot list {what}: kubernetes API error {exc.status}: {reason}"
+        ) from None
+    return json.loads(response.data).get("items") or []
+
+
+def _pod_template_labels(deployment: Any) -> dict[str, str]:
+    template = deployment.spec.template if deployment.spec else None
+    metadata = template.metadata if template else None
+    return dict((metadata.labels if metadata else None) or {})
+
+
+def _impact(
+    clients: "Clients", namespace: str, deployment: Any, replicas_from: int, replicas_to: int
+) -> dict[str, Any]:
+    """Read what the change affects. Any read failure fails the plan: the approver must see
+    facts, not gaps."""
+    pdbs = _list(
+        "PodDisruptionBudgets",
+        partial(clients.policy.list_namespaced_pod_disruption_budget, namespace=namespace),
+    )
+    services = _list("Services", partial(clients.core.list_namespaced_service, namespace=namespace))
+    slices = _list(
+        "EndpointSlices",
+        partial(clients.discovery.list_namespaced_endpoint_slice, namespace=namespace),
+    )
+    ready_now = (deployment.status.ready_replicas if deployment.status else None) or 0
+    try:
+        return scale_impact(
+            _pod_template_labels(deployment),
+            ready_now,
+            replicas_from,
+            replicas_to,
+            pdbs,
+            services,
+            slices,
+        )
+    except ValueError as exc:
+        # An object the preview cannot interpret, such as an unknown selector operator.
+        raise GuardError(KUBERNETES_ERROR, f"cannot build the impact preview: {exc}") from None
 
 
 def _desired_replicas(deployment: Any) -> int:
@@ -126,6 +180,18 @@ class Clients:
         return k8s.AutoscalingV2Api(api_client(self._settings.cluster_name))
 
     @property
+    def policy(self) -> k8s.PolicyV1Api:
+        return k8s.PolicyV1Api(api_client(self._settings.cluster_name))
+
+    @property
+    def core(self) -> k8s.CoreV1Api:
+        return k8s.CoreV1Api(api_client(self._settings.cluster_name))
+
+    @property
+    def discovery(self) -> k8s.DiscoveryV1Api:
+        return k8s.DiscoveryV1Api(api_client(self._settings.cluster_name))
+
+    @property
     def store(self) -> PlanStore:
         return _store(self._settings.plans_table, self._settings.region)
 
@@ -159,6 +225,7 @@ def plan_scale_deployment(
         )
 
     current = _desired_replicas(deployment)
+    check_replica_step(current, replicas, settings.max_replica_step_percent)
     uid = str(deployment.metadata.uid)
     # History checks give early feedback; apply runs all but the plan rate limit again.
     last_applied = last_applied_plan(clients.store, deployment)
@@ -178,6 +245,8 @@ def plan_scale_deployment(
         raise global_budget_error(
             now - now % GLOBAL_BUDGET_WINDOW_SECONDS, settings.global_hourly_apply_budget
         )
+    # Last, after every check has passed, and before the plan is stored.
+    impact = _impact(clients, namespace, deployment, current, replicas)
 
     plan = Plan(
         plan_id=str(uuid.uuid4()),
@@ -201,6 +270,7 @@ def plan_scale_deployment(
         "replica_bounds",
         "not_gitops_managed",
         "no_hpa",
+        "blast_radius",
         "no_manual_change",
         "cooldown",
         "not_flapping",
@@ -217,8 +287,10 @@ def plan_scale_deployment(
             "diff": {"replicas": {"from": plan.replicas_from, "to": plan.replicas_to}},
             "override_manual_change": override,
             "preflight": preflight,
+            "impact": impact,
             "expires_at": plan.expires_at,
-        }
+        },
+        truncated=impact["truncated"],
     )
 
 
