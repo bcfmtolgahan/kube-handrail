@@ -222,7 +222,7 @@ Plan (`k8s_read`):
 2. Namespace in `ALLOWED_NAMESPACES`.
 3. `MIN_REPLICAS <= replicas <= MAX_REPLICAS`.
 4. Deployment exists and is not GitOps-managed. Fail closed: treat it as managed if it has the Argo CD `argocd.argoproj.io/tracking-id` annotation or the `app.kubernetes.io/instance` label (Argo CD label tracking; may also match Helm releases, which is acceptable).
-5. Deployment has no HorizontalPodAutoscaler targeting it.
+5. Deployment has no HorizontalPodAutoscaler targeting it; otherwise `conflict` without `details`.
 6. Blast-radius budget: `|replicas - current| <= max(1, ceil(current * MAX_REPLICA_STEP_PERCENT / 100))`, where `current` is `spec.replicas` (unset counts as 1); otherwise `blast_radius_exceeded`. It is enforced whatever the approval says.
 7. History checks: manual change, cooldown, flapping, object budget, then plan rate limit (below).
 8. Global budget: the current hour's counter, read consistently, must be below `GLOBAL_HOURLY_APPLY_BUDGET`. Planning only reads it.
@@ -417,7 +417,7 @@ After the consume, the record's `namespace`, `name` and `replicas_to` must equal
 2. The record is read consistently: `plan_not_found`, `plan_used`, `plan_decided` (approved or rejected), `plan_expired`.
 3. If it already notified less than `APPROVAL_REQUEST_COOLDOWN_SECONDS` ago, nothing changes and nobody is notified: `ok` with `notified: false` and `retry_after`.
 4. One conditional update adds 1 to the current window's approval request counter only while it is below `APPROVAL_REQUEST_LIMIT` (`approval_rate_limited`, `details: {"limit", "window_seconds": 600, "window_start", "retry_after"}`). Clock windows, so up to twice the limit can pass across a window boundary.
-5. One conditional update sets `status = awaiting_approval`, `approval_requested_at = now`, `approval_request_correlation_id` and `expires_at = created_at + APPROVAL_WAIT_TTL_SECONDS` (from creation, so asking again never extends a plan).
+5. One conditional update sets `status = awaiting_approval`, `approval_requested_at = now`, `approval_request_correlation_id` and `expires_at = created_at + APPROVAL_WAIT_TTL_SECONDS` (from creation, so asking again never extends a plan). If the record changed between the read and this update and the cooldown does not explain it, the call fails with `conflict` ("plan changed concurrently; try again"); calling it again is safe.
 6. The notification is published to the server's SNS topic, rendered from the record: Deployment, replica change, override flag, requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
 
 Response `data`: `plan_id`, `status` (`awaiting_approval`), `expires_at`, `notified`, `approval_mode`, `correlation_id`, and `retry_after` when `notified` is false.
@@ -461,6 +461,20 @@ Known limits:
 - Separation of duties is between principal classes: every plan is requested by `mcp-gateway` and only listed human principals approve. Per-agent `requested_by` needs caller identity on the server (Milestone 1, item 6).
 - The apply triggered by the approval channel does not pass through the gateway, so gateway policy (Cedar, once added) does not see it; the write guard and RBAC do.
 - Slack is not an approval channel yet; the implemented channel is this IAM-authenticated API and its CLI.
+
+## Agent guidance
+
+Instructions for agents, derived from this contract; where they disagree, this contract is right.
+
+- `AGENTS.md` (repository root): the tools, the plan, approval and apply flow, what to do on each error code, and the handling of untrusted text in tool output. Its first line is `<!-- kube-handrail:agents-md -->`. `scripts/check_contract.py` fails unless it names every code in the `Error codes` list above.
+- `agent/skills/<name>/SKILL.md`: one directory per skill, holding only `SKILL.md`, with frontmatter of exactly a one-line `name` (the directory name, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, at most 64 characters) and a one-line `description` (at most 1024 characters), then the line `<!-- kube-handrail:skill -->` right after the frontmatter. Files and directories whose names start with `.` are ignored. Today: `kube-handrail-scale`.
+
+`scripts/devops_agent_register.py install-guidance` installs them as DevOps Agent assets in an agent space, after validating every file locally:
+
+- the `agents_md` asset for `--agent-type` (default `GENERIC`, every agent), with metadata `{"agent_type": ...}` and the single file `AGENTS.md` (at most 25 000 bytes). An agent space holds one per agent type; an existing one is updated only if its `AGENTS.md` starts with the marker line, or with `--replace-instructions`, so standing instructions written by an operator are never overwritten silently. `GENERIC` instructions are loaded by every agent type in addition to that type's own, so installing for `CHAT` next to a `GENERIC` install gives chat sessions the same text twice: install for one agent type or the other;
+- one `skill` asset per skill, found by `metadata.name`, with metadata `name`, `description` and `agent_types: ["GENERIC"]` (skills load only when relevant, so every agent type gets them whatever `--agent-type` says) and the single file `SKILL.md`. Like `AGENTS.md`, an existing skill of the same name is updated only if its `SKILL.md` has the marker line after the frontmatter, or with `--replace-instructions`. An update merges metadata, so a skill's `status` set by an operator is kept; `agent_types` is set back to `GENERIC`.
+
+Existing assets are found with `ListAssets` and checked before the first write; they are updated with `UpdateAsset`, and more than one match is an error. `status` lists the `agents_md` assets and the skills named in `agent/skills/`; `remove-guidance` deletes the `agents_md` assets and those skills whose files carry the marker. `status` reports `guidance.error` instead of the assets when the caller may not list them. Agents load the instructions when a session starts, so a session that was already open keeps the old text.
 
 ## Runtime and packaging
 

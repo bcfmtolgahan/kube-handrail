@@ -140,6 +140,16 @@ export ASSOCIATION_ID=...
 
 Once `enable-write` has passed, let the drift sentinel watch the association too: set `devops_agent_space_id` and `devops_agent_association_id` in `terraform.tfvars` and apply again. From then on a write tool that is no longer `MUTATIVE`, an unexpected tool, or `elevatedActionsEnabled` turned off turns the kill switch off within one schedule interval. To restore after a drift, follow [Drift sentinel](../mcp/CONTRACT.md#drift-sentinel): fix the cause, re-run `enable-write`, then set the kill switch back to `true` by hand.
 
+Install the agent guidance: [`AGENTS.md`](../AGENTS.md) as the agent space's instructions and the `kube-handrail-scale` skill from `agent/skills/` ([Agent guidance](../mcp/CONTRACT.md#agent-guidance)):
+
+```sh
+.venv/bin/python $R install-guidance                  # GENERIC: instructions for every agent
+.venv/bin/python $R install-guidance --agent-type CHAT  # or AGENTS.md for one agent type only (skills are always GENERIC)
+.venv/bin/python $R status                            # lists the agents_md and skill assets
+```
+
+Running it again updates the same assets instead of adding new ones. If the agent space already has instructions for that agent type that were not installed by this script (for example global instructions written in the Operator Web App), it stops without changing anything: merge `AGENTS.md` into them by hand, pick another `--agent-type`, or pass `--replace-instructions` to overwrite them. The same applies to a skill named `kube-handrail-scale` that this script did not install. Install `AGENTS.md` for `GENERIC` or for one agent type, not both: every agent loads the `GENERIC` instructions as well as its own type's, so a `CHAT` install next to a `GENERIC` one puts the same text into chat sessions twice. The credentials need `aidevops:ListAssets`, `aidevops:GetAssetFile`, `aidevops:CreateAsset` and `aidevops:UpdateAsset` on the agent space (`aidevops:DeleteAsset` for `remove-guidance`), and `status` uses `aidevops:ListAssets` for its `guidance` block (without it, `guidance` shows the error and the rest of `status` still works). Re-run `install-guidance` after changing `AGENTS.md` or a skill.
+
 Then start a **new** chat and ask the agent to scale `web` in `kube-handrail-sandbox` to 2. A chat keeps the tool list it was created with, so a chat opened before `enable-write` cannot see the apply tool. You can use the console, or the chat script:
 
 ```sh
@@ -148,7 +158,7 @@ C=scripts/devops_agent_chat.py
 .venv/bin/python $C approve --execution-id <id printed by ask>     # or: reject --reason "..."
 ```
 
-Expected behavior, observed on a test cluster:
+Expected behavior, observed on a test cluster (before the agent guidance existed):
 
 - The agent calls `plan_scale_deployment`, then `apply_scale_deployment`. Instead of running the apply, DevOps Agent returns an approval request with a risk assessment, blast radius, rollback notes and `argument_pins` (the exact `plan_id`, namespace, name and replica count).
 - `approve` records a single-use decision with `UpdateApprovalAction`, pinned to exactly those arguments, then resumes the chat with `SendMessage`. The resume context must include `userActionResponse: APPROVAL_ACTION` and the option's `buttonText`; without them DevOps Agent reports the approval as malformed and does not run the tool.
@@ -256,4 +266,4 @@ scripts/cleanup.sh                 # keeps the agent space
 scripts/cleanup.sh --delete-space  # also deletes it
 ```
 
-The script works in reverse order: disassociate, deregister, delete the agent space (only with `--delete-space`), `terraform destroy` in `TF_DIR` (default `terraform/`), then `kubectl delete -f k8s/sandbox`. It asks before each step unless `--yes` is given. Steps whose IDs are not set are skipped, and `--skip-terraform` and `--skip-k8s` skip those steps.
+The script works in reverse order: remove the agent guidance (`remove-guidance`, which deletes only the `AGENTS.md` and skills it installed; skipped with `--delete-space`, and a failure only prints a warning), disassociate, deregister, delete the agent space (only with `--delete-space`), `terraform destroy` in `TF_DIR` (default `terraform/`), then `kubectl delete -f k8s/sandbox`. It asks before each step unless `--yes` is given. Steps whose IDs are not set are skipped, and `--skip-terraform` and `--skip-k8s` skip those steps.

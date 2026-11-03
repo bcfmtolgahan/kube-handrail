@@ -2,22 +2,25 @@
 """Register the gateway with AWS DevOps Agent, one step per subcommand.
 
 Order: create-space, register-mcp, associate-read, then (after the read path
-works) enable-write. status shows the current state; disassociate, deregister
-and delete-space undo the steps.
+works) enable-write, then install-guidance. status shows the current state;
+remove-guidance, disassociate, deregister and delete-space undo the steps.
 
 IDs are passed as flags or as AGENT_SPACE_ID, SERVICE_ID and ASSOCIATION_ID.
 OAuth client credentials are read from CLIENT_ID and CLIENT_SECRET only and
 are never printed. Region and credentials come from the standard AWS
 environment (AWS_REGION, AWS_PROFILE) or --region.
 
-Tool names and classifications come from mcp/classification.json.
+Tool names and classifications come from mcp/classification.json. The agent
+guidance comes from AGENTS.md and agent/skills/<name>/SKILL.md.
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +38,34 @@ from handrail_common.drift import (  # noqa: E402
 )
 
 CLASSIFICATION = REPO_ROOT / "mcp/classification.json"
+AGENTS_MD = REPO_ROOT / "AGENTS.md"
+SKILLS_DIR = REPO_ROOT / "agent/skills"
+
+AGENTS_MD_TYPE = "agents_md"
+SKILL_TYPE = "skill"
+AGENTS_MD_PATH = "AGENTS.md"
+SKILL_PATH = "SKILL.md"
+# The first line of AGENTS.md. An agents_md asset that does not start with it was not
+# installed from this repository, and install-guidance refuses to overwrite it.
+AGENTS_MD_MARKER = "<!-- kube-handrail:agents-md -->"
+# The line right after a SKILL.md's frontmatter, with the same purpose for skills.
+SKILL_MARKER = "<!-- kube-handrail:skill -->"
+# Limits from the DevOps Agent asset documentation.
+AGENTS_MD_MAX_BYTES = 25_000
+SKILL_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
+SKILL_DESCRIPTION_MAX = 1024
+GENERIC = "GENERIC"
+AGENT_TYPES = (
+    GENERIC,
+    "CHAT",
+    "INCIDENT_TRIAGE",
+    "INCIDENT_RCA",
+    "INCIDENT_MITIGATION",
+    "INCIDENT_UI",
+    "PREVENTION",
+    "RELEASE_READINESS_REVIEW",
+    "RELEASE_TESTING",
+)
 
 
 def classified(classification: str) -> dict[str, str]:
@@ -136,6 +167,243 @@ def verify_write(client: Any, space_id: str, association_id: str) -> None:
     emit({"tools": actual, "preferences": preferences})
 
 
+@dataclass(frozen=True)
+class Skill:
+    name: str
+    description: str
+    text: str
+
+
+def frontmatter_end(lines: list[str]) -> int | None:
+    """Index of the line that closes the frontmatter, or None without frontmatter."""
+    if not lines or lines[0] != "---" or "---" not in lines[1:]:
+        return None
+    return lines.index("---", 1)
+
+
+def skill_marked(text: str) -> bool:
+    lines = text.splitlines()
+    end = frontmatter_end(lines)
+    return end is not None and lines[end + 1 : end + 2] == [SKILL_MARKER]
+
+
+def parse_skill(path: Path) -> Skill:
+    """Read a SKILL.md whose frontmatter has exactly a one-line name and description."""
+    text = path.read_text()
+    lines = text.splitlines()
+    end = frontmatter_end(lines)
+    if end is None:
+        sys.exit(f"{path}: must start with frontmatter between --- lines")
+    fields: dict[str, str] = {}
+    for line in lines[1:end]:
+        key, sep, value = line.partition(": ")
+        if not sep or key in fields or key not in ("name", "description") or not value.strip():
+            sys.exit(f"{path}: frontmatter must be one-line 'name: ...' and 'description: ...', got {line!r}")
+        fields[key] = value.strip()
+    if set(fields) != {"name", "description"}:
+        sys.exit(f"{path}: frontmatter needs name and description")
+    name, description = fields["name"], fields["description"]
+    if not SKILL_NAME.match(name) or name != path.parent.name:
+        sys.exit(f"{path}: name must match {SKILL_NAME.pattern} and the directory name")
+    if len(description) > SKILL_DESCRIPTION_MAX:
+        sys.exit(f"{path}: description must be at most {SKILL_DESCRIPTION_MAX} characters")
+    if not skill_marked(text):
+        sys.exit(f"{path}: the line after the frontmatter must be {SKILL_MARKER}")
+    return Skill(name, description, text)
+
+
+def hidden(path: Path, root: Path) -> bool:
+    """Dotfiles such as .DS_Store are never uploaded, so they are ignored."""
+    return any(part.startswith(".") for part in path.relative_to(root).parts)
+
+
+def load_skills(directory: Path) -> list[Skill]:
+    skills = []
+    for skill_dir in sorted(p for p in directory.iterdir() if p.is_dir() and not hidden(p, directory)):
+        # Only SKILL.md is uploaded, so any other file would silently be missing.
+        files = sorted(
+            str(p.relative_to(skill_dir)) for p in skill_dir.rglob("*") if p.is_file() and not hidden(p, skill_dir)
+        )
+        if files != [SKILL_PATH]:
+            sys.exit(f"{skill_dir}: must contain only {SKILL_PATH}, found {files}")
+        skills.append(parse_skill(skill_dir / SKILL_PATH))
+    if not skills:
+        sys.exit(f"no skills in {directory}")
+    return skills
+
+
+def load_agents_md(path: Path) -> str:
+    text = path.read_text()
+    if not text.startswith(AGENTS_MD_MARKER + "\n"):
+        sys.exit(f"{path}: first line must be {AGENTS_MD_MARKER}")
+    if len(text.encode()) > AGENTS_MD_MAX_BYTES:
+        sys.exit(f"{path}: must be at most {AGENTS_MD_MAX_BYTES} bytes")
+    return text
+
+
+def list_assets(client: Any, space_id: str, asset_type: str) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"agentSpaceId": space_id, "assetType": asset_type}
+    items: list[dict[str, Any]] = []
+    while True:
+        response = client.list_assets(**params)
+        items.extend(response["items"])
+        if not response.get("nextToken"):
+            return items
+        params["nextToken"] = response["nextToken"]
+
+
+def file_content(text: str, path: str) -> dict[str, Any]:
+    return {"file": {"path": path, "body": {"text": text}}}
+
+
+def installed_from_repo(client: Any, space_id: str, asset_id: str, path: str = AGENTS_MD_PATH) -> bool:
+    """Whether the asset's file carries this repository's marker (path is AGENTS.md or SKILL.md)."""
+    try:
+        file = client.get_asset_file(agentSpaceId=space_id, assetId=asset_id, path=path)["file"]
+    except client.exceptions.ResourceNotFoundException:
+        return False
+    # Content without text (bytes) was not written by install-guidance.
+    text = file["content"].get("text", "")
+    return skill_marked(text) if path == SKILL_PATH else text.startswith(AGENTS_MD_MARKER)
+
+
+def single(matches: list[dict[str, Any]], what: str) -> dict[str, Any] | None:
+    if len(matches) > 1:
+        sys.exit(f"more than one asset for {what}: {[a['assetId'] for a in matches]}")
+    return matches[0] if matches else None
+
+
+def put_asset(
+    client: Any,
+    space_id: str,
+    asset_type: str,
+    existing: dict[str, Any] | None,
+    metadata: dict[str, Any],
+    content: dict[str, Any],
+) -> dict[str, Any]:
+    if existing is None:
+        asset = client.create_asset(
+            agentSpaceId=space_id,
+            assetType=asset_type,
+            metadata=metadata,
+            content=content,
+            clientToken=str(uuid.uuid4()),
+        )["asset"]
+        action = "created"
+    else:
+        # Metadata is merged, so a skill's status (ACTIVE or INACTIVE) set by an operator is kept.
+        asset = client.update_asset(
+            agentSpaceId=space_id, assetId=existing["assetId"], metadata=metadata, content=content
+        )["asset"]
+        action = "updated"
+    return {"assetId": asset["assetId"], "version": asset["version"], "action": action}
+
+
+def install_guidance(client: Any, args: argparse.Namespace) -> None:
+    space_id, agent_type = args.agent_space_id, args.agent_type
+    # Everything is read and validated before the first call.
+    instructions = load_agents_md(AGENTS_MD)
+    skills = load_skills(SKILLS_DIR)
+
+    current = [
+        a for a in list_assets(client, space_id, AGENTS_MD_TYPE) if a["metadata"].get("agent_type") == agent_type
+    ]
+    existing = single(current, f"agent type {agent_type}")
+    # One AGENTS.md per agent type: updating someone else's would replace their instructions.
+    if existing and not args.replace_instructions and not installed_from_repo(client, space_id, existing["assetId"]):
+        sys.exit(
+            f"the AGENTS.md for agent type {agent_type} ({existing['assetId']}) was not installed from this "
+            "repository; merge AGENTS.md into it by hand, choose another --agent-type, "
+            "or pass --replace-instructions to overwrite it"
+        )
+    # Skills are checked the same way, before anything is written.
+    installed = list_assets(client, space_id, SKILL_TYPE)
+    existing_skills = {}
+    for skill in skills:
+        found = single([a for a in installed if a["metadata"].get("name") == skill.name], f"skill {skill.name}")
+        if (
+            found
+            and not args.replace_instructions
+            and not installed_from_repo(client, space_id, found["assetId"], SKILL_PATH)
+        ):
+            sys.exit(
+                f"the skill {skill.name} ({found['assetId']}) was not installed from this repository; "
+                "rename or remove it, or pass --replace-instructions to overwrite it"
+            )
+        existing_skills[skill.name] = found
+    payload: dict[str, Any] = {
+        "agentsMd": {
+            "agentType": agent_type,
+            **put_asset(
+                client,
+                space_id,
+                AGENTS_MD_TYPE,
+                existing,
+                {"agent_type": agent_type},
+                file_content(instructions, AGENTS_MD_PATH),
+            ),
+        },
+        "skills": [],
+    }
+
+    for skill in skills:
+        # Skills load only when relevant, so every agent type gets them, whatever --agent-type says.
+        metadata = {"name": skill.name, "description": skill.description, "agent_types": [GENERIC]}
+        result = put_asset(
+            client, space_id, SKILL_TYPE, existing_skills[skill.name], metadata, file_content(skill.text, SKILL_PATH)
+        )
+        payload["skills"].append({"name": skill.name, **result})
+    emit(payload)
+
+
+def remove_guidance(client: Any, args: argparse.Namespace) -> None:
+    space_id = args.agent_space_id
+    removed = []
+    for asset in list_assets(client, space_id, AGENTS_MD_TYPE):
+        if installed_from_repo(client, space_id, asset["assetId"]):
+            client.delete_asset(agentSpaceId=space_id, assetId=asset["assetId"])
+            removed.append({"assetId": asset["assetId"], "agentType": asset["metadata"].get("agent_type")})
+    names = skill_names()
+    for asset in list_assets(client, space_id, SKILL_TYPE):
+        if asset["metadata"].get("name") in names and installed_from_repo(
+            client, space_id, asset["assetId"], SKILL_PATH
+        ):
+            client.delete_asset(agentSpaceId=space_id, assetId=asset["assetId"])
+            removed.append({"assetId": asset["assetId"], "name": asset["metadata"]["name"]})
+    emit({"removed": removed})
+
+
+def skill_names() -> set[str]:
+    return {p.parent.name for p in SKILLS_DIR.glob(f"*/{SKILL_PATH}") if not hidden(p, SKILLS_DIR)}
+
+
+def guidance_status(client: Any, space_id: str) -> dict[str, Any]:
+    names = skill_names()
+    return {
+        "agentsMd": [
+            {
+                "assetId": a["assetId"],
+                "agentType": a["metadata"].get("agent_type"),
+                "version": a["version"],
+                "updatedAt": a["updatedAt"],
+            }
+            for a in list_assets(client, space_id, AGENTS_MD_TYPE)
+        ],
+        "skills": [
+            {
+                "assetId": a["assetId"],
+                "name": a["metadata"]["name"],
+                "status": a["metadata"].get("status"),
+                "agentTypes": a["metadata"].get("agent_types"),
+                "version": a["version"],
+                "updatedAt": a["updatedAt"],
+            }
+            for a in list_assets(client, space_id, SKILL_TYPE)
+            if a["metadata"].get("name") in names
+        ],
+    }
+
+
 def status(client: Any, args: argparse.Namespace) -> None:
     space = client.get_agent_space(agentSpaceId=args.agent_space_id)["agentSpace"]
     associations = client.list_associations(agentSpaceId=args.agent_space_id)["associations"]
@@ -152,6 +420,11 @@ def status(client: Any, args: argparse.Namespace) -> None:
     }
     if args.association_id:
         payload["tools"] = current_classifications(client, args.agent_space_id, args.association_id)
+    try:
+        payload["guidance"] = guidance_status(client, args.agent_space_id)
+    except client.exceptions.AccessDeniedException as exc:
+        # Credentials from before install-guidance may lack aidevops:ListAssets; show the rest anyway.
+        payload["guidance"] = {"error": str(exc)}
     emit(payload)
 
 
@@ -207,6 +480,23 @@ def build_parser() -> argparse.ArgumentParser:
     id_flag(p, "--agent-space-id", "AGENT_SPACE_ID")
     id_flag(p, "--association-id", "ASSOCIATION_ID")
     p.set_defaults(func=enable_write)
+
+    p = sub.add_parser("install-guidance", help="create or update the AGENTS.md and skill assets")
+    id_flag(p, "--agent-space-id", "AGENT_SPACE_ID")
+    p.add_argument(
+        "--agent-type", choices=AGENT_TYPES, default=GENERIC, help="agent type of the AGENTS.md; default GENERIC (every agent)"
+    )
+    p.add_argument(
+        "--replace-instructions",
+        action="store_true",
+        help="overwrite an AGENTS.md for this agent type, or a skill of the same name, "
+        "that was not installed from this repository",
+    )
+    p.set_defaults(func=install_guidance)
+
+    p = sub.add_parser("remove-guidance", help="delete the assets installed by install-guidance")
+    id_flag(p, "--agent-space-id", "AGENT_SPACE_ID")
+    p.set_defaults(func=remove_guidance)
 
     p = sub.add_parser("status")
     id_flag(p, "--agent-space-id", "AGENT_SPACE_ID")
