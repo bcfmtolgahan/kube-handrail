@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. Everything from Milestone 1 onward is planned and not yet implemented; the order will change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection) and 2 (per-object oscillation breaker) are implemented; everything else is planned and not yet implemented, and the order will change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -16,12 +16,14 @@ One read tool and a guarded `plan_scale_deployment` / `apply_scale_deployment` p
 
 **Done when:** an apply during a rollout no longer fails because pods are starting, while a spec change made after the plan is still rejected and the error shows what changed.
 
-### 2. Per-object oscillation breaker
+### 2. Per-object oscillation breaker (implemented)
+
+See [Oscillation breaker](guards.md).
 
 **Goal:** prevent ping-pong between agents and humans on the same object.
 
 - Scaling in the reverse direction within a configurable window is rejected as flapping.
-- A per-object hourly apply budget, added together with the global hourly budget and cooldown described in the design.
+- A per-object hourly apply budget, a global hourly apply budget and a per-object cooldown between applies.
 - If the object was changed by someone else since the last kube-handrail apply, undoing that change requires an explicit override pinned in the plan arguments.
 
 **Done when:** a scale-up followed shortly by a scale-down of the same Deployment is rejected, a manual change is not reverted without the override, and each rejection explains the recent history.

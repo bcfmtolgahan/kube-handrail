@@ -8,7 +8,8 @@
         "plan_id": { "type": "string", "description": "plan_id returned by plan_scale_deployment." },
         "namespace": { "type": "string", "description": "Kubernetes namespace." },
         "name": { "type": "string", "description": "Deployment name." },
-        "replicas": { "type": "integer", "description": "Desired replica count; must equal the planned value." }
+        "replicas": { "type": "integer", "description": "Desired replica count; must equal the planned value." },
+        "override_manual_change": { "type": "boolean", "description": "Must equal the value given to plan_scale_deployment (default false)." }
       },
       "required": ["plan_id", "namespace", "name", "replicas"]
     }

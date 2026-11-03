@@ -51,6 +51,13 @@ Note these outputs for the next steps:
 
 The kill switch is the SSM parameter in the `kill_switch_parameter` output (passed to the write Lambda as `REMEDIATION_ENABLED_PARAM`). It is created as `true`. Applies fail with `remediation_disabled` unless its value is exactly `true`.
 
+Upgrading a deployment made before the [oscillation breaker](guards.md): the plan table gains the `object-history` index and its TTL attribute moves from `expires_at` to `retain_until`. DynamoDB cannot switch the TTL attribute of a table in one step, so replace the table; it only holds short-lived plans, and any plan open at that moment has to be made again:
+
+```sh
+terraform -chdir=terraform plan -replace=aws_dynamodb_table.plans -out=tfplan
+terraform -chdir=terraform apply tfplan
+```
+
 Keep secrets out of shell history, for example by loading them from a local `.env` file (ignored by git).
 
 ## 3. Smoke test through the gateway
@@ -71,17 +78,25 @@ The test:
 
 The Deployment controller keeps updating status, and with it `resourceVersion`, while pods start. Apply compares `metadata.uid`, `metadata.generation` and `spec.replicas` with the plan rather than `resourceVersion` (status and label changes leave `generation` alone; spec and annotation changes bump it), re-runs the GitOps check, and retries a 409 caused by a status update, so this churn alone no longer produces `conflict`. The test still plans again on `conflict`, up to 3 times; the retry is harmless. If it fails part-way, `web` may be left at 2 replicas; scale it back with `kubectl` or rerun the test after fixing the cause.
 
+Scaling 1 -> 2 -> 1 is a single revert, which the [oscillation breaker](guards.md) allows. Running the smoke test a second time within `FLAP_WINDOW_SECONDS` (default 600 s) of the first makes its first plan, 1 -> 2, a second reversal, and the test fails with `flapping`: that is the breaker working. Wait for the window to pass before running it again. Likewise, after scaling `web` by hand (for example back to 1 replica after a failed run), the next plan is refused with `manual_change`, because the count no longer matches the plan named by the `kube-handrail.io/last-plan-id` annotation. Remove the annotation before running the test again:
+
+```sh
+kubectl -n kube-handrail-sandbox annotate deployment/web kube-handrail.io/last-plan-id-
+```
+
 ### Guard tests
 
 After the smoke test passes, run the end-to-end guard tests against the same deployment:
 
 ```sh
 export KILL_SWITCH_PARAM=$(terraform -chdir=terraform output -raw kill_switch_parameter)
-.venv/bin/python tests/e2e/e2e_gateway.py               # about 1 minute
+.venv/bin/python tests/e2e/e2e_gateway.py               # a few minutes
 .venv/bin/python tests/e2e/e2e_gateway.py --with-expiry # also waits out one plan TTL
 ```
 
-They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, and the kill switch. The test turns the kill switch off briefly and restores it, applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas), briefly labels `web`, sets an environment variable on it and scales it by hand, and leaves it at 1 replica without those changes.
+They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, the kill switch, and the oscillation breaker (a change right after an apply is `cooldown`, a single revert is allowed, a second reversal is `flapping`, a manual scale is `manual_change` unless overridden). Set `APPLY_COOLDOWN_SECONDS` to the deployed value; the test waits it out after each apply. The test turns the kill switch off briefly and restores it and applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas).
+
+The guard tests never change `web`, which belongs to the smoke test; they only plan against it for read-only validation cases that never reach apply. Every case that applies or edits a Deployment uses fixtures created for the run (`e2e-target`, `e2e-flap`, `e2e-manual`: 1-replica unprivileged nginx) and deleted at the end, so each run starts with an empty history. The per-object and global budgets and the plan rate limit are covered by unit tests only: reaching them takes 6 or 30 real applies or 20 plans, which is slow and adds nothing the unit tests at the exact limits do not show.
 
 ## 4. Register with AWS DevOps Agent
 

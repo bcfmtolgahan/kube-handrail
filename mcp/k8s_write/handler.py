@@ -10,6 +10,12 @@ import boto3
 from kubernetes import client as k8s
 from kubernetes.client.exceptions import ApiException
 
+from handrail_common.breaker import (
+    LAST_PLAN_ANNOTATION,
+    check_history,
+    check_manual_change,
+    last_applied_plan,
+)
 from handrail_common.config import ConfigError, Settings, load_settings
 from handrail_common.dispatch import dispatch
 from handrail_common.eks import api_client
@@ -25,13 +31,22 @@ from handrail_common.envelope import (
 )
 from handrail_common.gitops import is_gitops_managed
 from handrail_common.killswitch import KillSwitch
-from handrail_common.plans import SCALE_DEPLOYMENT, Plan, PlanStore, scale_args_hash
-from handrail_common.validation import GuardError, require_plan_id, validate_scale_args
+from handrail_common.plans import (
+    RESULT_APPLIED,
+    SCALE_DEPLOYMENT,
+    Plan,
+    PlanStore,
+    scale_args_hash,
+)
+from handrail_common.validation import (
+    GuardError,
+    require_override_flag,
+    require_plan_id,
+    validate_scale_args,
+)
 
 logger = logging.getLogger(__name__)
 
-LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
-RESULT_APPLIED = "applied"
 DEFAULT_REPLICAS = 1
 # Status updates (for example during a rollout) change resourceVersion but not the spec.
 # A 409 caused by one is retried after re-checking the object; a spec change never is.
@@ -143,10 +158,37 @@ def check_target(plan: Plan, deployment: Any) -> None:
     check_spec_unchanged(plan, deployment)
 
 
-def _patch(apps: k8s.AppsV1Api, plan: Plan, replicas: int) -> Any:
+def check_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now: int) -> None:
+    """History checks and the global budget, re-run after the spec check; authoritative over
+    the plan step.
+
+    check_spec_unchanged has confirmed that the current replica count is replicas_from.
+    """
+    last_applied = last_applied_plan(rt.store, deployment)
+    check_manual_change(last_applied, plan.replicas_from, override)
+    check_history(
+        rt.store,
+        plan.object_key,
+        now,
+        rt.settings,
+        plan.replicas_from,
+        plan.replicas_to,
+        plan_rate=False,
+        last_applied=last_applied,
+    )
+    # Last, so a request refused by another check does not use up the budget.
+    rt.store.take_global_budget(now, rt.settings.global_hourly_apply_budget)
+
+
+def _patch(
+    apps: k8s.AppsV1Api, plan: Plan, replicas: int, after_first_check: Callable[[Any], None]
+) -> Any:
     for attempt in range(1, PATCH_ATTEMPTS + 1):
         deployment = _read(apps, plan.namespace, plan.name)
         check_target(plan, deployment)
+        if attempt == 1:
+            # A retry only follows a 409 on an unchanged spec, so history is checked once.
+            after_first_check(deployment)
         body = scale_patch(replicas, deployment.metadata.resource_version, plan.plan_id)
         try:
             apps.patch_namespaced_deployment(plan.name, plan.namespace, body, dry_run="All")
@@ -175,14 +217,21 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
     namespace, name, replicas = validate_scale_args(
         args, s.allowed_namespaces, s.min_replicas, s.max_replicas
     )
+    override = require_override_flag(args)
     plan_id = require_plan_id(args.get("plan_id"))
 
+    now = int(rt.clock())
     plan = rt.store.consume(
-        plan_id, scale_args_hash(namespace, name, replicas), SCALE_DEPLOYMENT, int(rt.clock())
+        plan_id, scale_args_hash(namespace, name, replicas, override), SCALE_DEPLOYMENT, now
     )
 
     try:
-        updated = _patch(rt.apps(), plan, replicas)
+        updated = _patch(
+            rt.apps(),
+            plan,
+            replicas,
+            lambda deployment: check_breaker(rt, plan, deployment, override, now),
+        )
     except GuardError as exc:
         _record(rt, plan_id, exc.code)
         raise

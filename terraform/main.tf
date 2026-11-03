@@ -16,12 +16,15 @@ locals {
 
   cluster_arn = "arn:${local.partition}:eks:${local.region}:${local.account_id}:cluster/${var.cluster_name}"
 
+  # Must match OBJECT_HISTORY_INDEX in mcp/common/handrail_common/plans.py.
+  history_index = "object-history"
+
   # Gateway target name => Lambda settings. Tool schemas come from the contract's tools.json files.
   functions = {
     k8s_read = {
       target      = "k8sr"
       tools       = jsondecode(file("${path.module}/../mcp/k8s_read/tools.json"))
-      dynamo      = ["dynamodb:PutItem"]
+      dynamo      = ["dynamodb:PutItem", "dynamodb:GetItem"]
       kill_switch = false
       groups      = ["kube-handrail-reader"]
     }
@@ -41,6 +44,13 @@ locals {
     MIN_REPLICAS       = tostring(var.min_replicas)
     MAX_REPLICAS       = tostring(var.max_replicas)
     PLAN_TTL_SECONDS   = tostring(var.plan_ttl_seconds)
+
+    FLAP_WINDOW_SECONDS        = tostring(var.flap_window_seconds)
+    OBJECT_HOURLY_APPLY_BUDGET = tostring(var.object_hourly_apply_budget)
+    PLAN_RATE_LIMIT            = tostring(var.plan_rate_limit)
+    PLAN_RATE_WINDOW_SECONDS   = tostring(var.plan_rate_window_seconds)
+    APPLY_COOLDOWN_SECONDS     = tostring(var.apply_cooldown_seconds)
+    GLOBAL_HOURLY_APPLY_BUDGET = tostring(var.global_hourly_apply_budget)
   }
 
   # Tolerates a function directory that has no Python sources yet.
@@ -152,6 +162,12 @@ data "aws_iam_policy_document" "lambda" {
     resources = [aws_dynamodb_table.plans.arn]
   }
 
+  statement {
+    sid       = "PlanHistory"
+    actions   = ["dynamodb:Query"]
+    resources = ["${aws_dynamodb_table.plans.arn}/index/${local.history_index}"]
+  }
+
   dynamic "statement" {
     for_each = each.value.kill_switch ? [1] : []
     content {
@@ -212,8 +228,35 @@ resource "aws_dynamodb_table" "plans" {
     type = "S"
   }
 
+  attribute {
+    name = "object_key"
+    type = "S"
+  }
+
+  attribute {
+    name = "created_at"
+    type = "N"
+  }
+
+  # Plan history per object (namespace/name/uid), read by the oscillation breaker.
+  global_secondary_index {
+    name            = local.history_index
+    projection_type = "ALL"
+
+    key_schema {
+      attribute_name = "object_key"
+      key_type       = "HASH"
+    }
+
+    key_schema {
+      attribute_name = "created_at"
+      key_type       = "RANGE"
+    }
+  }
+
+  # Records outlive their plan (expires_at) so they can serve as history.
   ttl {
-    attribute_name = "expires_at"
+    attribute_name = "retain_until"
     enabled        = true
   }
 }

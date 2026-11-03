@@ -9,6 +9,14 @@ min_replicas     = 0
 max_replicas     = 5
 plan_ttl_seconds = 300
 
+# Oscillation breaker (mcp/CONTRACT.md, History checks).
+flap_window_seconds        = 600
+object_hourly_apply_budget = 6
+plan_rate_limit            = 20
+plan_rate_window_seconds   = 600
+apply_cooldown_seconds     = 60
+global_hourly_apply_budget = 30
+
 # The kill switch parameter is created with the value "true" and Terraform
 # ignores later changes to it, so it can be flipped without being reset:
 #   aws ssm put-parameter --overwrite --name <kill_switch_parameter> --value false

@@ -5,8 +5,16 @@ import pytest
 from moto import mock_aws
 
 from handrail_common.envelope import PLAN_EXPIRED, PLAN_MISMATCH, PLAN_NOT_FOUND, PLAN_USED
-from handrail_common.plans import SCALE_DEPLOYMENT, Plan, PlanStore, args_hash, scale_args_hash
-from handrail_common.validation import GuardError
+from handrail_common.plans import (
+    SCALE_DEPLOYMENT,
+    Plan,
+    PlanStore,
+    args_hash,
+    global_budget_key,
+    object_key,
+    scale_args_hash,
+)
+from handrail_common.validation import GuardError, require_plan_id
 
 NOW = 1_700_000_000
 TABLE = "plans-test"
@@ -25,36 +33,55 @@ def test_args_hash_distinguishes_values():
     assert args_hash({"replicas": 2}) != args_hash({"replicas": "2"})
 
 
+def test_override_enters_the_hash_only_when_true():
+    plain = scale_args_hash("sandbox", "web", 2)
+    # Hashes for plans without the override are unchanged by its introduction.
+    assert plain == args_hash(
+        {"action": "scale_deployment", "namespace": "sandbox", "name": "web", "replicas": 2}
+    )
+    assert scale_args_hash("sandbox", "web", 2, False) == plain
+    assert scale_args_hash("sandbox", "web", 2, True) == args_hash(
+        {
+            "action": "scale_deployment",
+            "namespace": "sandbox",
+            "name": "web",
+            "replicas": 2,
+            "override_manual_change": True,
+        }
+    )
+    assert scale_args_hash("sandbox", "web", 2, True) != plain
+
+
 @pytest.fixture
-def store(monkeypatch):
+def store(monkeypatch, plans_table):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     with mock_aws():
-        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
-        dynamodb.create_table(
-            TableName=TABLE,
-            KeySchema=[{"AttributeName": "plan_id", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "plan_id", "AttributeType": "S"}],
-            BillingMode="PAY_PER_REQUEST",
-        )
+        plans_table(TABLE, "us-east-1")
         yield PlanStore.from_name(TABLE, "us-east-1")
 
 
-def make_plan(expires_at: int = NOW + 300) -> Plan:
+UID = "8f7c1a2e-0000-4000-8000-000000000001"
+
+
+def make_plan(
+    expires_at: int = NOW + 300, created_at: int = NOW, uid: str = UID, name: str = "web"
+) -> Plan:
     return Plan(
         plan_id=str(uuid.uuid4()),
         action=SCALE_DEPLOYMENT,
         namespace="sandbox",
-        name="web",
+        name=name,
         replicas_from=1,
         replicas_to=3,
-        args_hash=scale_args_hash("sandbox", "web", 3),
+        args_hash=scale_args_hash("sandbox", name, 3),
         resource_version="12345",
         generation=4,
-        uid="8f7c1a2e-0000-4000-8000-000000000001",
-        created_at=NOW,
+        uid=uid,
+        created_at=created_at,
         expires_at=expires_at,
+        retain_until=created_at + 4000,
     )
 
 
@@ -125,3 +152,107 @@ def test_from_item_without_generation_or_uid_never_matches():
     plan = Plan.from_item(item)
     assert plan.generation == -1
     assert plan.uid == ""
+
+
+def test_item_carries_object_key_and_retention():
+    item = make_plan().to_item()
+    assert item["object_key"] == f"sandbox/web/{UID}" == object_key("sandbox", "web", UID)
+    assert item["retain_until"] == NOW + 4000
+    assert Plan.from_item(item).retain_until == NOW + 4000
+
+
+def test_history_returns_one_object_from_since_oldest_first(store):
+    other_uid = "8f7c1a2e-0000-4000-8000-000000000002"
+    plans = [make_plan(created_at=NOW - age) for age in (50, 10, 100, 200)]
+    for plan in plans:
+        store.create(plan)
+    store.create(make_plan(created_at=NOW - 20, uid=other_uid))  # recreated object
+    store.create(make_plan(created_at=NOW - 20, name="api"))  # another Deployment
+    store.consume(plans[0].plan_id, plans[0].args_hash, SCALE_DEPLOYMENT, NOW)
+    store.record_result(plans[0].plan_id, NOW - 40, "applied")
+
+    entries = store.history(object_key("sandbox", "web", UID), NOW - 100)
+
+    assert [e.created_at for e in entries] == [NOW - 100, NOW - 50, NOW - 10]
+    applied = [e for e in entries if e.applied]
+    assert [(e.plan_id, e.applied_at, e.result) for e in applied] == [
+        (plans[0].plan_id, NOW - 40, "applied")
+    ]
+    assert all(isinstance(e.created_at, int) for e in entries)
+
+
+def test_history_follows_pages(store, monkeypatch):
+    for age in range(5):
+        store.create(make_plan(created_at=NOW - age))
+    table = store._table
+    real_query = table.query
+    calls = []
+
+    def paged(**kwargs):
+        calls.append(kwargs)
+        return real_query(Limit=2, **kwargs)
+
+    monkeypatch.setattr(table, "query", paged)
+    assert len(store.history(object_key("sandbox", "web", UID), NOW - 10)) == 5
+    assert len(calls) >= 3
+
+
+def test_history_errors_propagate(store, monkeypatch):
+    def broken(**_kwargs):
+        raise RuntimeError("throttled")
+
+    monkeypatch.setattr(store._table, "query", broken)
+    with pytest.raises(RuntimeError):
+        store.history("k", NOW)
+
+
+def test_consumed_plan(store):
+    plan = make_plan()
+    store.create(plan)
+    assert store.consumed_plan(plan.plan_id) is None
+    store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW)
+    # Consumed with no result recorded yet (or ever): still returned, as the annotation that
+    # named it proves the patch ran.
+    consumed = store.consumed_plan(plan.plan_id)
+    assert consumed.replicas_to == 3 and consumed.result is None and consumed.applied_at is None
+    store.record_result(plan.plan_id, NOW + 1, "applied")
+    consumed = store.consumed_plan(plan.plan_id)
+    assert (consumed.result, consumed.applied_at) == ("applied", NOW + 1)
+    assert store.consumed_plan(str(uuid.uuid4())) is None
+
+
+def test_item_round_trips_result_and_applied_at():
+    plan = make_plan()
+    assert "result" not in plan.to_item() and "applied_at" not in plan.to_item()
+    item = plan.to_item() | {"result": "applied", "applied_at": NOW + 1}
+    restored = Plan.from_item(item)
+    assert (restored.result, restored.applied_at) == ("applied", NOW + 1)
+    assert restored.to_item() == item
+
+
+# --- Global budget ----------------------------------------------------------
+
+
+def test_global_budget_counts_applies_per_clock_hour(store):
+    hour = NOW - NOW % 3600
+    assert store.global_applies(NOW) == 0
+    store.take_global_budget(NOW, 2)
+    store.take_global_budget(NOW, 2)
+    assert store.global_applies(NOW) == 2
+    with pytest.raises(GuardError) as exc:
+        store.take_global_budget(NOW, 2)
+    assert exc.value.code == "global_budget_exceeded"
+    assert exc.value.details == {"limit": 2, "window_start": hour, "retry_after": hour + 3600}
+    assert store.global_applies(NOW) == 2
+    # The next clock hour starts from zero.
+    store.take_global_budget(hour + 3600, 2)
+    assert store.global_applies(hour + 3600) == 1
+
+
+def test_global_budget_counter_is_not_a_plan(store):
+    store.take_global_budget(NOW, 5)
+    item = boto3.resource("dynamodb", region_name="us-east-1").Table(TABLE).get_item(Key={"plan_id": global_budget_key(NOW)})["Item"]
+    assert "object_key" not in item
+    assert item["retain_until"] == NOW - NOW % 3600 + 7200
+    with pytest.raises(GuardError):
+        require_plan_id(global_budget_key(NOW))

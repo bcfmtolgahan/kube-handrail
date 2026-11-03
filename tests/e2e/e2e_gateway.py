@@ -3,17 +3,23 @@
 
 Covers authentication, argument validation, namespace and replica limits,
 GitOps and HPA checks, single-use and expiring plans, conflicts, concurrent
-applies and the kill switch. Run it after the smoke test, against a disposable
-cluster only.
+applies, the kill switch and the oscillation breaker (flapping and manual
+change). Run it after the smoke test, against a disposable cluster only.
 
 Environment: GATEWAY_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET, KILL_SWITCH_PARAM,
 KUBECONFIG, and the usual AWS variables. Pass --with-expiry to also wait out a
-plan TTL (PLAN_TTL_SECONDS, default 300).
+plan TTL (PLAN_TTL_SECONDS, default 300). APPLY_COOLDOWN_SECONDS (default 60) must
+match the deployment: the test waits it out after each apply.
 
-The test applies tests/e2e/fixtures/argo-managed.yaml and creates and deletes
-a temporary HPA, both in kube-handrail-sandbox. It briefly labels `web`, sets the
-E2E_TOUCH environment variable on it and scales it by hand, and leaves it at
-1 replica without the labels or the variable.
+The test never changes `web`, which belongs to the smoke test; it only plans
+against it for validation cases that are refused before apply. Every case that
+applies or edits a Deployment uses fixture Deployments created for this run in
+kube-handrail-sandbox (e2e-target, e2e-flap, e2e-manual) and deleted at the
+end, so each run starts with an empty history. It also applies
+tests/e2e/fixtures/argo-managed.yaml and creates and deletes a temporary HPA.
+
+The per-object and global hourly budgets and the plan rate limit are covered by
+unit tests only: reaching them here takes 6 or 30 applies or 20 plans.
 """
 
 import argparse
@@ -35,11 +41,25 @@ from mcp.client.streamable_http import streamablehttp_client
 
 NAMESPACE = "kube-handrail-sandbox"
 WEB = {"namespace": NAMESPACE, "name": "web"}
+TARGET = {"namespace": NAMESPACE, "name": "e2e-target"}
+FLAP = {"namespace": NAMESPACE, "name": "e2e-flap"}
+MANUAL = {"namespace": NAMESPACE, "name": "e2e-manual"}
+FIXTURES = (TARGET["name"], FLAP["name"], MANUAL["name"])
+LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
+# The plan history index is eventually consistent; give a just-recorded apply time to show up.
+HISTORY_SETTLE_SECONDS = 3
+# Must match the deployed APPLY_COOLDOWN_SECONDS; a lower value here makes cases fail.
+COOLDOWN_SECONDS = int(os.environ.get("APPLY_COOLDOWN_SECONDS", "60"))
 PLAN, APPLY = "k8sr___plan_scale_deployment", "k8sw___apply_scale_deployment"
 FIXTURE = Path(__file__).parent / "fixtures" / "argo-managed.yaml"
 UNKNOWN_PLAN = "00000000-0000-4000-8000-000000000000"
 
 results: list[bool] = []
+
+
+async def cool_down() -> None:
+    """Wait until the object last applied to is past its cooldown."""
+    await asyncio.sleep(COOLDOWN_SECONDS + 1)
 
 
 def report(name: str, ok: bool, detail: Any = "") -> None:
@@ -49,6 +69,55 @@ def report(name: str, ok: bool, detail: Any = "") -> None:
 
 def kubectl(*args: str, stdin: str | None = None) -> str:
     return subprocess.run(["kubectl", "-n", NAMESPACE, *args], check=True, capture_output=True, text=True, input=stdin).stdout
+
+
+def fixture(name: str) -> dict[str, Any]:
+    """A 1-replica unprivileged nginx that passes Pod Security `restricted` and has no GitOps markers."""
+    labels = {"app.kubernetes.io/name": name, "app.kubernetes.io/part-of": NAMESPACE}
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name, "namespace": NAMESPACE, "labels": labels},
+        "spec": {
+            "replicas": 1,
+            "revisionHistoryLimit": 1,
+            "selector": {"matchLabels": labels},
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "automountServiceAccountToken": False,
+                    "securityContext": {"runAsNonRoot": True, "runAsUser": 101, "runAsGroup": 101, "seccompProfile": {"type": "RuntimeDefault"}},
+                    "containers": [
+                        {
+                            "name": "nginx",
+                            "image": "nginxinc/nginx-unprivileged:1.27.5-alpine",
+                            "resources": {"requests": {"cpu": "5m", "memory": "16Mi"}, "limits": {"cpu": "50m", "memory": "64Mi"}},
+                            "securityContext": {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]}},
+                            "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+                        }
+                    ],
+                    "volumes": [{"name": "tmp", "emptyDir": {"sizeLimit": "16Mi"}}],
+                },
+            },
+        },
+    }
+
+
+def delete_fixtures() -> None:
+    kubectl("delete", "deployment", *FIXTURES, "--ignore-not-found", "--wait=true")
+
+
+def create_fixtures() -> None:
+    # Delete leftovers from an aborted run first: a new object (new uid) has no history.
+    delete_fixtures()
+    for name in FIXTURES:
+        kubectl("create", "-f", "-", stdin=json.dumps(fixture(name)))
+    for name in FIXTURES:
+        kubectl("rollout", "status", f"deploy/{name}", "--timeout=120s")
+
+
+def web_spec() -> str:
+    return kubectl("get", "deploy/web", "-o", "jsonpath={.metadata.uid}/{.metadata.generation}/{.spec.replicas}")
 
 
 def set_kill_switch(value: str) -> None:
@@ -108,11 +177,14 @@ class Gateway:
             # Schema violations are rejected by the gateway before the Lambda runs.
             return {"ok": False, "error": {"code": "gateway_rejected", "message": text[:200]}}
 
-    async def plan(self, replicas: int) -> str:
-        envelope = await self.call(PLAN, {**WEB, "replicas": replicas})
+    async def plan(self, target: dict[str, str], replicas: int, **extra: Any) -> str:
+        envelope = await self.call(PLAN, {**target, "replicas": replicas, **extra})
         if not envelope.get("ok"):
             raise RuntimeError(f"plan failed: {envelope}")
         return envelope["data"]["plan_id"]
+
+    async def apply(self, target: dict[str, str], plan_id: str, replicas: int, **extra: Any) -> dict[str, Any]:
+        return await self.call(APPLY, {"plan_id": plan_id, **target, "replicas": replicas, **extra})
 
 
 def code(envelope: dict[str, Any]) -> str | None:
@@ -125,7 +197,7 @@ async def expect(gw: Gateway, name: str, tool: str, arguments: dict[str, Any], e
 
 
 async def expect_conflict(gw: Gateway, name: str, plan_id: str, changed: str) -> None:
-    envelope = await gw.call(APPLY, {"plan_id": plan_id, **WEB, "replicas": 2})
+    envelope = await gw.apply(TARGET, plan_id, 2)
     details = (envelope.get("error") or {}).get("details") or {}
     entry = details.get(changed) or {}
     planned = entry.get("planned", entry.get("planned_from"))
@@ -133,9 +205,12 @@ async def expect_conflict(gw: Gateway, name: str, plan_id: str, changed: str) ->
     report(name, code(envelope) == "conflict" and passed, code(envelope) or "ok")
 
 
-def reset_web() -> None:
-    kubectl("scale", "deploy/web", "--replicas=1")
-    kubectl("rollout", "status", "deploy/web", "--timeout=120s")
+def reset_target() -> None:
+    """Back to 1 replica by hand. Dropping the last-plan annotation as well keeps the next
+    case from being refused as a manual change (the manual-change case has its own fixture)."""
+    kubectl("scale", "deploy/e2e-target", "--replicas=1")
+    kubectl("annotate", "deploy/e2e-target", f"{LAST_PLAN_ANNOTATION}-")
+    kubectl("rollout", "status", "deploy/e2e-target", "--timeout=120s")
 
 
 async def validation_tests(gw: Gateway) -> None:
@@ -156,9 +231,9 @@ async def ownership_tests(gw: Gateway) -> None:
     hpa = {
         "apiVersion": "autoscaling/v2",
         "kind": "HorizontalPodAutoscaler",
-        "metadata": {"name": "e2e-web", "namespace": NAMESPACE},
+        "metadata": {"name": "e2e-target", "namespace": NAMESPACE},
         "spec": {
-            "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "web"},
+            "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "e2e-target"},
             "minReplicas": 1,
             "maxReplicas": 1,
             "metrics": [{"type": "Resource", "resource": {"name": "cpu", "target": {"type": "Utilization", "averageUtilization": 90}}}],
@@ -166,70 +241,115 @@ async def ownership_tests(gw: Gateway) -> None:
     }
     kubectl("apply", "-f", "-", stdin=json.dumps(hpa))
     try:
-        await expect(gw, "deployment targeted by an HPA", PLAN, {**WEB, "replicas": 2}, "conflict")
+        await expect(gw, "deployment targeted by an HPA", PLAN, {**TARGET, "replicas": 2}, "conflict")
     finally:
-        kubectl("delete", "hpa", "e2e-web", "--ignore-not-found")
+        kubectl("delete", "hpa", "e2e-target", "--ignore-not-found")
 
 
 async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
-    await expect(gw, "apply with unknown plan", APPLY, {"plan_id": UNKNOWN_PLAN, **WEB, "replicas": 2}, "plan_not_found")
+    await expect(gw, "apply with unknown plan", APPLY, {"plan_id": UNKNOWN_PLAN, **TARGET, "replicas": 2}, "plan_not_found")
 
-    plan_id = await gw.plan(2)
-    await expect(gw, "apply with arguments that differ from the plan", APPLY, {"plan_id": plan_id, **WEB, "replicas": 3}, "plan_mismatch")
+    plan_id = await gw.plan(TARGET, 2)
+    await expect(gw, "apply with arguments that differ from the plan", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 3}, "plan_mismatch")
     try:
         # Label-only change: resourceVersion moves, generation and spec.replicas do not.
         # (An annotation change would bump a Deployment's generation.)
-        kubectl("label", "deploy/web", "kube-handrail.io/e2e-touch=1", "--overwrite")
-        envelope = await gw.call(APPLY, {"plan_id": plan_id, **WEB, "replicas": 2})
+        kubectl("label", "deploy/e2e-target", "kube-handrail.io/e2e-touch=1", "--overwrite")
+        envelope = await gw.apply(TARGET, plan_id, 2)
         report("apply after a label-only change succeeds", envelope.get("ok") is True, code(envelope) or "ok")
     finally:
-        kubectl("label", "deploy/web", "kube-handrail.io/e2e-touch-")
-        reset_web()
+        kubectl("label", "deploy/e2e-target", "kube-handrail.io/e2e-touch-")
+        reset_target()
+    await cool_down()
 
-    plan_id = await gw.plan(2)
+    plan_id = await gw.plan(TARGET, 2)
     try:
         # A pod template change bumps metadata.generation.
-        kubectl("set", "env", "deploy/web", f"E2E_TOUCH={int(time.time())}")
+        kubectl("set", "env", "deploy/e2e-target", f"E2E_TOUCH={int(time.time())}")
         await expect_conflict(gw, "apply after a spec change", plan_id, "generation")
     finally:
-        kubectl("set", "env", "deploy/web", "E2E_TOUCH-")
-        reset_web()
+        kubectl("set", "env", "deploy/e2e-target", "E2E_TOUCH-")
+        reset_target()
 
-    plan_id = await gw.plan(2)
+    plan_id = await gw.plan(TARGET, 2)
     try:
         # The GitOps marker is a label, so only the re-check at apply time catches it.
-        kubectl("label", "deploy/web", "app.kubernetes.io/instance=e2e", "--overwrite")
-        await expect(gw, "apply after a GitOps label was added", APPLY, {"plan_id": plan_id, **WEB, "replicas": 2}, "gitops_managed")
+        kubectl("label", "deploy/e2e-target", "app.kubernetes.io/instance=e2e", "--overwrite")
+        await expect(gw, "apply after a GitOps label was added", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 2}, "gitops_managed")
     finally:
-        kubectl("label", "deploy/web", "app.kubernetes.io/instance-")
-        reset_web()
+        kubectl("label", "deploy/e2e-target", "app.kubernetes.io/instance-")
+        reset_target()
 
-    plan_id = await gw.plan(2)
+    plan_id = await gw.plan(TARGET, 2)
     try:
-        kubectl("scale", "deploy/web", "--replicas=3")
+        kubectl("scale", "deploy/e2e-target", "--replicas=3")
         await expect_conflict(gw, "apply after a manual scale", plan_id, "replicas")
     finally:
-        reset_web()
+        reset_target()
 
-    plan_id = await gw.plan(2)
-    first, second = await asyncio.gather(*(gw.call(APPLY, {"plan_id": plan_id, **WEB, "replicas": 2}) for _ in range(2)))
+    plan_id = await gw.plan(TARGET, 2)
+    first, second = await asyncio.gather(*(gw.apply(TARGET, plan_id, 2) for _ in range(2)))
     outcomes = sorted([code(first) or "ok", code(second) or "ok"])
     report("concurrent applies of one plan: exactly one succeeds", outcomes == ["ok", "plan_used"], outcomes)
-    reset_web()
+    reset_target()
+    await cool_down()
 
-    plan_id = await gw.plan(2)
+    plan_id = await gw.plan(TARGET, 2)
     set_kill_switch("false")
     try:
-        await expect(gw, "kill switch off takes effect immediately", APPLY, {"plan_id": plan_id, **WEB, "replicas": 2}, "remediation_disabled")
+        await expect(gw, "kill switch off takes effect immediately", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 2}, "remediation_disabled")
     finally:
         set_kill_switch("true")
 
     if with_expiry:
-        plan_id = await gw.plan(2)
+        plan_id = await gw.plan(TARGET, 2)
         ttl = int(os.environ.get("PLAN_TTL_SECONDS", "300"))
         print(f"waiting {ttl + 5}s for the plan to expire", flush=True)
         await asyncio.sleep(ttl + 5)
-        await expect(gw, "apply after the plan expired", APPLY, {"plan_id": plan_id, **WEB, "replicas": 2}, "plan_expired")
+        await expect(gw, "apply after the plan expired", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 2}, "plan_expired")
+
+
+async def plan_and_apply(gw: Gateway, name: str, target: dict[str, str], replicas: int, **extra: Any) -> None:
+    envelope = await gw.apply(target, await gw.plan(target, replicas, **extra), replicas, **extra)
+    report(name, envelope.get("ok") is True, code(envelope) or "ok")
+    await asyncio.sleep(HISTORY_SETTLE_SECONDS)
+
+
+async def breaker_tests(gw: Gateway) -> None:
+    await plan_and_apply(gw, "breaker: scale up 1 -> 2 is applied", FLAP, 2)
+    envelope = await gw.call(PLAN, {**FLAP, "replicas": 1})
+    retry_after = ((envelope.get("error") or {}).get("details") or {}).get("retry_after")
+    report("cooldown: a change right after an apply is refused", code(envelope) == "cooldown" and bool(retry_after), code(envelope) or "ok")
+    await cool_down()
+    await plan_and_apply(gw, "breaker: scale back down 2 -> 1 is applied (single revert)", FLAP, 1)
+    await cool_down()
+    envelope = await gw.call(PLAN, {**FLAP, "replicas": 2})
+    history = ((envelope.get("error") or {}).get("details") or {}).get("history") or []
+    report(
+        "breaker: scaling up again within the window is flapping",
+        code(envelope) == "flapping" and [(h.get("from"), h.get("to")) for h in history] == [(1, 2), (2, 1)],
+        code(envelope) or "ok",
+    )
+
+    await plan_and_apply(gw, "manual change: scale up 1 -> 2 is applied", MANUAL, 2)
+    kubectl("rollout", "status", "deploy/e2e-manual", "--timeout=120s")
+    kubectl("scale", "deploy/e2e-manual", "--replicas=3")
+    await cool_down()
+    envelope = await gw.call(PLAN, {**MANUAL, "replicas": 1})
+    details = (envelope.get("error") or {}).get("details") or {}
+    report(
+        "manual change: plan after a scale by hand is refused",
+        code(envelope) == "manual_change" and details == {"last_applied_to": 2, "current": 3},
+        code(envelope) or "ok",
+    )
+    envelope = await gw.call(PLAN, {**MANUAL, "replicas": 1, "override_manual_change": True})
+    report("manual change: plan with override_manual_change succeeds", envelope.get("ok") is True, code(envelope) or "ok")
+    if not envelope.get("ok"):
+        return
+    plan_id = envelope["data"]["plan_id"]
+    await expect(gw, "manual change: apply without the planned override", APPLY, {"plan_id": plan_id, **MANUAL, "replicas": 1}, "plan_mismatch")
+    envelope = await gw.apply(MANUAL, plan_id, 1, override_manual_change=True)
+    report("manual change: apply with the planned override succeeds", envelope.get("ok") is True, code(envelope) or "ok")
 
 
 async def run(with_expiry: bool) -> None:
@@ -242,6 +362,15 @@ async def run(with_expiry: bool) -> None:
             await validation_tests(gw)
             await ownership_tests(gw)
             await plan_tests(gw, with_expiry)
+            await breaker_tests(gw)
+
+
+def describe(exc: BaseException) -> str:
+    """The innermost error: the MCP client wraps failures in nested exception groups."""
+    while isinstance(exc, BaseExceptionGroup) and len(exc.exceptions) == 1:
+        exc = exc.exceptions[0]
+    stderr = getattr(exc, "stderr", None)
+    return f"{type(exc).__name__}: {exc}" + (f" stderr: {stderr.strip()}" if stderr else "")
 
 
 def main() -> None:
@@ -249,12 +378,17 @@ def main() -> None:
     parser.add_argument("--with-expiry", action="store_true", help="also wait out a plan TTL")
     args = parser.parse_args()
     started = time.time()
+    web_before = web_spec()
     try:
+        create_fixtures()
         asyncio.run(run(args.with_expiry))
+    except Exception as exc:
+        # A case that raised (for example a plan that failed unexpectedly) still gets the
+        # fixtures deleted and the summary printed.
+        report("run completed", False, describe(exc)[:400])
     finally:
-        replicas = kubectl("get", "deploy/web", "-o", "jsonpath={.spec.replicas}")
-        if replicas != "1":
-            kubectl("scale", "deploy/web", "--replicas=1")
+        delete_fixtures()
+    report("web was not changed", web_spec() == web_before, web_before)
     print(f"{sum(results)}/{len(results)} passed in {int(time.time() - started)}s")
     sys.exit(0 if results and all(results) else 1)
 

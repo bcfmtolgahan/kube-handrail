@@ -19,6 +19,12 @@ class Settings:
     plan_ttl_seconds: int
     remediation_enabled_param: str | None
     region: str | None
+    flap_window_seconds: int = 600
+    object_hourly_apply_budget: int = 6
+    plan_rate_limit: int = 20
+    plan_rate_window_seconds: int = 600
+    apply_cooldown_seconds: int = 60
+    global_hourly_apply_budget: int = 30
 
 
 def _required(env: Mapping[str, str], key: str) -> str:
@@ -58,6 +64,22 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
     if ttl <= 0:
         raise ConfigError("PLAN_TTL_SECONDS must be positive")
 
+    breaker = {
+        key: _int(env, key, default)
+        for key, default in (
+            ("FLAP_WINDOW_SECONDS", 600),
+            ("OBJECT_HOURLY_APPLY_BUDGET", 6),
+            ("PLAN_RATE_LIMIT", 20),
+            ("PLAN_RATE_WINDOW_SECONDS", 600),
+            ("APPLY_COOLDOWN_SECONDS", 60),
+            ("GLOBAL_HOURLY_APPLY_BUDGET", 30),
+        )
+    }
+    for key, value in breaker.items():
+        # A cooldown of 0 turns it off; every other limit must be positive.
+        if value < 0 or (value == 0 and key != "APPLY_COOLDOWN_SECONDS"):
+            raise ConfigError(f"{key} must be positive")
+
     param = env.get("REMEDIATION_ENABLED_PARAM", "").strip() or None
     if write and param is None:
         raise ConfigError("REMEDIATION_ENABLED_PARAM is required")
@@ -71,4 +93,10 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         plan_ttl_seconds=ttl,
         remediation_enabled_param=param,
         region=env.get("AWS_REGION") or None,
+        flap_window_seconds=breaker["FLAP_WINDOW_SECONDS"],
+        object_hourly_apply_budget=breaker["OBJECT_HOURLY_APPLY_BUDGET"],
+        plan_rate_limit=breaker["PLAN_RATE_LIMIT"],
+        plan_rate_window_seconds=breaker["PLAN_RATE_WINDOW_SECONDS"],
+        apply_cooldown_seconds=breaker["APPLY_COOLDOWN_SECONDS"],
+        global_hourly_apply_budget=breaker["GLOBAL_HOURLY_APPLY_BUDGET"],
     )
