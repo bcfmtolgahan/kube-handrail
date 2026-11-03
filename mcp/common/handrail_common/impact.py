@@ -12,6 +12,9 @@ PDB_HEADROOM = "pdb_headroom"
 SERVICE_WITHOUT_ENDPOINTS = "service_without_endpoints"
 SCALE_TO_ZERO = "scale_to_zero"
 SERVICE_NAME_LABEL = "kubernetes.io/service-name"
+# Items returned per list, so a namespace with many matches cannot blow up the response.
+# Warnings are computed over every match before the lists are cut.
+LIST_LIMIT = 20
 
 Obj = Mapping[str, Any]
 
@@ -150,6 +153,7 @@ def scale_impact(
                 }
             )
 
+    truncated = any(len(items) > LIST_LIMIT for items in (matching_pdbs, matching_services, warnings))
     return {
         "pods": {
             "ready_now": ready_now,
@@ -158,7 +162,8 @@ def scale_impact(
             "added": max(0, replicas_to - replicas_from),
             "removed": removed,
         },
-        "pod_disruption_budgets": matching_pdbs,
-        "services": matching_services,
-        "warnings": warnings,
+        "pod_disruption_budgets": matching_pdbs[:LIST_LIMIT],
+        "services": matching_services[:LIST_LIMIT],
+        "warnings": warnings[:LIST_LIMIT],
+        "truncated": truncated,
     }

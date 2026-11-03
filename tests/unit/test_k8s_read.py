@@ -714,3 +714,12 @@ def test_plan_reads_impact_after_the_guard_checks(clients, table):
     seed(table, 3, 2, NOW - 40, NOW - 30)
     assert plan_error(clients) == "cooldown"
     clients.policy.list_namespaced_pod_disruption_budget.assert_not_called()
+
+
+def test_plan_with_an_uninterpretable_selector_fails_closed(clients, table):
+    pdb = {
+        "metadata": {"name": "odd"},
+        "spec": {"selector": {"matchExpressions": [{"key": "app", "operator": "Near"}]}},
+    }
+    clients.policy.list_namespaced_pod_disruption_budget.return_value = raw_list([pdb])
+    assert plan_error(clients) == "kubernetes_error"

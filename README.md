@@ -22,7 +22,7 @@ Whether a `MUTATIVE` custom MCP tool is a workable path for in-cluster writes fr
 
 ## How it is intended to work
 
-This is the target design. Implemented today (Milestone 0): the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the blast-radius budget, the measured impact preview, the kill switch, namespace-scoped RBAC and client-side approval in DevOps Agent. Everything else shown below is planned.
+This is the target design. Implemented today: the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the blast-radius budget, the measured impact preview, the kill switch, namespace-scoped RBAC and client-side approval in DevOps Agent. Everything else shown below is planned.
 
 ```
   MCP client

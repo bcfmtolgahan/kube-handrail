@@ -238,6 +238,7 @@ def test_impact_of_a_scale_up():
         ],
         "services": [{"name": "web", "ready_endpoints_now": 2, "projected_ready_endpoints": 3}],
         "warnings": [],
+        "truncated": False,
     }
 
 
@@ -343,3 +344,13 @@ def test_services_and_pdbs_are_sorted_by_name():
     result = impact(2, 3, [pdb("b"), pdb("a")], [service("z"), service("m")])
     assert [p["name"] for p in result["pod_disruption_budgets"]] == ["a", "b"]
     assert [s["name"] for s in result["services"]] == ["m", "z"]
+
+
+def test_long_lists_are_cut_after_the_warnings_are_computed():
+    services = [service(f"svc-{i:02d}") for i in range(25)]
+    result = impact(1, 0, [], services, [])
+    assert len(result["services"]) == 20
+    assert result["services"][0]["name"] == "svc-00"
+    # scale_to_zero plus one service_without_endpoints per Service, cut to 20.
+    assert len(result["warnings"]) == 20
+    assert result["truncated"] is True

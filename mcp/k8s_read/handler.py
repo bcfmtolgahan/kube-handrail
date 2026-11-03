@@ -119,15 +119,19 @@ def _impact(
         partial(clients.discovery.list_namespaced_endpoint_slice, namespace=namespace),
     )
     ready_now = (deployment.status.ready_replicas if deployment.status else None) or 0
-    return scale_impact(
-        _pod_template_labels(deployment),
-        ready_now,
-        replicas_from,
-        replicas_to,
-        pdbs,
-        services,
-        slices,
-    )
+    try:
+        return scale_impact(
+            _pod_template_labels(deployment),
+            ready_now,
+            replicas_from,
+            replicas_to,
+            pdbs,
+            services,
+            slices,
+        )
+    except ValueError as exc:
+        # An object the preview cannot interpret, such as an unknown selector operator.
+        raise GuardError(KUBERNETES_ERROR, f"cannot build the impact preview: {exc}") from None
 
 
 def _desired_replicas(deployment: Any) -> int:
@@ -285,7 +289,8 @@ def plan_scale_deployment(
             "preflight": preflight,
             "impact": impact,
             "expires_at": plan.expires_at,
-        }
+        },
+        truncated=impact["truncated"],
     )
 
 
