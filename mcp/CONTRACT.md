@@ -48,7 +48,7 @@ Every handler returns a JSON object (not wrapped in `statusCode`/`body`):
 
 `replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. A `conflict` from a 409 that persists after all patch attempts has no `details`. The history checks below also return `details`; every value in them is an integer or a string.
 
-Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `kubernetes_error`, `internal`.
+Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `blast_radius_exceeded`, `kubernetes_error`, `internal`.
 
 ## Plan record (DynamoDB)
 
@@ -81,21 +81,59 @@ Plan (`k8s_read`):
 3. `MIN_REPLICAS <= replicas <= MAX_REPLICAS`.
 4. Deployment exists and is not GitOps-managed. Fail closed: treat it as managed if it has the Argo CD `argocd.argoproj.io/tracking-id` annotation or the `app.kubernetes.io/instance` label (Argo CD label tracking; may also match Helm releases, which is acceptable).
 5. Deployment has no HorizontalPodAutoscaler targeting it.
-6. History checks: manual change, cooldown, flapping, object budget, then plan rate limit (below).
-7. Global budget: the current hour's counter, read consistently, must be below `GLOBAL_HOURLY_APPLY_BUDGET`. Planning only reads it.
+6. Blast-radius budget: `|replicas - current| <= max(1, ceil(current * MAX_REPLICA_STEP_PERCENT / 100))`, where `current` is `spec.replicas` (unset counts as 1); otherwise `blast_radius_exceeded`. It is enforced whatever the approval says.
+7. History checks: manual change, cooldown, flapping, object budget, then plan rate limit (below).
+8. Global budget: the current hour's counter, read consistently, must be below `GLOBAL_HOURLY_APPLY_BUDGET`. Planning only reads it.
+9. Impact preview: list the PodDisruptionBudgets, Services and EndpointSlices in the namespace (below). Any error fails the plan with `kubernetes_error`, so the approver never sees a preview with gaps. Only then is the plan record written.
 
-The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight` and `expires_at`.
+The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact` and `expires_at`. `preflight` lists the checks that passed, in this order: `arguments`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`.
+
+`blast_radius_exceeded` `details`:
+
+```json
+{ "code": "blast_radius_exceeded", "details": { "from": 1, "to": 3, "max_step": 1, "max_step_percent": 100 } }
+```
+
+With the default of 100 %, a Deployment at 0 or 1 replica can change by 1, at 3 by 3 (to anything from 0 to 6); at 50 %, a Deployment at 3 can change by 2.
 
 Apply (`k8s_write`), all re-checked independently of the plan step:
 1. Kill switch: SSM parameter `REMEDIATION_ENABLED_PARAM` must equal `true`.
-2. Checks 1-3 above (check 4 is re-run in step 4; check 5 is not, because the writer identity cannot list HPAs).
-3. Plan exists, `action` matches, `args_hash` matches, not expired, not used. Mark used with a conditional update before patching.
+2. Checks 1-3 above (check 4 is re-run in step 4, check 6 in step 3; check 5 is not, because the writer identity cannot list HPAs, and the impact preview is not, because it only informs the approver).
+3. Plan exists, `action` matches, `args_hash` matches, not expired, not used. Mark used with a conditional update before patching. Then the blast-radius budget (plan check 6), with the plan's `replicas_from` and `replicas_to` and the current `MAX_REPLICA_STEP_PERCENT`, so lowering the setting also stops plans made before the change. A rejection leaves the plan consumed with `result = "blast_radius_exceeded"`.
 4. Read the Deployment. Its `metadata.uid` must equal the planned `uid` (a Deployment deleted and recreated under the same name starts again at generation 1), it must not be GitOps-managed (check 4 above, re-run because a label-only change does not bump `generation`), and its `metadata.generation` must equal the planned `generation` and its `spec.replicas` (unset counts as 1) must equal `replicas_from`; otherwise return `conflict` with `details`, or `gitops_managed`. The API server bumps a Deployment's `generation` on spec and annotation changes but not on status or label updates, so a rollout in progress does not block the apply. Patch `spec.replicas` with a `metadata.resourceVersion` precondition taken from that read. On 409, read again, re-run these checks and patch again, up to 3 attempts in total; a change found on a retry returns the error immediately, and a 409 on the last attempt returns `conflict`.
 5. Server-side dry run (`dryRun=All`) before each real patch. A plan is consumed before the dry run, so any failure after step 3 requires a new plan.
 6. The patch also sets the annotation `kube-handrail.io/last-plan-id` to the applied `plan_id`.
 7. History checks, after step 3 and after the first read in step 4 has passed: manual change, cooldown, flapping and object budget (not the plan rate limit), then the global budget: one conditional update adds 1 to the current hour's counter only if it is below `GLOBAL_HOURLY_APPLY_BUDGET`, so concurrent applies cannot overshoot it. The unit is taken before the patch and not returned if the patch then fails. They use the planned `replicas_from` and `replicas_to`; the check in step 4 has confirmed that `replicas_from` is the current count. A 409 retry re-runs step 4 but not the history checks. A rejection here leaves the plan consumed, with the error code as its `result`.
 
 The kill switch is read on every apply (no caching), so turning it off takes effect immediately.
+
+## Impact preview
+
+`data.impact` in the plan response, computed from objects read when the plan is made. Nothing in it blocks the plan; it is there for the approver. Values that depend on what happens after the change are named `projected_*`.
+
+```json
+{
+  "pods": { "ready_now": 2, "from": 2, "to": 1, "added": 0, "removed": 1 },
+  "pod_disruption_budgets": [
+    { "name": "web", "min_available": 2, "max_unavailable": null,
+      "current_healthy": 2, "desired_healthy": 2, "disruptions_allowed": 0 }
+  ],
+  "services": [ { "name": "web", "ready_endpoints_now": 2, "projected_ready_endpoints": 1 } ],
+  "warnings": [
+    { "code": "pdb_headroom", "message": "removing 1 pod(s) is more than PodDisruptionBudget web allows now (0); a scale-down is not an eviction, so the PodDisruptionBudget will not stop it" }
+  ]
+}
+```
+
+- `pods`: `ready_now` is the Deployment's `status.readyReplicas` (0 when unset); `from` and `to` are the planned replica counts; `added = max(0, to - from)`, `removed = max(0, from - to)`.
+- `pod_disruption_budgets`: PodDisruptionBudgets in the namespace whose `spec.selector` matches the Deployment's pod template labels (`matchLabels` and `matchExpressions` with `In`, `NotIn`, `Exists`, `DoesNotExist`). As in `policy/v1`, an empty selector matches every pod and a missing selector matches none. `min_available` and `max_unavailable` are as given (an integer or a percentage string, `null` when unset); `current_healthy`, `desired_healthy` and `disruptions_allowed` are from `status` (`null` when unset). Sorted by name.
+- `services`: Services in the namespace with a non-empty `spec.selector` that is a subset of the pod template labels; Services without a selector are skipped. `ready_endpoints_now` counts endpoints with `conditions.ready` true in the EndpointSlices labelled `kubernetes.io/service-name=<service>`; an unset `ready` counts as not ready, so the count can be low but never high, and a pod listed in several slices (dual-stack) is counted once (by `targetRef.uid`, otherwise by its addresses). `projected_ready_endpoints = max(0, ready_endpoints_now - ready_now) + to` is a projection: it assumes the new pods become ready and the Service's other backends stay as they are. Sorted by name.
+- `warnings`, each `{code, message}`, in this order:
+  - `scale_to_zero`: `to` is 0.
+  - `pdb_headroom`: `removed` is greater than `disruptions_allowed` of a matching PodDisruptionBudget (unset counts as 0). A scale-down is not an eviction, so the PodDisruptionBudget will not stop it.
+  - `service_without_endpoints`: a matching Service's `projected_ready_endpoints` is 0.
+
+The lists are read as raw JSON (`_preload_content=False`), because the Kubernetes Python client refuses some valid objects, such as the placeholder EndpointSlice with `endpoints: null` of a Service without pods.
 
 ## History checks (oscillation breaker)
 
@@ -184,7 +222,7 @@ Known limits:
 - Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the kill switch parameter only; `bedrock-agentcore:ListGatewayTargets` and `bedrock-agentcore:GetGatewayTarget` on this gateway; `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
 - Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations.
 - RBAC in the sandbox namespace only:
-  - reader: `get`, `list` on `deployments`, `horizontalpodautoscalers`;
+  - reader: `get`, `list` on `deployments`, `horizontalpodautoscalers`, `poddisruptionbudgets` (`policy`), `services` and `endpointslices` (`discovery.k8s.io`). No access to pods: the impact preview takes ready counts from the Deployment status and readiness from EndpointSlices, so the reader never sees pod specs or environment variables;
   - writer: `get`, `patch` on `deployments`.
 
 ## Configuration (environment variables)
@@ -201,3 +239,9 @@ History checks, set on both Lambdas; each must be a positive integer, except tha
 | `PLAN_RATE_WINDOW_SECONDS` | 600 | `plan_rate_window_seconds` |
 | `APPLY_COOLDOWN_SECONDS` | 60 (`0` turns it off) | `apply_cooldown_seconds` |
 | `GLOBAL_HOURLY_APPLY_BUDGET` | 30 | `global_hourly_apply_budget` |
+
+Blast-radius budget, set on both Lambdas; a positive integer:
+
+| Variable | Default | Terraform variable |
+|---|---|---|
+| `MAX_REPLICA_STEP_PERCENT` | 100 | `max_replica_step_percent` |

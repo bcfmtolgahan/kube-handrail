@@ -1,4 +1,6 @@
+import dataclasses
 import importlib.util
+import json
 import sys
 import uuid
 from pathlib import Path
@@ -99,6 +101,11 @@ def table(monkeypatch, plans_table):
         yield plans_table(TABLE, REGION)
 
 
+def raw_list(items: list[dict]) -> SimpleNamespace:
+    """A list response read with _preload_content=False, as the impact reads are."""
+    return SimpleNamespace(data=json.dumps({"kind": "List", "items": items}).encode())
+
+
 @pytest.fixture
 def clients(table):
     apps = MagicMock()
@@ -107,7 +114,20 @@ def clients(table):
     autoscaling.list_namespaced_horizontal_pod_autoscaler.return_value = (
         k8s.V2HorizontalPodAutoscalerList(items=[])
     )
-    return SimpleNamespace(apps=apps, autoscaling=autoscaling, store=PlanStore(table))
+    policy = MagicMock()
+    policy.list_namespaced_pod_disruption_budget.return_value = raw_list([])
+    core = MagicMock()
+    core.list_namespaced_service.return_value = raw_list([])
+    discovery = MagicMock()
+    discovery.list_namespaced_endpoint_slice.return_value = raw_list([])
+    return SimpleNamespace(
+        apps=apps,
+        autoscaling=autoscaling,
+        policy=policy,
+        core=core,
+        discovery=discovery,
+        store=PlanStore(table),
+    )
 
 
 def plan(clients, **overrides):
@@ -155,7 +175,7 @@ def test_plan_stores_record_and_returns_diff(clients, table):
 
 def test_plan_defaults_missing_replicas_to_one(clients):
     clients.apps.read_namespaced_deployment.return_value = deployment(replicas=None)
-    assert plan(clients)["data"]["diff"]["replicas"]["from"] == 1
+    assert plan(clients, replicas=2)["data"]["diff"]["replicas"]["from"] == 1
 
 
 @pytest.mark.parametrize(
@@ -563,3 +583,134 @@ def test_plan_only_reads_the_global_budget(clients, table):
 def test_plan_rejects_a_change_within_the_cooldown(clients, table):
     seed(table, 3, 2, NOW - 40, NOW - 30)
     assert plan_error(clients) == "cooldown"
+
+
+# --- Blast radius and impact preview ------------------------------------------
+
+
+def test_plan_rejects_a_step_over_the_blast_radius_budget(clients, table):
+    clients.apps.read_namespaced_deployment.return_value = deployment(replicas=1)
+    with pytest.raises(GuardError) as exc:
+        plan(clients, replicas=3)
+    assert exc.value.code == "blast_radius_exceeded"
+    assert exc.value.details == {"from": 1, "to": 3, "max_step": 1, "max_step_percent": 100}
+    assert table.scan()["Count"] == 0
+    clients.policy.list_namespaced_pod_disruption_budget.assert_not_called()
+
+
+def test_plan_allows_a_step_at_the_budget(clients):
+    # From 2 at 100 %: up to 4 or down to 0.
+    assert plan(clients, replicas=4)["ok"] is True
+    assert plan(clients, replicas=0)["ok"] is True
+
+
+def test_plan_uses_the_configured_step_percent(clients):
+    settings = dataclasses.replace(SETTINGS, max_replica_step_percent=50)
+    args = {"namespace": "sandbox", "name": "web", "replicas": 4}
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(args, settings, clients, NOW)
+    assert exc.value.code == "blast_radius_exceeded"
+    assert exc.value.details["max_step"] == 1
+
+
+def test_plan_reports_blast_radius_in_preflight(clients):
+    checks = [check["check"] for check in plan(clients)["data"]["preflight"]]
+    assert checks.index("blast_radius") == checks.index("no_hpa") + 1
+
+
+def labelled_deployment() -> k8s.V1Deployment:
+    dep = deployment()
+    dep.spec.template = k8s.V1PodTemplateSpec(
+        metadata=k8s.V1ObjectMeta(labels={"app": "web", "tier": "front"})
+    )
+    return dep
+
+
+def test_plan_returns_the_measured_impact(clients):
+    clients.apps.read_namespaced_deployment.return_value = labelled_deployment()
+    clients.policy.list_namespaced_pod_disruption_budget.return_value = raw_list(
+        [
+            {
+                "metadata": {"name": "web"},
+                "spec": {"minAvailable": 2, "selector": {"matchLabels": {"app": "web"}}},
+                "status": {
+                    "currentHealthy": 2,
+                    "desiredHealthy": 2,
+                    "disruptionsAllowed": 0,
+                    "expectedPods": 2,
+                },
+            }
+        ]
+    )
+    clients.core.list_namespaced_service.return_value = raw_list(
+        [
+            {"metadata": {"name": "web"}, "spec": {"selector": {"app": "web"}}},
+            {"metadata": {"name": "db"}, "spec": {}},
+        ]
+    )
+    clients.discovery.list_namespaced_endpoint_slice.return_value = raw_list(
+        [
+            {
+                "metadata": {"labels": {"kubernetes.io/service-name": "web"}},
+                "endpoints": [
+                    {"addresses": [f"10.0.0.{i}"], "conditions": {"ready": True}} for i in range(2)
+                ],
+            },
+            # A Service with no pods has a placeholder slice with null endpoints.
+            {"metadata": {"labels": {"kubernetes.io/service-name": "db"}}, "endpoints": None},
+        ]
+    )
+
+    impact = plan(clients, replicas=1)["data"]["impact"]
+
+    assert impact["pods"] == {"ready_now": 2, "from": 2, "to": 1, "added": 0, "removed": 1}
+    assert impact["pod_disruption_budgets"] == [
+        {
+            "name": "web",
+            "min_available": 2,
+            "max_unavailable": None,
+            "current_healthy": 2,
+            "desired_healthy": 2,
+            "disruptions_allowed": 0,
+        }
+    ]
+    assert impact["services"] == [
+        {"name": "web", "ready_endpoints_now": 2, "projected_ready_endpoints": 1}
+    ]
+    assert [w["code"] for w in impact["warnings"]] == ["pdb_headroom"]
+    for call in (
+        clients.policy.list_namespaced_pod_disruption_budget,
+        clients.core.list_namespaced_service,
+        clients.discovery.list_namespaced_endpoint_slice,
+    ):
+        call.assert_called_once_with(namespace="sandbox", _preload_content=False)
+
+
+def test_plan_warnings_do_not_block(clients, table):
+    data = plan(clients, replicas=0)["data"]
+    assert [w["code"] for w in data["impact"]["warnings"]] == ["scale_to_zero"]
+    assert table.get_item(Key={"plan_id": data["plan_id"]})["Item"]["replicas_to"] == 0
+
+
+@pytest.mark.parametrize(
+    ("api", "method"),
+    [
+        ("policy", "list_namespaced_pod_disruption_budget"),
+        ("core", "list_namespaced_service"),
+        ("discovery", "list_namespaced_endpoint_slice"),
+    ],
+)
+@pytest.mark.parametrize("status", [403, 404, 500])
+def test_plan_fails_closed_when_impact_cannot_be_read(clients, table, api, method, status):
+    getattr(getattr(clients, api), method).side_effect = ApiException(status=status, reason="x")
+    with pytest.raises(GuardError) as exc:
+        plan(clients)
+    assert exc.value.code == "kubernetes_error"
+    assert str(status) in exc.value.message
+    assert table.scan()["Count"] == 0
+
+
+def test_plan_reads_impact_after_the_guard_checks(clients, table):
+    seed(table, 3, 2, NOW - 40, NOW - 30)
+    assert plan_error(clients) == "cooldown"
+    clients.policy.list_namespaced_pod_disruption_budget.assert_not_called()

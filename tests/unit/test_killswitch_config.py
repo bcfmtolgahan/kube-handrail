@@ -21,6 +21,7 @@ def test_settings_parse():
     assert (s.flap_window_seconds, s.object_hourly_apply_budget) == (600, 6)
     assert (s.plan_rate_limit, s.plan_rate_window_seconds) == (20, 600)
     assert (s.apply_cooldown_seconds, s.global_hourly_apply_budget) == (60, 30)
+    assert s.max_replica_step_percent == 100
 
 
 def test_breaker_settings_parse():
@@ -33,11 +34,13 @@ def test_breaker_settings_parse():
             "PLAN_RATE_WINDOW_SECONDS": "300",
             "APPLY_COOLDOWN_SECONDS": "0",
             "GLOBAL_HOURLY_APPLY_BUDGET": "12",
+            "MAX_REPLICA_STEP_PERCENT": "250",
         }
     )
     assert (s.flap_window_seconds, s.object_hourly_apply_budget) == (900, 3)
     assert (s.plan_rate_limit, s.plan_rate_window_seconds) == (10, 300)
     assert (s.apply_cooldown_seconds, s.global_hourly_apply_budget) == (0, 12)
+    assert s.max_replica_step_percent == 250
 
 
 @pytest.mark.parametrize(
@@ -55,6 +58,9 @@ def test_breaker_settings_parse():
         {"PLAN_RATE_WINDOW_SECONDS": "0"},
         {"APPLY_COOLDOWN_SECONDS": "-1"},
         {"GLOBAL_HOURLY_APPLY_BUDGET": "0"},
+        {"MAX_REPLICA_STEP_PERCENT": "0"},
+        {"MAX_REPLICA_STEP_PERCENT": "-50"},
+        {"MAX_REPLICA_STEP_PERCENT": "1.5"},
     ],
 )
 def test_settings_invalid(override):

@@ -1,6 +1,18 @@
-# Oscillation breaker
+# Guards
 
-Two actors who disagree about a Deployment (an agent and a human, or two agents) can scale it back and forth indefinitely, and each change on its own looks reasonable. The breaker looks at what kube-handrail has already done to the same object and refuses the next change when the pattern is wrong. The exact rules, settings and error `details` are in [`mcp/CONTRACT.md`](../mcp/CONTRACT.md#history-checks-oscillation-breaker).
+Server-side checks that hold whatever the client, the agent or the approver does. The exact rules, settings and error `details` are in [`mcp/CONTRACT.md`](../mcp/CONTRACT.md#guard-checks).
+
+## Blast-radius budget
+
+A single plan may change a Deployment's replica count by at most `MAX_REPLICA_STEP_PERCENT` (default 100) of its current count, rounded up and never less than 1. At the default, a Deployment at 1 replica can go to 0 or 2, one at 3 to anything from 0 to 6. A larger change is refused with `blast_radius_exceeded`, both when planning and again when applying, with the setting in force at apply time; an approval does not lift it. Bigger changes take several steps, each of which also passes the oscillation breaker below.
+
+## Impact preview
+
+A plan reports what the change touches, measured when the plan is made, so the approver sees facts rather than the agent's description of them: the pods added or removed, the PodDisruptionBudgets that select the Deployment's pods and how many disruptions each allows now, and for each Service in front of the pods its ready endpoints now and a projection after the change. Warnings flag a scale to zero, a scale-down that removes more pods than a PodDisruptionBudget allows (a scale-down is not an eviction, so the budget itself will not stop it), and a Service projected to have no ready endpoints. Warnings never block a plan; they are for the human deciding. If any of these objects cannot be read, the plan fails instead of showing a partial picture. See [Impact preview](../mcp/CONTRACT.md#impact-preview).
+
+## Oscillation breaker
+
+Two actors who disagree about a Deployment (an agent and a human, or two agents) can scale it back and forth indefinitely, and each change on its own looks reasonable. The breaker looks at what kube-handrail has already done to the same object and refuses the next change when the pattern is wrong. The exact rules are in [History checks](../mcp/CONTRACT.md#history-checks-oscillation-breaker).
 
 - **Flapping.** Scaling up and then back down is allowed: one revert is often the right fix. A second reversal of direction within `FLAP_WINDOW_SECONDS` (default 10 minutes), for example up, down, up, is refused with `flapping`.
 - **Cooldown.** At least `APPLY_COOLDOWN_SECONDS` (default 60) between two applies to one Deployment, so the effect of a change can show before the next one (`cooldown`).

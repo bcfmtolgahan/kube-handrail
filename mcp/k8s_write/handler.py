@@ -40,6 +40,7 @@ from handrail_common.plans import (
 )
 from handrail_common.validation import (
     GuardError,
+    check_replica_step,
     require_override_flag,
     require_plan_id,
     validate_scale_args,
@@ -226,6 +227,8 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
     )
 
     try:
+        # Re-checked against the current setting; the plan step is not trusted.
+        check_replica_step(plan.replicas_from, plan.replicas_to, s.max_replica_step_percent)
         updated = _patch(
             rt.apps(),
             plan,

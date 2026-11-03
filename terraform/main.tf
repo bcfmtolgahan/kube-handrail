@@ -51,6 +51,8 @@ locals {
     PLAN_RATE_WINDOW_SECONDS   = tostring(var.plan_rate_window_seconds)
     APPLY_COOLDOWN_SECONDS     = tostring(var.apply_cooldown_seconds)
     GLOBAL_HOURLY_APPLY_BUDGET = tostring(var.global_hourly_apply_budget)
+
+    MAX_REPLICA_STEP_PERCENT = tostring(var.max_replica_step_percent)
   }
 
   # Every packaged Lambda => its requirements file. The sentinel is packaged but is not a gateway target.

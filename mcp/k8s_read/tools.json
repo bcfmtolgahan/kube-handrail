@@ -13,7 +13,7 @@
   },
   {
     "name": "plan_scale_deployment",
-    "description": "Plan a replica change for a Deployment without changing anything. Runs preflight checks and returns a single-use plan_id, the diff and an expiry. The change is only made by apply_scale_deployment with the same arguments and plan_id. Refused when the change would flap the Deployment, exceed its hourly apply budget or plan rate limit, or undo a manual change without override_manual_change.",
+    "description": "Plan a replica change for a Deployment without changing anything. Runs preflight checks and returns a single-use plan_id, the diff, a measured impact preview (pods added or removed, matching PodDisruptionBudgets and their headroom, ready and projected endpoints of Services selecting the Deployment, and warnings for the approver) and an expiry. The change is only made by apply_scale_deployment with the same arguments and plan_id. Refused when the change is larger than the blast-radius budget allows, would flap the Deployment, exceed its hourly apply budget or plan rate limit, or undo a manual change without override_manual_change.",
     "inputSchema": {
       "type": "object",
       "properties": {
