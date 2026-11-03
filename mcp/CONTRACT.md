@@ -486,10 +486,27 @@ Existing assets are found with `ListAssets` and checked before the first write; 
 - Two IAM roles, one per tool Lambda. On the plan table: read role `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:UpdateItem` (for `request_approval` and its counter); write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only. The read role also has `sns:Publish` on the approval topic, and an explicit deny of `PutItem` and `UpdateItem` that name any approval attribute (`approved_*`, `approval_channel`, `approval_expires_at`, `rejected_*`, `reject_reason`, `decision_correlation_id`, through `dynamodb:Attributes`). The write role has no such deny, because its consume condition reads those attributes; nothing in IAM keeps it from writing them. What is guaranteed: the read role cannot write an approval, the approver refuses the Lambda and gateway roles, and the write guard re-validates the consumed record against the request's arguments before it touches the cluster.
 - Approver role: `dynamodb:GetItem` and `dynamodb:UpdateItem` on the plan table, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS access: the apply it triggers runs as the write Lambda.
 - Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the kill switch parameter only; `bedrock-agentcore:ListGatewayTargets` and `bedrock-agentcore:GetGatewayTarget` on this gateway; `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
-- Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations.
+- With `lambda_subnet_ids` set, both tool roles also have the network interface actions Lambda needs to run in a VPC (`ec2:CreateNetworkInterface`, `ec2:DescribeNetworkInterfaces`, `ec2:DescribeSubnets`, `ec2:DeleteNetworkInterface`, `ec2:AssignPrivateIpAddresses`, `ec2:UnassignPrivateIpAddresses`, on `*`). This is the EC2 part of `AWSLambdaVPCAccessExecutionRole`, without its `logs` actions on every log group.
+- Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations. The group names are fixed, not derived from `name_prefix`: deployments that share a cluster share the groups and their RoleBindings. The cluster's authentication mode must be `API` or `API_AND_CONFIG_MAP`; Terraform checks it before creating the entries.
 - RBAC in the sandbox namespace only:
   - reader: `get`, `list` on `deployments` and `horizontalpodautoscalers`; `list` only on `poddisruptionbudgets` (`policy`), `services` and `endpointslices` (`discovery.k8s.io`), and, for `get_workload_events`, `replicasets` (`apps`) and `events` (core). No access to pods: the impact preview takes ready counts from the Deployment status and readiness from EndpointSlices, and events name pods without the reader reading them, so the reader never sees pod specs or environment variables;
   - writer: `get`, `patch` on `deployments`.
+
+## Network
+
+Only the two tool Lambdas talk to the cluster. At runtime they make these calls, all HTTPS on port 443:
+
+| Call | Lambda | Endpoint |
+|---|---|---|
+| `eks:DescribeCluster` (API server URL and CA, whenever a Kubernetes client is built: on a cold start and every 10 minutes after) | both | `eks.<region>.amazonaws.com` |
+| Kubernetes API | both | the cluster endpoint |
+| `dynamodb:GetItem`, `PutItem`, `UpdateItem`, `Query` | both (`PutItem` read only) | `dynamodb.<region>.amazonaws.com` |
+| `ssm:GetParameter` (kill switch) | write | `ssm.<region>.amazonaws.com` |
+| `sns:Publish` (`request_approval`) | read | `sns.<region>.amazonaws.com` |
+
+The EKS token is a presigned `sts:GetCallerIdentity` URL built locally; the Lambdas never call STS, the API server does. Lambda delivers function logs itself, outside the function's network. So neither STS nor CloudWatch Logs has to be reachable from the Lambdas' subnets. The approver, sentinel and interceptor Lambdas never run in a VPC.
+
+`lambda_subnet_ids` (default empty) puts both tool Lambdas in those subnets, with `lambda_security_group_ids` or, when that is empty, a created security group that allows outbound TCP 443 only. Terraform refuses a cluster without a public endpoint unless `lambda_subnet_ids` is set. `allow_lambda_to_cluster_endpoint` (default `false`) adds inbound TCP 443 from those security groups to the cluster security group. `create_vpc_endpoints` (default `false`) creates interface endpoints with private DNS for `eks`, `ssm` and `sns` in one Lambda subnet per Availability Zone, with a security group that allows TCP 443 from the Lambdas, and a DynamoDB gateway endpoint on `vpc_endpoint_route_table_ids`. Deployment steps are in [Deploying to a new account](../docs/deploy.md).
 
 ## Configuration (environment variables)
 

@@ -97,7 +97,7 @@ A remediation follows this sequence:
 
 Milestone 0 is implemented and tested on a test cluster: `get_workload_status` and a guarded `plan_scale_deployment` / `apply_scale_deployment` pair behind an AgentCore Gateway, with Terraform, namespace-scoped RBAC, end-to-end guard tests and AWS DevOps Agent registration. Setup, tests and observed behavior are in [Milestone 0](docs/milestone-0.md). There is no release.
 
-Milestone 1 (server-verified write path): items 1-5 are implemented and tested on a test cluster, and the caller identity spike (item 6) is done, with an experimental interceptor that is off by default. Tool output hygiene, with the `get_workload_events` tool, and agent guidance ([`AGENTS.md`](AGENTS.md) and a DevOps Agent skill, installed by `scripts/devops_agent_register.py install-guidance`) are implemented and unit-tested. The remaining Milestone 1 work is listed under "Later in this milestone" in the [roadmap](docs/roadmap.md). Integration details that are still unverified are listed there under "Open questions".
+Milestone 1 (server-verified write path): items 1-5 are implemented and tested on a test cluster, and the caller identity spike (item 6) is done, with an experimental interceptor that is off by default. Tool output hygiene, with the `get_workload_events` tool, and agent guidance ([`AGENTS.md`](AGENTS.md) and a DevOps Agent skill, installed by `scripts/devops_agent_register.py install-guidance`) are implemented and unit-tested. Deployment to a new account, including clusters with a private endpoint ([Deploying to a new account](docs/deploy.md)), is implemented but not yet tested on a fresh account or a private-endpoint cluster. The remaining Milestone 1 work is listed under "Later in this milestone" in the [roadmap](docs/roadmap.md). Integration details that are still unverified are listed there under "Open questions".
 
 ## Planned layout
 
@@ -129,6 +129,7 @@ AGENTS.md        tool contract for MCP clients
 - [ADR 0001: Scope](docs/adr/0001-scope.md) - why a complement layer and not another AI SRE agent
 - [ADR 0002: Server-verified approval](docs/adr/0002-server-verified-approval.md) - approvals pinned to exact arguments and verified by the server
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
+- [Deploying to a new account](docs/deploy.md) - prerequisites, names, RBAC, networking for clusters with a private endpoint, and the order of steps
 - [Guards](docs/guards.md) - blast-radius budget, impact preview, and the oscillation breaker: flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks
 - [Drift sentinel](mcp/CONTRACT.md#drift-sentinel) - what it checks, outcomes, and how to restore remediation after drift
 - [Server-side approval](mcp/CONTRACT.md#server-side-approval) - approval modes, `request_approval`, the approval API and who can approve
