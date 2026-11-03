@@ -129,6 +129,12 @@ def main() -> None:
     )
     emit(envelope)
     applied = (envelope.get("data") or {}).get("apply")
+    if envelope.get("ok") and args.command == "approve" and applied is None:
+        print(
+            "Approval recorded; no apply was run. The client must now apply the plan "
+            "(in both mode after its own approval) before the approval expires.",
+            file=sys.stderr,
+        )
     sys.exit(0 if envelope.get("ok") and (applied is None or applied.get("ok")) else 1)
 
 

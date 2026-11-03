@@ -207,8 +207,8 @@ data "aws_iam_policy_document" "lambda" {
     }
   }
 
-  # A machine identity never writes an approval, even if its code is compromised. Only the
-  # read role: the write role's consume condition reads these attributes.
+  # The read role cannot write approval attributes, even if its code is compromised. Not on
+  # the write role: its consume condition reads these attributes.
   dynamic "statement" {
     for_each = each.value.approval_requests ? [1] : []
     content {

@@ -810,6 +810,26 @@ def test_request_approval_global_limit(approvals):
     assert len(approvals.sns.messages) == 1
 
 
+def test_request_approval_is_refused_in_client_mode(approvals, table):
+    """A server approval changes nothing in client mode; the wait would only keep the plan alive."""
+    settings = dataclasses.replace(APPROVAL_SETTINGS, approval_mode="client")
+    plan_id = plan(approvals)["data"]["plan_id"]
+    with pytest.raises(GuardError) as exc:
+        request(approvals, plan_id, settings=settings)
+    assert exc.value.code == "invalid_argument"
+    record = table.get_item(Key={"plan_id": plan_id})["Item"]
+    assert (record["status"], record["expires_at"]) == ("planned", NOW + 300)
+    assert approvals.sns.messages == []
+
+
+@pytest.mark.parametrize("mode", ["server", "both"])
+def test_request_approval_in_server_and_both_mode(approvals, mode):
+    settings = dataclasses.replace(APPROVAL_SETTINGS, approval_mode=mode)
+    plan_id = plan(approvals)["data"]["plan_id"]
+    data = request(approvals, plan_id, settings=settings)["data"]
+    assert data["notified"] is True and data["approval_mode"] == mode
+
+
 def test_request_approval_without_a_destination_changes_nothing(approvals, table):
     plan_id = plan(approvals)["data"]["plan_id"]
     with pytest.raises(GuardError) as exc:

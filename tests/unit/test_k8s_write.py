@@ -162,6 +162,7 @@ def test_apply_success_dry_run_then_real(rt):
         "replicas_from": 1,
         "replicas_to": 3,
         "resource_version": "12346",
+        "approved": False,
     }
     apps.read_namespaced_deployment.assert_called_once_with("web", "sandbox")
     dry, real = apps.patch_namespaced_deployment.call_args_list
@@ -821,7 +822,9 @@ def test_server_mode_apply_after_approval(server_rt):
     runtime_.store.approve(plan.plan_id, HUMAN, NOW, 120)
     response = apply(plan.plan_id)
     assert response["ok"] is True
-    assert response["data"]["approved_by"] == HUMAN
+    # The client learns that an approval covered it; the record names the approver.
+    assert response["data"]["approved"] is True
+    assert HUMAN not in str(response)
     record = item(plan.plan_id)
     assert record["used"] is True and record["result"] == "applied"
     assert record["approved_by"] == HUMAN
@@ -868,4 +871,23 @@ def test_client_mode_needs_no_approval(rt):
     assert runtime_.settings.approval_mode == "client"
     plan = create_plan(runtime_.store)
     response = apply(plan.plan_id)
-    assert response["ok"] is True and "approved_by" not in response["data"]
+    assert response["ok"] is True and response["data"]["approved"] is False
+
+
+@pytest.mark.parametrize(
+    "change", [{"namespace": "other"}, {"name": "api"}, {"replicas_to": 2}]
+)
+def test_a_record_altered_in_the_table_cannot_redirect_the_apply(rt, change):
+    """Matching args_hash is not enough: the record itself must describe the request."""
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    names = {f"#{k}": k for k in change}
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in change),
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues={f":{k}": v for k, v in change.items()},
+    )
+    assert error_code(apply(plan.plan_id)) == "plan_mismatch"
+    apps.read_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "plan_mismatch"

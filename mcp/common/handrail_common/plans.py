@@ -255,7 +255,11 @@ class PlanStore:
         With `require_approval`, the same conditional write also requires a server approval
         of exactly these arguments, by someone other than the requester, that has not expired.
         """
-        condition = "#used = :false AND expires_at > :now AND args_hash = :h AND #action = :a"
+        # A rejection also ends the plan's validity; this holds even if clocks disagree.
+        condition = (
+            "#used = :false AND expires_at > :now AND args_hash = :h AND #action = :a"
+            " AND attribute_not_exists(rejected_by)"
+        )
         names = {"#used": "used", "#action": "action"}
         values: dict[str, Any] = {
             ":true": True,

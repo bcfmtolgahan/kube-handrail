@@ -66,7 +66,7 @@ Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespa
 | `created_at` | N | epoch seconds; sort key of the `object-history` index |
 | `expires_at` | N | epoch seconds, end of plan validity: `created_at + PLAN_TTL_SECONDS` (default 300 s); `created_at + APPROVAL_WAIT_TTL_SECONDS` once an approval is requested; `approved_at + APPLY_AFTER_APPROVAL_TTL_SECONDS` once approved; `rejected_at` once rejected |
 | `retain_until` | N | epoch seconds, the table TTL attribute: `created_at + max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60`, the longest window plus the longest a plan can stay valid, so a record stays readable as history after the plan expired. A record without it is kept until deleted |
-| `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a`, extended in `server` and `both` mode (see [Server-side approval](#server-side-approval)) |
+| `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a AND attribute_not_exists(rejected_by)`, extended in `server` and `both` mode (see [Server-side approval](#server-side-approval)) |
 | `requested_by` | S | the requesting principal. Until per-agent identity reaches the server it is the constant `mcp-gateway`, the class of the gateway's machine identities |
 | `status` | S | `planned`, `awaiting_approval`, `approved` or `rejected`. `applied` (`used = true`) and `expired` (`expires_at <= now`) are derived, never stored. Records made before server approval have no `status` and `requested_by`; they can be applied in `client` mode until they expire but never requested or approved |
 | `override_manual_change` | BOOL | the value pinned in `args_hash` |
@@ -234,9 +234,9 @@ Implements [ADR 0002](../docs/adr/0002-server-verified-approval.md). A human app
 |---|---|---|
 | `client` | No; the condition is the one from Milestone 0. | DevOps Agent chat: the chat approval is the only one. |
 | `server` | Yes. | Every other client, and DevOps Agent autonomous investigations (plan and `request_approval`, then a human approves through the approval channel, which also runs the apply). |
-| `both` | Yes. The server cannot see the client's approval, so on the server side `both` is exactly `server`; the difference is only that the client asks its own user as well. | DevOps Agent chat with a server approval too: approve with `apply: false`, then the agent applies in chat. |
+| `both` | Yes. The server cannot see the client's approval, so the apply condition is the one of `server`. The approval channel never runs the apply in this mode: the client applies, after its own approval. | DevOps Agent chat with a server approval too: the agent plans and calls `request_approval`, a human approves through the approval channel, then the agent applies in chat and the chat approval is asked as usual. |
 
-`request_approval` and the approval API work in every mode. In `client` mode an approval is recorded but not required, and the approval API never runs the apply.
+Only in `server` mode does the approval channel run the apply. `request_approval` is refused with `invalid_argument` in `client` mode, where the client approves and a server approval would change nothing. The approval API works in every mode; in `client` mode an approval is recorded but not required.
 
 ### Lifecycle
 
@@ -252,10 +252,11 @@ A plan can be approved without a request (for example right after planning). Eve
 
 ### Apply condition
 
-In `server` and `both` mode the consume update's condition becomes
+In every mode the consume condition refuses a rejected plan (`attribute_not_exists(rejected_by)`), even if the rejecting and the applying clock disagree about `expires_at`. In `server` and `both` mode it becomes
 
 ```
 used = false AND expires_at > :now AND args_hash = :h AND action = :a
+AND attribute_not_exists(rejected_by)
 AND status = "approved" AND attribute_exists(approved_by)
 AND approved_by <> requested_by AND approved_args_hash = args_hash
 AND approval_expires_at > :now
@@ -271,13 +272,13 @@ Approval, argument match, separation of duties, expiry and single use are one at
 6. not approved (server and both): `approval_required`, `details: {"status": "planned" | "awaiting_approval"}`;
 7. approved by the requester, or an approval of other arguments (only possible by writing the table directly): `approval_required`, `details: {"status": "approval_invalid"}`.
 
-A successful apply's `data` also carries `approved_by` when the plan was approved. Everything after the consume (blast radius, live object checks, history checks, global budget, dry run) is unchanged: an approval never lifts a guard.
+After the consume, the record's `namespace`, `name` and `replicas_to` must equal the arguments (`plan_mismatch` otherwise), so a record altered in the table cannot redirect an apply even with a matching `args_hash`. A successful apply's `data` carries `approved: true | false`; the approver's identity stays in the plan record and the logs. Everything after the consume (blast radius, live object checks, history checks, global budget, dry run) is unchanged: an approval never lifts a guard.
 
 ### `request_approval(plan_id)`
 
 `READ_ONLY` tool on `k8sr`. It approves nothing and only `plan_id` is read from the arguments, so no agent text reaches the approvers.
 
-1. `plan_id` must be a UUID (`invalid_argument`). Without a configured `APPROVAL_TOPIC_ARN` the call fails with `internal` before the plan changes.
+1. `plan_id` must be a UUID, and the mode must be `server` or `both` (`invalid_argument` otherwise, so a plan's life is never extended in `client` mode). Without a configured `APPROVAL_TOPIC_ARN` the call fails with `internal` before the plan changes.
 2. The record is read consistently: `plan_not_found`, `plan_used`, `plan_decided` (approved or rejected), `plan_expired`.
 3. If it already notified less than `APPROVAL_REQUEST_COOLDOWN_SECONDS` ago, nothing changes and nobody is notified: `ok` with `notified: false` and `retry_after`.
 4. One conditional update adds 1 to the current window's approval request counter only while it is below `APPROVAL_REQUEST_LIMIT` (`approval_rate_limited`, `details: {"limit", "window_seconds": 600, "window_start", "retry_after"}`). Clock windows, so up to twice the limit can pass across a window boundary.
@@ -293,7 +294,7 @@ The approver Lambda (`mcp/approver/`) is not a gateway target and has no MCP too
 Authorization, before anything else:
 
 1. A request without an IAM identity is `forbidden`.
-2. A caller matching `DENIED_PRINCIPALS` (the roles of the read, write, sentinel and approver Lambdas, set by Terraform) is `forbidden`, even if it is also listed as an approver: machine identities never approve.
+2. A caller matching `DENIED_PRINCIPALS` (the roles of the read, write, sentinel and approver Lambdas and of the gateway, set by Terraform) is `forbidden`, even if it is also listed as an approver: machine identities never approve.
 3. The caller must match `APPROVER_PRINCIPALS`: an IAM user ARN matches exactly that ARN (including its path); an IAM role ARN `arn:aws:iam::<account>:role[/path]/<name>` matches its sessions `arn:aws:sts::<account>:assumed-role/<name>/<any session>`. Otherwise `forbidden`.
 
 Requests (responses are the JSON envelope in the body):
@@ -303,13 +304,13 @@ Requests (responses are the JSON envelope in the body):
   - `approve`: one conditional update, `status IN (planned, awaiting_approval) AND used = false AND expires_at > now AND requested_by <> caller`, sets `status = approved`, `approved_by`, `approved_at`, `approved_args_hash = args_hash` (copied from the record in the same update), `approval_channel = api`, and `approval_expires_at = expires_at = now + APPLY_AFTER_APPROVAL_TTL_SECONDS`.
   - `reject`: the same condition; sets `status = rejected`, `rejected_by`, `rejected_at`, `reject_reason`, `expires_at = now`.
   - Refusals: `plan_not_found`, `plan_used`, `plan_decided`, `plan_expired`, `forbidden` (the requester), `conflict` (changed concurrently).
-  - In `server` and `both` mode, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id`, `namespace`, `name`, `replicas = replicas_to`, and `override_manual_change: true` only when the plan has it) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "k8sw___apply_scale_deployment"}}`, exactly as the gateway calls it. The write guard is unchanged and authoritative.
-  - Response `data`: `plan` (the view above, read again after the apply) and `apply` (the write Lambda's envelope, or `null` when no apply ran). A failed apply does not undo the approval: an approval whose apply was refused before the consume (for example `remediation_disabled`) can still be applied through the gateway until it expires.
+  - In `server` mode only, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id`, `namespace`, `name`, `replicas = replicas_to`, and `override_manual_change: true` only when the plan has it) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "k8sw___apply_scale_deployment"}}`, exactly as the gateway calls it. The write guard is unchanged and authoritative.
+  - Response `data`: `plan` (the view above, read again after the apply), `apply` (the write Lambda's envelope, or `null` when no apply ran, as always in `client` and `both` mode) and `approval_mode`. If the write Lambda cannot be invoked at all, `apply` is `internal` with the message `approval recorded; apply could not be started: <error code>`. A failed apply does not undo the approval: an approval whose apply was refused before the consume (for example `remediation_disabled`) can still be applied through the gateway until it expires.
 - Any other method: `invalid_argument`.
 
 HTTP status: 200 for `ok` (also when the triggered apply failed; see `data.apply`), 400 `invalid_argument`, 403 `forbidden`, 404 `plan_not_found`, 409 `plan_used`, `plan_expired`, `plan_decided`, `conflict`, 500 otherwise. Each decision and refusal is logged with the caller ARN and `plan_id`.
 
-`scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and asks for confirmation unless `--yes`.
+`scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and asks for confirmation unless `--yes`. When an approval ran no apply, it says that the client must now apply the plan.
 
 ### MFA and who can reach the URL
 
@@ -333,7 +334,7 @@ Known limits:
 
 ## Identity
 
-- Two IAM roles, one per tool Lambda. On the plan table: read role `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:UpdateItem` (for `request_approval` and its counter); write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only. The read role also has `sns:Publish` on the approval topic, and an explicit deny of `PutItem` and `UpdateItem` that name any approval attribute (`approved_*`, `approval_channel`, `approval_expires_at`, `rejected_*`, `reject_reason`, through `dynamodb:Attributes`). The write role has no such deny, because its consume condition reads those attributes; only its code keeps it from writing them.
+- Two IAM roles, one per tool Lambda. On the plan table: read role `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:UpdateItem` (for `request_approval` and its counter); write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only. The read role also has `sns:Publish` on the approval topic, and an explicit deny of `PutItem` and `UpdateItem` that name any approval attribute (`approved_*`, `approval_channel`, `approval_expires_at`, `rejected_*`, `reject_reason`, through `dynamodb:Attributes`). The write role has no such deny, because its consume condition reads those attributes; nothing in IAM keeps it from writing them. What is guaranteed: the read role cannot write an approval, the approver refuses the Lambda and gateway roles, and the write guard re-validates the consumed record against the request's arguments before it touches the cluster.
 - Approver role: `dynamodb:GetItem` and `dynamodb:UpdateItem` on the plan table, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS access: the apply it triggers runs as the write Lambda.
 - Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the kill switch parameter only; `bedrock-agentcore:ListGatewayTargets` and `bedrock-agentcore:GetGatewayTarget` on this gateway; `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
 - Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations.
@@ -355,7 +356,7 @@ Server-side approval, set on both tool Lambdas (the approver reads `APPROVAL_MOD
 | `APPROVAL_REQUEST_COOLDOWN_SECONDS` | 60 (`0` turns it off) | `approval_request_cooldown_seconds` |
 | `APPROVAL_REQUEST_LIMIT` | 10 per 600 s | `approval_request_limit` |
 
-Read Lambda only: `APPROVAL_TOPIC_ARN` (the approval topic) and `APPROVAL_URL` (shown in notifications). Approver: `PLANS_TABLE`, `WRITE_FUNCTION_NAME`, `APPROVER_PRINCIPALS` and `DENIED_PRINCIPALS` (comma-separated IAM user or role ARNs). Terraform variables: `approver_principals` (required in `server` and `both` mode; must not list the Lambda roles), `approval_require_mfa` (default `true`), `approval_email`; outputs `approval_url`, `approval_topic_arn`, `approver_policy_arn`.
+Read Lambda only: `APPROVAL_TOPIC_ARN` (the approval topic) and `APPROVAL_URL` (shown in notifications). Approver: `PLANS_TABLE`, `WRITE_FUNCTION_NAME`, `APPROVER_PRINCIPALS` and `DENIED_PRINCIPALS` (comma-separated IAM user or role ARNs). Terraform variables: `approver_principals` (required in `server` and `both` mode; must not list the Lambda or gateway roles), `approval_require_mfa` (default `true`), `approval_email`; outputs `approval_url`, `approval_topic_arn`, `approver_policy_arn`.
 
 History checks, set on both Lambdas; each must be a positive integer, except that the cooldown may be 0:
 

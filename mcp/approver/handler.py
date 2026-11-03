@@ -16,9 +16,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import boto3
+from botocore.exceptions import ClientError
 
 from handrail_common.approval import plan_view, sanitize_reason
-from handrail_common.config import CLIENT, ConfigError, approval_mode, int_env, required_env
+from handrail_common.config import SERVER, ConfigError, approval_mode, int_env, required_env
 from handrail_common.envelope import (
     CONFLICT,
     FORBIDDEN,
@@ -74,7 +75,9 @@ class ApproverSettings:
 
     @property
     def applies_after_approval(self) -> bool:
-        return self.approval_mode != CLIENT
+        """Only in server mode. In both mode the client's own approval must still happen, so
+        the client applies; in client mode the server approval is not required at all."""
+        return self.approval_mode == SERVER
 
 
 def _arns(env: Mapping[str, str], key: str) -> tuple[str, ...]:
@@ -176,12 +179,22 @@ def apply_arguments(item: Mapping[str, Any]) -> dict[str, Any]:
 def trigger_apply(rt: Runtime, item: Mapping[str, Any]) -> Envelope:
     """Run the apply through the write Lambda, as the gateway would call it."""
     context = {"custom": {"bedrockAgentCoreToolName": APPLY_TOOL}}
-    response = rt.lambda_client.invoke(
-        FunctionName=rt.settings.write_function,
-        InvocationType="RequestResponse",
-        ClientContext=base64.b64encode(json.dumps(context).encode()).decode(),
-        Payload=json.dumps(apply_arguments(item)).encode(),
-    )
+    try:
+        response = rt.lambda_client.invoke(
+            FunctionName=rt.settings.write_function,
+            InvocationType="RequestResponse",
+            ClientContext=base64.b64encode(json.dumps(context).encode()).decode(),
+            Payload=json.dumps(apply_arguments(item)).encode(),
+        )
+    except Exception as exc:
+        # The decision is already recorded; report that the apply did not start.
+        reason = (
+            exc.response.get("Error", {}).get("Code", "unknown")
+            if isinstance(exc, ClientError)
+            else type(exc).__name__
+        )
+        logger.exception("cannot invoke the apply of plan %s", item["plan_id"])
+        return err(INTERNAL, f"approval recorded; apply could not be started: {reason}")
     if response.get("FunctionError"):
         logger.error("apply of plan %s failed: %s", item["plan_id"], response["FunctionError"])
         return err(INTERNAL, "the apply failed to run")
@@ -226,7 +239,9 @@ def decide(rt: Runtime, event: Mapping[str, Any], approver: str) -> Envelope:
         logger.info("apply of plan %s: ok=%s", plan_id, applied.get("ok"))
         refreshed = rt.store.get(plan_id)
         item = refreshed if refreshed is not None else item
-    return ok({"plan": plan_view(item, int(rt.clock())), "apply": applied})
+    return ok(
+        {"plan": plan_view(item, int(rt.clock())), "apply": applied, "approval_mode": s.approval_mode}
+    )
 
 
 def handle(rt: Runtime, event: Mapping[str, Any]) -> Envelope:

@@ -20,7 +20,7 @@ PodDisruptionBudget for e2e-target) and deleted at the end, so each run starts
 with an empty history. It also applies
 tests/e2e/fixtures/argo-managed.yaml and creates and deletes a temporary HPA.
 
-With --approval-mode server (the deployment's approval_mode is server or both), the
+With --approval-mode server (the deployment's approval_mode is server), the
 cases that need an apply to succeed through the gateway are skipped; instead the
 server approval cases run: an apply without approval is approval_required,
 request_approval notifies once per cooldown, the approval URL refuses a Cognito
@@ -577,7 +577,7 @@ def main() -> None:
         "--approval-mode",
         choices=["client", "server"],
         default="client",
-        help="server: the deployment requires server approval (approval_mode server or both)",
+        help="server: the deployment's approval_mode is server",
     )
     args = parser.parse_args()
     started = time.time()

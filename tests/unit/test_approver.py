@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from handrail_common.config import ConfigError, load_settings
@@ -237,7 +238,8 @@ def test_approve_triggers_the_apply_with_the_plans_own_arguments(env):
         "override_manual_change": True,
     }
     applied = body["data"]["apply"]
-    assert applied["ok"] is True and applied["data"]["approved_by"] == ALICE
+    assert applied["ok"] is True and applied["data"]["approved"] is True
+    assert body["data"]["approval_mode"] == "server"
     view = body["data"]["plan"]
     assert view["status"] == "applied"
     assert view["approval"]["approved_by"] == ALICE
@@ -273,6 +275,33 @@ def test_client_mode_records_the_approval_without_applying(env):
     plan = make_plan(env.store)
     status, body = approve(env, plan)
     assert status == 200 and body["data"]["apply"] is None and env.lam.calls == []
+
+
+def test_both_mode_records_the_approval_and_leaves_the_apply_to_the_client(env):
+    """In both mode the client's own approval must still happen, so the approver never applies."""
+    env.rt.settings = settings(mode="both")
+    plan = make_plan(env.store)
+    status, body = approve(env, plan)
+    assert status == 200 and body["data"]["apply"] is None and env.lam.calls == []
+    assert body["data"]["plan"]["status"] == "approved"
+    assert body["data"]["approval_mode"] == "both"
+    assert not settings(mode="both").applies_after_approval
+    assert settings(mode="server").applies_after_approval
+
+
+def test_an_invoke_error_reports_the_recorded_approval(env):
+    class Failing:
+        def invoke(self, **_kwargs):
+            raise ClientError({"Error": {"Code": "TooManyRequestsException", "Message": "x"}}, "Invoke")
+
+    env.rt.lambda_client = Failing()
+    plan = make_plan(env.store)
+    status, body = approve(env, plan)
+    assert status == 200 and body["ok"] is True
+    error = body["data"]["apply"]["error"]
+    assert error["code"] == "internal"
+    assert error["message"] == "approval recorded; apply could not be started: TooManyRequestsException"
+    assert body["data"]["plan"]["status"] == "approved"
 
 
 def test_a_failed_apply_is_reported_and_the_approval_kept(env):

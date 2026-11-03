@@ -27,7 +27,7 @@
   },
   {
     "name": "request_approval",
-    "description": "Ask the human approvers configured on the server to approve or reject a plan returned by plan_scale_deployment. Approves nothing and changes nothing in the cluster: it marks the plan as awaiting approval, extends its validity for the wait, and notifies the approvers with the plan as recorded by the server. Approvers decide outside MCP; with server approval, the approver's decision also triggers the apply. Repeated calls within a short cooldown notify nobody again, and requests are rate limited.",
+    "description": "Ask the human approvers configured on the server to approve or reject a plan returned by plan_scale_deployment. Only when the server requires approval (server or both mode; in client mode it is refused because the client approves). Approves nothing and changes nothing in the cluster: it marks the plan as awaiting approval, keeps it valid for the approval wait counted from its creation, and notifies the approvers with the plan as recorded by the server. Approvers decide outside MCP; in server mode their approval also triggers the apply, in both mode the client applies after its own approval. Repeated calls within a short cooldown notify nobody again, and requests are rate limited.",
     "inputSchema": {
       "type": "object",
       "properties": {

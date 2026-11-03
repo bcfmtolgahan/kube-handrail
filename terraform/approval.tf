@@ -2,8 +2,8 @@
 #
 # The approver Lambda is the human approval channel: a Function URL with AWS_IAM auth,
 # outside the gateway, so no MCP client can reach it. request_approval (k8s_read)
-# notifies the approval topic; the approver records the decision and, in server and
-# both mode, runs the apply through the write Lambda.
+# notifies the approval topic; the approver records the decision and, in server
+# mode, runs the apply through the write Lambda.
 
 locals {
   approver_name = "${var.name_prefix}-approver"
@@ -18,7 +18,7 @@ locals {
   machine_role_arns = concat(
     [for r in aws_iam_role.lambda : r.arn],
     aws_iam_role.sentinel[*].arn,
-    [aws_iam_role.approver.arn],
+    [aws_iam_role.approver.arn, aws_iam_role.gateway.arn],
   )
 
   # Plan attributes only the approval channel writes (mcp/CONTRACT.md, Plan record).
@@ -117,7 +117,7 @@ resource "aws_lambda_function" "approver" {
     }
     precondition {
       condition     = length(setintersection(toset(var.approver_principals), toset(local.machine_role_arns))) == 0
-      error_message = "approver_principals must not list the kube-handrail Lambda roles; machine identities can never approve."
+      error_message = "approver_principals must not list the kube-handrail Lambda or gateway roles; machine identities can never approve."
     }
     precondition {
       condition     = var.approval_wait_ttl_seconds >= var.plan_ttl_seconds

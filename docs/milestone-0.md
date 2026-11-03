@@ -106,7 +106,7 @@ export KILL_SWITCH_PARAM=$(terraform -chdir=terraform output -raw kill_switch_pa
 .venv/bin/python tests/e2e/e2e_gateway.py --with-expiry # also waits out one plan TTL
 ```
 
-These run against `approval_mode = "client"`. Against `server` or `both`, run `tests/e2e/e2e_gateway.py --approval-mode server` with `APPROVAL_URL` set and AWS credentials of a principal listed in `approver_principals`: it skips the cases that apply through the gateway and instead checks that an apply without approval is `approval_required`, that `request_approval` notifies once per cooldown, that the approval URL refuses the Cognito token and unsigned requests, that a signed approval applies the plan and its record names the approver, and that a rejected plan cannot be applied.
+These run against `approval_mode = "client"`. Against `server`, run `tests/e2e/e2e_gateway.py --approval-mode server` with `APPROVAL_URL` set and AWS credentials of a principal listed in `approver_principals`: it skips the cases that apply through the gateway and instead checks that an apply without approval is `approval_required`, that `request_approval` notifies once per cooldown, that the approval URL refuses the Cognito token and unsigned requests, that a signed approval applies the plan and its record names the approver, and that a rejected plan cannot be applied. `both` mode is not covered by the end-to-end tests, because its apply needs the DevOps Agent chat approval.
 
 They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, the kill switch, and the oscillation breaker (a change right after an apply is `cooldown`, a single revert is allowed, a second reversal is `flapping`, a manual scale is `manual_change` unless overridden), the blast-radius budget (a plan from 1 to 3 replicas is `blast_radius_exceeded`) and the impact preview (a Service and a PodDisruptionBudget in front of `e2e-target` are reported, and a scale-down past the budget's headroom warns `pdb_headroom`). Set `APPLY_COOLDOWN_SECONDS` to the deployed value; the test waits it out after each apply. The blast-radius case expects the default `MAX_REPLICA_STEP_PERCENT` of 100 and a `max_replicas` of at least 3. The test turns the kill switch off briefly and restores it and applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas).
 
@@ -178,14 +178,14 @@ In `server` (default) and `both` mode an apply needs an approval recorded by the
    ```sh
    export APPROVAL_URL=$(terraform -chdir=terraform output -raw approval_url)
    .venv/bin/python scripts/approve.py show <plan_id>
-   .venv/bin/python scripts/approve.py approve <plan_id>              # records the approval and runs the apply
-   .venv/bin/python scripts/approve.py approve <plan_id> --no-apply   # only records it (both mode, the client applies)
+   .venv/bin/python scripts/approve.py approve <plan_id>              # records the approval; in server mode also runs the apply
+   .venv/bin/python scripts/approve.py approve <plan_id> --no-apply   # only records it, in server mode too
    .venv/bin/python scripts/approve.py reject <plan_id> --reason "..."
    ```
 
    The script signs with your AWS credentials (SigV4), prints the plan and asks for confirmation (`--yes` skips the prompt). After an approval the plan must be applied within `apply_after_approval_ttl_seconds` (default 120); a plan waiting for approval stays valid for `approval_wait_ttl_seconds` (default 900) from its creation.
 
-4. **Switch modes.** Change `approval_mode` and apply; both tool Lambdas and the approver pick it up on their next cold start (a configuration change replaces running environments). In `client` mode DevOps Agent chat works as in Milestone 0 with a single approval, and autonomous investigations can plan and request approval but not apply. In `server` mode an apply through any client without a server approval is refused with `approval_required`; the approver's apply is the way a change happens. In `both` mode the DevOps Agent chat asks for its own approval as well: approve with `--no-apply`, then approve the apply in chat.
+4. **Switch modes.** Change `approval_mode` and apply; both tool Lambdas and the approver pick it up on their next cold start (a configuration change replaces running environments). In `client` mode DevOps Agent chat works as in Milestone 0 with a single approval, and `request_approval` is refused (the client approves). In `server` mode an apply through any client without a server approval is refused with `approval_required`; the approver's apply is the way a change happens. In `both` mode the approval channel never applies: approve, then the agent applies in chat and DevOps Agent asks for its own approval as well. An autonomous investigation can plan and request approval in `server` and `both` mode; in `server` mode the approval then applies the change.
 
 ## 5. Clean up
 

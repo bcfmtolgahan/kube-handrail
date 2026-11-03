@@ -25,6 +25,7 @@ from handrail_common.envelope import (
     INTERNAL,
     KUBERNETES_ERROR,
     NOT_FOUND,
+    PLAN_MISMATCH,
     REMEDIATION_DISABLED,
     Envelope,
     ok,
@@ -152,6 +153,13 @@ def check_spec_unchanged(plan: Plan, deployment: Any) -> None:
         )
 
 
+def check_record_matches(plan: Plan, namespace: str, name: str, replicas: int) -> None:
+    """The record must describe the requested change, not only carry its hash: a record
+    altered in the table cannot redirect an apply to another object or count."""
+    if (plan.namespace, plan.name, plan.replicas_to) != (namespace, name, replicas):
+        raise GuardError(PLAN_MISMATCH, "the plan record does not match the arguments")
+
+
 def check_target(plan: Plan, deployment: Any) -> None:
     """All checks on the live Deployment; run before every patch attempt."""
     check_same_object(plan, deployment)
@@ -231,6 +239,7 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
     )
 
     try:
+        check_record_matches(plan, namespace, name, replicas)
         # Re-checked against the current setting; the plan step is not trusted.
         check_replica_step(plan.replicas_from, plan.replicas_to, s.max_replica_step_percent)
         updated = _patch(
@@ -247,17 +256,18 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
         raise
     _record(rt, plan_id, RESULT_APPLIED)
 
-    data: dict[str, Any] = {
-        "plan_id": plan_id,
-        "namespace": namespace,
-        "name": name,
-        "replicas_from": plan.replicas_from,
-        "replicas_to": replicas,
-        "resource_version": updated.metadata.resource_version,
-    }
-    if plan.approved_by is not None:
-        data["approved_by"] = plan.approved_by
-    return ok(data)
+    return ok(
+        {
+            "plan_id": plan_id,
+            "namespace": namespace,
+            "name": name,
+            "replicas_from": plan.replicas_from,
+            "replicas_to": replicas,
+            "resource_version": updated.metadata.resource_version,
+            # The approver's identity stays in the plan record and the logs.
+            "approved": plan.approved_by is not None,
+        }
+    )
 
 
 HANDLERS = {"apply_scale_deployment": apply_scale_deployment}

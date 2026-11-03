@@ -25,6 +25,7 @@ from handrail_common.envelope import (
     CONFLICT,
     GITOPS_MANAGED,
     INTERNAL,
+    INVALID_ARGUMENT,
     KUBERNETES_ERROR,
     NOT_FOUND,
     Envelope,
@@ -321,6 +322,9 @@ def request_approval(
     """Ask the configured approvers to decide on a plan. Approves nothing; only the plan_id
     is read from the arguments, so no agent text reaches the approvers."""
     plan_id = require_plan_id(args.get("plan_id"))
+    if not settings.approval_required:
+        # A server approval would change nothing, and the wait would only keep the plan alive.
+        raise GuardError(INVALID_ARGUMENT, "approval is handled by the client in client mode")
     if settings.approval_topic_arn is None:
         # Fail before the plan changes state: an approval nobody hears about cannot come.
         raise GuardError(INTERNAL, "no approval destination is configured")

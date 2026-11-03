@@ -10,7 +10,7 @@ Implementation notes:
 
 - The implemented approval channel is an IAM-authenticated approval API (a Lambda Function URL with `AWS_IAM` auth, outside the gateway) and its CLI, `scripts/approve.py`. Slack is a later channel and is not implemented.
 - MFA cannot be required in a Lambda resource policy. It is required through an identity policy that approvers are given (`approval_require_mfa`); principals with broader Lambda rights bypass it, so the approver allowlist in code is the authoritative gate.
-- In `both` mode the server cannot see the client's approval, so on the server side `both` behaves exactly like `server`.
+- In `both` mode the server cannot see the client's approval, so the apply condition is the one of `server`; the approval channel runs the apply only in `server` mode, so in `both` mode the client still applies after its own approval. `request_approval` is refused in `client` mode.
 - Separation of duties is by principal class: `requested_by` is `mcp-gateway` until per-agent identity exists, and the tool and sentinel Lambda roles are refused as approvers even if listed.
 
 ## Context

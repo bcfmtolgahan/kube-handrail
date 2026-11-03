@@ -190,6 +190,19 @@ def test_a_rejected_plan_cannot_be_applied_in_any_mode(store):
     assert (code, details) == ("approval_required", {"status": "rejected"})
 
 
+def test_a_rejected_plan_is_not_consumed_even_with_clock_skew(store):
+    # Rejected on a clock ahead of the applier's: expires_at is still in the applier's future.
+    plan = make_plan(store)
+    store.reject(plan.plan_id, HUMAN, NOW + 30, "")
+    for require_approval in (False, True):
+        with pytest.raises(GuardError) as exc:
+            store.consume(
+                plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, require_approval=require_approval
+            )
+        assert (exc.value.code, exc.value.details) == ("approval_required", {"status": "rejected"})
+    assert item(store, plan.plan_id)["used"] is False
+
+
 def test_unknown_plan_in_server_mode(store):
     plan = make_plan(store)
     missing = Plan(**{**plan.__dict__, "plan_id": str(uuid.uuid4())})
