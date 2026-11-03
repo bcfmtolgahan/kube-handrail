@@ -68,11 +68,13 @@ terraform -chdir=terraform plan -replace=aws_dynamodb_table.plans -out=tfplan
 terraform -chdir=terraform apply tfplan
 ```
 
+Terraform also deploys [server-side approval](../mcp/CONTRACT.md#server-side-approval): the approver Lambda behind the `approval_url` output and the approval topic in `approval_topic_arn` (subscribe an address with `approval_email`). `approval_mode` defaults to `server`, which needs at least one entry in `approver_principals`; set `approval_mode = "client"` to keep the Milestone 0 behavior (DevOps Agent chat approval only). See [Server-side approval](#server-side-approval) below.
+
 Keep secrets out of shell history, for example by loading them from a local `.env` file (ignored by git).
 
 ## 3. Smoke test through the gateway
 
-With the kill switch set to `true`:
+With the kill switch set to `true` and `approval_mode = "client"` (the smoke test applies through the gateway; in `server` or `both` mode each of its applies is refused with `approval_required` unless the plan is approved first, see [Server-side approval](#server-side-approval)):
 
 ```sh
 export GATEWAY_URL=... TOKEN_URL=... CLIENT_ID=... CLIENT_SECRET=... SCOPE=...
@@ -81,7 +83,7 @@ export GATEWAY_URL=... TOKEN_URL=... CLIENT_ID=... CLIENT_SECRET=... SCOPE=...
 
 The test:
 
-1. checks that `tools/list` returns exactly `k8sr___get_workload_status`, `k8sr___plan_scale_deployment` and `k8sw___apply_scale_deployment`. If semantic search is enabled on the gateway, its built-in search tool also appears and this check fails;
+1. checks that `tools/list` returns exactly `k8sr___get_workload_status`, `k8sr___plan_scale_deployment`, `k8sr___request_approval` and `k8sw___apply_scale_deployment`. If semantic search is enabled on the gateway, its built-in search tool also appears and this check fails;
 2. reads `web` status and requires 1 replica and no GitOps ownership;
 3. plans and applies a scale to 2, then checks that reusing the same `plan_id` returns `plan_used`;
 4. waits for 2 ready replicas, then plans and applies the scale back to 1.
@@ -104,6 +106,8 @@ export KILL_SWITCH_PARAM=$(terraform -chdir=terraform output -raw kill_switch_pa
 .venv/bin/python tests/e2e/e2e_gateway.py --with-expiry # also waits out one plan TTL
 ```
 
+These run against `approval_mode = "client"`. Against `server`, run `tests/e2e/e2e_gateway.py --approval-mode server` with `APPROVAL_URL` set and AWS credentials of a principal listed in `approver_principals`: it skips the cases that apply through the gateway and instead checks that an apply without approval is `approval_required`, that `request_approval` notifies once per cooldown, that the approval URL refuses the Cognito token and unsigned requests, that a signed approval applies the plan and its record names the approver, and that a rejected plan cannot be applied. `both` mode is not covered by the end-to-end tests, because its apply needs the DevOps Agent chat approval.
+
 They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, the kill switch, and the oscillation breaker (a change right after an apply is `cooldown`, a single revert is allowed, a second reversal is `flapping`, a manual scale is `manual_change` unless overridden), the blast-radius budget (a plan from 1 to 3 replicas is `blast_radius_exceeded`) and the impact preview (a Service and a PodDisruptionBudget in front of `e2e-target` are reported, and a scale-down past the budget's headroom warns `pdb_headroom`). Set `APPLY_COOLDOWN_SECONDS` to the deployed value; the test waits it out after each apply. The blast-radius case expects the default `MAX_REPLICA_STEP_PERCENT` of 100 and a `max_replicas` of at least 3. The test turns the kill switch off briefly and restores it and applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas).
 
 The guard tests never change `web`, which belongs to the smoke test; they only plan against it for read-only validation cases that never reach apply. Every case that applies or edits a Deployment uses fixtures created for the run (`e2e-target`, `e2e-flap`, `e2e-manual`: 1-replica unprivileged nginx, plus a Service and a PodDisruptionBudget for `e2e-target`) and deleted at the end, so each run starts with an empty history. The per-object and global budgets and the plan rate limit are covered by unit tests only: reaching them takes 6 or 30 real applies or 20 plans, which is slow and adds nothing the unit tests at the exact limits do not show. The same goes for the `scale_to_zero` and `service_without_endpoints` warnings, which need a plan to 0 replicas: a sandbox with `min_replicas` of 1 refuses that as `out_of_bounds`.
@@ -123,7 +127,7 @@ export ASSOCIATION_ID=...
 .venv/bin/python $R status
 ```
 
-`associate-read` associates only the two `k8sr` tools, each classified `READ_ONLY` explicitly. Confirm in chat that the agent can read `web` status and create a plan before enabling writes.
+`associate-read` associates only the `k8sr` tools (including `request_approval`), each classified `READ_ONLY` explicitly. Confirm in chat that the agent can read `web` status and create a plan before enabling writes.
 
 ```sh
 .venv/bin/python $R enable-write
@@ -152,6 +156,36 @@ Expected behavior, observed on a test cluster:
 ### Tool names inside DevOps Agent
 
 DevOps Agent prefixes each tool with the MCP server's registered name and an underscore, for example `kube-handrail_k8sw___apply_scale_deployment`. The 64-character name limit applies to this full name, so keep the server name short. `toolDetails` classifications still use the unprefixed names (`k8sw___apply_scale_deployment`).
+
+## Server-side approval
+
+In `server` (default) and `both` mode an apply needs an approval recorded by the server ([contract](../mcp/CONTRACT.md#server-side-approval)). Approvers are IAM principals outside MCP; the Cognito clients and the Lambda roles can never approve.
+
+1. **Choose the approvers.** List their ARNs exactly as `aws sts get-caller-identity` would identify them: an IAM user ARN (including its path, if any), or an IAM role ARN, which covers every session of that role. Then apply:
+
+   ```hcl
+   approval_mode       = "server"   # or "both", or "client"
+   approver_principals = ["arn:aws:iam::<account>:role/<approver-role>"]
+   approval_email      = "oncall@example.com"   # optional SNS subscription for approval requests
+   ```
+
+   With `approval_require_mfa = true` (default), attach the policy in the `approver_policy_arn` output to each approver user or role; it allows the approval URL only with MFA. For a test identity without MFA, such as an IAM user with access keys, set `approval_require_mfa = false`, which grants the listed principals in the function's resource policy instead. That setting is for test setups only.
+
+2. **Upgrade an existing deployment.** The new `request_approval` tool changes the tool set. With the DevOps Agent IDs configured, the drift sentinel reports it as drift and turns the kill switch off until the association matches. Run `enable-write` right after `terraform apply`, wait for a sentinel run to report `ok`, then set the kill switch back to `true`. Start a new chat afterwards so it sees the new tool. Plans made before the upgrade cannot be requested or approved; plan again.
+
+3. **Approve from the CLI.** An agent (in DevOps Agent, also an autonomous investigation, because the tool is `READ_ONLY`) plans and calls `request_approval`; approvers receive the plan as recorded by the server. Then:
+
+   ```sh
+   export APPROVAL_URL=$(terraform -chdir=terraform output -raw approval_url)
+   .venv/bin/python scripts/approve.py show <plan_id>
+   .venv/bin/python scripts/approve.py approve <plan_id>              # records the approval; in server mode also runs the apply
+   .venv/bin/python scripts/approve.py approve <plan_id> --no-apply   # only records it, in server mode too
+   .venv/bin/python scripts/approve.py reject <plan_id> --reason "..."
+   ```
+
+   The script signs with your AWS credentials (SigV4), prints the plan and asks for confirmation (`--yes` skips the prompt). After an approval the plan must be applied within `apply_after_approval_ttl_seconds` (default 120); a plan waiting for approval stays valid for `approval_wait_ttl_seconds` (default 900) from its creation.
+
+4. **Switch modes.** Change `approval_mode` and apply; both tool Lambdas and the approver pick it up on their next cold start (a configuration change replaces running environments). In `client` mode DevOps Agent chat works as in Milestone 0 with a single approval, and `request_approval` is refused (the client approves). In `server` mode an apply through any client without a server approval is refused with `approval_required`; the approver's apply is the way a change happens. In `both` mode the approval channel never applies: approve, then the agent applies in chat and DevOps Agent asks for its own approval as well. An autonomous investigation can plan and request approval in `server` and `both` mode; in `server` mode the approval then applies the change.
 
 ## 5. Clean up
 

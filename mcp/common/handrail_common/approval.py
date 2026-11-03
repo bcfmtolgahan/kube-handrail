@@ -1,0 +1,139 @@
+"""What an approver sees: a plan rendered from the server's own record (mcp/CONTRACT.md,
+Server-side approval). Nothing here comes from text an agent supplied.
+"""
+
+import unicodedata
+from collections.abc import Mapping
+from decimal import Decimal
+from typing import Any
+
+from handrail_common.envelope import INVALID_ARGUMENT
+from handrail_common.plans import STATUS_PLANNED, STATUS_REJECTED
+from handrail_common.validation import GuardError
+
+STATUS_APPLIED = "applied"
+STATUS_EXPIRED = "expired"
+REASON_MAX_LENGTH = 500
+APPROVE_SCRIPT = "scripts/approve.py"
+
+
+def plain(value: Any) -> Any:
+    """DynamoDB returns numbers as Decimal; every number in a plan record is an integer."""
+    if isinstance(value, Decimal):
+        return int(value)
+    if isinstance(value, Mapping):
+        return {str(k): plain(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [plain(v) for v in value]
+    return value
+
+
+def derived_status(item: Mapping[str, Any], now: int) -> str:
+    """The lifecycle state: applied and expired are derived from `used` and `expires_at`."""
+    if item.get("used") is True:
+        return STATUS_APPLIED
+    status = str(item.get("status") or STATUS_PLANNED)
+    if status == STATUS_REJECTED:
+        return status
+    if int(item.get("expires_at", 0)) <= now:
+        return STATUS_EXPIRED
+    return status
+
+
+def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
+    record = plain(item)
+    view: dict[str, Any] = {
+        "plan_id": record["plan_id"],
+        "status": derived_status(record, now),
+        "action": record.get("action"),
+        "namespace": record.get("namespace"),
+        "name": record.get("name"),
+        "replicas": {"from": record.get("replicas_from"), "to": record.get("replicas_to")},
+        "override_manual_change": record.get("override_manual_change") is True,
+        "impact": record.get("impact"),
+        "requested_by": record.get("requested_by"),
+        "created_at": record.get("created_at"),
+        "expires_at": record.get("expires_at"),
+    }
+    if "approved_by" in record:
+        view["approval"] = {
+            key: record.get(key)
+            for key in ("approved_by", "approved_at", "approval_channel", "approval_expires_at")
+        }
+    if "rejected_by" in record:
+        view["rejection"] = {
+            "rejected_by": record.get("rejected_by"),
+            "rejected_at": record.get("rejected_at"),
+            "reason": record.get("reject_reason"),
+        }
+    if "result" in record:
+        view["result"] = {"result": record.get("result"), "applied_at": record.get("applied_at")}
+    return view
+
+
+def _impact_lines(impact: Mapping[str, Any] | None) -> list[str]:
+    if not impact:
+        return ["Impact: not recorded"]
+    pods = impact.get("pods") or {}
+    lines = [
+        f"Pods: {pods.get('ready_now')} ready now, {pods.get('added')} added, "
+        f"{pods.get('removed')} removed"
+    ]
+    for pdb in impact.get("pod_disruption_budgets") or []:
+        lines.append(
+            f"PodDisruptionBudget {pdb.get('name')}: disruptions allowed now "
+            f"{pdb.get('disruptions_allowed')}"
+        )
+    for service in impact.get("services") or []:
+        lines.append(
+            f"Service {service.get('name')}: {service.get('ready_endpoints_now')} ready "
+            f"endpoints now, {service.get('projected_ready_endpoints')} projected"
+        )
+    warnings = impact.get("warnings") or []
+    lines.append("Warnings:" if warnings else "Warnings: none")
+    lines += [f"- {w.get('code')}: {w.get('message')}" for w in warnings]
+    if impact.get("truncated"):
+        lines.append("(lists truncated)")
+    return lines
+
+
+def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
+    """The approval request sent to approvers, built from plan_view only."""
+    plan_id = view["plan_id"]
+    url = approval_url or "<approval_url output>"
+    replicas = view["replicas"]
+    return "\n".join(
+        [
+            "kube-handrail: a plan is waiting for approval.",
+            "",
+            f"Plan: {plan_id}",
+            f"Deployment: {view['namespace']}/{view['name']}",
+            f"Replicas: {replicas['from']} -> {replicas['to']}",
+            f"Override manual change: {'yes' if view['override_manual_change'] else 'no'}",
+            f"Requested by: {view['requested_by']}",
+            f"Expires at (epoch seconds): {view['expires_at']}",
+            "",
+            *_impact_lines(view.get("impact")),
+            "",
+            "Review and decide with your own AWS credentials:",
+            f"  APPROVAL_URL={url} {APPROVE_SCRIPT} show {plan_id}",
+            f"  APPROVAL_URL={url} {APPROVE_SCRIPT} approve {plan_id}",
+            f'  APPROVAL_URL={url} {APPROVE_SCRIPT} reject {plan_id} --reason "..."',
+        ]
+    )
+
+
+def sanitize_reason(value: Any) -> str:
+    """An optional free-text reason: control characters removed, length bounded."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise GuardError(INVALID_ARGUMENT, "reason must be a string")
+    cleaned = "".join(
+        " " if ch in "\t\n\r" else ch
+        for ch in value
+        if ch in "\t\n\r" or not unicodedata.category(ch).startswith("C")
+    ).strip()
+    if len(cleaned) > REASON_MAX_LENGTH:
+        raise GuardError(INVALID_ARGUMENT, f"reason must be at most {REASON_MAX_LENGTH} characters")
+    return cleaned

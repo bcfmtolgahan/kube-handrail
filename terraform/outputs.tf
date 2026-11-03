@@ -42,3 +42,18 @@ output "alert_topic_arn" {
   description = "SNS topic for drift alerts and sentinel alarms, or null when the sentinel is disabled."
   value       = one(aws_sns_topic.alerts[*].arn)
 }
+
+output "approval_url" {
+  description = "Approval API (Function URL, AWS_IAM auth) for scripts/approve.py (APPROVAL_URL)."
+  value       = aws_lambda_function_url.approver.function_url
+}
+
+output "approval_topic_arn" {
+  description = "SNS topic that request_approval notifies."
+  value       = aws_sns_topic.approvals.arn
+}
+
+output "approver_policy_arn" {
+  description = "IAM policy granting access to the approval URL (with MFA when approval_require_mfa). Attach it to each approver when approval_require_mfa is true."
+  value       = aws_iam_policy.approver_invoke.arn
+}

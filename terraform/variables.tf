@@ -173,3 +173,81 @@ variable "alert_email" {
   type        = string
   default     = ""
 }
+
+variable "approval_mode" {
+  description = "client: the MCP client approves (DevOps Agent chat), the server requires no approval record. server: every apply requires a server approval. both: as server on the server side; the client approves as well."
+  type        = string
+  default     = "server"
+
+  validation {
+    condition     = contains(["client", "server", "both"], var.approval_mode)
+    error_message = "approval_mode must be client, server or both."
+  }
+}
+
+variable "approver_principals" {
+  description = "IAM user or role ARNs allowed to approve or reject plans. A role ARN covers its assumed-role sessions. Required in server and both mode."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for arn in var.approver_principals : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(user|role)/.+$", arn))])
+    error_message = "approver_principals must be IAM user or role ARNs."
+  }
+}
+
+variable "approval_require_mfa" {
+  description = "Grant access to the approval URL only through the approver_invoke policy, which requires MFA. false (test setups only) grants the listed principals in the function's resource policy, without MFA."
+  type        = bool
+  default     = true
+}
+
+variable "approval_wait_ttl_seconds" {
+  description = "Seconds from its creation a plan stays valid once an approval was requested. At least plan_ttl_seconds."
+  type        = number
+  default     = 900
+
+  validation {
+    condition     = var.approval_wait_ttl_seconds > 0 && floor(var.approval_wait_ttl_seconds) == var.approval_wait_ttl_seconds
+    error_message = "approval_wait_ttl_seconds must be a positive integer."
+  }
+}
+
+variable "apply_after_approval_ttl_seconds" {
+  description = "Seconds after an approval within which the plan must be applied."
+  type        = number
+  default     = 120
+
+  validation {
+    condition     = var.apply_after_approval_ttl_seconds > 0 && floor(var.apply_after_approval_ttl_seconds) == var.apply_after_approval_ttl_seconds
+    error_message = "apply_after_approval_ttl_seconds must be a positive integer."
+  }
+}
+
+variable "approval_request_cooldown_seconds" {
+  description = "Minimum seconds between two notifications for one plan; 0 turns the cooldown off."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.approval_request_cooldown_seconds >= 0 && floor(var.approval_request_cooldown_seconds) == var.approval_request_cooldown_seconds
+    error_message = "approval_request_cooldown_seconds must be a non-negative integer."
+  }
+}
+
+variable "approval_request_limit" {
+  description = "Approval notifications allowed across all plans in one 600-second clock window."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.approval_request_limit > 0 && floor(var.approval_request_limit) == var.approval_request_limit
+    error_message = "approval_request_limit must be a positive integer."
+  }
+}
+
+variable "approval_email" {
+  description = "Email address subscribed to the approval topic. Empty adds no subscription."
+  type        = string
+  default     = ""
+}

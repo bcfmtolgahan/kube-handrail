@@ -9,6 +9,10 @@ run within FLAP_WINDOW_SECONDS (default 600) of the first is a second reversal
 and fails with `flapping`, as it should; wait for the window to pass. Between
 the two applies the test waits out APPLY_COOLDOWN_SECONDS.
 
+It applies through the gateway, so it needs approval_mode client. In server or both
+mode its applies are refused with approval_required unless each plan is approved
+through the approval URL (scripts/approve.py approve --no-apply) before the apply.
+
 Configuration (flags override environment variables):
   GATEWAY_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET, SCOPE (optional,
   space-separated),
@@ -31,6 +35,7 @@ from mcp.client.streamable_http import create_mcp_http_client, streamable_http_c
 EXPECTED_TOOLS = {
     "k8sr___get_workload_status",
     "k8sr___plan_scale_deployment",
+    "k8sr___request_approval",
     "k8sw___apply_scale_deployment",
 }
 READY_TIMEOUT_SECONDS = 180

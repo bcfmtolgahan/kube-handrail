@@ -37,7 +37,14 @@ def retention_seconds(settings: Settings) -> int:
         settings.plan_rate_window_seconds,
         settings.apply_cooldown_seconds,
     )
-    return window + settings.plan_ttl_seconds + APPLY_GRACE_SECONDS
+    return window + max_plan_lifetime(settings) + APPLY_GRACE_SECONDS
+
+
+def max_plan_lifetime(settings: Settings) -> int:
+    """Longest a plan can stay valid after it was created: an approval can come at the last
+    moment of the wait for it and then opens a new window for the apply."""
+    wait = max(settings.plan_ttl_seconds, settings.approval_wait_ttl_seconds)
+    return wait + settings.apply_after_approval_ttl_seconds
 
 
 def _sign(value: int) -> int:

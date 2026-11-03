@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks) and 4 (measured impact preview and blast-radius budget) are implemented and tested on a test cluster; everything else is planned and not yet implemented, and the order will change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster; everything else is planned and not yet implemented, and the order will change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -52,16 +52,23 @@ See [Guards](guards.md) and [Impact preview](../mcp/CONTRACT.md#impact-preview).
 
 **Done when:** a plan that would violate a PDB or empty a Service says so in its output, and a plan over the budget is rejected even if a human would approve it.
 
-### 5. Server-side approval
+### 5. Server-side approval (implemented)
+
+See [Server-side approval](../mcp/CONTRACT.md#server-side-approval). Implemented and unit-tested: `APPROVAL_MODE`, the extended consume condition, `request_approval` with an SNS notification and per-plan and global limits, split TTLs, and the approver Lambda behind an IAM-authenticated Function URL with `scripts/approve.py`. On a test deployment:
+
+- In `server` mode (`tests/e2e/e2e_gateway.py --approval-mode server`), an apply without approval returned `approval_required`. A second `request_approval` within the cooldown notified nobody. The approval URL refused a Cognito token and an unsigned request with 403. A SigV4-signed approval by the listed approver applied the plan and the record names the approver. The applied plan could not be approved again, and a rejected plan could not be applied.
+- A DevOps Agent investigation started from a backlog task planned the change and called `request_approval`; the write Lambda was not invoked. The plan was rejected through `scripts/approve.py`.
+- In `client` mode, the DevOps Agent chat flow (plan, chat approval, apply) worked unchanged with a single approval.
+- `both` mode with a DevOps Agent chat was not tested.
 
 **Goal:** implement [ADR 0002](adr/0002-server-verified-approval.md).
 
 - Plan lifecycle `planned -> awaiting_approval -> approved -> applied | rejected | expired`.
 - Apply consumes a plan only if an approval record exists for the same arguments and the approver differs from the requester, checked in the same conditional write.
-- Approvals come only from an authenticated human channel outside MCP (Slack interactive message with verified signature; CLI/API with human identity and MFA). Machine identities can never approve. Approval rights are limited to an explicit approver group.
+- Approvals come only from an authenticated human channel outside MCP. Implemented: an IAM-authenticated approval API and CLI, with MFA through the approvers' identity policy. A Slack interactive message with a verified signature is a later channel. Machine identities can never approve. Approval rights are limited to an explicit approver list.
 - `APPROVAL_MODE = client | server | both`; `request_approval(plan_id)` as a `READ_ONLY` tool with server-configured destinations and rate limiting; split TTLs; error code `approval_required`.
 
-**Done when:** in `server` mode an apply without an approval is rejected with `approval_required`, an approval attempt with a machine token is rejected, a plan approved from Slack is applied and its record names the approver; in `client` mode the DevOps Agent chat flow works unchanged with a single approval; and an autonomous investigation can plan and request approval but still cannot call the write tool itself.
+**Done when:** in `server` mode an apply without an approval is rejected with `approval_required`, an approval attempt with a machine token is rejected, a plan approved through the approval API is applied and its record names the approver; in `client` mode the DevOps Agent chat flow works unchanged with a single approval; and an autonomous investigation can plan and request approval but still cannot call the write tool itself. That last point is DevOps Agent behavior observed in Milestone 0 (it cancels `MUTATIVE` calls outside chat), not something this repository enforces; the server's part is that `request_approval` is `READ_ONLY` and that in `server` mode the approval channel runs the apply.
 
 ### 6. Caller identity spike (parallel)
 

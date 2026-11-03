@@ -7,9 +7,11 @@ from collections.abc import Callable
 from functools import cache, partial
 from typing import Any
 
+import boto3
 from kubernetes import client as k8s
 from kubernetes.client.rest import ApiException
 
+from handrail_common.approval import notification, plain, plan_view
 from handrail_common.breaker import (
     check_history,
     check_manual_change,
@@ -22,6 +24,8 @@ from handrail_common.eks import api_client
 from handrail_common.envelope import (
     CONFLICT,
     GITOPS_MANAGED,
+    INTERNAL,
+    INVALID_ARGUMENT,
     KUBERNETES_ERROR,
     NOT_FOUND,
     Envelope,
@@ -31,7 +35,10 @@ from handrail_common.gitops import is_gitops_managed
 from handrail_common.impact import scale_impact
 from handrail_common.plans import (
     GLOBAL_BUDGET_WINDOW_SECONDS,
+    REQUESTER_GATEWAY,
     SCALE_DEPLOYMENT,
+    STATUS_AWAITING,
+    STATUS_PLANNED,
     Plan,
     PlanStore,
     global_budget_error,
@@ -45,10 +52,12 @@ from handrail_common.validation import (
     require_name,
     require_namespace,
     require_override_flag,
+    require_plan_id,
     validate_scale_args,
 )
 
 REVISION_ANNOTATION = "deployment.kubernetes.io/revision"
+APPROVAL_SUBJECT = "kube-handrail: approval requested"
 # The API server defaults spec.replicas to 1 when it is omitted.
 DEFAULT_REPLICAS = 1
 
@@ -195,10 +204,19 @@ class Clients:
     def store(self) -> PlanStore:
         return _store(self._settings.plans_table, self._settings.region)
 
+    @property
+    def sns(self) -> Any:
+        return _sns(self._settings.region)
+
 
 @cache
 def _store(table: str, region: str | None) -> PlanStore:
     return PlanStore.from_name(table, region)
+
+
+@cache
+def _sns(region: str | None) -> Any:
+    return boto3.client("sns", region_name=region)
 
 
 def get_workload_status(args: dict[str, Any], settings: Settings, clients: Clients) -> Envelope:
@@ -262,6 +280,10 @@ def plan_scale_deployment(
         created_at=now,
         expires_at=now + settings.plan_ttl_seconds,
         retain_until=now + retention_seconds(settings),
+        requested_by=REQUESTER_GATEWAY,
+        status=STATUS_PLANNED,
+        override_manual_change=override,
+        impact=impact,
     )
     clients.store.create(plan)
     checks = (
@@ -294,6 +316,43 @@ def plan_scale_deployment(
     )
 
 
+def request_approval(
+    args: dict[str, Any], settings: Settings, clients: Clients, now: int
+) -> Envelope:
+    """Ask the configured approvers to decide on a plan. Approves nothing; only the plan_id
+    is read from the arguments, so no agent text reaches the approvers."""
+    plan_id = require_plan_id(args.get("plan_id"))
+    if not settings.approval_required:
+        # A server approval would change nothing, and the wait would only keep the plan alive.
+        raise GuardError(INVALID_ARGUMENT, "approval is handled by the client in client mode")
+    if settings.approval_topic_arn is None:
+        # Fail before the plan changes state: an approval nobody hears about cannot come.
+        raise GuardError(INTERNAL, "no approval destination is configured")
+    item, retry_after = clients.store.request_approval(
+        plan_id,
+        now,
+        settings.approval_wait_ttl_seconds,
+        settings.approval_request_cooldown_seconds,
+        settings.approval_request_limit,
+    )
+    data: dict[str, Any] = {
+        "plan_id": plan_id,
+        "status": STATUS_AWAITING,
+        "expires_at": plain(item.get("expires_at")),
+        "notified": retry_after is None,
+        "approval_mode": settings.approval_mode,
+    }
+    if retry_after is not None:
+        data["retry_after"] = retry_after
+        return ok(data)
+    clients.sns.publish(
+        TopicArn=settings.approval_topic_arn,
+        Subject=APPROVAL_SUBJECT,
+        Message=notification(plan_view(item, now), settings.approval_url),
+    )
+    return ok(data)
+
+
 @cache
 def _settings() -> Settings:
     return load_settings()
@@ -304,6 +363,9 @@ HANDLERS = {
         args, _settings(), Clients(_settings())
     ),
     "plan_scale_deployment": lambda args: plan_scale_deployment(
+        args, _settings(), Clients(_settings()), int(time.time())
+    ),
+    "request_approval": lambda args: request_approval(
         args, _settings(), Clients(_settings()), int(time.time())
     ),
 }

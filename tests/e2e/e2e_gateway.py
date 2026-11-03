@@ -7,8 +7,8 @@ applies, the kill switch, the oscillation breaker (flapping and manual
 change), the blast-radius budget and the impact preview. Run it after the smoke test, against a disposable cluster only.
 
 Environment: GATEWAY_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET, KILL_SWITCH_PARAM,
-KUBECONFIG, and the usual AWS variables. Pass --with-expiry to also wait out a
-plan TTL (PLAN_TTL_SECONDS, default 300). APPLY_COOLDOWN_SECONDS (default 60) must
+KUBECONFIG, the usual AWS variables, and APPROVAL_URL with --approval-mode server.
+Pass --with-expiry to also wait out a plan TTL (PLAN_TTL_SECONDS, default 300). APPLY_COOLDOWN_SECONDS (default 60) must
 match the deployment: the test waits it out after each apply. The blast-radius
 case expects MAX_REPLICA_STEP_PERCENT=100 (the default) and MAX_REPLICAS >= 3.
 
@@ -20,6 +20,15 @@ PodDisruptionBudget for e2e-target) and deleted at the end, so each run starts
 with an empty history. It also applies
 tests/e2e/fixtures/argo-managed.yaml and creates and deletes a temporary HPA.
 
+With --approval-mode server (the deployment's approval_mode is server), the
+cases that need an apply to succeed through the gateway are skipped; instead the
+server approval cases run: an apply without approval is approval_required,
+request_approval notifies once per cooldown, the approval URL refuses a Cognito
+token and an unsigned request, an approval signed with the operator's AWS
+credentials (SigV4, service lambda) applies the plan and the record names the
+approver, and a rejected plan cannot be applied. They need APPROVAL_URL (the
+approval_url output) and an operator identity listed in approver_principals.
+
 The per-object and global hourly budgets and the plan rate limit are covered by
 unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
 scale_to_zero and service_without_endpoints warnings: they need a plan to 0
@@ -29,6 +38,7 @@ replicas, which a sandbox with MIN_REPLICAS=1 refuses as out_of_bounds.
 import argparse
 import asyncio
 import base64
+import importlib.util
 import json
 import os
 import subprocess
@@ -40,6 +50,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import boto3
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -55,6 +66,7 @@ HISTORY_SETTLE_SECONDS = 3
 # Must match the deployed APPLY_COOLDOWN_SECONDS; a lower value here makes cases fail.
 COOLDOWN_SECONDS = int(os.environ.get("APPLY_COOLDOWN_SECONDS", "60"))
 PLAN, APPLY = "k8sr___plan_scale_deployment", "k8sw___apply_scale_deployment"
+REQUEST_APPROVAL = "k8sr___request_approval"
 FIXTURE = Path(__file__).parent / "fixtures" / "argo-managed.yaml"
 UNKNOWN_PLAN = "00000000-0000-4000-8000-000000000000"
 
@@ -455,7 +467,83 @@ async def breaker_tests(gw: Gateway) -> None:
     report("manual change: apply with the planned override succeeds", envelope.get("ok") is True, code(envelope) or "ok")
 
 
-async def run(with_expiry: bool) -> None:
+def approve_script() -> Any:
+    """scripts/approve.py, for its SigV4 signing: the test signs exactly as an operator would."""
+    spec = importlib.util.spec_from_file_location("approve", Path(__file__).parents[2] / "scripts" / "approve.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def url_status(url: str, headers: dict[str, str]) -> int:
+    try:
+        return urllib.request.urlopen(urllib.request.Request(url, headers=headers)).status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+def operator_arn() -> str:
+    return boto3.client("sts").get_caller_identity()["Arn"]
+
+
+def last_plan_id(name: str) -> str:
+    return kubectl("get", f"deploy/{name}", "-o", f"jsonpath={{.metadata.annotations.kube-handrail\\.io/last-plan-id}}")
+
+
+async def approval_tests(gw: Gateway, token: str) -> None:
+    approve = approve_script()
+    url = os.environ["APPROVAL_URL"]
+    region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
+
+    plan_id = await gw.plan(TARGET, 2)
+    envelope = await gw.apply(TARGET, plan_id, 2)
+    details = (envelope.get("error") or {}).get("details")
+    report("approval: apply without approval is approval_required", code(envelope) == "approval_required" and details == {"status": "planned"}, code(envelope) or "ok")
+
+    envelope = await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+    data = envelope.get("data") or {}
+    report("approval: request_approval notifies", data.get("status") == "awaiting_approval" and data.get("notified") is True, code(envelope) or data)
+    envelope = await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+    data = envelope.get("data") or {}
+    report("approval: a second request within the cooldown notifies nobody", data.get("notified") is False and bool(data.get("retry_after")), code(envelope) or data)
+
+    show_url = f"{url.rstrip('/')}/?{urllib.parse.urlencode({'plan_id': plan_id})}"
+    status = url_status(show_url, {"Authorization": f"Bearer {token}"})
+    report("approval: the approval URL refuses a Cognito token", status == 403, status)
+    status = url_status(show_url, {})
+    report("approval: the approval URL refuses an unsigned request", status == 403, status)
+
+    status, envelope = approve.show(url, region, plan_id)
+    view = envelope.get("data") or {}
+    report(
+        "approval: show renders the server record",
+        status == 200 and view.get("status") == "awaiting_approval" and view.get("replicas") == {"from": 1, "to": 2} and bool(view.get("impact")),
+        status,
+    )
+
+    status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
+    applied = (envelope.get("data") or {}).get("apply") or {}
+    report("approval: an approval signed by an approver applies the plan", status == 200 and applied.get("ok") is True, (applied.get("error") or {}).get("code") or status)
+    report("approval: the Deployment carries the approved plan", last_plan_id(TARGET["name"]) == plan_id)
+    status, envelope = approve.show(url, region, plan_id)
+    view = envelope.get("data") or {}
+    approver = (view.get("approval") or {}).get("approved_by")
+    report("approval: the record is applied and names the approver", view.get("status") == "applied" and approver == operator_arn(), approver)
+
+    status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
+    report("approval: an applied plan cannot be approved again", status == 409 and code(envelope) == "plan_used", code(envelope))
+    reset_target()
+    await cool_down()
+
+    plan_id = await gw.plan(TARGET, 2)
+    status, envelope = approve.decide(url, region, plan_id, "reject", "e2e rejection", False)
+    report("approval: a plan can be rejected", status == 200 and (envelope.get("data") or {}).get("plan", {}).get("status") == "rejected", status)
+    envelope = await gw.apply(TARGET, plan_id, 2)
+    details = (envelope.get("error") or {}).get("details")
+    report("approval: a rejected plan cannot be applied", code(envelope) == "approval_required" and details == {"status": "rejected"}, code(envelope) or "ok")
+
+
+async def run(with_expiry: bool, approval_mode: str) -> None:
     token = fetch_token()
     auth_tests(token)
     async with streamablehttp_client(os.environ["GATEWAY_URL"], headers={"Authorization": f"Bearer {token}"}) as (read, write, _):
@@ -464,6 +552,11 @@ async def run(with_expiry: bool) -> None:
             gw = Gateway(session)
             await validation_tests(gw)
             await ownership_tests(gw)
+            if approval_mode == "server":
+                print("server approval mode: skipping the cases that apply through the gateway", flush=True)
+                await impact_tests(gw)
+                await approval_tests(gw, token)
+                return
             await plan_tests(gw, with_expiry)
             await impact_tests(gw)
             await breaker_tests(gw)
@@ -480,12 +573,18 @@ def describe(exc: BaseException) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--with-expiry", action="store_true", help="also wait out a plan TTL")
+    parser.add_argument(
+        "--approval-mode",
+        choices=["client", "server"],
+        default="client",
+        help="server: the deployment's approval_mode is server",
+    )
     args = parser.parse_args()
     started = time.time()
     web_before = web_spec()
     try:
         create_fixtures()
-        asyncio.run(run(args.with_expiry))
+        asyncio.run(run(args.with_expiry, args.approval_mode))
     except Exception as exc:
         # A case that raised (for example a plan that failed unexpectedly) still gets the
         # fixtures deleted and the summary printed.
