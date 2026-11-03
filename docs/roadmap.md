@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection) and 2 (per-object oscillation breaker) are implemented; everything else is planned and not yet implemented, and the order will change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker) and 3 (classification drift sentinel and CI checks) are implemented and tested on a test cluster; everything else is planned and not yet implemented, and the order will change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -28,7 +28,9 @@ See [Oscillation breaker](guards.md).
 
 **Done when:** a scale-up followed shortly by a scale-down of the same Deployment is rejected, a manual change is not reverted without the override, and each rejection explains the recent history.
 
-### 3. Classification drift sentinel and CI checks
+### 3. Classification drift sentinel and CI checks (implemented)
+
+See [Drift sentinel](../mcp/CONTRACT.md#drift-sentinel). Implemented: `mcp/classification.json` as the single classification source, `scripts/check_contract.py` and the GitHub Actions workflow, and the scheduled sentinel with its alert topic and alarms. On a test deployment, reclassifying the write tool as `READ_ONLY` in the DevOps Agent association was reported as `not_mutative` drift on the next run, the kill switch was turned off and the alert published; `enable-write` restored the classification, the next run was `ok`, and the kill switch was turned back on by hand. A simulated API outage (`unknown`, kill switch untouched) is covered by unit tests only.
 
 **Goal:** a write tool that loses its `MUTATIVE` classification must stop working, not start running without approval.
 
@@ -70,7 +72,7 @@ See [Oscillation breaker](guards.md).
 
 ### Later in this milestone
 
-- CI: formatting, linting, unit tests and policy validation on every change.
+- CI: linting and policy validation on every change (unit tests, the contract check and Terraform formatting and validation run since item 3).
 - Correlation ID across gateway, Lambda, DynamoDB and Kubernetes, with basic self-observability.
 - Tool output hygiene for future log and event tools: size limits, control-character stripping, secret redaction, untrusted-content delimiters.
 - DevOps Agent skills and an `AGENTS.md` describing the tool contract.
@@ -123,7 +125,7 @@ Not committed; listed for discussion.
 These are unverified and may change the design.
 
 - **Gateway authentication from DevOps Agent.** OAuth client credentials works (Milestone 0). Whether DevOps Agent's SigV4 signing works against an AgentCore Gateway with IAM inbound authorization is untested. ([Connecting MCP servers](https://docs.aws.amazon.com/devopsagent/latest/userguide/configuring-integrations-and-knowledge-connecting-mcp-servers.html))
-- **Persistence of tool classification.** Whether `MUTATIVE` / `READ_ONLY` classifications survive infrastructure-as-code updates of the MCP server association, given that unclassified tools default to `READ_ONLY`. ([Directed actions](https://docs.aws.amazon.com/devopsagent/latest/userguide/working-with-devops-agent-working-with-directed-actions.html))
+- **Persistence of tool classification.** Whether `MUTATIVE` / `READ_ONLY` classifications survive infrastructure-as-code updates of the MCP server association, given that unclassified tools default to `READ_ONLY`. Partly answered: a Terraform update of a gateway target (a changed tool description) left the association's classifications unchanged; an update of the association itself replaces its whole configuration, which is why `enable-write` writes every tool explicitly and the drift sentinel watches it. ([Directed actions](https://docs.aws.amazon.com/devopsagent/latest/userguide/working-with-devops-agent-working-with-directed-actions.html))
 - **Conditional Cedar policies and tool listing.** How argument-conditioned `permit` and `forbid` policies affect which tools appear in `tools/list`. ([Action-scoped policies](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html))
 - **DevOps Agent tool limits.** The per-call timeout and response size limit for custom MCP tools, which determine output and time budgets.
 - **Flux ownership detection.** Which labels or annotations reliably identify Flux-managed objects, so they can be blocked like Argo CD-managed ones.

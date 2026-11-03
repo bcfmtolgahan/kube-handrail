@@ -9,6 +9,8 @@ IDs are passed as flags or as AGENT_SPACE_ID, SERVICE_ID and ASSOCIATION_ID.
 OAuth client credentials are read from CLIENT_ID and CLIENT_SECRET only and
 are never printed. Region and credentials come from the standard AWS
 environment (AWS_REGION, AWS_PROFILE) or --region.
+
+Tool names and classifications come from mcp/classification.json.
 """
 
 import argparse
@@ -22,14 +24,21 @@ from typing import Any
 import boto3
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-READ_TARGET = ("k8sr", REPO_ROOT / "mcp/k8s_read/tools.json")
-WRITE_TARGET = ("k8sw", REPO_ROOT / "mcp/k8s_write/tools.json")
-ELEVATED_PREFERENCE = "elevatedActionsEnabled"
+sys.path.insert(0, str(REPO_ROOT / "mcp/common"))
+
+from handrail_common.drift import (  # noqa: E402
+    ELEVATED_PREFERENCE,
+    MUTATIVE,
+    READ_ONLY,
+    association_classifications,
+    load_classification,
+)
+
+CLASSIFICATION = REPO_ROOT / "mcp/classification.json"
 
 
-def tool_names(target: tuple[str, Path]) -> list[str]:
-    prefix, schema = target
-    return [f"{prefix}___{tool['name']}" for tool in json.loads(schema.read_text())]
+def classified(classification: str) -> dict[str, str]:
+    return {t: c for t, c in load_classification(CLASSIFICATION).items() if c == classification}
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -86,13 +95,11 @@ def mcp_configuration(classifications: dict[str, str]) -> dict[str, Any]:
 
 def current_classifications(client: Any, space_id: str, association_id: str) -> dict[str, str]:
     association = client.get_association(agentSpaceId=space_id, associationId=association_id)
-    config = association["association"]["configuration"].get("mcpserver", {})
-    details = {d["name"]: d.get("toolClassification", "READ_ONLY") for d in config.get("toolDetails", [])}
-    return {tool: details.get(tool, "READ_ONLY") for tool in config.get("tools", [])}
+    return association_classifications(association)
 
 
 def associate_read(client: Any, args: argparse.Namespace) -> None:
-    configuration = mcp_configuration({tool: "READ_ONLY" for tool in tool_names(READ_TARGET)})
+    configuration = mcp_configuration(classified(READ_ONLY))
     association = client.associate_service(
         agentSpaceId=args.agent_space_id, serviceId=args.service_id, configuration=configuration
     )["association"]
@@ -101,11 +108,8 @@ def associate_read(client: Any, args: argparse.Namespace) -> None:
 
 def enable_write(client: Any, args: argparse.Namespace) -> None:
     space_id, association_id = args.agent_space_id, args.association_id
-    classifications = current_classifications(client, space_id, association_id)
-    for tool in tool_names(READ_TARGET):
-        classifications.setdefault(tool, "READ_ONLY")
-    for tool in tool_names(WRITE_TARGET):
-        classifications[tool] = "MUTATIVE"
+    # Exactly the tools in mcp/classification.json, so a tool added by hand is removed too.
+    classifications = {**classified(READ_ONLY), **classified(MUTATIVE)}
     # The write tool is added and classified in one update; configuration is replaced wholesale.
     client.update_association(
         agentSpaceId=space_id,
@@ -123,7 +127,7 @@ def enable_write(client: Any, args: argparse.Namespace) -> None:
 
 def verify_write(client: Any, space_id: str, association_id: str) -> None:
     actual = current_classifications(client, space_id, association_id)
-    wrong = [tool for tool in tool_names(WRITE_TARGET) if actual.get(tool) != "MUTATIVE"]
+    wrong = [tool for tool in classified(MUTATIVE) if actual.get(tool) != MUTATIVE]
     if wrong:
         sys.exit(f"write tools not classified MUTATIVE after update: {wrong}")
     preferences = client.get_agent_space(agentSpaceId=space_id)["agentSpace"].get("preferences", {})

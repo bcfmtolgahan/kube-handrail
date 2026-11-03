@@ -1,0 +1,4 @@
+# Bundled into the sentinel package only. The Lambda runtime's boto3 may not know the
+# devops-agent service, so a pinned copy is shipped. Keep it equal to the boto3 pin in
+# requirements-dev.txt, whose service models include devops-agent and bedrock-agentcore-control.
+boto3==1.43.119

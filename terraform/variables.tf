@@ -126,3 +126,39 @@ variable "python" {
   type        = string
   default     = "python3"
 }
+
+variable "sentinel_enabled" {
+  description = "Deploy the drift sentinel, which turns the kill switch off when the tools or their classification drift."
+  type        = bool
+  default     = true
+}
+
+variable "sentinel_schedule" {
+  description = "EventBridge schedule expression for the drift sentinel. The unknown-result alarm assumes a run at least every 5 minutes."
+  type        = string
+  default     = "rate(5 minutes)"
+}
+
+variable "devops_agent_space_id" {
+  description = "DevOps Agent space whose association the sentinel checks. Empty skips the DevOps Agent checks. Set it only after enable-write."
+  type        = string
+  default     = ""
+}
+
+variable "devops_agent_association_id" {
+  description = "DevOps Agent association of the gateway. Set together with devops_agent_space_id."
+  type        = string
+  default     = ""
+}
+
+variable "expect_elevated_actions" {
+  description = "Expected value of elevatedActionsEnabled on the agent space; any other value is drift."
+  type        = bool
+  default     = true
+}
+
+variable "alert_email" {
+  description = "Email address subscribed to the alert topic. Empty adds no subscription."
+  type        = string
+  default     = ""
+}

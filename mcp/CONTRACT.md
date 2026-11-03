@@ -13,6 +13,13 @@ Single source of truth for handlers, infrastructure code and tests. Change this 
 
 Clients see `<target>___<tool>`, for example `k8sw___apply_scale_deployment`. Full names must be at most 64 characters and match `^[a-z0-9_]+$`.
 
+The classification of every tool is in `mcp/classification.json`, a map from full tool name to `READ_ONLY` or `MUTATIVE` (`DESTRUCTIVE` is never used). It is the only place a classification is defined: `scripts/devops_agent_register.py` registers from it (`associate-read` the `READ_ONLY` tools; `enable-write` sets the association to exactly the classified tools, which also removes any tool added by hand), Terraform passes it to the drift sentinel, and `scripts/check_contract.py` (run in CI) fails unless:
+
+- every tool in `mcp/*/tools.json` has a classification, and every classified tool exists;
+- every tool of the write target `k8sw` (`mcp/k8s_write/tools.json`), and every `apply_*` tool on any target, is `MUTATIVE`. The sentinel and the registration script refuse a classification that breaks this rule as well, so a tampered `TOOL_CLASSIFICATION` cannot make a downgraded write tool look expected;
+- every full name is at most 64 characters and matches `^[a-z0-9_]+$`;
+- `terraform/main.tf` loads each `mcp/<function>/tools.json` under the target name used in the classification.
+
 ## Dispatch
 
 The tool name is the part after `___` in `context.client_context.custom["bedrockAgentCoreToolName"]`. The event is the tool arguments object. There is no `tool_name` argument and no fallback. An unknown tool returns error code `unknown_tool`.
@@ -131,14 +138,50 @@ Known limits:
 - The global budget counts clock hours, not a sliding window, so up to twice the limit can be applied across an hour boundary.
 - The windows compare `applied_at` and `created_at`, written by one Lambda, with `now` on another; Lambda clocks are NTP-synchronised, so the skew is negligible against windows of minutes.
 
+## Drift sentinel
+
+A write tool that loses its `MUTATIVE` classification runs without approval in DevOps Agent (an unclassified tool counts as `READ_ONLY`). The sentinel is a scheduled Lambda (`mcp/sentinel/`, every 5 minutes by default) that turns remediation off when that happens. It is not a gateway target and has no MCP tools.
+
+Each run checks, against `mcp/classification.json`:
+
+1. **Gateway.** `ListGatewayTargets`, then `GetGatewayTarget` for each expected target: the tool names in the target's inline tool schema must be exactly the classified tools of that target. A missing or extra tool, a missing target, or a target that is not in the classification is drift.
+2. **DevOps Agent** (only when an agent space and association are configured). `GetAssociation`: the associated `mcpserver` tools must be exactly the classified tools, and every `MUTATIVE` tool must be associated as `MUTATIVE`; a tool without a `toolDetails` entry counts as `READ_ONLY`. A `READ_ONLY` tool associated as `MUTATIVE` only adds an approval and is not drift. `GetAgentSpace`: `elevatedActionsEnabled` (absent counts as `false`) must equal the configured expectation. Configure the IDs only after `enable-write`: before it, the write tool is not associated, which is reported as drift.
+
+The gateway, association and agent-space checks run independently. Findings from one are acted on even if another fails, because the only action is turning remediation off; a run with errors and no findings is `unknown`.
+
+Outcomes, returned and logged as one JSON line `{ "status": "ok" | "drift" | "unknown", "findings": [ { "check", "issue", "subject", ... } ], "errors": [ "<Operation>: <ErrorCode>" ] }` that is also a CloudWatch embedded metric record (namespace `<name_prefix>/sentinel`, metrics `Drift` and `Unknown`, 0 or 1 per run):
+
+| Status | When | Action |
+|---|---|---|
+| `ok` | No finding. | None. |
+| `drift` | At least one finding (issues `missing_tool`, `extra_tool`, `missing_target`, `extra_target`, `not_mutative`, `elevated_actions`). | Set the kill switch parameter to `false` (skipped if it already is), then publish an alert to the SNS topic listing the findings by tool name only. If either step fails, the run still does the other, then fails, so it is retried and the error alarm fires. |
+| `unknown` | Any API error (including throttling and missing permissions), a response that cannot be read, a gateway target that is not `READY`, or invalid configuration. | Log the error code and operation (not the message), emit `Unknown = 1`. The kill switch is never touched and no drift alert is sent. A CloudWatch alarm notifies the same topic after 3 consecutive 5-minute periods with an unknown result or with no run at all (missing data counts as breaching). |
+
+The sentinel only ever writes `false`. Restoring remediation is manual:
+
+1. Find the cause in the alert and fix it, for example a registration update that dropped `toolDetails`.
+2. Re-run `scripts/devops_agent_register.py enable-write`, which reclassifies from `mcp/classification.json` and exits non-zero unless the write tools are `MUTATIVE` and elevated actions are on. For gateway drift, re-apply Terraform.
+3. Wait for a sentinel run to report `ok` (or invoke the function), then set the kill switch parameter back to `true`: `aws ssm put-parameter --overwrite --name <kill_switch_parameter> --value true`.
+
+Configuration (environment variables, set by Terraform): `GATEWAY_ID`, `REMEDIATION_ENABLED_PARAM` (the write Lambda's kill switch), `ALERT_TOPIC_ARN`, `METRIC_NAMESPACE`, `TOOL_CLASSIFICATION` (the content of `mcp/classification.json`), `AGENT_SPACE_ID` and `ASSOCIATION_ID` (both or neither; empty skips the DevOps Agent checks), `EXPECT_ELEVATED_ACTIONS` (`true` or `false`, default `true`). Terraform variables: `sentinel_enabled`, `sentinel_schedule`, `devops_agent_space_id`, `devops_agent_association_id`, `expect_elevated_actions`, `alert_email`.
+
+Known limits:
+
+- A Terraform apply that changes the tool set updates the gateway targets before the sentinel's own configuration; a run in between reports drift and turns remediation off.
+- Detection takes up to one schedule interval; until then a misclassified write tool runs without approval, within the server-side limits.
+- The sentinel sees what the control-plane APIs report, not what a running DevOps Agent chat has cached (a chat keeps the tool list it was created with).
+- It watches one association in one agent space. Another association of the same gateway, in this or another agent space, is not checked; server-side approval (Milestone 1, item 5) removes the dependency on client classification.
+- It compares tool names, not the Lambda function behind a target. Changing a target's function needs gateway write access, which is outside what classification drift covers.
+
 ## Runtime and packaging
 
 - Python 3.12, `x86_64`, pinned in one Terraform local.
-- Dependencies installed by Terraform-driven build into `build/<function>/` with `pip install --target build/<function> --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12`, plus `mcp/common/`. `archive_file` zips `build/<function>/`.
+- Dependencies installed by Terraform-driven build into `build/<function>/` with `pip install --target build/<function> --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 -r <requirements>`, plus `mcp/common/`. `archive_file` zips `build/<function>/`. The tool Lambdas use `requirements.txt`; the sentinel uses `mcp/sentinel/requirements.txt`, which bundles its own `boto3` because the runtime's copy may not know the `devops-agent` service. That pin must match the `boto3` pin in `requirements-dev.txt`, whose service models include `devops-agent` and `bedrock-agentcore-control`.
 
 ## Identity
 
 - Two IAM roles, one per Lambda. On the plan table: read role `dynamodb:PutItem` and `dynamodb:GetItem`; write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only.
+- Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the kill switch parameter only; `bedrock-agentcore:ListGatewayTargets` and `bedrock-agentcore:GetGatewayTarget` on this gateway; `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
 - Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations.
 - RBAC in the sandbox namespace only:
   - reader: `get`, `list` on `deployments`, `horizontalpodautoscalers`;
