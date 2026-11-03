@@ -18,6 +18,26 @@ def test_settings_parse():
     assert s.allowed_namespaces == {"sandbox", "demo"}
     assert (s.min_replicas, s.max_replicas, s.plan_ttl_seconds) == (0, 5, 300)
     assert s.remediation_enabled_param is None
+    assert (s.flap_window_seconds, s.object_hourly_apply_budget) == (600, 6)
+    assert (s.plan_rate_limit, s.plan_rate_window_seconds) == (20, 600)
+    assert (s.apply_cooldown_seconds, s.global_hourly_apply_budget) == (60, 30)
+
+
+def test_breaker_settings_parse():
+    s = load_settings(
+        BASE
+        | {
+            "FLAP_WINDOW_SECONDS": "900",
+            "OBJECT_HOURLY_APPLY_BUDGET": "3",
+            "PLAN_RATE_LIMIT": "10",
+            "PLAN_RATE_WINDOW_SECONDS": "300",
+            "APPLY_COOLDOWN_SECONDS": "0",
+            "GLOBAL_HOURLY_APPLY_BUDGET": "12",
+        }
+    )
+    assert (s.flap_window_seconds, s.object_hourly_apply_budget) == (900, 3)
+    assert (s.plan_rate_limit, s.plan_rate_window_seconds) == (10, 300)
+    assert (s.apply_cooldown_seconds, s.global_hourly_apply_budget) == (0, 12)
 
 
 @pytest.mark.parametrize(
@@ -29,6 +49,12 @@ def test_settings_parse():
         {"MIN_REPLICAS": "6"},
         {"PLAN_TTL_SECONDS": "0"},
         {"MAX_REPLICAS": ""},
+        {"FLAP_WINDOW_SECONDS": "0"},
+        {"OBJECT_HOURLY_APPLY_BUDGET": "-1"},
+        {"PLAN_RATE_LIMIT": "x"},
+        {"PLAN_RATE_WINDOW_SECONDS": "0"},
+        {"APPLY_COOLDOWN_SECONDS": "-1"},
+        {"GLOBAL_HOURLY_APPLY_BUDGET": "0"},
     ],
 )
 def test_settings_invalid(override):

@@ -72,6 +72,14 @@ def validate_scale_args(
     return namespace, name, replicas
 
 
+def require_override_flag(args: Mapping[str, Any]) -> bool:
+    """Optional `override_manual_change`; absent means false, anything but a boolean is refused."""
+    value = args.get("override_manual_change", False)
+    if not isinstance(value, bool):
+        raise GuardError(INVALID_ARGUMENT, "override_manual_change must be a boolean")
+    return value
+
+
 def require_plan_id(value: Any) -> str:
     """Plan ids are lowercase canonical UUIDs, exactly as issued."""
     try:

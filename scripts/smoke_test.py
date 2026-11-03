@@ -4,6 +4,11 @@
 Gets a client-credentials token, lists tools, scales the sandbox Deployment
 1 -> 2 -> 1 through plan/apply and checks that a plan cannot be reused.
 
+1 -> 2 -> 1 is a single revert, which the oscillation breaker allows. A second
+run within FLAP_WINDOW_SECONDS (default 600) of the first is a second reversal
+and fails with `flapping`, as it should; wait for the window to pass. Between
+the two applies the test waits out APPLY_COOLDOWN_SECONDS.
+
 Configuration (flags override environment variables):
   GATEWAY_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET, SCOPE (optional,
   space-separated),
@@ -30,6 +35,7 @@ EXPECTED_TOOLS = {
 }
 READY_TIMEOUT_SECONDS = 180
 CONFLICT_RETRIES = 3
+COOLDOWN_WAIT_LIMIT_SECONDS = 600
 
 
 class SmokeTestError(Exception):
@@ -120,7 +126,19 @@ async def wait_ready(gw: Gateway, namespace: str, name: str, replicas: int) -> N
 
 
 async def plan(gw: Gateway, args: dict[str, Any]) -> str:
-    data = await gw.call_ok("k8sr___plan_scale_deployment", args)
+    envelope = await gw.call("k8sr___plan_scale_deployment", args)
+    if not envelope["ok"] and envelope["error"]["code"] == "cooldown":
+        # The scale-down follows the scale-up within APPLY_COOLDOWN_SECONDS; wait it out once.
+        wait = envelope["error"]["details"]["retry_after"] - int(time.time()) + 1
+        print(f"cooldown: waiting {wait}s before planning again")
+        await asyncio.sleep(min(max(wait, 1), COOLDOWN_WAIT_LIMIT_SECONDS))
+        envelope = await gw.call("k8sr___plan_scale_deployment", args)
+    if not envelope["ok"]:
+        hint = ""
+        if envelope["error"]["code"] == "flapping":
+            hint = " (the smoke test ran recently; wait for FLAP_WINDOW_SECONDS to pass)"
+        raise SmokeTestError(f"k8sr___plan_scale_deployment: {envelope['error']}{hint}")
+    data = envelope["data"]
     plan_id = data["plan_id"]
     print(f"ok: planned {args} as {plan_id}")
     return plan_id

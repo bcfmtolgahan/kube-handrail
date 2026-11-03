@@ -62,10 +62,10 @@ This is the target design. Implemented today (Milestone 0): the `k8sr` and `k8sw
 
 A remediation follows this sequence:
 
-1. **Plan.** The agent calls a read-only tool such as `plan_scale_deployment`. It reads current state, runs preflight checks (HPA and GitOps ownership today; PodDisruptionBudget and revision history are planned), computes the diff locally, and stores a plan with `plan_id`, `args_hash`, the object's `uid`, `generation` and current replica count, and a short expiry.
+1. **Plan.** The agent calls a read-only tool such as `plan_scale_deployment`. It reads current state, runs preflight checks (HPA and GitOps ownership, and the [oscillation breaker](docs/guards.md) today; PodDisruptionBudget and revision history are planned), computes the diff locally, and stores a plan with `plan_id`, `args_hash`, the object's `uid`, `generation` and current replica count, and a short expiry.
 2. **Policy.** The matching `apply_*` call passes through Cedar at the gateway, which checks tool arguments (namespace allowlist, replica bounds). Planned; today the same limits are enforced only by the write Lambda.
 3. **Approve.** The client shows the exact arguments to a human. In DevOps Agent this is the chat approval for a `MUTATIVE` tool.
-4. **Apply.** The write Lambda's guard re-validates everything: plan exists, is unexpired and unused (single-use, conditional write), arguments match, the object is the same one with an unchanged spec and no GitOps marker, kill switch is on. Cooldown and hourly budget are planned. It then runs a server-side dry run and the real patch, with a `resourceVersion` precondition so nothing can change in between.
+4. **Apply.** The write Lambda's guard re-validates everything: plan exists, is unexpired and unused (single-use, conditional write), arguments match, the object is the same one with an unchanged spec and no GitOps marker, kill switch is on, and the [oscillation breaker](docs/guards.md) (manual-change override, per-object cooldown, flapping, per-object and global hourly apply budgets) still allows the change. It then runs a server-side dry run and the real patch, with a `resourceVersion` precondition so nothing can change in between.
 5. **Audit.** The result is written to DynamoDB with a correlation ID that is also annotated on the target object and traceable through gateway and Kubernetes audit logs.
 
 ## Design principles
@@ -82,7 +82,7 @@ A remediation follows this sequence:
 - **GitOps-aware.** Resources managed by Argo CD (and Flux, once its ownership markers are validated) are not modified; the plan returns the error `gitops_managed`. ([Argo CD resource tracking](https://argo-cd.readthedocs.io/en/stable/user-guide/resource_tracking/))
 - **No delete-class tools.** No delete, no generic `apply_yaml`. The first action is scale; restart and rollback of Deployments are planned.
 - **Tool output is untrusted (planned).** Logs, events and alert annotations are size-limited, stripped of control characters, redacted for secret patterns and wrapped in explicit untrusted-content delimiters. ([OWASP LLM01](https://genai.owasp.org/llmrisk/llm01-prompt-injection/))
-- **Bounded blast radius.** A kill switch in SSM Parameter Store is implemented. Reserved concurrency on the write Lambda and a global hourly apply budget are planned.
+- **Bounded blast radius.** A kill switch in SSM Parameter Store, a per-object cooldown, and per-object and global hourly apply budgets.
 
 ## Non-goals
 
@@ -126,6 +126,7 @@ AGENTS.md        tool contract for MCP clients
 - [ADR 0001: Scope](docs/adr/0001-scope.md) - why a complement layer and not another AI SRE agent
 - [ADR 0002: Server-verified approval](docs/adr/0002-server-verified-approval.md) - approvals pinned to exact arguments and verified by the server
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
+- [Oscillation breaker](docs/guards.md) - flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks
 - [Roadmap](docs/roadmap.md) - milestones and open questions
 
 ## Contributing

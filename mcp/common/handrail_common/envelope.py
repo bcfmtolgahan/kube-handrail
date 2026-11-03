@@ -14,6 +14,12 @@ PLAN_USED = "plan_used"
 PLAN_MISMATCH = "plan_mismatch"
 CONFLICT = "conflict"
 REMEDIATION_DISABLED = "remediation_disabled"
+FLAPPING = "flapping"
+OBJECT_BUDGET_EXCEEDED = "object_budget_exceeded"
+PLAN_RATE_LIMITED = "plan_rate_limited"
+MANUAL_CHANGE = "manual_change"
+COOLDOWN = "cooldown"
+GLOBAL_BUDGET_EXCEEDED = "global_budget_exceeded"
 KUBERNETES_ERROR = "kubernetes_error"
 INTERNAL = "internal"
 
@@ -31,6 +37,12 @@ ERROR_CODES = frozenset(
         PLAN_MISMATCH,
         CONFLICT,
         REMEDIATION_DISABLED,
+        FLAPPING,
+        OBJECT_BUDGET_EXCEEDED,
+        PLAN_RATE_LIMITED,
+        MANUAL_CHANGE,
+        COOLDOWN,
+        GLOBAL_BUDGET_EXCEEDED,
         KUBERNETES_ERROR,
         INTERNAL,
     }

@@ -41,17 +41,12 @@ CONTEXT = SimpleNamespace(
 
 
 @pytest.fixture
-def aws(monkeypatch):
+def aws(monkeypatch, plans_table):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     with mock_aws():
-        boto3.resource("dynamodb", region_name=REGION).create_table(
-            TableName=TABLE,
-            KeySchema=[{"AttributeName": "plan_id", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "plan_id", "AttributeType": "S"}],
-            BillingMode="PAY_PER_REQUEST",
-        )
+        plans_table(TABLE, REGION)
         yield
 
 
@@ -107,7 +102,9 @@ def rt(aws, monkeypatch):
     return rt, apps
 
 
-def create_plan(store: PlanStore, replicas: int = 3, expires_at: int = NOW + 300) -> Plan:
+def create_plan(
+    store: PlanStore, replicas: int = 3, expires_at: int = NOW + 300, override: bool = False
+) -> Plan:
     plan = Plan(
         plan_id=str(uuid.uuid4()),
         action=SCALE_DEPLOYMENT,
@@ -115,7 +112,7 @@ def create_plan(store: PlanStore, replicas: int = 3, expires_at: int = NOW + 300
         name="web",
         replicas_from=1,
         replicas_to=replicas,
-        args_hash=scale_args_hash("sandbox", "web", replicas),
+        args_hash=scale_args_hash("sandbox", "web", replicas, override),
         resource_version="12345",
         generation=4,
         uid=UID,
@@ -477,3 +474,286 @@ def test_record_failure_does_not_fail_apply(rt, monkeypatch):
 
     monkeypatch.setattr(runtime_.store, "record_result", broken)
     assert apply(plan.plan_id)["ok"] is True
+
+
+# --- Oscillation breaker, re-checked after consume and the spec check -------
+
+KEY = f"sandbox/web/{UID}"
+
+
+def seed(
+    replicas_from: int,
+    replicas_to: int,
+    applied_at: int,
+    key: str = KEY,
+    indexed: bool = True,
+    result: str | None = "applied",
+) -> str:
+    """An earlier applied plan for the object.
+
+    `indexed=False` leaves out object_key, so the record is not in the history index (an
+    apply the eventually consistent index has not caught up with). `result=None` is an apply
+    whose result was never recorded.
+    """
+    plan_id = str(uuid.uuid4())
+    item = {
+        "plan_id": plan_id,
+        "action": SCALE_DEPLOYMENT,
+        "namespace": "sandbox",
+        "name": "web",
+        "replicas_from": replicas_from,
+        "replicas_to": replicas_to,
+        "args_hash": "h",
+        "resource_version": "1",
+        "generation": 1,
+        "uid": key.rsplit("/", 1)[1],
+        "created_at": applied_at - 10,
+        "expires_at": applied_at + 290,
+        "used": True,
+    }
+    if indexed:
+        item["object_key"] = key
+    if result is not None:
+        item |= {"result": result, "applied_at": applied_at}
+    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).put_item(Item=item)
+    return plan_id
+
+
+def test_apply_rejects_flapping_after_consuming_the_plan(rt):
+    runtime_, apps = rt
+    seed(1, 2, NOW - 200)
+    seed(2, 1, NOW - 100)
+    plan = create_plan(runtime_.store)  # 1 -> 3 reverses the last change a second time
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "flapping"
+    assert response["error"]["details"]["history"] == [
+        {"applied_at": NOW - 200, "from": 1, "to": 2},
+        {"applied_at": NOW - 100, "from": 2, "to": 1},
+    ]
+    apps.patch_namespaced_deployment.assert_not_called()
+    record = item(plan.plan_id)
+    assert record["used"] is True
+    assert record["result"] == "flapping"
+
+
+def test_apply_allows_a_single_revert(rt):
+    runtime_, _ = rt
+    seed(3, 1, NOW - 100)
+    assert apply(create_plan(runtime_.store).plan_id)["ok"] is True
+
+
+def test_apply_history_of_a_replaced_object_does_not_count(rt):
+    runtime_, _ = rt
+    old = "sandbox/web/8f7c1a2e-0000-4000-8000-000000000002"
+    seed(1, 2, NOW - 200, key=old)
+    seed(2, 1, NOW - 100, key=old)
+    assert apply(create_plan(runtime_.store).plan_id)["ok"] is True
+
+
+def test_apply_rejects_object_over_hourly_budget(rt):
+    runtime_, apps = rt
+    for i in range(6):
+        seed(1, 3, NOW - 3000 + i)
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "object_budget_exceeded"
+    assert response["error"]["details"]["count"] == 6
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "object_budget_exceeded"
+
+
+def test_apply_budget_does_not_count_the_plan_being_applied(rt):
+    runtime_, _ = rt
+    for i in range(5):
+        seed(1, 3, NOW - 3000 + i)
+    assert apply(create_plan(runtime_.store).plan_id)["ok"] is True
+
+
+def test_apply_does_not_check_the_plan_rate(rt):
+    runtime_, _ = rt
+    plans = [create_plan(runtime_.store) for _ in range(25)]
+    assert apply(plans[-1].plan_id)["ok"] is True
+
+
+def test_apply_rejects_manual_change(rt):
+    runtime_, apps = rt
+    last = seed(3, 2, NOW - 100)  # kube-handrail left it at 2; it now has 1
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "manual_change"
+    assert response["error"]["details"] == {"last_applied_to": 2, "current": 1}
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "manual_change"
+
+
+def test_apply_rejects_manual_change_when_the_apply_result_was_not_recorded(rt):
+    runtime_, apps = rt
+    last = seed(3, 2, NOW - 100, result=None)  # patched to 2, then record_result failed
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    plan = create_plan(runtime_.store)
+
+    assert error_code(apply(plan.plan_id)) == "manual_change"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_apply_rejects_flapping_when_the_index_missed_the_last_apply(rt):
+    runtime_, apps = rt
+    seed(1, 2, NOW - 200)
+    last = seed(2, 1, NOW - 100, indexed=False)  # not in the index yet; the annotation names it
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    plan = create_plan(runtime_.store)  # 1 -> 3: a second reversal
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "flapping"
+    assert [(h["from"], h["to"]) for h in response["error"]["details"]["history"]] == [
+        (1, 2),
+        (2, 1),
+    ]
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "flapping"
+
+
+def test_apply_budget_counts_an_apply_the_index_missed(rt):
+    runtime_, apps = rt
+    for i in range(5):
+        seed(1, 3, NOW - 3000 + i)
+    # Unrecorded, so it counts as applied at expires_at; old enough to be past the cooldown.
+    last = seed(3, 1, NOW - 400, indexed=False, result=None)
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    plan = create_plan(runtime_.store)
+
+    assert error_code(apply(plan.plan_id)) == "object_budget_exceeded"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_apply_with_override_allows_manual_change(rt):
+    runtime_, apps = rt
+    last = seed(3, 2, NOW - 100)
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    plan = create_plan(runtime_.store, override=True)
+
+    assert apply(plan.plan_id, override_manual_change=True)["ok"] is True
+    assert item(plan.plan_id)["result"] == "applied"
+
+
+@pytest.mark.parametrize(("planned", "applied"), [(True, None), (True, False), (False, True)])
+def test_override_flag_must_match_the_plan(rt, planned, applied):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store, override=planned)
+    overrides = {} if applied is None else {"override_manual_change": applied}
+
+    assert error_code(apply(plan.plan_id, **overrides)) == "plan_mismatch"
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["used"] is False
+
+
+def test_override_false_matches_a_plan_without_it(rt):
+    runtime_, _ = rt
+    plan = create_plan(runtime_.store)
+    assert apply(plan.plan_id, override_manual_change=False)["ok"] is True
+
+
+def test_apply_override_must_be_boolean(rt):
+    runtime_, _ = rt
+    plan = create_plan(runtime_.store)
+    assert error_code(apply(plan.plan_id, override_manual_change="yes")) == "invalid_argument"
+    assert item(plan.plan_id)["used"] is False
+
+
+@pytest.mark.parametrize("method", ["history", "consumed_plan"])
+def test_apply_fails_closed_when_history_cannot_be_read(rt, monkeypatch, method):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: str(uuid.uuid4())}
+    )
+    plan = create_plan(runtime_.store)
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("throttled")
+
+    monkeypatch.setattr(runtime_.store, method, broken)
+    response = apply(plan.plan_id)
+
+    assert response["error"] == {"code": "internal", "message": "internal error"}
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "internal"
+
+
+def test_apply_checks_history_after_the_spec_check(rt, monkeypatch):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.return_value = deployment(generation=5)
+    plan = create_plan(runtime_.store)
+    calls = []
+    monkeypatch.setattr(runtime_.store, "history", lambda *a: calls.append(a) or [])
+
+    assert error_code(apply(plan.plan_id)) == "conflict"
+    assert calls == []
+
+
+def test_apply_checks_history_once_across_retries(rt, monkeypatch):
+    runtime_, apps = rt
+    apps.patch_namespaced_deployment.side_effect = [
+        conflict(),
+        SimpleNamespace(metadata=SimpleNamespace(resource_version="12347")),
+        SimpleNamespace(metadata=SimpleNamespace(resource_version="12348")),
+    ]
+    plan = create_plan(runtime_.store)
+    calls = []
+    monkeypatch.setattr(runtime_.store, "history", lambda *a: calls.append(a) or [])
+
+    assert apply(plan.plan_id)["ok"] is True
+    assert len(calls) == 1
+
+
+def test_apply_takes_one_unit_of_the_global_budget(rt):
+    runtime_, _ = rt
+    assert apply(create_plan(runtime_.store).plan_id)["ok"] is True
+    assert runtime_.store.global_applies(NOW) == 1
+
+
+def test_apply_rejects_when_the_global_budget_is_spent(rt):
+    runtime_, apps = rt
+    for _ in range(runtime_.settings.global_hourly_apply_budget):
+        runtime_.store.take_global_budget(NOW, runtime_.settings.global_hourly_apply_budget)
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "global_budget_exceeded"
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "global_budget_exceeded"
+
+
+def test_apply_refused_by_another_check_does_not_use_the_global_budget(rt):
+    runtime_, _ = rt
+    for i in range(6):
+        seed(1, 3, NOW - 3000 + i)
+    assert error_code(apply(create_plan(runtime_.store).plan_id)) == "object_budget_exceeded"
+    assert runtime_.store.global_applies(NOW) == 0
+
+
+def test_apply_rejects_a_change_within_the_cooldown(rt):
+    runtime_, apps = rt
+    seed(3, 1, NOW - 30)
+    response = apply(create_plan(runtime_.store).plan_id)
+    assert error_code(response) == "cooldown"
+    assert response["error"]["details"]["retry_after"] == NOW + 30
+    apps.patch_namespaced_deployment.assert_not_called()

@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -11,7 +12,8 @@ from kubernetes.client.rest import ApiException
 from moto import mock_aws
 
 from handrail_common.config import Settings
-from handrail_common.plans import PlanStore, scale_args_hash
+from handrail_common.breaker import LAST_PLAN_ANNOTATION, retention_seconds
+from handrail_common.plans import PlanStore, object_key, scale_args_hash
 from handrail_common.validation import GuardError, require_plan_id
 
 HANDLER_PATH = Path(__file__).resolve().parents[2] / "mcp" / "k8s_read" / "handler.py"
@@ -89,18 +91,12 @@ def hpa(target_name: str, kind: str = "Deployment") -> k8s.V2HorizontalPodAutosc
 
 
 @pytest.fixture
-def table(monkeypatch):
+def table(monkeypatch, plans_table):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     with mock_aws():
-        dynamodb = boto3.resource("dynamodb", region_name=REGION)
-        yield dynamodb.create_table(
-            TableName=TABLE,
-            KeySchema=[{"AttributeName": "plan_id", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "plan_id", "AttributeType": "S"}],
-            BillingMode="PAY_PER_REQUEST",
-        )
+        yield plans_table(TABLE, REGION)
 
 
 @pytest.fixture
@@ -144,6 +140,17 @@ def test_plan_stores_record_and_returns_diff(clients, table):
     assert (item["replicas_from"], item["replicas_to"]) == (2, 3)
     assert (item["created_at"], item["expires_at"]) == (NOW, NOW + 300)
     assert item["used"] is False
+    assert item["object_key"] == "sandbox/web/8f7c1a2e-0000-4000-8000-000000000001"
+    assert item["retain_until"] == NOW + retention_seconds(SETTINGS)
+    assert data["override_manual_change"] is False
+    assert [check["check"] for check in data["preflight"]][-6:] == [
+        "no_manual_change",
+        "cooldown",
+        "not_flapping",
+        "object_budget",
+        "plan_rate",
+        "global_budget",
+    ]
 
 
 def test_plan_defaults_missing_replicas_to_one(clients):
@@ -327,3 +334,232 @@ def test_lambda_handler_missing_config_is_internal(monkeypatch):
     )
     handler._settings.cache_clear()
     assert result["error"] == {"code": "internal", "message": "internal error"}
+
+
+# --- Oscillation breaker ----------------------------------------------------
+
+UID = "8f7c1a2e-0000-4000-8000-000000000001"
+KEY = object_key("sandbox", "web", UID)
+
+
+def seed(
+    table,
+    replicas_from: int,
+    replicas_to: int,
+    created_at: int,
+    applied_at: int | None = None,
+    key: str = KEY,
+    plan_id: str | None = None,
+    indexed: bool = True,
+    result: str | None = "applied",
+) -> str:
+    """Write a plan record directly, as an earlier plan (and apply) would have.
+
+    `indexed=False` leaves out object_key, so the record is not in the history index: this
+    stands in for an apply the eventually consistent index has not caught up with.
+    `result=None` with an applied_at stands in for an apply whose result was never recorded.
+    """
+    plan_id = plan_id or str(uuid.uuid4())
+    item = {
+        "plan_id": plan_id,
+        "action": "scale_deployment",
+        "namespace": "sandbox",
+        "name": "web",
+        "replicas_from": replicas_from,
+        "replicas_to": replicas_to,
+        "args_hash": "h",
+        "resource_version": "1",
+        "generation": 1,
+        "uid": key.rsplit("/", 1)[1],
+        "created_at": created_at,
+        "expires_at": created_at + 300,
+        "used": applied_at is not None,
+    }
+    if indexed:
+        item["object_key"] = key
+    if applied_at is not None and result is not None:
+        item |= {"result": result, "applied_at": applied_at}
+    table.put_item(Item=item)
+    return plan_id
+
+
+def test_plan_allows_a_single_revert(clients, table):
+    seed(table, 1, 2, NOW - 100, NOW - 90)
+    assert plan(clients, replicas=1)["ok"] is True
+
+
+def test_plan_rejects_second_reversal(clients, table):
+    seed(table, 1, 2, NOW - 200, NOW - 190)
+    seed(table, 2, 1, NOW - 100, NOW - 90)
+    with pytest.raises(GuardError) as exc:
+        plan(clients, replicas=3)
+    assert exc.value.code == "flapping"
+    assert exc.value.details["requested"] == {"from": 2, "to": 3}
+    assert [h["to"] for h in exc.value.details["history"]] == [2, 1]
+    assert table.scan()["Count"] == 2
+
+
+def test_recreated_deployment_starts_a_new_history(clients, table):
+    old = object_key("sandbox", "web", "8f7c1a2e-0000-4000-8000-000000000002")
+    seed(table, 1, 2, NOW - 200, NOW - 190, key=old)
+    seed(table, 2, 1, NOW - 100, NOW - 90, key=old)
+    for i in range(6):
+        seed(table, 1, 2, NOW - 50 - i, NOW - 40 - i, key=old)
+    assert plan(clients, replicas=3)["ok"] is True
+
+
+def test_plan_rejects_object_over_hourly_budget(clients, table):
+    for i in range(6):
+        seed(table, 1, 2, NOW - 3000 + i, NOW - 2990 + i)
+    assert plan_error(clients) == "object_budget_exceeded"
+
+
+def test_plan_budget_counts_applies_of_plans_created_before_the_window(clients, table):
+    # Created 3650 s ago, applied 3590 s ago: inside the hour.
+    seed(table, 1, 2, NOW - 3650, NOW - 3590)
+    for i in range(5):
+        seed(table, 1, 2, NOW - 100 + i, NOW - 90 + i)
+    assert plan_error(clients) == "object_budget_exceeded"
+
+
+def test_plan_rate_limit(clients, table):
+    for i in range(19):
+        seed(table, 2, 3, NOW - 500 + i)
+    assert plan(clients)["ok"] is True  # the 20th plan in the window
+    assert plan_error(clients) == "plan_rate_limited"
+
+
+def test_plan_rate_limit_window_edge(clients, table):
+    seed(table, 2, 3, NOW - SETTINGS.plan_rate_window_seconds)
+    for i in range(19):
+        seed(table, 2, 3, NOW - 10 - i)
+    assert plan(clients)["ok"] is True
+
+
+def test_plan_rejects_manual_change(clients, table):
+    last = seed(table, 1, 3, NOW - 100, NOW - 90)
+    # Applied 1 -> 3, but the Deployment now has 2.
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    with pytest.raises(GuardError) as exc:
+        plan(clients, replicas=3)
+    assert exc.value.code == "manual_change"
+    assert exc.value.details == {"last_applied_to": 3, "current": 2}
+    assert table.scan()["Count"] == 1
+
+
+def test_plan_with_override_allows_manual_change_and_pins_it(clients, table):
+    last = seed(table, 1, 3, NOW - 100, NOW - 90)
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    result = plan(clients, replicas=1, override_manual_change=True)
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["override_manual_change"] is True
+    assert {"check": "no_manual_change", "passed": True, "overridden": True} in data["preflight"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["args_hash"] == scale_args_hash("sandbox", "web", 1, True)
+    assert item["args_hash"] != scale_args_hash("sandbox", "web", 1)
+
+
+def test_override_without_manual_change_is_not_reported(clients):
+    data = plan(clients, override_manual_change=True)["data"]
+    assert all("overridden" not in check for check in data["preflight"])
+
+
+@pytest.mark.parametrize("applied", [False, True])
+def test_no_manual_change_check_without_an_applied_plan(clients, table, applied):
+    last = seed(table, 1, 3, NOW - 100, NOW - 90 if applied else None)
+    annotation = last if not applied else str(uuid.uuid4())  # not applied, or not in the table
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: annotation}
+    )
+    assert plan(clients)["ok"] is True
+
+
+def test_no_manual_change_when_last_plan_was_for_another_object(clients, table):
+    old = object_key("sandbox", "web", "8f7c1a2e-0000-4000-8000-000000000002")
+    last = seed(table, 1, 3, NOW - 100, NOW - 90, key=old)
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    assert plan(clients)["ok"] is True
+
+
+def test_plan_rejects_manual_change_when_the_apply_result_was_not_recorded(clients, table):
+    # The patch set the annotation, then record_result failed: the plan is consumed but has
+    # no result. The annotation is proof enough that it was applied.
+    last = seed(table, 1, 3, NOW - 100, NOW - 90, result=None)
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    assert plan_error(clients, replicas=3) == "manual_change"
+
+
+def test_plan_sees_flapping_when_the_index_missed_the_last_apply(clients, table):
+    seed(table, 1, 2, NOW - 200, NOW - 190)
+    last = seed(table, 2, 1, NOW - 100, NOW - 90, indexed=False)
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        replicas=1, annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    with pytest.raises(GuardError) as exc:
+        plan(clients, replicas=2)
+    assert exc.value.code == "flapping"
+    assert [(h["from"], h["to"]) for h in exc.value.details["history"]] == [(1, 2), (2, 1)]
+
+
+def test_plan_budget_counts_an_apply_the_index_missed(clients, table):
+    for i in range(5):
+        seed(table, 1, 2, NOW - 100 + i, NOW - 90 + i)
+    last = seed(table, 1, 2, NOW - 80, NOW - 70, indexed=False)
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    assert plan_error(clients, replicas=3) == "object_budget_exceeded"
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_plan_override_must_be_boolean(clients, value):
+    assert plan_error(clients, override_manual_change=value) == "invalid_argument"
+
+
+def test_plan_fails_closed_when_history_cannot_be_read(wired, monkeypatch):
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("throttled")
+
+    monkeypatch.setattr(wired.store, "history", broken)
+    event = {"namespace": "sandbox", "name": "web", "replicas": 3}
+    result = handler.lambda_handler(event, context("plan_scale_deployment"))
+    assert result["error"] == {"code": "internal", "message": "internal error"}
+
+
+def test_plan_fails_closed_when_last_plan_cannot_be_read(wired, monkeypatch):
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("throttled")
+
+    monkeypatch.setattr(wired.store, "consumed_plan", broken)
+    wired.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: str(uuid.uuid4())}
+    )
+    event = {"namespace": "sandbox", "name": "web", "replicas": 3}
+    result = handler.lambda_handler(event, context("plan_scale_deployment"))
+    assert result["error"]["code"] == "internal"
+
+
+def test_plan_rejects_when_the_global_budget_is_spent(clients, table):
+    for _ in range(SETTINGS.global_hourly_apply_budget):
+        clients.store.take_global_budget(NOW, SETTINGS.global_hourly_apply_budget)
+    assert plan_error(clients) == "global_budget_exceeded"
+
+
+def test_plan_only_reads_the_global_budget(clients, table):
+    assert plan(clients)["ok"] is True
+    assert clients.store.global_applies(NOW) == 0
+
+
+def test_plan_rejects_a_change_within_the_cooldown(clients, table):
+    seed(table, 3, 2, NOW - 40, NOW - 30)
+    assert plan_error(clients) == "cooldown"

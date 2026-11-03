@@ -8,6 +8,12 @@ from typing import Any
 from kubernetes import client as k8s
 from kubernetes.client.rest import ApiException
 
+from handrail_common.breaker import (
+    check_history,
+    check_manual_change,
+    last_applied_plan,
+    retention_seconds,
+)
 from handrail_common.config import Settings, load_settings
 from handrail_common.dispatch import dispatch
 from handrail_common.eks import api_client
@@ -20,12 +26,21 @@ from handrail_common.envelope import (
     ok,
 )
 from handrail_common.gitops import is_gitops_managed
-from handrail_common.plans import SCALE_DEPLOYMENT, Plan, PlanStore, scale_args_hash
+from handrail_common.plans import (
+    GLOBAL_BUDGET_WINDOW_SECONDS,
+    SCALE_DEPLOYMENT,
+    Plan,
+    PlanStore,
+    global_budget_error,
+    object_key,
+    scale_args_hash,
+)
 from handrail_common.validation import (
     GuardError,
     check_namespace_allowed,
     require_name,
     require_namespace,
+    require_override_flag,
     validate_scale_args,
 )
 
@@ -133,6 +148,7 @@ def plan_scale_deployment(
     namespace, name, replicas = validate_scale_args(
         args, settings.allowed_namespaces, settings.min_replicas, settings.max_replicas
     )
+    override = require_override_flag(args)
     deployment = _read_deployment(clients.apps, namespace, name)
     if is_gitops_managed(deployment):
         raise GuardError(GITOPS_MANAGED, "deployment is managed by GitOps; change it in Git")
@@ -142,27 +158,65 @@ def plan_scale_deployment(
             CONFLICT, f"HorizontalPodAutoscaler {', '.join(sorted(hpas))} targets this deployment"
         )
 
+    current = _desired_replicas(deployment)
+    uid = str(deployment.metadata.uid)
+    # History checks give early feedback; apply runs all but the plan rate limit again.
+    last_applied = last_applied_plan(clients.store, deployment)
+    overridden = check_manual_change(last_applied, current, override)
+    check_history(
+        clients.store,
+        object_key(namespace, name, uid),
+        now,
+        settings,
+        current,
+        replicas,
+        plan_rate=True,
+        last_applied=last_applied,
+    )
+    # Read only here; apply takes a unit of the budget atomically.
+    if clients.store.global_applies(now) >= settings.global_hourly_apply_budget:
+        raise global_budget_error(
+            now - now % GLOBAL_BUDGET_WINDOW_SECONDS, settings.global_hourly_apply_budget
+        )
+
     plan = Plan(
         plan_id=str(uuid.uuid4()),
         action=SCALE_DEPLOYMENT,
         namespace=namespace,
         name=name,
-        replicas_from=_desired_replicas(deployment),
+        replicas_from=current,
         replicas_to=replicas,
-        args_hash=scale_args_hash(namespace, name, replicas),
+        args_hash=scale_args_hash(namespace, name, replicas, override),
         resource_version=str(deployment.metadata.resource_version),
         generation=int(deployment.metadata.generation),
-        uid=str(deployment.metadata.uid),
+        uid=uid,
         created_at=now,
         expires_at=now + settings.plan_ttl_seconds,
+        retain_until=now + retention_seconds(settings),
     )
     clients.store.create(plan)
-    checks = ("arguments", "namespace_allowed", "replica_bounds", "not_gitops_managed", "no_hpa")
+    checks = (
+        "arguments",
+        "namespace_allowed",
+        "replica_bounds",
+        "not_gitops_managed",
+        "no_hpa",
+        "no_manual_change",
+        "cooldown",
+        "not_flapping",
+        "object_budget",
+        "plan_rate",
+        "global_budget",
+    )
+    preflight: list[dict[str, Any]] = [{"check": check, "passed": True} for check in checks]
+    if overridden:
+        preflight[checks.index("no_manual_change")]["overridden"] = True
     return ok(
         {
             "plan_id": plan.plan_id,
             "diff": {"replicas": {"from": plan.replicas_from, "to": plan.replicas_to}},
-            "preflight": [{"check": check, "passed": True} for check in checks],
+            "override_manual_change": override,
+            "preflight": preflight,
             "expires_at": plan.expires_at,
         }
     )

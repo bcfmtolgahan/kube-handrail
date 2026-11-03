@@ -49,6 +49,72 @@ variable "plan_ttl_seconds" {
   }
 }
 
+variable "flap_window_seconds" {
+  description = "Window in which a second reversal of scaling direction on one Deployment is rejected as flapping."
+  type        = number
+  default     = 600
+
+  validation {
+    condition     = var.flap_window_seconds > 0 && floor(var.flap_window_seconds) == var.flap_window_seconds
+    error_message = "flap_window_seconds must be a positive integer."
+  }
+}
+
+variable "object_hourly_apply_budget" {
+  description = "Applies allowed per Deployment in any 3600-second window."
+  type        = number
+  default     = 6
+
+  validation {
+    condition     = var.object_hourly_apply_budget > 0 && floor(var.object_hourly_apply_budget) == var.object_hourly_apply_budget
+    error_message = "object_hourly_apply_budget must be a positive integer."
+  }
+}
+
+variable "plan_rate_limit" {
+  description = "Plans allowed per Deployment in plan_rate_window_seconds."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.plan_rate_limit > 0 && floor(var.plan_rate_limit) == var.plan_rate_limit
+    error_message = "plan_rate_limit must be a positive integer."
+  }
+}
+
+variable "plan_rate_window_seconds" {
+  description = "Window for plan_rate_limit."
+  type        = number
+  default     = 600
+
+  validation {
+    condition     = var.plan_rate_window_seconds > 0 && floor(var.plan_rate_window_seconds) == var.plan_rate_window_seconds
+    error_message = "plan_rate_window_seconds must be a positive integer."
+  }
+}
+
+variable "apply_cooldown_seconds" {
+  description = "Minimum seconds between two applies to one Deployment; 0 turns the cooldown off."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.apply_cooldown_seconds >= 0 && floor(var.apply_cooldown_seconds) == var.apply_cooldown_seconds
+    error_message = "apply_cooldown_seconds must be a non-negative integer."
+  }
+}
+
+variable "global_hourly_apply_budget" {
+  description = "Applies allowed across all objects in one clock hour."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.global_hourly_apply_budget > 0 && floor(var.global_hourly_apply_budget) == var.global_hourly_apply_budget
+    error_message = "global_hourly_apply_budget must be a positive integer."
+  }
+}
+
 variable "log_retention_days" {
   description = "CloudWatch Logs retention for the Lambda functions."
   type        = number
