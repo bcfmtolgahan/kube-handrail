@@ -2,7 +2,7 @@
 
 Guarded remediation layer for AI agents on Kubernetes: **plan → policy → approve → apply → audit**. MCP tools for Amazon EKS, intended to work with AWS DevOps Agent and other MCP clients.
 
-> **Status: Milestone 0 implemented.** A vertical slice (one read tool and one guarded plan/apply pair) is implemented and tested on a test cluster. Most of what is described below is planned, not built. See [Status](#status).
+> **Status: Milestone 0 implemented; Milestone 1 in progress.** A vertical slice (one read tool and one guarded plan/apply pair) is implemented and tested on a test cluster, and server-verified approval is implemented and unit-tested. Much of what is described below is planned, not built. See [Status](#status).
 
 ## Why
 
@@ -22,7 +22,7 @@ Whether a `MUTATIVE` custom MCP tool is a workable path for in-cluster writes fr
 
 ## How it is intended to work
 
-This is the target design. Implemented today: the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the blast-radius budget, the measured impact preview, the kill switch, namespace-scoped RBAC and client-side approval in DevOps Agent. Everything else shown below is planned.
+This is the target design. Implemented today: the `k8sr` and `k8sw` targets, the plan/apply flow with single-use plans, the namespace, replica, GitOps and HPA checks, the blast-radius budget, the measured impact preview, the kill switch, namespace-scoped RBAC, client-side approval in DevOps Agent, and [server-side approval](mcp/CONTRACT.md#server-side-approval) (`request_approval`, an IAM-authenticated approval API and CLI, and an apply that consumes only an approved plan). Everything else shown below is planned.
 
 ```
   MCP client
@@ -64,20 +64,21 @@ A remediation follows this sequence:
 
 1. **Plan.** The agent calls a read-only tool such as `plan_scale_deployment`. It reads current state, runs preflight checks (HPA and GitOps ownership, the blast-radius budget and the [oscillation breaker](docs/guards.md) today; revision history is planned), computes the diff locally, previews the measured impact for the approver (pods added or removed, PodDisruptionBudget headroom, ready and projected endpoints of the Services in front of it, and warnings such as a Service left without endpoints), and stores a plan with `plan_id`, `args_hash`, the object's `uid`, `generation` and current replica count, and a short expiry.
 2. **Policy.** The matching `apply_*` call passes through Cedar at the gateway, which checks tool arguments (namespace allowlist, replica bounds). Planned; today the same limits are enforced only by the write Lambda.
-3. **Approve.** The client shows the exact arguments to a human. In DevOps Agent this is the chat approval for a `MUTATIVE` tool.
-4. **Apply.** The write Lambda's guard re-validates everything: plan exists, is unexpired and unused (single-use, conditional write), arguments match, the object is the same one with an unchanged spec and no GitOps marker, kill switch is on, the change is within the blast-radius budget, and the [oscillation breaker](docs/guards.md) (manual-change override, per-object cooldown, flapping, per-object and global hourly apply budgets) still allows the change. It then runs a server-side dry run and the real patch, with a `resourceVersion` precondition so nothing can change in between.
+3. **Approve.** In `client` mode the client shows the exact arguments to a human; in DevOps Agent this is the chat approval for a `MUTATIVE` tool. In `server` mode (the default) the agent calls the `READ_ONLY` tool `request_approval`, approvers are notified with the plan as the server recorded it, and a listed human approves through an IAM-authenticated API outside MCP (`scripts/approve.py`); the approval is pinned to the plan's arguments and also triggers the apply.
+4. **Apply.** The write Lambda's guard re-validates everything: plan exists, is unexpired and unused (single-use, conditional write), arguments match, in `server` mode an unexpired approval by someone other than the requester covers exactly these arguments (in the same conditional write), the object is the same one with an unchanged spec and no GitOps marker, kill switch is on, the change is within the blast-radius budget, and the [oscillation breaker](docs/guards.md) (manual-change override, per-object cooldown, flapping, per-object and global hourly apply budgets) still allows the change. It then runs a server-side dry run and the real patch, with a `resourceVersion` precondition so nothing can change in between.
 5. **Audit.** The result is written to DynamoDB with a correlation ID that is also annotated on the target object and traceable through gateway and Kubernetes audit logs.
 
 ## Design principles
 
 - **Plan/apply split.** Every write is two tools: a `READ_ONLY` `plan_*` and a `MUTATIVE` `apply_*` with identical arguments, so policy and the human approver see real values.
 - **Single-use, short-lived plans.** A plan can be applied once, within minutes, and only to the object it was computed from (same `uid`) with its spec unchanged (same `generation` and replica count). Concurrent spec changes return a conflict; status churn during a rollout does not.
-- **Misclassification loses the approval, not the limits.** If the write tool is accidentally left `READ_ONLY`, DevOps Agent can plan and apply on its own without asking anyone (observed in testing). The server-side limits still hold: allowed namespaces, replica bounds, the blast-radius budget, GitOps and HPA checks, single-use plans and the kill switch. Classification is therefore checked after every registration change, and a scheduled [drift sentinel](mcp/CONTRACT.md#drift-sentinel) turns the kill switch off and alerts when a write tool is no longer `MUTATIVE` or the tool set changes.
+- **Misclassification loses the approval, not the limits.** If the write tool is accidentally left `READ_ONLY`, DevOps Agent can plan and apply on its own without asking anyone (observed in testing). The server-side limits still hold: allowed namespaces, replica bounds, the blast-radius budget, GitOps and HPA checks, single-use plans and the kill switch. Classification is therefore checked after every registration change, and a scheduled [drift sentinel](mcp/CONTRACT.md#drift-sentinel) turns the kill switch off and alerts when a write tool is no longer `MUTATIVE` or the tool set changes. In `server` mode a misclassified write tool still cannot apply anything without a server approval.
 - **Defense in depth (target design; Cedar and admission policy are planned).** Each layer assumes the others may fail:
   - `guard.py` in the write Lambda (authoritative check)
   - Cedar policy at the gateway ([AgentCore Policy examples](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html))
   - ValidatingAdmissionPolicy in the cluster ([Kubernetes docs](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/))
   - Kubernetes RBAC with separate reader and writer identities, writer bound only to allowlisted namespaces
+  - Server-verified approval, pinned to the plan's arguments (`server` and `both` mode)
   - Client-side approval (DevOps Agent directed actions)
 - **GitOps-aware.** Resources managed by Argo CD (and Flux, once its ownership markers are validated) are not modified; the plan returns the error `gitops_managed`. ([Argo CD resource tracking](https://argo-cd.readthedocs.io/en/stable/user-guide/resource_tracking/))
 - **No delete-class tools.** No delete, no generic `apply_yaml`. The first action is scale; restart and rollback of Deployments are planned.
@@ -90,7 +91,7 @@ A remediation follows this sequence:
 - **Not an AI SRE agent.** Investigation and root-cause analysis are handled by the MCP client (for example AWS DevOps Agent). See [ADR 0001](docs/adr/0001-scope.md).
 - **No generic Kubernetes read tools** (`get_pods`, `get_logs`, `describe`, ...) that duplicate the hosted Amazon EKS MCP server (in preview) or DevOps Agent's native EKS access. Only summarizing tools that serve the plan/apply flow, node triage and change correlation are in scope. ([EKS MCP tools](https://docs.aws.amazon.com/eks/latest/userguide/eks-mcp-tools.html))
 - **No CloudWatch tools.** DevOps Agent includes CloudWatch; other clients can use existing CloudWatch MCP servers.
-- **No unapproved remediation.** Every write is covered by a human approval pinned to its exact arguments and verified by the server ([ADR 0002](docs/adr/0002-server-verified-approval.md)). Today the approval is given in the client (DevOps Agent directed actions); server-side verification is planned in Milestone 1.
+- **No unapproved remediation.** Every write is covered by a human approval pinned to its exact arguments and verified by the server ([ADR 0002](docs/adr/0002-server-verified-approval.md)). In `client` mode the approval is given in the client (DevOps Agent directed actions); in `server` and `both` mode the server requires its own approval record.
 
 ## Status
 
@@ -129,6 +130,7 @@ AGENTS.md        tool contract for MCP clients
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
 - [Guards](docs/guards.md) - blast-radius budget, impact preview, and the oscillation breaker: flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks
 - [Drift sentinel](mcp/CONTRACT.md#drift-sentinel) - what it checks, outcomes, and how to restore remediation after drift
+- [Server-side approval](mcp/CONTRACT.md#server-side-approval) - approval modes, `request_approval`, the approval API and who can approve
 - [Roadmap](docs/roadmap.md) - milestones and open questions
 
 ## Contributing

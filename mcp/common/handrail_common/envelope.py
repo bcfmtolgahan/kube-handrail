@@ -21,6 +21,10 @@ MANUAL_CHANGE = "manual_change"
 COOLDOWN = "cooldown"
 GLOBAL_BUDGET_EXCEEDED = "global_budget_exceeded"
 BLAST_RADIUS_EXCEEDED = "blast_radius_exceeded"
+APPROVAL_REQUIRED = "approval_required"
+APPROVAL_RATE_LIMITED = "approval_rate_limited"
+PLAN_DECIDED = "plan_decided"
+FORBIDDEN = "forbidden"
 KUBERNETES_ERROR = "kubernetes_error"
 INTERNAL = "internal"
 
@@ -45,6 +49,10 @@ ERROR_CODES = frozenset(
         COOLDOWN,
         GLOBAL_BUDGET_EXCEEDED,
         BLAST_RADIUS_EXCEEDED,
+        APPROVAL_REQUIRED,
+        APPROVAL_RATE_LIMITED,
+        PLAN_DECIDED,
+        FORBIDDEN,
         KUBERNETES_ERROR,
         INTERNAL,
     }

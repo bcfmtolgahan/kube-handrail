@@ -35,6 +35,8 @@ ENV = {
     "AWS_REGION": REGION,
     # Most plans here go from 1 to 3; the blast-radius budget has its own tests.
     "MAX_REPLICA_STEP_PERCENT": "200",
+    # The guard cases below are the same in every mode; server approval has its own tests.
+    "APPROVAL_MODE": "client",
 }
 CONTEXT = SimpleNamespace(
     client_context=SimpleNamespace(
@@ -788,3 +790,82 @@ def test_apply_rejects_a_change_within_the_cooldown(rt):
     assert error_code(response) == "cooldown"
     assert response["error"]["details"]["retry_after"] == NOW + 30
     apps.patch_namespaced_deployment.assert_not_called()
+
+
+# --- Server-side approval ------------------------------------------------------
+
+HUMAN = "arn:aws:iam::123456789012:user/alice"
+
+
+@pytest.fixture(params=["server", "both"])
+def server_rt(aws, monkeypatch, request):
+    rt, apps = runtime()
+    rt.settings = load_settings(ENV | {"APPROVAL_MODE": request.param}, write=True)
+    monkeypatch.setattr(handler, "get_runtime", lambda: rt)
+    return rt, apps
+
+
+def test_server_mode_apply_without_approval_is_refused(server_rt):
+    runtime_, apps = server_rt
+    plan = create_plan(runtime_.store)
+    response = apply(plan.plan_id)
+    assert error_code(response) == "approval_required"
+    assert response["error"]["details"] == {"status": "planned"}
+    apps.read_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["used"] is False
+
+
+def test_server_mode_apply_after_approval(server_rt):
+    runtime_, apps = server_rt
+    plan = create_plan(runtime_.store)
+    runtime_.store.approve(plan.plan_id, HUMAN, NOW, 120)
+    response = apply(plan.plan_id)
+    assert response["ok"] is True
+    assert response["data"]["approved_by"] == HUMAN
+    record = item(plan.plan_id)
+    assert record["used"] is True and record["result"] == "applied"
+    assert record["approved_by"] == HUMAN
+    assert len(apps.patch_namespaced_deployment.call_args_list) == 2
+
+
+def test_server_mode_approval_does_not_cover_other_arguments(server_rt):
+    runtime_, apps = server_rt
+    plan = create_plan(runtime_.store)
+    runtime_.store.approve(plan.plan_id, HUMAN, NOW, 120)
+    assert error_code(apply(plan.plan_id, replicas=2)) == "plan_mismatch"
+    assert error_code(apply(plan.plan_id, override_manual_change=True)) == "plan_mismatch"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_server_mode_expired_approval(server_rt):
+    runtime_, _ = server_rt
+    plan = create_plan(runtime_.store)
+    runtime_.store.approve(plan.plan_id, HUMAN, NOW - 120, 120)
+    response = apply(plan.plan_id)
+    assert error_code(response) == "approval_required"
+    assert response["error"]["details"] == {"status": "approval_expired"}
+
+
+def test_server_mode_rejected_plan(server_rt):
+    runtime_, _ = server_rt
+    plan = create_plan(runtime_.store)
+    runtime_.store.reject(plan.plan_id, HUMAN, NOW - 1, "no")
+    response = apply(plan.plan_id)
+    assert response["error"]["details"] == {"status": "rejected"}
+
+
+def test_server_mode_guard_still_applies_after_approval(server_rt):
+    runtime_, apps = server_rt
+    plan = create_plan(runtime_.store)
+    runtime_.store.approve(plan.plan_id, HUMAN, NOW, 120)
+    apps.read_namespaced_deployment.return_value = deployment(generation=5)
+    assert error_code(apply(plan.plan_id)) == "conflict"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_client_mode_needs_no_approval(rt):
+    runtime_, _ = rt
+    assert runtime_.settings.approval_mode == "client"
+    plan = create_plan(runtime_.store)
+    response = apply(plan.plan_id)
+    assert response["ok"] is True and "approved_by" not in response["data"]

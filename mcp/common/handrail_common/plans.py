@@ -11,7 +11,12 @@ import boto3
 from botocore.exceptions import ClientError
 
 from handrail_common.envelope import (
+    APPROVAL_RATE_LIMITED,
+    APPROVAL_REQUIRED,
+    CONFLICT,
+    FORBIDDEN,
     GLOBAL_BUDGET_EXCEEDED,
+    PLAN_DECIDED,
     PLAN_EXPIRED,
     PLAN_MISMATCH,
     PLAN_NOT_FOUND,
@@ -26,11 +31,30 @@ OBJECT_HISTORY_INDEX = "object-history"
 # Global apply counters share the plan table under keys that can never be a plan id (a UUID).
 GLOBAL_BUDGET_PREFIX = "budget#global#"
 GLOBAL_BUDGET_WINDOW_SECONDS = 3600
+# Approval requests (notifications) across all plans, counted per clock window like the budget.
+APPROVAL_REQUEST_PREFIX = "approval#global#"
+APPROVAL_REQUEST_WINDOW_SECONDS = 600
+
+# Until per-agent identity reaches the server, every plan is requested by the gateway's
+# machine principal class; approvals come only from human IAM principals.
+REQUESTER_GATEWAY = "mcp-gateway"
+STATUS_PLANNED = "planned"
+STATUS_AWAITING = "awaiting_approval"
+STATUS_APPROVED = "approved"
+STATUS_REJECTED = "rejected"
+# Reported in approval_required details; never stored.
+APPROVAL_EXPIRED = "approval_expired"
+APPROVAL_INVALID = "approval_invalid"
+CHANNEL_API = "api"
 
 
 def global_budget_key(now: int) -> str:
     """Counter for the clock hour that contains `now`."""
     return f"{GLOBAL_BUDGET_PREFIX}{now - now % GLOBAL_BUDGET_WINDOW_SECONDS}"
+
+
+def approval_request_key(now: int) -> str:
+    return f"{APPROVAL_REQUEST_PREFIX}{now - now % APPROVAL_REQUEST_WINDOW_SECONDS}"
 
 
 def args_hash(payload: Mapping[str, Any]) -> str:
@@ -78,6 +102,21 @@ class Plan:
     # Written by apply after the patch (see record_result); absent until then.
     result: str | None = None
     applied_at: int | None = None
+    requested_by: str = REQUESTER_GATEWAY
+    status: str = STATUS_PLANNED
+    override_manual_change: bool = False
+    # The impact preview returned with the plan, so an approver sees the server's own record.
+    impact: Mapping[str, Any] | None = None
+    # Written by request_approval and by the approval channel; absent until then.
+    approval_requested_at: int | None = None
+    approved_by: str | None = None
+    approved_at: int | None = None
+    approved_args_hash: str | None = None
+    approval_channel: str | None = None
+    approval_expires_at: int | None = None
+    rejected_by: str | None = None
+    rejected_at: int | None = None
+    reject_reason: str | None = None
 
     @property
     def object_key(self) -> str:
@@ -99,13 +138,16 @@ class Plan:
             "expires_at": self.expires_at,
             "used": self.used,
             "object_key": self.object_key,
+            "requested_by": self.requested_by,
+            "status": self.status,
+            "override_manual_change": self.override_manual_change,
         }
-        if self.retain_until is not None:
-            item["retain_until"] = self.retain_until
-        if self.result is not None:
-            item["result"] = self.result
-        if self.applied_at is not None:
-            item["applied_at"] = self.applied_at
+        if self.impact is not None:
+            item["impact"] = self.impact
+        for field in (*_OPTIONAL_INTS, *_OPTIONAL_STRS):
+            value = getattr(self, field)
+            if value is not None:
+                item[field] = value
         return item
 
     @classmethod
@@ -125,10 +167,32 @@ class Plan:
             created_at=int(item["created_at"]),
             expires_at=int(item["expires_at"]),
             used=bool(item["used"]),
-            retain_until=int(item["retain_until"]) if "retain_until" in item else None,
-            result=str(item["result"]) if item.get("result") is not None else None,
-            applied_at=int(item["applied_at"]) if item.get("applied_at") is not None else None,
+            # Plans made before server approval have neither; they can never be approved.
+            requested_by=str(item.get("requested_by", "")),
+            status=str(item.get("status", "")),
+            override_manual_change=item.get("override_manual_change") is True,
+            impact=item.get("impact"),
+            **{f: int(item[f]) for f in _OPTIONAL_INTS if item.get(f) is not None},
+            **{f: str(item[f]) for f in _OPTIONAL_STRS if item.get(f) is not None},
         )
+
+
+_OPTIONAL_INTS = (
+    "retain_until",
+    "applied_at",
+    "approval_requested_at",
+    "approved_at",
+    "approval_expires_at",
+    "rejected_at",
+)
+_OPTIONAL_STRS = (
+    "result",
+    "approved_by",
+    "approved_args_hash",
+    "approval_channel",
+    "rejected_by",
+    "reject_reason",
+)
 
 
 @dataclass(frozen=True)
@@ -178,30 +242,165 @@ class PlanStore:
             ConditionExpression="attribute_not_exists(plan_id)",
         )
 
-    def consume(self, plan_id: str, expected_hash: str, action: str, now: int) -> Plan:
-        """Atomically mark the plan used; raise GuardError with the precise reason otherwise."""
+    def consume(
+        self,
+        plan_id: str,
+        expected_hash: str,
+        action: str,
+        now: int,
+        require_approval: bool = False,
+    ) -> Plan:
+        """Atomically mark the plan used; raise GuardError with the precise reason otherwise.
+
+        With `require_approval`, the same conditional write also requires a server approval
+        of exactly these arguments, by someone other than the requester, that has not expired.
+        """
+        condition = "#used = :false AND expires_at > :now AND args_hash = :h AND #action = :a"
+        names = {"#used": "used", "#action": "action"}
+        values: dict[str, Any] = {
+            ":true": True,
+            ":false": False,
+            ":now": now,
+            ":h": expected_hash,
+            ":a": action,
+        }
+        if require_approval:
+            condition += (
+                " AND #status = :approved AND attribute_exists(approved_by)"
+                " AND approved_by <> requested_by AND approved_args_hash = args_hash"
+                " AND approval_expires_at > :now"
+            )
+            names["#status"] = "status"
+            values[":approved"] = STATUS_APPROVED
         try:
             response = self._table.update_item(
                 Key={"plan_id": plan_id},
                 UpdateExpression="SET #used = :true",
-                ConditionExpression=(
-                    "#used = :false AND expires_at > :now AND args_hash = :h AND #action = :a"
+                ConditionExpression=condition,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+                ReturnValues="ALL_NEW",
+            )
+        except ClientError as exc:
+            if not _is_conditional_failure(exc):
+                raise
+            raise self._rejection(
+                plan_id, expected_hash, action, now, require_approval
+            ) from None
+        return Plan.from_item(response["Attributes"])
+
+    def get(self, plan_id: str) -> dict[str, Any] | None:
+        """The raw record, read consistently."""
+        return self._table.get_item(Key={"plan_id": plan_id}, ConsistentRead=True).get("Item")
+
+    def request_approval(
+        self, plan_id: str, now: int, wait_ttl: int, cooldown: int, limit: int
+    ) -> tuple[dict[str, Any], int | None]:
+        """Move a plan to awaiting_approval and give it `wait_ttl` seconds from its creation.
+
+        Returns the record and None when approvers should be notified now. When this plan
+        already asked less than `cooldown` seconds ago, nothing changes and the second value
+        is the time it may ask again. A notification takes one unit of the global limit first.
+        """
+        current = self.get(plan_id)
+        retry_after = _request_state(current, now, cooldown)
+        if current is not None and retry_after is not None:
+            return current, retry_after
+        window_start = now - now % APPROVAL_REQUEST_WINDOW_SECONDS
+        self._take_counter(
+            approval_request_key(now),
+            "requests",
+            limit,
+            window_start + 2 * APPROVAL_REQUEST_WINDOW_SECONDS,
+            approval_rate_error(window_start, limit),
+        )
+        try:
+            response = self._table.update_item(
+                Key={"plan_id": plan_id},
+                UpdateExpression=(
+                    "SET #status = :awaiting, approval_requested_at = :now, "
+                    "expires_at = created_at + :wait"
                 ),
-                ExpressionAttributeNames={"#used": "used", "#action": "action"},
+                ConditionExpression=(
+                    "#used = :false AND expires_at > :now AND #status IN (:planned, :awaiting)"
+                    " AND (attribute_not_exists(approval_requested_at)"
+                    " OR approval_requested_at <= :cutoff)"
+                ),
+                ExpressionAttributeNames={"#used": "used", "#status": "status"},
                 ExpressionAttributeValues={
-                    ":true": True,
                     ":false": False,
                     ":now": now,
-                    ":h": expected_hash,
-                    ":a": action,
+                    ":wait": wait_ttl,
+                    ":cutoff": now - cooldown,
+                    ":planned": STATUS_PLANNED,
+                    ":awaiting": STATUS_AWAITING,
                 },
                 ReturnValues="ALL_NEW",
             )
         except ClientError as exc:
             if not _is_conditional_failure(exc):
                 raise
-            raise self._rejection(plan_id, expected_hash, action, now) from None
-        return Plan.from_item(response["Attributes"])
+            item = self.get(plan_id)
+            retry_after = _request_state(item, now, cooldown)
+            if retry_after is None:
+                raise GuardError(CONFLICT, "plan changed concurrently; try again") from None
+            return item or {}, retry_after
+        return response["Attributes"], None
+
+    def approve(self, plan_id: str, approver: str, now: int, apply_ttl: int) -> dict[str, Any]:
+        """Record a human approval pinned to the plan's own args_hash, in one conditional write.
+
+        The plan then stays valid for `apply_ttl` seconds, whatever was left of it before.
+        """
+        expires = now + apply_ttl
+        return self._decide(
+            plan_id,
+            approver,
+            now,
+            "SET #status = :decided, approved_by = :by, approved_at = :now, "
+            "approved_args_hash = args_hash, approval_channel = :channel, "
+            "approval_expires_at = :expires, expires_at = :expires",
+            {":decided": STATUS_APPROVED, ":channel": CHANNEL_API, ":expires": expires},
+        )
+
+    def reject(self, plan_id: str, approver: str, now: int, reason: str) -> dict[str, Any]:
+        """Record a rejection. The plan expires at once, so no mode can apply it any more."""
+        return self._decide(
+            plan_id,
+            approver,
+            now,
+            "SET #status = :decided, rejected_by = :by, rejected_at = :now, "
+            "reject_reason = :reason, expires_at = :now",
+            {":decided": STATUS_REJECTED, ":reason": reason},
+        )
+
+    def _decide(
+        self, plan_id: str, approver: str, now: int, update: str, values: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            response = self._table.update_item(
+                Key={"plan_id": plan_id},
+                UpdateExpression=update,
+                ConditionExpression=(
+                    "#status IN (:planned, :awaiting) AND #used = :false AND expires_at > :now"
+                    " AND requested_by <> :by"
+                ),
+                ExpressionAttributeNames={"#status": "status", "#used": "used"},
+                ExpressionAttributeValues={
+                    ":planned": STATUS_PLANNED,
+                    ":awaiting": STATUS_AWAITING,
+                    ":false": False,
+                    ":now": now,
+                    ":by": approver,
+                    **values,
+                },
+                ReturnValues="ALL_NEW",
+            )
+        except ClientError as exc:
+            if not _is_conditional_failure(exc):
+                raise
+            raise _decision_error(self.get(plan_id), now, approver) from None
+        return response["Attributes"]
 
     def consumed_plan(self, plan_id: str) -> Plan | None:
         """The plan if it is in the table and an apply has consumed it, otherwise None.
@@ -258,32 +457,67 @@ class PlanStore:
         is taken before the patch and not given back if the apply fails afterwards.
         """
         start = now - now % GLOBAL_BUDGET_WINDOW_SECONDS
+        self._take_counter(
+            global_budget_key(now),
+            "applies",
+            limit,
+            start + 2 * GLOBAL_BUDGET_WINDOW_SECONDS,
+            global_budget_error(start, limit),
+        )
+
+    def _take_counter(
+        self, key: str, attribute: str, limit: int, retain_until: int, error: GuardError
+    ) -> None:
+        """Add 1 to a counter item only while it is below `limit`; raise `error` otherwise."""
         try:
             self._table.update_item(
-                Key={"plan_id": global_budget_key(now)},
-                UpdateExpression="ADD applies :one SET retain_until = :retain",
-                ConditionExpression="attribute_not_exists(applies) OR applies < :limit",
-                ExpressionAttributeValues={
-                    ":one": 1,
-                    ":limit": limit,
-                    ":retain": start + 2 * GLOBAL_BUDGET_WINDOW_SECONDS,
-                },
+                Key={"plan_id": key},
+                UpdateExpression="ADD #count :one SET retain_until = :retain",
+                ConditionExpression="attribute_not_exists(#count) OR #count < :limit",
+                ExpressionAttributeNames={"#count": attribute},
+                ExpressionAttributeValues={":one": 1, ":limit": limit, ":retain": retain_until},
             )
         except ClientError as exc:
             if not _is_conditional_failure(exc):
                 raise
-            raise global_budget_error(start, limit) from None
+            raise error from None
 
-    def _rejection(self, plan_id: str, expected_hash: str, action: str, now: int) -> GuardError:
-        item = self._table.get_item(Key={"plan_id": plan_id}, ConsistentRead=True).get("Item")
+    def _rejection(
+        self, plan_id: str, expected_hash: str, action: str, now: int, require_approval: bool
+    ) -> GuardError:
+        item = self.get(plan_id)
         if item is None:
             return GuardError(PLAN_NOT_FOUND, "plan not found")
         if item.get("used") is True:
             return GuardError(PLAN_USED, "plan already used")
+        status = item.get("status")
+        if status == STATUS_REJECTED:
+            return _approval_required(STATUS_REJECTED, "the plan was rejected by an approver")
+        if (
+            require_approval
+            and status == STATUS_APPROVED
+            and Decimal(item.get("approval_expires_at", 0)) <= now
+        ):
+            return _approval_required(
+                APPROVAL_EXPIRED, "the approval expired before the apply; plan again"
+            )
         if Decimal(item.get("expires_at", 0)) <= now:
             return GuardError(PLAN_EXPIRED, "plan expired")
         if item.get("action") != action or item.get("args_hash") != expected_hash:
             return GuardError(PLAN_MISMATCH, "arguments do not match the plan")
+        if require_approval:
+            if status != STATUS_APPROVED or "approved_by" not in item:
+                return _approval_required(
+                    str(status or STATUS_PLANNED),
+                    "the plan has no server approval; call request_approval and wait for an "
+                    "approver",
+                )
+            if item.get("approved_by") == item.get(
+                "requested_by"
+            ) or item.get("approved_args_hash") != item.get("args_hash"):
+                return _approval_required(
+                    APPROVAL_INVALID, "the approval does not cover this plan"
+                )
         # The record satisfies every condition now, so it changed concurrently; refuse.
         return GuardError(PLAN_USED, "plan was consumed concurrently")
 
@@ -298,3 +532,65 @@ def global_budget_error(window_start: int, limit: int) -> GuardError:
             "retry_after": window_start + GLOBAL_BUDGET_WINDOW_SECONDS,
         },
     )
+
+
+def approval_rate_error(window_start: int, limit: int) -> GuardError:
+    return GuardError(
+        APPROVAL_RATE_LIMITED,
+        f"the limit of {limit} approval requests in {APPROVAL_REQUEST_WINDOW_SECONDS} s has "
+        "been reached",
+        {
+            "limit": limit,
+            "window_seconds": APPROVAL_REQUEST_WINDOW_SECONDS,
+            "window_start": window_start,
+            "retry_after": window_start + APPROVAL_REQUEST_WINDOW_SECONDS,
+        },
+    )
+
+
+def _approval_required(status: str, message: str) -> GuardError:
+    return GuardError(APPROVAL_REQUIRED, message, {"status": status})
+
+
+def _decided(item: Mapping[str, Any]) -> GuardError | None:
+    status = item.get("status")
+    if status in (STATUS_APPROVED, STATUS_REJECTED):
+        return GuardError(PLAN_DECIDED, f"the plan was already {status}", {"status": status})
+    return None
+
+
+def _request_state(item: Mapping[str, Any] | None, now: int, cooldown: int) -> int | None:
+    """Raise if the plan cannot await approval; return when it may notify again if it asked
+    within the cooldown, otherwise None."""
+    if item is None:
+        raise GuardError(PLAN_NOT_FOUND, "plan not found")
+    if item.get("used") is True:
+        raise GuardError(PLAN_USED, "plan already used")
+    decided = _decided(item)
+    if decided is not None:
+        raise decided
+    if Decimal(item.get("expires_at", 0)) <= now:
+        raise GuardError(PLAN_EXPIRED, "plan expired")
+    if item.get("status") not in (STATUS_PLANNED, STATUS_AWAITING):
+        raise GuardError(PLAN_EXPIRED, "plan predates server approval; plan again")
+    requested = item.get("approval_requested_at")
+    if requested is not None and int(requested) > now - cooldown:
+        return int(requested) + cooldown
+    return None
+
+
+def _decision_error(item: Mapping[str, Any] | None, now: int, approver: str) -> GuardError:
+    if item is None:
+        return GuardError(PLAN_NOT_FOUND, "plan not found")
+    if item.get("used") is True:
+        return GuardError(PLAN_USED, "plan already used")
+    decided = _decided(item)
+    if decided is not None:
+        return decided
+    if Decimal(item.get("expires_at", 0)) <= now:
+        return GuardError(PLAN_EXPIRED, "plan expired")
+    if item.get("status") not in (STATUS_PLANNED, STATUS_AWAITING):
+        return GuardError(PLAN_EXPIRED, "plan predates server approval; plan again")
+    if item.get("requested_by") == approver:
+        return GuardError(FORBIDDEN, "the requester of a plan cannot decide on it")
+    return GuardError(CONFLICT, "plan changed concurrently; try again")

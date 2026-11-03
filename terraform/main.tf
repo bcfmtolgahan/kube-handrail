@@ -24,9 +24,11 @@ locals {
     k8s_read = {
       target      = "k8sr"
       tools       = jsondecode(file("${path.module}/../mcp/k8s_read/tools.json"))
-      dynamo      = ["dynamodb:PutItem", "dynamodb:GetItem"]
+      dynamo      = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"]
       kill_switch = false
       groups      = ["kube-handrail-reader"]
+      # request_approval: moves plans to awaiting_approval and notifies approvers.
+      approval_requests = true
     }
     k8s_write = {
       target      = "k8sw"
@@ -34,6 +36,8 @@ locals {
       dynamo      = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
       kill_switch = true
       groups      = ["kube-handrail-writer"]
+
+      approval_requests = false
     }
   }
 
@@ -53,12 +57,20 @@ locals {
     GLOBAL_HOURLY_APPLY_BUDGET = tostring(var.global_hourly_apply_budget)
 
     MAX_REPLICA_STEP_PERCENT = tostring(var.max_replica_step_percent)
+
+    APPROVAL_MODE                     = var.approval_mode
+    APPROVAL_WAIT_TTL_SECONDS         = tostring(var.approval_wait_ttl_seconds)
+    APPLY_AFTER_APPROVAL_TTL_SECONDS  = tostring(var.apply_after_approval_ttl_seconds)
+    APPROVAL_REQUEST_COOLDOWN_SECONDS = tostring(var.approval_request_cooldown_seconds)
+    APPROVAL_REQUEST_LIMIT            = tostring(var.approval_request_limit)
   }
 
-  # Every packaged Lambda => its requirements file. The sentinel is packaged but is not a gateway target.
+  # Every packaged Lambda => its requirements file. The sentinel and the approver are packaged
+  # but are not gateway targets.
   packages = merge(
     { for fn in keys(local.functions) : fn => "requirements.txt" },
     var.sentinel_enabled ? { sentinel = "mcp/sentinel/requirements.txt" } : {},
+    { approver = "mcp/approver/requirements.txt" },
   )
 
   # Tolerates a function directory that has no Python sources yet.
@@ -185,6 +197,32 @@ data "aws_iam_policy_document" "lambda" {
       resources = [aws_ssm_parameter.kill_switch.arn]
     }
   }
+
+  dynamic "statement" {
+    for_each = each.value.approval_requests ? [1] : []
+    content {
+      sid       = "ApprovalRequests"
+      actions   = ["sns:Publish"]
+      resources = [aws_sns_topic.approvals.arn]
+    }
+  }
+
+  # A machine identity never writes an approval, even if its code is compromised. Only the
+  # read role: the write role's consume condition reads these attributes.
+  dynamic "statement" {
+    for_each = each.value.approval_requests ? [1] : []
+    content {
+      sid       = "NeverApprove"
+      effect    = "Deny"
+      actions   = ["dynamodb:PutItem", "dynamodb:UpdateItem"]
+      resources = [aws_dynamodb_table.plans.arn]
+      condition {
+        test     = "ForAnyValue:StringEquals"
+        variable = "dynamodb:Attributes"
+        values   = local.approval_attributes
+      }
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "lambda" {
@@ -212,6 +250,10 @@ resource "aws_lambda_function" "this" {
     variables = merge(
       local.common_env,
       each.value.kill_switch ? { REMEDIATION_ENABLED_PARAM = aws_ssm_parameter.kill_switch.name } : {},
+      each.value.approval_requests ? {
+        APPROVAL_TOPIC_ARN = aws_sns_topic.approvals.arn
+        APPROVAL_URL       = aws_lambda_function_url.approver.function_url
+      } : {},
     )
   }
 

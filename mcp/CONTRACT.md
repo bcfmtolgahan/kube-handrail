@@ -6,10 +6,10 @@ Single source of truth for handlers, infrastructure code and tests. Change this 
 
 | Gateway target | Lambda | Classification | Tools (schema file) |
 |---|---|---|---|
-| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `plan_scale_deployment` (`mcp/k8s_read/tools.json`) |
+| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `plan_scale_deployment`, `request_approval` (`mcp/k8s_read/tools.json`) |
 | `k8sw` | `k8s_write` | `MUTATIVE` | `apply_scale_deployment` (`mcp/k8s_write/tools.json`) |
 
-`plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`); apply also takes `plan_id`. See [History checks](#history-checks-oscillation-breaker).
+`plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`); apply also takes `plan_id`. See [History checks](#history-checks-oscillation-breaker). `request_approval` takes only `plan_id`; see [Server-side approval](#server-side-approval).
 
 Clients see `<target>___<tool>`, for example `k8sw___apply_scale_deployment`. Full names must be at most 64 characters and match `^[a-z0-9_]+$`.
 
@@ -48,7 +48,7 @@ Every handler returns a JSON object (not wrapped in `statusCode`/`body`):
 
 `replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. A `conflict` from a 409 that persists after all patch attempts has no `details`. The history checks below also return `details`; every value in them is an integer or a string.
 
-Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `blast_radius_exceeded`, `kubernetes_error`, `internal`.
+Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `forbidden`, `kubernetes_error`, `internal`.
 
 ## Plan record (DynamoDB)
 
@@ -64,14 +64,21 @@ Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespa
 | `uid` | S | Deployment `metadata.uid` at plan time; a record without it is treated as `""` and never matches |
 | `object_key` | S | `<namespace>/<name>/<uid>`; partition key of the `object-history` index |
 | `created_at` | N | epoch seconds; sort key of the `object-history` index |
-| `expires_at` | N | epoch seconds, end of plan validity (`PLAN_TTL_SECONDS`, default 300 s) |
-| `retain_until` | N | epoch seconds, the table TTL attribute: `created_at + max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + PLAN_TTL_SECONDS + 60`, so a record stays readable as history after the plan expired. A record without it is kept until deleted |
-| `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a` |
+| `expires_at` | N | epoch seconds, end of plan validity: `created_at + PLAN_TTL_SECONDS` (default 300 s); `created_at + APPROVAL_WAIT_TTL_SECONDS` once an approval is requested; `approved_at + APPLY_AFTER_APPROVAL_TTL_SECONDS` once approved; `rejected_at` once rejected |
+| `retain_until` | N | epoch seconds, the table TTL attribute: `created_at + max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60`, the longest window plus the longest a plan can stay valid, so a record stays readable as history after the plan expired. A record without it is kept until deleted |
+| `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a`, extended in `server` and `both` mode (see [Server-side approval](#server-side-approval)) |
+| `requested_by` | S | the requesting principal. Until per-agent identity reaches the server it is the constant `mcp-gateway`, the class of the gateway's machine identities |
+| `status` | S | `planned`, `awaiting_approval`, `approved` or `rejected`. `applied` (`used = true`) and `expired` (`expires_at <= now`) are derived, never stored. Records made before server approval have no `status` and `requested_by`; they can be applied in `client` mode until they expire but never requested or approved |
+| `override_manual_change` | BOOL | the value pinned in `args_hash` |
+| `impact` | M | the impact preview returned with the plan, so the approval channel renders the server's own record |
+| `approval_requested_at` | N | last `request_approval` that notified |
+| `approved_by`, `approved_at`, `approved_args_hash`, `approval_channel`, `approval_expires_at` | S, N, S, S, N | written by an approval: the approver's IAM principal ARN as it signed the request, the time, the plan's own `args_hash` copied in the same update, `api`, and `approved_at + APPLY_AFTER_APPROVAL_TTL_SECONDS` |
+| `rejected_by`, `rejected_at`, `reject_reason` | S, N, S | written by a rejection; the reason is at most 500 characters with control characters removed |
 | `applied_at`, `result` | N, S | written by apply after the patch, on a best-effort basis: `result` is `applied`, or the error code that stopped the apply. An applied plan can therefore lack them; the Deployment's `kube-handrail.io/last-plan-id` annotation is the authoritative record of the last apply (see History checks) |
 
 Global secondary index `object-history`: partition key `object_key` (S), sort key `created_at` (N), projection `ALL`. It is eventually consistent, so a plan or apply from the last moment may not be visible yet.
 
-The table also holds one global budget counter per clock hour: `plan_id = "budget#global#<hour start, epoch seconds>"` (never a UUID, so it cannot be named as a plan), `applies` (N), and `retain_until` two hours after the hour starts. It has no `object_key`, so it is not in the index.
+The table also holds one global budget counter per clock hour: `plan_id = "budget#global#<hour start, epoch seconds>"` (never a UUID, so it cannot be named as a plan), `applies` (N), and `retain_until` two hours after the hour starts; and one approval request counter per 600-second clock window: `plan_id = "approval#global#<window start>"`, `requests` (N), `retain_until` two windows after the window starts. They have no `object_key`, so they are not in the index.
 
 ## Guard checks
 
@@ -99,7 +106,7 @@ With the default of 100 %, a Deployment at 0 or 1 replica can change by 1, at 3 
 Apply (`k8s_write`), all re-checked independently of the plan step:
 1. Kill switch: SSM parameter `REMEDIATION_ENABLED_PARAM` must equal `true`.
 2. Checks 1-3 above (check 4 is re-run in step 4, check 6 in step 3; check 5 is not, because the writer identity cannot list HPAs, and the impact preview is not, because it only informs the approver).
-3. Plan exists, `action` matches, `args_hash` matches, not expired, not used. Mark used with a conditional update before patching. Then the blast-radius budget (plan check 6), with the plan's `replicas_from` and `replicas_to` and the current `MAX_REPLICA_STEP_PERCENT`, so lowering the setting also stops plans made before the change. A rejection leaves the plan consumed with `result = "blast_radius_exceeded"`.
+3. Plan exists, `action` matches, `args_hash` matches, not expired, not used, and in `server` and `both` mode approved (see [Server-side approval](#server-side-approval)). Mark used with a conditional update before patching. Then the blast-radius budget (plan check 6), with the plan's `replicas_from` and `replicas_to` and the current `MAX_REPLICA_STEP_PERCENT`, so lowering the setting also stops plans made before the change. A rejection leaves the plan consumed with `result = "blast_radius_exceeded"`.
 4. Read the Deployment. Its `metadata.uid` must equal the planned `uid` (a Deployment deleted and recreated under the same name starts again at generation 1), it must not be GitOps-managed (check 4 above, re-run because a label-only change does not bump `generation`), and its `metadata.generation` must equal the planned `generation` and its `spec.replicas` (unset counts as 1) must equal `replicas_from`; otherwise return `conflict` with `details`, or `gitops_managed`. The API server bumps a Deployment's `generation` on spec and annotation changes but not on status or label updates, so a rollout in progress does not block the apply. Patch `spec.replicas` with a `metadata.resourceVersion` precondition taken from that read. On 409, read again, re-run these checks and patch again, up to 3 attempts in total; a change found on a retry returns the error immediately, and a 409 on the last attempt returns `conflict`.
 5. Server-side dry run (`dryRun=All`) before each real patch. A plan is consumed before the dry run, so any failure after step 3 requires a new plan.
 6. The patch also sets the annotation `kube-handrail.io/last-plan-id` to the applied `plan_id`.
@@ -140,7 +147,7 @@ The lists are read as raw JSON (`_preload_content=False`), because the Kubernete
 
 ## History checks (oscillation breaker)
 
-History is the set of plan records for one object, read through the `object-history` index for `created_at >= now - (max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + PLAN_TTL_SECONDS + 60)`. An object is `<namespace>/<name>/<uid>`, so a Deployment deleted and recreated under the same name starts with no history. An apply is a record with `result = "applied"`, ordered by `applied_at`; its direction is the sign of `replicas_to - replicas_from`. Windows exclude their start: an event exactly `W` seconds old is outside a window of `W` seconds. Any error reading the history or the last plan fails the request with `internal`; a check is never skipped.
+History is the set of plan records for one object, read through the `object-history` index for `created_at >= now - (max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60)`, the same span as `retain_until`. An object is `<namespace>/<name>/<uid>`, so a Deployment deleted and recreated under the same name starts with no history. An apply is a record with `result = "applied"`, ordered by `applied_at`; its direction is the sign of `replicas_to - replicas_from`. Windows exclude their start: an event exactly `W` seconds old is outside a window of `W` seconds. Any error reading the history or the last plan fails the request with `internal`; a check is never skipped.
 
 The last apply is also taken from the Deployment itself: the plan named by its `kube-handrail.io/last-plan-id` annotation, read with a consistent `GetItem`, counts as applied when it is in the table, was consumed (`used = true`) and carries the Deployment's `uid`, whatever its recorded `result`. The annotation is set by the apply's own patch and read from the API server, so the most recent apply is counted even when the index has not caught up with it or its result was never recorded; when no `applied_at` was recorded, the latest time the apply can have happened, `min(expires_at, now)`, is used.
 
@@ -211,17 +218,123 @@ Known limits:
 - A Terraform apply that changes the tool set updates the gateway targets before the sentinel's own configuration; a run in between reports drift and turns remediation off.
 - Detection takes up to one schedule interval; until then a misclassified write tool runs without approval, within the server-side limits.
 - The sentinel sees what the control-plane APIs report, not what a running DevOps Agent chat has cached (a chat keeps the tool list it was created with).
-- It watches one association in one agent space. Another association of the same gateway, in this or another agent space, is not checked; server-side approval (Milestone 1, item 5) removes the dependency on client classification.
+- It watches one association in one agent space. Another association of the same gateway, in this or another agent space, is not checked; in `server` or `both` mode ([Server-side approval](#server-side-approval)) a misclassified write tool still cannot apply without a server approval.
+- A deploy that adds a tool (such as `request_approval`) is drift for the association check until `enable-write` has added it to the association: with the DevOps Agent IDs configured, run `enable-write` right after `terraform apply`, wait for an `ok` run, then set the kill switch back to `true`.
 - It compares tool names, not the Lambda function behind a target. Changing a target's function needs gateway write access, which is outside what classification drift covers.
+
+## Server-side approval
+
+Implements [ADR 0002](../docs/adr/0002-server-verified-approval.md). A human approval is a fact stored in the plan record and checked by the apply's own conditional write, instead of a step the server trusts the client to have done.
+
+### Modes
+
+`APPROVAL_MODE` (Terraform `approval_mode`, default `server`; an unset variable also means `server`, so a missing setting fails closed):
+
+| Mode | Apply requires a server approval | Use |
+|---|---|---|
+| `client` | No; the condition is the one from Milestone 0. | DevOps Agent chat: the chat approval is the only one. |
+| `server` | Yes. | Every other client, and DevOps Agent autonomous investigations (plan and `request_approval`, then a human approves through the approval channel, which also runs the apply). |
+| `both` | Yes. The server cannot see the client's approval, so on the server side `both` is exactly `server`; the difference is only that the client asks its own user as well. | DevOps Agent chat with a server approval too: approve with `apply: false`, then the agent applies in chat. |
+
+`request_approval` and the approval API work in every mode. In `client` mode an approval is recorded but not required, and the approval API never runs the apply.
+
+### Lifecycle
+
+```
+planned -> awaiting_approval -> approved -> applied
+   |               |               +-> expired (APPLY_AFTER_APPROVAL_TTL_SECONDS)
+   |               +-> rejected
+   |               +-> expired (APPROVAL_WAIT_TTL_SECONDS from created_at)
+   +-> approved, rejected, expired (PLAN_TTL_SECONDS)
+```
+
+A plan can be approved without a request (for example right after planning). Every decision is final: an approved or rejected plan cannot be decided again or re-requested (`plan_decided`, `details: {"status": "approved" | "rejected"}`). A rejection also sets `expires_at` to the rejection time, so no mode can apply a rejected plan.
+
+### Apply condition
+
+In `server` and `both` mode the consume update's condition becomes
+
+```
+used = false AND expires_at > :now AND args_hash = :h AND action = :a
+AND status = "approved" AND attribute_exists(approved_by)
+AND approved_by <> requested_by AND approved_args_hash = args_hash
+AND approval_expires_at > :now
+```
+
+Approval, argument match, separation of duties, expiry and single use are one atomic write. When it fails, the record is read again and the first matching reason is returned:
+
+1. no record: `plan_not_found`; `used`: `plan_used`;
+2. `status = rejected` (every mode): `approval_required`, `details: {"status": "rejected"}`;
+3. approved but `approval_expires_at <= now` (server and both): `approval_required`, `details: {"status": "approval_expired"}`;
+4. `expires_at <= now`: `plan_expired`;
+5. arguments differ: `plan_mismatch` (the approval is pinned to `args_hash`, including `override_manual_change`);
+6. not approved (server and both): `approval_required`, `details: {"status": "planned" | "awaiting_approval"}`;
+7. approved by the requester, or an approval of other arguments (only possible by writing the table directly): `approval_required`, `details: {"status": "approval_invalid"}`.
+
+A successful apply's `data` also carries `approved_by` when the plan was approved. Everything after the consume (blast radius, live object checks, history checks, global budget, dry run) is unchanged: an approval never lifts a guard.
+
+### `request_approval(plan_id)`
+
+`READ_ONLY` tool on `k8sr`. It approves nothing and only `plan_id` is read from the arguments, so no agent text reaches the approvers.
+
+1. `plan_id` must be a UUID (`invalid_argument`). Without a configured `APPROVAL_TOPIC_ARN` the call fails with `internal` before the plan changes.
+2. The record is read consistently: `plan_not_found`, `plan_used`, `plan_decided` (approved or rejected), `plan_expired`.
+3. If it already notified less than `APPROVAL_REQUEST_COOLDOWN_SECONDS` ago, nothing changes and nobody is notified: `ok` with `notified: false` and `retry_after`.
+4. One conditional update adds 1 to the current window's approval request counter only while it is below `APPROVAL_REQUEST_LIMIT` (`approval_rate_limited`, `details: {"limit", "window_seconds": 600, "window_start", "retry_after"}`). Clock windows, so up to twice the limit can pass across a window boundary.
+5. One conditional update sets `status = awaiting_approval`, `approval_requested_at = now` and `expires_at = created_at + APPROVAL_WAIT_TTL_SECONDS` (from creation, so asking again never extends a plan).
+6. The notification is published to the server's SNS topic, rendered from the record: Deployment, replica change, override flag, requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
+
+Response `data`: `plan_id`, `status` (`awaiting_approval`), `expires_at`, `notified`, `approval_mode`, and `retry_after` when `notified` is false.
+
+### Approval API
+
+The approver Lambda (`mcp/approver/`) is not a gateway target and has no MCP tools. It is served through a Lambda Function URL with `AuthType AWS_IAM`, so every request is SigV4-signed (service `lambda`) by an IAM principal; a bearer token, such as a Cognito token, is refused by the URL itself with 403. The caller is `requestContext.authorizer.iam.userArn`.
+
+Authorization, before anything else:
+
+1. A request without an IAM identity is `forbidden`.
+2. A caller matching `DENIED_PRINCIPALS` (the roles of the read, write, sentinel and approver Lambdas, set by Terraform) is `forbidden`, even if it is also listed as an approver: machine identities never approve.
+3. The caller must match `APPROVER_PRINCIPALS`: an IAM user ARN matches exactly that ARN (including its path); an IAM role ARN `arn:aws:iam::<account>:role[/path]/<name>` matches its sessions `arn:aws:sts::<account>:assumed-role/<name>/<any session>`. Otherwise `forbidden`.
+
+Requests (responses are the JSON envelope in the body):
+
+- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `override_manual_change`, `impact`, `requested_by`, `created_at`, `expires_at`, and when present `approval`, `rejection` and `result`.
+- `POST /` with a JSON object of at most 4096 bytes and only these fields: `plan_id` (UUID), `decision` (`approve` or `reject`), optional `reason` (string, at most 500 characters, control characters removed), optional `apply` (boolean, default `true`). Any other field is `invalid_argument`.
+  - `approve`: one conditional update, `status IN (planned, awaiting_approval) AND used = false AND expires_at > now AND requested_by <> caller`, sets `status = approved`, `approved_by`, `approved_at`, `approved_args_hash = args_hash` (copied from the record in the same update), `approval_channel = api`, and `approval_expires_at = expires_at = now + APPLY_AFTER_APPROVAL_TTL_SECONDS`.
+  - `reject`: the same condition; sets `status = rejected`, `rejected_by`, `rejected_at`, `reject_reason`, `expires_at = now`.
+  - Refusals: `plan_not_found`, `plan_used`, `plan_decided`, `plan_expired`, `forbidden` (the requester), `conflict` (changed concurrently).
+  - In `server` and `both` mode, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id`, `namespace`, `name`, `replicas = replicas_to`, and `override_manual_change: true` only when the plan has it) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "k8sw___apply_scale_deployment"}}`, exactly as the gateway calls it. The write guard is unchanged and authoritative.
+  - Response `data`: `plan` (the view above, read again after the apply) and `apply` (the write Lambda's envelope, or `null` when no apply ran). A failed apply does not undo the approval: an approval whose apply was refused before the consume (for example `remediation_disabled`) can still be applied through the gateway until it expires.
+- Any other method: `invalid_argument`.
+
+HTTP status: 200 for `ok` (also when the triggered apply failed; see `data.apply`), 400 `invalid_argument`, 403 `forbidden`, 404 `plan_not_found`, 409 `plan_used`, `plan_expired`, `plan_decided`, `conflict`, 500 otherwise. Each decision and refusal is logged with the caller ARN and `plan_id`.
+
+`scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and asks for confirmation unless `--yes`.
+
+### MFA and who can reach the URL
+
+A Lambda resource policy cannot carry an `aws:MultiFactorAuthPresent` condition (AddPermission takes no conditions). Calling an `AWS_IAM` function URL takes `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` (the latter with `lambda:InvokedViaFunctionUrl`). Therefore:
+
+- `approval_require_mfa = true` (default): Terraform creates the IAM policy in the `approver_policy_arn` output, which grants both actions on the approver function only with MFA present. Attach it to each approver user or role (for a role, require MFA in its trust policy as well). The function's resource policy grants nobody, because a same-account allow there would bypass the MFA condition.
+- `approval_require_mfa = false` (test setups only, for example an IAM user with access keys and no MFA session): the resource policy grants each listed principal both actions, without MFA.
+
+Either way the allowlist in the approver's code is the gate that counts. Any same-account principal whose own policies allow `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` broadly (for example administrator access) reaches the URL without MFA and is stopped only by the allowlist. Grant approvers access only through the policy above. Anyone who can invoke the approver function directly (outside the URL, with a forged event) or write the plan table can forge an approval; both are administrator-level rights and should be kept that way.
+
+Known limits:
+
+- Separation of duties is between principal classes: every plan is requested by `mcp-gateway` and only listed human principals approve. Per-agent `requested_by` needs caller identity on the server (Milestone 1, item 6).
+- The apply triggered by the approval channel does not pass through the gateway, so gateway policy (Cedar, once added) does not see it; the write guard and RBAC do.
+- Slack is not an approval channel yet; the implemented channel is this IAM-authenticated API and its CLI.
 
 ## Runtime and packaging
 
 - Python 3.12, `x86_64`, pinned in one Terraform local.
-- Dependencies installed by Terraform-driven build into `build/<function>/` with `pip install --target build/<function> --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 -r <requirements>`, plus `mcp/common/`. `archive_file` zips `build/<function>/`. The tool Lambdas use `requirements.txt`; the sentinel uses `mcp/sentinel/requirements.txt`, which bundles its own `boto3` because the runtime's copy may not know the `devops-agent` service. That pin must match the `boto3` pin in `requirements-dev.txt`, whose service models include `devops-agent` and `bedrock-agentcore-control`.
+- Dependencies installed by Terraform-driven build into `build/<function>/` with `pip install --target build/<function> --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 -r <requirements>`, plus `mcp/common/`. `archive_file` zips `build/<function>/`. The tool Lambdas use `requirements.txt`; the approver uses `mcp/approver/requirements.txt`, which installs nothing (it needs only the runtime's `boto3` and `handrail_common`, never `kubernetes`); the sentinel uses `mcp/sentinel/requirements.txt`, which bundles its own `boto3` because the runtime's copy may not know the `devops-agent` service. That pin must match the `boto3` pin in `requirements-dev.txt`, whose service models include `devops-agent` and `bedrock-agentcore-control`.
 
 ## Identity
 
-- Two IAM roles, one per Lambda. On the plan table: read role `dynamodb:PutItem` and `dynamodb:GetItem`; write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only.
+- Two IAM roles, one per tool Lambda. On the plan table: read role `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:UpdateItem` (for `request_approval` and its counter); write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only. The read role also has `sns:Publish` on the approval topic, and an explicit deny of `PutItem` and `UpdateItem` that name any approval attribute (`approved_*`, `approval_channel`, `approval_expires_at`, `rejected_*`, `reject_reason`, through `dynamodb:Attributes`). The write role has no such deny, because its consume condition reads those attributes; only its code keeps it from writing them.
+- Approver role: `dynamodb:GetItem` and `dynamodb:UpdateItem` on the plan table, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS access: the apply it triggers runs as the write Lambda.
 - Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the kill switch parameter only; `bedrock-agentcore:ListGatewayTargets` and `bedrock-agentcore:GetGatewayTarget` on this gateway; `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
 - Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations.
 - RBAC in the sandbox namespace only:
@@ -231,6 +344,18 @@ Known limits:
 ## Configuration (environment variables)
 
 `CLUSTER_NAME`, `PLANS_TABLE`, `ALLOWED_NAMESPACES` (comma-separated), `MIN_REPLICAS`, `MAX_REPLICAS`, `PLAN_TTL_SECONDS`, `REMEDIATION_ENABLED_PARAM` (write only). `AWS_REGION` is provided by Lambda.
+
+Server-side approval, set on both tool Lambdas (the approver reads `APPROVAL_MODE` and `APPLY_AFTER_APPROVAL_TTL_SECONDS` as well):
+
+| Variable | Default | Terraform variable |
+|---|---|---|
+| `APPROVAL_MODE` | `server` (also when unset) | `approval_mode` (`client`, `server`, `both`) |
+| `APPROVAL_WAIT_TTL_SECONDS` | 900; at least `PLAN_TTL_SECONDS` | `approval_wait_ttl_seconds` |
+| `APPLY_AFTER_APPROVAL_TTL_SECONDS` | 120 | `apply_after_approval_ttl_seconds` |
+| `APPROVAL_REQUEST_COOLDOWN_SECONDS` | 60 (`0` turns it off) | `approval_request_cooldown_seconds` |
+| `APPROVAL_REQUEST_LIMIT` | 10 per 600 s | `approval_request_limit` |
+
+Read Lambda only: `APPROVAL_TOPIC_ARN` (the approval topic) and `APPROVAL_URL` (shown in notifications). Approver: `PLANS_TABLE`, `WRITE_FUNCTION_NAME`, `APPROVER_PRINCIPALS` and `DENIED_PRINCIPALS` (comma-separated IAM user or role ARNs). Terraform variables: `approver_principals` (required in `server` and `both` mode; must not list the Lambda roles), `approval_require_mfa` (default `true`), `approval_email`; outputs `approval_url`, `approval_topic_arn`, `approver_policy_arn`.
 
 History checks, set on both Lambdas; each must be a positive integer, except that the cooldown may be 0:
 

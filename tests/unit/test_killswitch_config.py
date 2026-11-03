@@ -22,6 +22,34 @@ def test_settings_parse():
     assert (s.plan_rate_limit, s.plan_rate_window_seconds) == (20, 600)
     assert (s.apply_cooldown_seconds, s.global_hourly_apply_budget) == (60, 30)
     assert s.max_replica_step_percent == 100
+    # Without an explicit mode, apply requires a server approval.
+    assert s.approval_mode == "server" and s.approval_required
+    assert (s.approval_wait_ttl_seconds, s.apply_after_approval_ttl_seconds) == (900, 120)
+    assert (s.approval_request_cooldown_seconds, s.approval_request_limit) == (60, 10)
+    assert s.approval_topic_arn is None and s.approval_url is None
+
+
+@pytest.mark.parametrize(("mode", "required"), [("client", False), ("server", True), ("both", True)])
+def test_approval_modes(mode, required):
+    assert load_settings(BASE | {"APPROVAL_MODE": mode}).approval_required is required
+
+
+def test_approval_settings_parse():
+    s = load_settings(
+        BASE
+        | {
+            "APPROVAL_MODE": "both",
+            "APPROVAL_WAIT_TTL_SECONDS": "600",
+            "APPLY_AFTER_APPROVAL_TTL_SECONDS": "30",
+            "APPROVAL_REQUEST_COOLDOWN_SECONDS": "0",
+            "APPROVAL_REQUEST_LIMIT": "3",
+            "APPROVAL_TOPIC_ARN": "arn:aws:sns:us-east-1:123456789012:approvals",
+            "APPROVAL_URL": "https://example.lambda-url.us-east-1.on.aws/",
+        }
+    )
+    assert (s.approval_wait_ttl_seconds, s.apply_after_approval_ttl_seconds) == (600, 30)
+    assert (s.approval_request_cooldown_seconds, s.approval_request_limit) == (0, 3)
+    assert s.approval_topic_arn.endswith(":approvals") and s.approval_url.startswith("https://")
 
 
 def test_breaker_settings_parse():
@@ -61,6 +89,14 @@ def test_breaker_settings_parse():
         {"MAX_REPLICA_STEP_PERCENT": "0"},
         {"MAX_REPLICA_STEP_PERCENT": "-50"},
         {"MAX_REPLICA_STEP_PERCENT": "1.5"},
+        {"APPROVAL_MODE": "none"},
+        {"APPROVAL_MODE": "SERVER"},
+        {"APPROVAL_WAIT_TTL_SECONDS": "0"},
+        # Shorter than the plan TTL: requesting an approval would shorten the plan.
+        {"APPROVAL_WAIT_TTL_SECONDS": "299"},
+        {"APPLY_AFTER_APPROVAL_TTL_SECONDS": "0"},
+        {"APPROVAL_REQUEST_COOLDOWN_SECONDS": "-1"},
+        {"APPROVAL_REQUEST_LIMIT": "0"},
     ],
 )
 def test_settings_invalid(override):

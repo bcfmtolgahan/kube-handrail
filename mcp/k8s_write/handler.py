@@ -223,7 +223,11 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
 
     now = int(rt.clock())
     plan = rt.store.consume(
-        plan_id, scale_args_hash(namespace, name, replicas, override), SCALE_DEPLOYMENT, now
+        plan_id,
+        scale_args_hash(namespace, name, replicas, override),
+        SCALE_DEPLOYMENT,
+        now,
+        require_approval=s.approval_required,
     )
 
     try:
@@ -243,16 +247,17 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
         raise
     _record(rt, plan_id, RESULT_APPLIED)
 
-    return ok(
-        {
-            "plan_id": plan_id,
-            "namespace": namespace,
-            "name": name,
-            "replicas_from": plan.replicas_from,
-            "replicas_to": replicas,
-            "resource_version": updated.metadata.resource_version,
-        }
-    )
+    data: dict[str, Any] = {
+        "plan_id": plan_id,
+        "namespace": namespace,
+        "name": name,
+        "replicas_from": plan.replicas_from,
+        "replicas_to": replicas,
+        "resource_version": updated.metadata.resource_version,
+    }
+    if plan.approved_by is not None:
+        data["approved_by"] = plan.approved_by
+    return ok(data)
 
 
 HANDLERS = {"apply_scale_deployment": apply_scale_deployment}

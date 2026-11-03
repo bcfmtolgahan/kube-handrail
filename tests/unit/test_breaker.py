@@ -16,6 +16,7 @@ from handrail_common.breaker import (
     check_plan_rate,
     last_applied_plan,
     last_plan_id,
+    max_plan_lifetime,
     retention_seconds,
     with_last_applied,
 )
@@ -328,7 +329,14 @@ SETTINGS = load_settings(
 
 
 def test_retention_covers_the_longest_window_plus_plan_lifetime():
-    assert retention_seconds(SETTINGS) == 3600 + 300 + APPLY_GRACE_SECONDS
+    # The longest a plan lives: the approval wait (900) plus the apply window after it (120).
+    assert retention_seconds(SETTINGS) == 3600 + 900 + 120 + APPLY_GRACE_SECONDS
+    assert max_plan_lifetime(SETTINGS) == 1020
+
+
+def test_plan_lifetime_without_a_longer_approval_wait():
+    settings = replace(SETTINGS, plan_ttl_seconds=900, approval_wait_ttl_seconds=900)
+    assert max_plan_lifetime(settings) == 900 + 120
 
 
 class FakeStore:
@@ -485,4 +493,4 @@ def test_check_history_runs_the_cooldown_first():
 
 def test_retention_covers_a_long_cooldown():
     settings = replace(SETTINGS, apply_cooldown_seconds=7200)
-    assert retention_seconds(settings) == 7200 + 300 + APPLY_GRACE_SECONDS
+    assert retention_seconds(settings) == 7200 + 1020 + APPLY_GRACE_SECONDS

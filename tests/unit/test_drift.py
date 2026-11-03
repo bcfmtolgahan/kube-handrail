@@ -29,6 +29,7 @@ def test_repository_classification():
     assert load_classification(REPO / "mcp" / "classification.json") == {
         "k8sr___get_workload_status": READ_ONLY,
         "k8sr___plan_scale_deployment": READ_ONLY,
+        "k8sr___request_approval": READ_ONLY,
         "k8sw___apply_scale_deployment": MUTATIVE,
     }
 
@@ -147,4 +148,5 @@ def test_associate_read_uses_read_only_tools():
     assert client.configuration["mcpserver"]["toolDetails"] == [
         {"name": "k8sr___get_workload_status", "toolClassification": READ_ONLY},
         {"name": "k8sr___plan_scale_deployment", "toolClassification": READ_ONLY},
+        {"name": "k8sr___request_approval", "toolClassification": READ_ONLY},
     ]
