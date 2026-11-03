@@ -3,6 +3,7 @@ import uuid
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from handrail_common.envelope import PLAN_EXPIRED, PLAN_MISMATCH, PLAN_NOT_FOUND, PLAN_USED
@@ -131,7 +132,7 @@ def test_consume_action_mismatch(store):
 def test_create_refuses_duplicate_id(store):
     plan = make_plan()
     store.create(plan)
-    with pytest.raises(Exception):
+    with pytest.raises(ClientError, match="ConditionalCheckFailed"):
         store.create(plan)
 
 
@@ -140,9 +141,11 @@ def test_record_result(store):
     store.create(plan)
     store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW)
     store.record_result(plan.plan_id, NOW + 1, "applied")
-    item = boto3.resource("dynamodb", region_name="us-east-1").Table(TABLE).get_item(
-        Key={"plan_id": plan.plan_id}
-    )["Item"]
+    item = (
+        boto3.resource("dynamodb", region_name="us-east-1")
+        .Table(TABLE)
+        .get_item(Key={"plan_id": plan.plan_id})["Item"]
+    )
     assert item["result"] == "applied" and item["applied_at"] == NOW + 1
     assert "apply_correlation_id" not in item
 
@@ -275,7 +278,11 @@ def test_global_budget_counts_applies_per_clock_hour(store):
 
 def test_global_budget_counter_is_not_a_plan(store):
     store.take_global_budget(NOW, 5)
-    item = boto3.resource("dynamodb", region_name="us-east-1").Table(TABLE).get_item(Key={"plan_id": global_budget_key(NOW)})["Item"]
+    item = (
+        boto3.resource("dynamodb", region_name="us-east-1")
+        .Table(TABLE)
+        .get_item(Key={"plan_id": global_budget_key(NOW)})["Item"]
+    )
     assert "object_key" not in item
     assert item["retain_until"] == NOW - NOW % 3600 + 7200
     with pytest.raises(GuardError):

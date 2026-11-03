@@ -39,7 +39,9 @@ ALICE = f"arn:aws:iam::{ACCOUNT}:user/alice"
 OPERATOR_ROLE = f"arn:aws:iam::{ACCOUNT}:role/ops/oncall-approver"
 OPERATOR_SESSION = f"arn:aws:sts::{ACCOUNT}:assumed-role/oncall-approver/bob"
 WRITE_ROLE = f"arn:aws:iam::{ACCOUNT}:role/kube-handrail-k8s-write"
-WRITE_SESSION = f"arn:aws:sts::{ACCOUNT}:assumed-role/kube-handrail-k8s-write/kube-handrail-k8s-write"
+WRITE_SESSION = (
+    f"arn:aws:sts::{ACCOUNT}:assumed-role/kube-handrail-k8s-write/kube-handrail-k8s-write"
+)
 READ_ROLE = f"arn:aws:iam::{ACCOUNT}:role/kube-handrail-k8s-read"
 UID = "8f7c1a2e-0000-4000-8000-000000000001"
 WRITE_ENV = {
@@ -178,7 +180,7 @@ def approve(env, plan: Plan, caller: str = ALICE, **extra) -> tuple[int, dict]:
         (ALICE, f"arn:aws:iam::{ACCOUNT}:user/alice2", False),
         (OPERATOR_ROLE, OPERATOR_SESSION, True),
         (OPERATOR_ROLE, f"arn:aws:sts::{ACCOUNT}:assumed-role/oncall-approver/any-session", True),
-        (OPERATOR_ROLE, f"arn:aws:sts::999999999999:assumed-role/oncall-approver/bob", False),
+        (OPERATOR_ROLE, "arn:aws:sts::999999999999:assumed-role/oncall-approver/bob", False),
         (OPERATOR_ROLE, f"arn:aws:sts::{ACCOUNT}:assumed-role/oncall-approver-x/bob", False),
         (OPERATOR_ROLE, f"arn:aws-cn:sts::{ACCOUNT}:assumed-role/oncall-approver/bob", False),
         # A role entry never matches the role ARN itself, nor a user of the same name.
@@ -337,7 +339,9 @@ def test_both_mode_records_the_approval_and_leaves_the_apply_to_the_client(env):
 def test_an_invoke_error_reports_the_recorded_approval(env):
     class Failing:
         def invoke(self, **_kwargs):
-            raise ClientError({"Error": {"Code": "TooManyRequestsException", "Message": "x"}}, "Invoke")
+            raise ClientError(
+                {"Error": {"Code": "TooManyRequestsException", "Message": "x"}}, "Invoke"
+            )
 
     env.rt.lambda_client = Failing()
     plan = make_plan(env.store)
@@ -345,7 +349,10 @@ def test_an_invoke_error_reports_the_recorded_approval(env):
     assert status == 200 and body["ok"] is True
     error = body["data"]["apply"]["error"]
     assert error["code"] == "internal"
-    assert error["message"] == "approval recorded; apply could not be started: TooManyRequestsException"
+    assert (
+        error["message"]
+        == "approval recorded; apply could not be started: TooManyRequestsException"
+    )
     assert body["data"]["plan"]["status"] == "approved"
 
 
@@ -462,7 +469,10 @@ def test_malformed_requests(env, body):
 def test_base64_body_is_decoded(env):
     plan = make_plan(env.store)
     status, _ = call(
-        env.rt, ALICE, body={"plan_id": plan.plan_id, "decision": "approve", "apply": False}, b64=True
+        env.rt,
+        ALICE,
+        body={"plan_id": plan.plan_id, "decision": "approve", "apply": False},
+        b64=True,
     )
     assert status == 200
 

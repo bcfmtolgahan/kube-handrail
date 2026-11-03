@@ -29,8 +29,9 @@ import time
 from typing import Any
 
 import httpx
-from mcp import ClientSession
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+
+from mcp import ClientSession
 
 EXPECTED_TOOLS = {
     "k8sr___get_workload_status",
@@ -169,10 +170,13 @@ async def run(args: argparse.Namespace, token: str) -> None:
     http_client = create_mcp_http_client(
         headers={"Authorization": f"Bearer {token}"}, timeout=httpx.Timeout(30, read=300)
     )
-    async with http_client, streamable_http_client(args.gateway_url, http_client=http_client) as (
-        read,
-        write,
-        _,
+    async with (
+        http_client,
+        streamable_http_client(args.gateway_url, http_client=http_client) as (
+            read,
+            write,
+            _,
+        ),
     ):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -188,7 +192,9 @@ async def run(args: argparse.Namespace, token: str) -> None:
 
             scale_up = {**target, "replicas": 2}
             plan_id = await plan_and_apply(gw, scale_up)
-            reused = await gw.call("k8sw___apply_scale_deployment", {"plan_id": plan_id, **scale_up})
+            reused = await gw.call(
+                "k8sw___apply_scale_deployment", {"plan_id": plan_id, **scale_up}
+            )
             check(
                 not reused["ok"] and reused["error"]["code"] == "plan_used",
                 "second apply with the same plan_id is rejected as plan_used",

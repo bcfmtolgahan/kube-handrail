@@ -134,7 +134,12 @@ def associate_read(client: Any, args: argparse.Namespace) -> None:
     association = client.associate_service(
         agentSpaceId=args.agent_space_id, serviceId=args.service_id, configuration=configuration
     )["association"]
-    emit({"associationId": association["associationId"], "tools": configuration["mcpserver"]["tools"]})
+    emit(
+        {
+            "associationId": association["associationId"],
+            "tools": configuration["mcpserver"]["tools"],
+        }
+    )
 
 
 def enable_write(client: Any, args: argparse.Namespace) -> None:
@@ -198,7 +203,9 @@ def parse_skill(path: Path) -> Skill:
     for line in lines[1:end]:
         key, sep, value = line.partition(": ")
         if not sep or key in fields or key not in ("name", "description") or not value.strip():
-            sys.exit(f"{path}: frontmatter must be one-line 'name: ...' and 'description: ...', got {line!r}")
+            sys.exit(
+                f"{path}: frontmatter must be one-line 'name: ...' and 'description: ...', got {line!r}"
+            )
         fields[key] = value.strip()
     if set(fields) != {"name", "description"}:
         sys.exit(f"{path}: frontmatter needs name and description")
@@ -219,10 +226,14 @@ def hidden(path: Path, root: Path) -> bool:
 
 def load_skills(directory: Path) -> list[Skill]:
     skills = []
-    for skill_dir in sorted(p for p in directory.iterdir() if p.is_dir() and not hidden(p, directory)):
+    for skill_dir in sorted(
+        p for p in directory.iterdir() if p.is_dir() and not hidden(p, directory)
+    ):
         # Only SKILL.md is uploaded, so any other file would silently be missing.
         files = sorted(
-            str(p.relative_to(skill_dir)) for p in skill_dir.rglob("*") if p.is_file() and not hidden(p, skill_dir)
+            str(p.relative_to(skill_dir))
+            for p in skill_dir.rglob("*")
+            if p.is_file() and not hidden(p, skill_dir)
         )
         if files != [SKILL_PATH]:
             sys.exit(f"{skill_dir}: must contain only {SKILL_PATH}, found {files}")
@@ -256,7 +267,9 @@ def file_content(text: str, path: str) -> dict[str, Any]:
     return {"file": {"path": path, "body": {"text": text}}}
 
 
-def installed_from_repo(client: Any, space_id: str, asset_id: str, path: str = AGENTS_MD_PATH) -> bool:
+def installed_from_repo(
+    client: Any, space_id: str, asset_id: str, path: str = AGENTS_MD_PATH
+) -> bool:
     """Whether the asset's file carries this repository's marker (path is AGENTS.md or SKILL.md)."""
     try:
         file = client.get_asset_file(agentSpaceId=space_id, assetId=asset_id, path=path)["file"]
@@ -306,11 +319,17 @@ def install_guidance(client: Any, args: argparse.Namespace) -> None:
     skills = load_skills(SKILLS_DIR)
 
     current = [
-        a for a in list_assets(client, space_id, AGENTS_MD_TYPE) if a["metadata"].get("agent_type") == agent_type
+        a
+        for a in list_assets(client, space_id, AGENTS_MD_TYPE)
+        if a["metadata"].get("agent_type") == agent_type
     ]
     existing = single(current, f"agent type {agent_type}")
     # One AGENTS.md per agent type: updating someone else's would replace their instructions.
-    if existing and not args.replace_instructions and not installed_from_repo(client, space_id, existing["assetId"]):
+    if (
+        existing
+        and not args.replace_instructions
+        and not installed_from_repo(client, space_id, existing["assetId"])
+    ):
         sys.exit(
             f"the AGENTS.md for agent type {agent_type} ({existing['assetId']}) was not installed from this "
             "repository; merge AGENTS.md into it by hand, choose another --agent-type, "
@@ -320,7 +339,9 @@ def install_guidance(client: Any, args: argparse.Namespace) -> None:
     installed = list_assets(client, space_id, SKILL_TYPE)
     existing_skills = {}
     for skill in skills:
-        found = single([a for a in installed if a["metadata"].get("name") == skill.name], f"skill {skill.name}")
+        found = single(
+            [a for a in installed if a["metadata"].get("name") == skill.name], f"skill {skill.name}"
+        )
         if (
             found
             and not args.replace_instructions
@@ -350,7 +371,12 @@ def install_guidance(client: Any, args: argparse.Namespace) -> None:
         # Skills load only when relevant, so every agent type gets them, whatever --agent-type says.
         metadata = {"name": skill.name, "description": skill.description, "agent_types": [GENERIC]}
         result = put_asset(
-            client, space_id, SKILL_TYPE, existing_skills[skill.name], metadata, file_content(skill.text, SKILL_PATH)
+            client,
+            space_id,
+            SKILL_TYPE,
+            existing_skills[skill.name],
+            metadata,
+            file_content(skill.text, SKILL_PATH),
         )
         payload["skills"].append({"name": skill.name, **result})
     emit(payload)
@@ -362,7 +388,9 @@ def remove_guidance(client: Any, args: argparse.Namespace) -> None:
     for asset in list_assets(client, space_id, AGENTS_MD_TYPE):
         if installed_from_repo(client, space_id, asset["assetId"]):
             client.delete_asset(agentSpaceId=space_id, assetId=asset["assetId"])
-            removed.append({"assetId": asset["assetId"], "agentType": asset["metadata"].get("agent_type")})
+            removed.append(
+                {"assetId": asset["assetId"], "agentType": asset["metadata"].get("agent_type")}
+            )
     names = skill_names()
     for asset in list_assets(client, space_id, SKILL_TYPE):
         if asset["metadata"].get("name") in names and installed_from_repo(
@@ -445,7 +473,9 @@ def delete_space(client: Any, args: argparse.Namespace) -> None:
     emit({"deleted": args.agent_space_id})
 
 
-def id_flag(parser: argparse.ArgumentParser, flag: str, env_name: str, required: bool = True) -> None:
+def id_flag(
+    parser: argparse.ArgumentParser, flag: str, env_name: str, required: bool = True
+) -> None:
     default = os.environ.get(env_name)
     parser.add_argument(flag, default=default, required=required and default is None)
 
@@ -466,9 +496,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("register-mcp", help="register the gateway with OAuth client credentials")
     p.add_argument("--name", required=True, help="display name of the MCP server")
-    p.add_argument("--endpoint", default=os.environ.get("GATEWAY_URL"), required="GATEWAY_URL" not in os.environ)
-    p.add_argument("--token-url", default=os.environ.get("TOKEN_URL"), required="TOKEN_URL" not in os.environ)
-    p.add_argument("--scope", action="append", help="OAuth scope(s), space-separated; may be repeated")
+    p.add_argument(
+        "--endpoint",
+        default=os.environ.get("GATEWAY_URL"),
+        required="GATEWAY_URL" not in os.environ,
+    )
+    p.add_argument(
+        "--token-url", default=os.environ.get("TOKEN_URL"), required="TOKEN_URL" not in os.environ
+    )
+    p.add_argument(
+        "--scope", action="append", help="OAuth scope(s), space-separated; may be repeated"
+    )
     p.set_defaults(func=register_mcp)
 
     p = sub.add_parser("associate-read", help="associate the server with the k8sr tools only")
@@ -484,7 +522,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("install-guidance", help="create or update the AGENTS.md and skill assets")
     id_flag(p, "--agent-space-id", "AGENT_SPACE_ID")
     p.add_argument(
-        "--agent-type", choices=AGENT_TYPES, default=GENERIC, help="agent type of the AGENTS.md; default GENERIC (every agent)"
+        "--agent-type",
+        choices=AGENT_TYPES,
+        default=GENERIC,
+        help="agent type of the AGENTS.md; default GENERIC (every agent)",
     )
     p.add_argument(
         "--replace-instructions",

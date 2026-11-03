@@ -53,7 +53,9 @@ def transform(body: Any, headers: Mapping[str, Any]) -> Any:
 
 
 def lambda_handler(event: Any, context: Any) -> dict[str, Any]:
-    request = (event.get("mcp") or {}).get("gatewayRequest") or {} if isinstance(event, dict) else {}
+    request = (
+        (event.get("mcp") or {}).get("gatewayRequest") or {} if isinstance(event, dict) else {}
+    )
     headers = request.get("headers") or {}
     body = transform(request.get("body"), headers if isinstance(headers, Mapping) else {})
     return {"interceptorOutputVersion": "1.0", "mcp": {"transformedGatewayRequest": {"body": body}}}

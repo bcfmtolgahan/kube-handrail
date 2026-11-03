@@ -53,10 +53,10 @@ from handrail_common.validation import (
     GuardError,
     check_namespace_allowed,
     check_replica_step,
+    require_int,
     require_name,
     require_namespace,
     require_override_flag,
-    require_int,
     require_plan_id,
     validate_scale_args,
 )
@@ -170,7 +170,9 @@ def _conditions(status: Any) -> tuple[list[dict[str, Any]], bool]:
         reason, reason_cut = untrusted_text(c.reason)
         message, message_cut = untrusted_text(c.message)
         truncated = truncated or reason_cut or message_cut
-        conditions.append({"type": c.type, "status": c.status, "reason": reason, "message": message})
+        conditions.append(
+            {"type": c.type, "status": c.status, "reason": reason, "message": message}
+        )
     return conditions, truncated
 
 
@@ -380,7 +382,9 @@ def get_workload_events(args: dict[str, Any], settings: Settings, clients: Clien
     deployment = _read_deployment(clients.apps, namespace, name)
     uid = str(deployment.metadata.uid)
     replica_sets = _owned_replica_sets(
-        _list("ReplicaSets", partial(clients.apps.list_namespaced_replica_set, namespace=namespace)),
+        _list(
+            "ReplicaSets", partial(clients.apps.list_namespaced_replica_set, namespace=namespace)
+        ),
         uid,
     )
     events = _list("Events", partial(clients.core.list_namespaced_event, namespace=namespace))

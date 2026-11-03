@@ -46,12 +46,19 @@ def test_requests_are_signed_for_lambda():
     [
         ("approve", None, True, {"plan_id": PLAN_ID, "decision": "approve"}),
         ("approve", None, False, {"plan_id": PLAN_ID, "decision": "approve", "apply": False}),
-        ("reject", "no", False, {"plan_id": PLAN_ID, "decision": "reject", "reason": "no", "apply": False}),
+        (
+            "reject",
+            "no",
+            False,
+            {"plan_id": PLAN_ID, "decision": "reject", "reason": "no", "apply": False},
+        ),
     ],
 )
 def test_decide_body(monkeypatch, decision, reason, apply, body):
     sent = []
-    monkeypatch.setattr(approve, "send", lambda request: sent.append(request) or (200, {"ok": True}))
+    monkeypatch.setattr(
+        approve, "send", lambda request: sent.append(request) or (200, {"ok": True})
+    )
     approve.decide(URL, "eu-central-1", PLAN_ID, decision, reason, apply)
     (request,) = sent
     assert json.loads(request.data) == body
@@ -60,6 +67,8 @@ def test_decide_body(monkeypatch, decision, reason, apply, body):
 
 def test_show_puts_the_plan_id_in_the_query(monkeypatch):
     sent = []
-    monkeypatch.setattr(approve, "send", lambda request: sent.append(request) or (200, {"ok": True}))
+    monkeypatch.setattr(
+        approve, "send", lambda request: sent.append(request) or (200, {"ok": True})
+    )
     approve.show(URL, "eu-central-1", PLAN_ID)
     assert sent[0].full_url == f"{URL}?plan_id={PLAN_ID}" and sent[0].get_method() == "GET"

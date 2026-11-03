@@ -19,11 +19,19 @@ def token(claims: dict) -> str:
 
 def event(body, authorization: str | None = None) -> dict:
     headers = {"Authorization": f"Bearer {authorization}"} if authorization else {}
-    return {"interceptorInputVersion": "1.0", "mcp": {"gatewayRequest": {"headers": headers, "body": body}}}
+    return {
+        "interceptorInputVersion": "1.0",
+        "mcp": {"gatewayRequest": {"headers": headers, "body": body}},
+    }
 
 
 def call(arguments) -> dict:
-    return {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "k8sr___x", "arguments": arguments}}
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "k8sr___x", "arguments": arguments},
+    }
 
 
 def transformed(result: dict):
@@ -32,33 +40,46 @@ def transformed(result: dict):
 
 
 def test_tool_call_gets_the_verified_client_id():
-    body = transformed(interceptor.lambda_handler(event(call({"replicas": 2}), token({"client_id": "abc"})), None))
+    body = transformed(
+        interceptor.lambda_handler(event(call({"replicas": 2}), token({"client_id": "abc"})), None)
+    )
     assert body["params"]["arguments"] == {"replicas": 2, CALLER_ARGUMENT: "abc"}
     assert body["params"]["name"] == "k8sr___x"
 
 
 def test_client_supplied_caller_is_overwritten():
     body = transformed(
-        interceptor.lambda_handler(event(call({CALLER_ARGUMENT: "attacker"}), token({"client_id": "abc"})), None)
+        interceptor.lambda_handler(
+            event(call({CALLER_ARGUMENT: "attacker"}), token({"client_id": "abc"})), None
+        )
     )
     assert body["params"]["arguments"][CALLER_ARGUMENT] == "abc"
 
 
 def test_unreadable_token_gives_unknown_never_the_client_value():
     for auth in (None, "not-a-jwt", "a.!!!.c", token({"sub": "x"})):
-        body = transformed(interceptor.lambda_handler(event(call({CALLER_ARGUMENT: "attacker"}), auth), None))
+        body = transformed(
+            interceptor.lambda_handler(event(call({CALLER_ARGUMENT: "attacker"}), auth), None)
+        )
         assert body["params"]["arguments"][CALLER_ARGUMENT] == "unknown"
 
 
 def test_lowercase_header_and_missing_arguments():
     raw = event({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "t"}})
-    raw["mcp"]["gatewayRequest"]["headers"] = {"authorization": f"Bearer {token({'client_id': 'abc'})}"}
-    assert transformed(interceptor.lambda_handler(raw, None))["params"]["arguments"] == {CALLER_ARGUMENT: "abc"}
+    raw["mcp"]["gatewayRequest"]["headers"] = {
+        "authorization": f"Bearer {token({'client_id': 'abc'})}"
+    }
+    assert transformed(interceptor.lambda_handler(raw, None))["params"]["arguments"] == {
+        CALLER_ARGUMENT: "abc"
+    }
 
 
 def test_other_methods_pass_through_unchanged():
     body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-    assert transformed(interceptor.lambda_handler(event(body, token({"client_id": "abc"})), None)) == body
+    assert (
+        transformed(interceptor.lambda_handler(event(body, token({"client_id": "abc"})), None))
+        == body
+    )
 
 
 def test_pop_caller_trusts_the_argument_only_with_the_interceptor_enabled():
@@ -78,6 +99,12 @@ def test_dispatch_never_hands_the_reserved_argument_to_a_tool():
     from handrail_common.dispatch import dispatch
 
     seen = {}
-    context = SimpleNamespace(client_context=SimpleNamespace(custom={"bedrockAgentCoreToolName": "k8sr___t"}))
-    dispatch({"t": lambda args: seen.update(args) or {"ok": True}}, {"a": 1, CALLER_ARGUMENT: "x"}, context)
+    context = SimpleNamespace(
+        client_context=SimpleNamespace(custom={"bedrockAgentCoreToolName": "k8sr___t"})
+    )
+    dispatch(
+        {"t": lambda args: seen.update(args) or {"ok": True}},
+        {"a": 1, CALLER_ARGUMENT: "x"},
+        context,
+    )
     assert seen == {"a": 1}

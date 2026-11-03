@@ -18,7 +18,13 @@ from handrail_common.untrusted import (
 AWS_KEY_ID = "AKIA" + "IOSFODNN7EXAMPLE"
 AWS_SESSION_KEY_ID = "ASIA" + "Q3EGVXN7EXAMPLE1"
 AWS_SECRET = "wJalrXUtnFEMI/K7MDENG/" + "bPxRfiCYEXAMPLEKEY"
-JWT = "eyJ" + "hbGciOiJIUzI1NiJ9" + ".eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0" + ".dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+JWT = (
+    "eyJ"
+    + "hbGciOiJIUzI1NiJ9"
+    + ".eyJ"
+    + "zdWIiOiIxMjM0NTY3ODkwIn0"
+    + ".dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+)
 GITHUB_TOKENS = ["ghp_" + "A1b2" * 9, "gho_" + "Z9" * 18, "github_pat_" + "11AB" * 6 + "_x"]
 SLACK_TOKEN = "xoxb-" + "123456789012-abcdefABCDEF"
 PEM = (
@@ -38,7 +44,7 @@ K8S_MESSAGES = [
     "Readiness probe failed: HTTP probe failed with statuscode: 503",
     "failed to get token: context deadline exceeded",
     "Created container nginx",
-    "ReplicaSet \"web-5d4f8c7b9\" has successfully progressed.",
+    'ReplicaSet "web-5d4f8c7b9" has successfully progressed.',
     "Deployment has minimum availability.",
     "0/3 nodes are available: 3 Insufficient cpu. preemption: 0/3 nodes are available",
     "Started container with token-refresher sidecar",

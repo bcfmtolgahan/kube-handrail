@@ -29,7 +29,9 @@ def test_settings_parse():
     assert s.approval_topic_arn is None and s.approval_url is None
 
 
-@pytest.mark.parametrize(("mode", "required"), [("client", False), ("server", True), ("both", True)])
+@pytest.mark.parametrize(
+    ("mode", "required"), [("client", False), ("server", True), ("both", True)]
+)
 def test_approval_modes(mode, required):
     assert load_settings(BASE | {"APPROVAL_MODE": mode}).approval_required is required
 

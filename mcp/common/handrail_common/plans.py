@@ -307,9 +307,7 @@ class PlanStore:
         except ClientError as exc:
             if not _is_conditional_failure(exc):
                 raise
-            raise self._rejection(
-                plan_id, expected_hash, action, now, require_approval
-            ) from None
+            raise self._rejection(plan_id, expected_hash, action, now, require_approval) from None
         return Plan.from_item(response["Attributes"])
 
     def get(self, plan_id: str) -> dict[str, Any] | None:
@@ -575,12 +573,10 @@ class PlanStore:
                     "the plan has no server approval; call request_approval and wait for an "
                     "approver",
                 )
-            if item.get("approved_by") == item.get(
-                "requested_by"
-            ) or item.get("approved_args_hash") != item.get("args_hash"):
-                return _approval_required(
-                    APPROVAL_INVALID, "the approval does not cover this plan"
-                )
+            if item.get("approved_by") == item.get("requested_by") or item.get(
+                "approved_args_hash"
+            ) != item.get("args_hash"):
+                return _approval_required(APPROVAL_INVALID, "the approval does not cover this plan")
         # The record satisfies every condition now, so it changed concurrently; refuse.
         return GuardError(PLAN_USED, "plan was consumed concurrently")
 

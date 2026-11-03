@@ -9,3 +9,16 @@ requires-python = ">=3.12"
 [tool.pytest.ini_options]
 pythonpath = ["mcp/common", "mcp/k8s_read", "mcp/k8s_write"]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# Line length is the formatter's job; the long lines left are strings and URLs.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["handrail_common"]
