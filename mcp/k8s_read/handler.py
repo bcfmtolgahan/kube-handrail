@@ -33,6 +33,7 @@ from handrail_common.envelope import (
 )
 from handrail_common.gitops import is_gitops_managed
 from handrail_common.impact import scale_impact
+from handrail_common.observability import current_correlation_id
 from handrail_common.plans import (
     GLOBAL_BUDGET_WINDOW_SECONDS,
     REQUESTER_GATEWAY,
@@ -265,6 +266,7 @@ def plan_scale_deployment(
         )
     # Last, after every check has passed, and before the plan is stored.
     impact = _impact(clients, namespace, deployment, current, replicas)
+    correlation_id = current_correlation_id()
 
     plan = Plan(
         plan_id=str(uuid.uuid4()),
@@ -284,6 +286,7 @@ def plan_scale_deployment(
         status=STATUS_PLANNED,
         override_manual_change=override,
         impact=impact,
+        plan_correlation_id=correlation_id,
     )
     clients.store.create(plan)
     checks = (
@@ -311,6 +314,7 @@ def plan_scale_deployment(
             "preflight": preflight,
             "impact": impact,
             "expires_at": plan.expires_at,
+            "correlation_id": correlation_id,
         },
         truncated=impact["truncated"],
     )
@@ -328,12 +332,14 @@ def request_approval(
     if settings.approval_topic_arn is None:
         # Fail before the plan changes state: an approval nobody hears about cannot come.
         raise GuardError(INTERNAL, "no approval destination is configured")
+    correlation_id = current_correlation_id()
     item, retry_after = clients.store.request_approval(
         plan_id,
         now,
         settings.approval_wait_ttl_seconds,
         settings.approval_request_cooldown_seconds,
         settings.approval_request_limit,
+        correlation_id,
     )
     data: dict[str, Any] = {
         "plan_id": plan_id,
@@ -341,6 +347,7 @@ def request_approval(
         "expires_at": plain(item.get("expires_at")),
         "notified": retry_after is None,
         "approval_mode": settings.approval_mode,
+        "correlation_id": correlation_id,
     }
     if retry_after is not None:
         data["retry_after"] = retry_after

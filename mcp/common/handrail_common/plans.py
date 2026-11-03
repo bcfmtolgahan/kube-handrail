@@ -117,6 +117,12 @@ class Plan:
     rejected_by: str | None = None
     rejected_at: int | None = None
     reject_reason: str | None = None
+    # Correlation ids of the invocations that planned, requested approval, decided and
+    # applied (mcp/CONTRACT.md, Observability); absent until each step happens.
+    plan_correlation_id: str | None = None
+    approval_request_correlation_id: str | None = None
+    decision_correlation_id: str | None = None
+    apply_correlation_id: str | None = None
 
     @property
     def object_key(self) -> str:
@@ -192,7 +198,20 @@ _OPTIONAL_STRS = (
     "approval_channel",
     "rejected_by",
     "reject_reason",
+    "plan_correlation_id",
+    "approval_request_correlation_id",
+    "decision_correlation_id",
+    "apply_correlation_id",
 )
+
+
+def _with_correlation(
+    update: str, values: dict[str, Any], attribute: str, correlation_id: str | None
+) -> tuple[str, dict[str, Any]]:
+    """Add `SET attribute = id` to an update expression when there is an id."""
+    if correlation_id is None:
+        return update, values
+    return f"{update}, {attribute} = :cid", {**values, ":cid": correlation_id}
 
 
 @dataclass(frozen=True)
@@ -298,7 +317,13 @@ class PlanStore:
         return self._table.get_item(Key={"plan_id": plan_id}, ConsistentRead=True).get("Item")
 
     def request_approval(
-        self, plan_id: str, now: int, wait_ttl: int, cooldown: int, limit: int
+        self,
+        plan_id: str,
+        now: int,
+        wait_ttl: int,
+        cooldown: int,
+        limit: int,
+        correlation_id: str | None = None,
     ) -> tuple[dict[str, Any], int | None]:
         """Move a plan to awaiting_approval and give it `wait_ttl` seconds from its creation.
 
@@ -318,27 +343,31 @@ class PlanStore:
             window_start + 2 * APPROVAL_REQUEST_WINDOW_SECONDS,
             approval_rate_error(window_start, limit),
         )
+        update, values = _with_correlation(
+            "SET #status = :awaiting, approval_requested_at = :now, "
+            "expires_at = created_at + :wait",
+            {
+                ":false": False,
+                ":now": now,
+                ":wait": wait_ttl,
+                ":cutoff": now - cooldown,
+                ":planned": STATUS_PLANNED,
+                ":awaiting": STATUS_AWAITING,
+            },
+            "approval_request_correlation_id",
+            correlation_id,
+        )
         try:
             response = self._table.update_item(
                 Key={"plan_id": plan_id},
-                UpdateExpression=(
-                    "SET #status = :awaiting, approval_requested_at = :now, "
-                    "expires_at = created_at + :wait"
-                ),
+                UpdateExpression=update,
                 ConditionExpression=(
                     "#used = :false AND expires_at > :now AND #status IN (:planned, :awaiting)"
                     " AND (attribute_not_exists(approval_requested_at)"
                     " OR approval_requested_at <= :cutoff)"
                 ),
                 ExpressionAttributeNames={"#used": "used", "#status": "status"},
-                ExpressionAttributeValues={
-                    ":false": False,
-                    ":now": now,
-                    ":wait": wait_ttl,
-                    ":cutoff": now - cooldown,
-                    ":planned": STATUS_PLANNED,
-                    ":awaiting": STATUS_AWAITING,
-                },
+                ExpressionAttributeValues=values,
                 ReturnValues="ALL_NEW",
             )
         except ClientError as exc:
@@ -351,7 +380,14 @@ class PlanStore:
             return item or {}, retry_after
         return response["Attributes"], None
 
-    def approve(self, plan_id: str, approver: str, now: int, apply_ttl: int) -> dict[str, Any]:
+    def approve(
+        self,
+        plan_id: str,
+        approver: str,
+        now: int,
+        apply_ttl: int,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         """Record a human approval pinned to the plan's own args_hash, in one conditional write.
 
         The plan then stays valid for `apply_ttl` seconds, whatever was left of it before.
@@ -361,21 +397,36 @@ class PlanStore:
             plan_id,
             approver,
             now,
-            "SET #status = :decided, approved_by = :by, approved_at = :now, "
-            "approved_args_hash = args_hash, approval_channel = :channel, "
-            "approval_expires_at = :expires, expires_at = :expires",
-            {":decided": STATUS_APPROVED, ":channel": CHANNEL_API, ":expires": expires},
+            *_with_correlation(
+                "SET #status = :decided, approved_by = :by, approved_at = :now, "
+                "approved_args_hash = args_hash, approval_channel = :channel, "
+                "approval_expires_at = :expires, expires_at = :expires",
+                {":decided": STATUS_APPROVED, ":channel": CHANNEL_API, ":expires": expires},
+                "decision_correlation_id",
+                correlation_id,
+            ),
         )
 
-    def reject(self, plan_id: str, approver: str, now: int, reason: str) -> dict[str, Any]:
+    def reject(
+        self,
+        plan_id: str,
+        approver: str,
+        now: int,
+        reason: str,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         """Record a rejection. The plan expires at once, so no mode can apply it any more."""
         return self._decide(
             plan_id,
             approver,
             now,
-            "SET #status = :decided, rejected_by = :by, rejected_at = :now, "
-            "reject_reason = :reason, expires_at = :now",
-            {":decided": STATUS_REJECTED, ":reason": reason},
+            *_with_correlation(
+                "SET #status = :decided, rejected_by = :by, rejected_at = :now, "
+                "reject_reason = :reason, expires_at = :now",
+                {":decided": STATUS_REJECTED, ":reason": reason},
+                "decision_correlation_id",
+                correlation_id,
+            ),
         )
 
     def _decide(
@@ -439,12 +490,20 @@ class PlanStore:
             query["ExclusiveStartKey"] = last
         return sorted(entries, key=lambda e: (e.created_at, e.plan_id))
 
-    def record_result(self, plan_id: str, applied_at: int, result: str) -> None:
+    def record_result(
+        self, plan_id: str, applied_at: int, result: str, correlation_id: str | None = None
+    ) -> None:
+        update, values = _with_correlation(
+            "SET applied_at = :t, #result = :r",
+            {":t": applied_at, ":r": result},
+            "apply_correlation_id",
+            correlation_id,
+        )
         self._table.update_item(
             Key={"plan_id": plan_id},
-            UpdateExpression="SET applied_at = :t, #result = :r",
+            UpdateExpression=update,
             ExpressionAttributeNames={"#result": "result"},
-            ExpressionAttributeValues={":t": applied_at, ":r": result},
+            ExpressionAttributeValues=values,
         )
 
     def global_applies(self, now: int) -> int:

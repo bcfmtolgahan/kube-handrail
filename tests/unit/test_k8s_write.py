@@ -38,10 +38,15 @@ ENV = {
     # The guard cases below are the same in every mode; server approval has its own tests.
     "APPROVAL_MODE": "client",
 }
+GATEWAY_REQUEST_ID = "6c1f9a52-1f0e-4d7e-9a0b-3d1c2b4a5e6f"
 CONTEXT = SimpleNamespace(
     client_context=SimpleNamespace(
-        custom={"bedrockAgentCoreToolName": "k8sw___apply_scale_deployment"}
-    )
+        custom={
+            "bedrockAgentCoreToolName": "k8sw___apply_scale_deployment",
+            "bedrockAgentCoreAwsRequestId": GATEWAY_REQUEST_ID,
+        }
+    ),
+    aws_request_id="lambda-request-id",
 )
 
 
@@ -163,6 +168,7 @@ def test_apply_success_dry_run_then_real(rt):
         "replicas_to": 3,
         "resource_version": "12346",
         "approved": False,
+        "correlation_id": GATEWAY_REQUEST_ID,
     }
     apps.read_namespaced_deployment.assert_called_once_with("web", "sandbox")
     dry, real = apps.patch_namespaced_deployment.call_args_list
@@ -172,12 +178,17 @@ def test_apply_success_dry_run_then_real(rt):
     assert dry.args == real.args == ("web", "sandbox", body)
     assert body["spec"] == {"replicas": 3}
     assert body["metadata"]["resourceVersion"] == "12345"
-    assert body["metadata"]["annotations"] == {handler.LAST_PLAN_ANNOTATION: plan.plan_id}
+    # Both annotations change in the one patch, so the apply bumps generation once.
+    assert body["metadata"]["annotations"] == {
+        handler.LAST_PLAN_ANNOTATION: plan.plan_id,
+        "kube-handrail.io/correlation-id": GATEWAY_REQUEST_ID,
+    }
 
     record = item(plan.plan_id)
     assert record["used"] is True
     assert record["result"] == "applied"
     assert record["applied_at"] == NOW
+    assert record["apply_correlation_id"] == GATEWAY_REQUEST_ID
 
 
 def test_kill_switch_off(aws, monkeypatch):
@@ -469,6 +480,22 @@ def test_patch_api_errors(rt, status, code):
     assert error_code(apply(plan.plan_id)) == code
     assert apps.patch_namespaced_deployment.call_count == 1
     assert item(plan.plan_id)["result"] == code
+
+
+def test_a_refused_apply_records_its_correlation_id(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    apps.read_namespaced_deployment.return_value = deployment(generation=5)
+
+    assert apply(plan.plan_id)["error"]["code"] == "conflict"
+    record = item(plan.plan_id)
+    assert record["result"] == "conflict"
+    assert record["apply_correlation_id"] == GATEWAY_REQUEST_ID
+
+
+def test_scale_patch_without_a_correlation_id_sets_only_the_plan():
+    body = handler.scale_patch(2, "7", "p")
+    assert body["metadata"]["annotations"] == {handler.LAST_PLAN_ANNOTATION: "p"}
 
 
 def test_record_failure_does_not_fail_apply(rt, monkeypatch):

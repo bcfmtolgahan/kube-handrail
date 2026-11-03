@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. The work listed under "Later in this milestone" and the later milestones is planned and not yet implemented, and the order may change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID is implemented and unit-tested; the rest, and the later milestones, are planned and not yet implemented, and the order may change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -93,7 +93,7 @@ The identity is per OAuth client, not per agent session: two agents sharing a cl
 ### Later in this milestone
 
 - CI: linting and policy validation on every change (unit tests, the contract check and Terraform formatting and validation run since item 3).
-- Correlation ID across gateway, Lambda, DynamoDB and Kubernetes, with basic self-observability.
+- Correlation ID across gateway, Lambda, DynamoDB and Kubernetes, with basic self-observability (implemented and unit-tested). See [Observability](../mcp/CONTRACT.md#observability): the gateway's request ID is recorded per step in the plan record and set as an annotation by the apply, every tool call logs one record that is also a CloudWatch metric (`ToolCalls`, `ToolErrors`, `GuardRejections`), and alarms notify the alert topic on internal and Kubernetes API errors and on failed tool Lambda invocations. Not yet tested on a cluster.
 - Tool output hygiene for future log and event tools: size limits, control-character stripping, secret redaction, untrusted-content delimiters.
 - DevOps Agent skills and an `AGENTS.md` describing the tool contract.
 - Infrastructure as code that deploys cleanly to a new account, including clusters with a private endpoint.

@@ -1,3 +1,4 @@
+import dataclasses
 import uuid
 
 import boto3
@@ -143,6 +144,29 @@ def test_record_result(store):
         Key={"plan_id": plan.plan_id}
     )["Item"]
     assert item["result"] == "applied" and item["applied_at"] == NOW + 1
+    assert "apply_correlation_id" not in item
+
+
+def test_record_result_with_a_correlation_id(store):
+    plan = make_plan()
+    store.create(plan)
+    store.record_result(plan.plan_id, NOW + 1, "conflict", "req-1")
+    item = store.get(plan.plan_id)
+    assert (item["result"], item["apply_correlation_id"]) == ("conflict", "req-1")
+
+
+def test_correlation_ids_round_trip():
+    plan = dataclasses.replace(
+        make_plan(),
+        plan_correlation_id="a",
+        approval_request_correlation_id="b",
+        decision_correlation_id="c",
+        apply_correlation_id="d",
+    )
+    item = plan.to_item()
+    steps = ("plan", "approval_request", "decision", "apply")
+    assert [item[f"{step}_correlation_id"] for step in steps] == ["a", "b", "c", "d"]
+    assert Plan.from_item(item) == plan
 
 
 def test_from_item_without_generation_or_uid_never_matches():

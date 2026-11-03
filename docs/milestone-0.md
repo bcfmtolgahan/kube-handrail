@@ -108,7 +108,7 @@ export KILL_SWITCH_PARAM=$(terraform -chdir=terraform output -raw kill_switch_pa
 
 These run against `approval_mode = "client"`. Against `server`, run `tests/e2e/e2e_gateway.py --approval-mode server` with `APPROVAL_URL` set and AWS credentials of a principal listed in `approver_principals`: it skips the cases that apply through the gateway and instead checks that an apply without approval is `approval_required`, that `request_approval` notifies once per cooldown, that the approval URL refuses the Cognito token and unsigned requests, that a signed approval applies the plan and its record names the approver, and that a rejected plan cannot be applied. `both` mode is not covered by the end-to-end tests, because its apply needs the DevOps Agent chat approval.
 
-They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, the kill switch, and the oscillation breaker (a change right after an apply is `cooldown`, a single revert is allowed, a second reversal is `flapping`, a manual scale is `manual_change` unless overridden), the blast-radius budget (a plan from 1 to 3 replicas is `blast_radius_exceeded`) and the impact preview (a Service and a PodDisruptionBudget in front of `e2e-target` are reported, and a scale-down past the budget's headroom warns `pdb_headroom`). Set `APPLY_COOLDOWN_SECONDS` to the deployed value; the test waits it out after each apply. The blast-radius case expects the default `MAX_REPLICA_STEP_PERCENT` of 100 and a `max_replicas` of at least 3. The test turns the kill switch off briefly and restores it and applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas).
+They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, the kill switch, and the oscillation breaker (a change right after an apply is `cooldown`, a single revert is allowed, a second reversal is `flapping`, a manual scale is `manual_change` unless overridden), the blast-radius budget (a plan from 1 to 3 replicas is `blast_radius_exceeded`) and the impact preview (a Service and a PodDisruptionBudget in front of `e2e-target` are reported, and a scale-down past the budget's headroom warns `pdb_headroom`). Both modes also check the [correlation ID](../mcp/CONTRACT.md#observability): in `client` mode, that a successful apply's `correlation_id` is the Deployment's `kube-handrail.io/correlation-id` annotation and differs from its plan's; in `server` mode, that the plan record has an ID for each step (plan, approval request, decision, apply) and that the decision, the apply and the annotation share one. Set `APPLY_COOLDOWN_SECONDS` to the deployed value; the test waits it out after each apply. The blast-radius case expects the default `MAX_REPLICA_STEP_PERCENT` of 100 and a `max_replicas` of at least 3. The test turns the kill switch off briefly and restores it and applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas).
 
 The guard tests never change `web`, which belongs to the smoke test; they only plan against it for read-only validation cases that never reach apply. Every case that applies or edits a Deployment uses fixtures created for the run (`e2e-target`, `e2e-flap`, `e2e-manual`: 1-replica unprivileged nginx, plus a Service and a PodDisruptionBudget for `e2e-target`) and deleted at the end, so each run starts with an empty history. The per-object and global budgets and the plan rate limit are covered by unit tests only: reaching them takes 6 or 30 real applies or 20 plans, which is slow and adds nothing the unit tests at the exact limits do not show. The same goes for the `scale_to_zero` and `service_without_endpoints` warnings, which need a plan to 0 replicas: a sandbox with `min_replicas` of 1 refuses that as `out_of_bounds`.
 
@@ -186,6 +186,46 @@ In `server` (default) and `both` mode an apply needs an approval recorded by the
    The script signs with your AWS credentials (SigV4), prints the plan and asks for confirmation (`--yes` skips the prompt). After an approval the plan must be applied within `apply_after_approval_ttl_seconds` (default 120); a plan waiting for approval stays valid for `approval_wait_ttl_seconds` (default 900) from its creation.
 
 4. **Switch modes.** Change `approval_mode` and apply; both tool Lambdas and the approver pick it up on their next cold start (a configuration change replaces running environments). In `client` mode DevOps Agent chat works as in Milestone 0 with a single approval, and `request_approval` is refused (the client approves). In `server` mode an apply through any client without a server approval is refused with `approval_required`; the approver's apply is the way a change happens. In `both` mode the approval channel never applies: approve, then the agent applies in chat and DevOps Agent asks for its own approval as well. An autonomous investigation can plan and request approval in `server` and `both` mode; in `server` mode the approval then applies the change.
+
+## Logs, metrics and correlation
+
+Every tool call prints one JSON record in its Lambda's log group (`/aws/lambda/<name_prefix>-k8s-read` or `-k8s-write`), with `tool`, `correlation_id`, `caller`, `plan_id`, `outcome` and `duration_ms`, which is also a CloudWatch metric in the namespace `<name_prefix>/tools`: `ToolCalls` and `ToolErrors` by `Tool` and across all tools, and `GuardRejections` by `Tool` and `Code`. The approver (`/aws/lambda/<name_prefix>-approver`) prints one record per decision. The correlation ID is the gateway's request ID, or the approver's for an apply it triggered; the plan record stores one per step, and the Deployment carries the last apply's in the annotation `kube-handrail.io/correlation-id`. See [Observability](../mcp/CONTRACT.md#observability).
+
+With `sentinel_enabled`, the alarm `<name_prefix>-tool-errors` notifies the alert topic when any tool returns `internal` or `kubernetes_error` within 5 minutes, and `<name_prefix>-k8s-read-errors` and `<name_prefix>-k8s-write-errors` when a tool Lambda invocation fails outright (timeout, out of memory, failed start), which leaves no tool record.
+
+CloudWatch Logs Insights queries; select the three log groups above. Everything for one plan, in order (the `like` clause also finds the approver's text lines, such as a failed invocation of the apply):
+
+```
+fields @timestamp, @log, tool, event, outcome, decision, apply_outcome, correlation_id, caller, approver
+| filter plan_id = "<plan_id>" or @message like "<plan_id>"
+| sort @timestamp asc
+```
+
+Everything for one correlation ID, for example from the annotation or the plan record (an apply run by the approver shares the approver's ID, and an internal error's stack trace names it):
+
+```
+fields @timestamp, @log, tool, event, outcome, plan_id, @message
+| filter correlation_id = "<correlation_id>" or @message like "<correlation_id>"
+| sort @timestamp asc
+```
+
+Errors and guard rejections by tool:
+
+```
+filter ispresent(outcome) and outcome != "ok"
+| stats count(*) by tool, outcome
+```
+
+The plan record holds the IDs to start from:
+
+```sh
+aws dynamodb get-item --table-name "$(terraform -chdir=terraform output -raw plans_table_name)" \
+  --key '{"plan_id": {"S": "<plan_id>"}}' \
+  --projection-expression "plan_correlation_id, approval_request_correlation_id, decision_correlation_id, apply_correlation_id, #r" \
+  --expression-attribute-names '{"#r": "result"}'
+```
+
+Upgrading an earlier deployment: apply Terraform, which sets `METRIC_NAMESPACE` on both tool Lambdas, adds `decision_correlation_id` to the read role's deny of approval attributes and creates the alarm. No RBAC change is needed: the writer already patches Deployments, and the new annotation is part of the same patch. Plans made before the upgrade have no correlation IDs. Removing `kube-handrail.io/last-plan-id` by hand (as in the smoke test notes above) can leave `kube-handrail.io/correlation-id` in place; nothing reads it.
 
 ## 5. Clean up
 
