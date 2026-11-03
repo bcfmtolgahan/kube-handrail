@@ -55,7 +55,9 @@ def build_api_client(cluster_name: str, session: boto3.Session | None = None) ->
     region = session.region_name
     if not region:
         raise RuntimeError("AWS region is not configured")
-    cluster = session.client("eks", region_name=region).describe_cluster(name=cluster_name)["cluster"]
+    cluster = session.client("eks", region_name=region).describe_cluster(name=cluster_name)[
+        "cluster"
+    ]
 
     config = k8s.Configuration()
     config.host = cluster["endpoint"]

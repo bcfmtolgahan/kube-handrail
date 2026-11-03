@@ -15,7 +15,9 @@ def test_plain_deployment_not_managed():
 
 
 def test_argocd_annotation():
-    assert is_gitops_managed(deployment({"argocd.argoproj.io/tracking-id": "app:apps/Deployment:ns/web"}))
+    assert is_gitops_managed(
+        deployment({"argocd.argoproj.io/tracking-id": "app:apps/Deployment:ns/web"})
+    )
 
 
 def test_instance_label():

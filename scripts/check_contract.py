@@ -33,7 +33,9 @@ CODE = re.compile(r"`([a-z_]+)`")
 #   }
 BLOCK_START = re.compile(r"^\s*(\w+)\s*=\s*\{\s*$")
 TARGET = re.compile(r"^\s*target\s*=\s*\"([^\"]*)\"\s*$", re.MULTILINE)
-TOOLS = re.compile(r"^\s*tools\s*=\s*jsondecode\(file\(\"[^\"]*/mcp/(\w+)/tools\.json\"\)\)\s*$", re.MULTILINE)
+TOOLS = re.compile(
+    r"^\s*tools\s*=\s*jsondecode\(file\(\"[^\"]*/mcp/(\w+)/tools\.json\"\)\)\s*$", re.MULTILINE
+)
 
 
 def terraform_targets(main_tf: str) -> dict[str, str]:
@@ -57,7 +59,9 @@ def terraform_targets(main_tf: str) -> dict[str, str]:
 
 
 def schema_tools(root: Path, directory: str) -> list[str]:
-    return [tool["name"] for tool in json.loads((root / "mcp" / directory / "tools.json").read_text())]
+    return [
+        tool["name"] for tool in json.loads((root / "mcp" / directory / "tools.json").read_text())
+    ]
 
 
 def contract_error_codes(contract: str) -> list[str]:
@@ -88,7 +92,9 @@ def check(root: Path) -> list[str]:
             errors.append(f"terraform/main.tf does not load mcp/{directory}/tools.json")
 
     if targets.get(WRITE_TARGET) != WRITE_DIR:
-        errors.append(f"terraform/main.tf must load mcp/{WRITE_DIR}/tools.json as target {WRITE_TARGET}")
+        errors.append(
+            f"terraform/main.tf must load mcp/{WRITE_DIR}/tools.json as target {WRITE_TARGET}"
+        )
 
     tools: set[str] = set()
     for target, directory in sorted(targets.items()):

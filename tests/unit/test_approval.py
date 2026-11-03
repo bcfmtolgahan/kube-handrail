@@ -176,7 +176,10 @@ def test_an_expired_approval_is_reported(store):
     plan = make_plan(store)
     store.approve(plan.plan_id, HUMAN, NOW, APPLY_TTL)
     late = NOW + APPLY_TTL
-    assert code_of(consume, store, plan, late) == ("approval_required", {"status": "approval_expired"})
+    assert code_of(consume, store, plan, late) == (
+        "approval_required",
+        {"status": "approval_expired"},
+    )
     # Client mode sees the same record as an expired plan.
     code, _ = code_of(store.consume, plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, late)
     assert code == "plan_expired"
@@ -197,7 +200,11 @@ def test_a_rejected_plan_is_not_consumed_even_with_clock_skew(store):
     for require_approval in (False, True):
         with pytest.raises(GuardError) as exc:
             store.consume(
-                plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, require_approval=require_approval
+                plan.plan_id,
+                plan.args_hash,
+                SCALE_DEPLOYMENT,
+                NOW,
+                require_approval=require_approval,
             )
         assert (exc.value.code, exc.value.details) == ("approval_required", {"status": "rejected"})
     assert item(store, plan.plan_id)["used"] is False
@@ -256,11 +263,15 @@ def test_used_expired_and_unknown_plans_cannot_be_decided(store):
 def test_plans_made_before_server_approval_cannot_be_decided(store):
     plan = make_plan(store)
     store._table.update_item(
-        Key={"plan_id": plan.plan_id}, UpdateExpression="REMOVE #s, requested_by",
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="REMOVE #s, requested_by",
         ExpressionAttributeNames={"#s": "status"},
     )
     assert code_of(store.approve, plan.plan_id, HUMAN, NOW, APPLY_TTL)[0] == "plan_expired"
-    assert code_of(store.request_approval, plan.plan_id, NOW, WAIT, COOLDOWN, LIMIT)[0] == "plan_expired"
+    assert (
+        code_of(store.request_approval, plan.plan_id, NOW, WAIT, COOLDOWN, LIMIT)[0]
+        == "plan_expired"
+    )
 
 
 def test_reject_records_the_reason_and_ends_the_plan(store):
@@ -311,7 +322,9 @@ def test_request_approval_within_the_cooldown_takes_no_global_unit(store):
 def test_request_approval_refuses_finished_plans(store):
     used = make_plan(store)
     store.consume(used.plan_id, used.args_hash, SCALE_DEPLOYMENT, NOW)
-    assert code_of(store.request_approval, used.plan_id, NOW, WAIT, COOLDOWN, LIMIT)[0] == "plan_used"
+    assert (
+        code_of(store.request_approval, used.plan_id, NOW, WAIT, COOLDOWN, LIMIT)[0] == "plan_used"
+    )
     expired = make_plan(store)
     code, _ = code_of(store.request_approval, expired.plan_id, NOW + 300, WAIT, COOLDOWN, LIMIT)
     assert code == "plan_expired"
@@ -411,7 +424,9 @@ def test_notification_is_rendered_from_the_record(store):
     assert "- pdb_headroom: a server-generated warning" in message
     assert "Service web: 1 ready endpoints now, 3 projected" in message
     assert f"Expires at (epoch seconds): {NOW + 300}" in message
-    assert f"APPROVAL_URL=https://approve.example scripts/approve.py approve {plan.plan_id}" in message
+    assert (
+        f"APPROVAL_URL=https://approve.example scripts/approve.py approve {plan.plan_id}" in message
+    )
     assert f"scripts/approve.py reject {plan.plan_id}" in message
 
 
@@ -422,4 +437,3 @@ def test_sanitize_reason():
     for bad in ("a" * (REASON_MAX_LENGTH + 1), 5, ["x"]):
         with pytest.raises(GuardError):
             sanitize_reason(bad)
-

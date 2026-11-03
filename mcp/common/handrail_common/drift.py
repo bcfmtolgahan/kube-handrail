@@ -142,5 +142,7 @@ def compare_elevated(expected: bool, actual: bool) -> list[Finding]:
     if expected == actual:
         return []
     return [
-        finding("agent_space", "elevated_actions", ELEVATED_PREFERENCE, expected=expected, actual=actual)
+        finding(
+            "agent_space", "elevated_actions", ELEVATED_PREFERENCE, expected=expected, actual=actual
+        )
     ]

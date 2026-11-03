@@ -250,7 +250,11 @@ def decide(
         item = refreshed if refreshed is not None else item
     emit(decision_record(plan_id, decision, approver, correlation_id, applied))
     return ok(
-        {"plan": plan_view(item, int(rt.clock())), "apply": applied, "approval_mode": s.approval_mode}
+        {
+            "plan": plan_view(item, int(rt.clock())),
+            "apply": applied,
+            "approval_mode": s.approval_mode,
+        }
     )
 
 
@@ -275,9 +279,7 @@ def decision_record(
     }
 
 
-def handle(
-    rt: Runtime, event: Mapping[str, Any], correlation_id: str | None = None
-) -> Envelope:
+def handle(rt: Runtime, event: Mapping[str, Any], correlation_id: str | None = None) -> Envelope:
     approver = check_approver(rt.settings, caller_arn(event))
     method = ((event.get("requestContext") or {}).get("http") or {}).get("method")
     if method == "GET":

@@ -153,7 +153,9 @@ def scale_impact(
                 }
             )
 
-    truncated = any(len(items) > LIST_LIMIT for items in (matching_pdbs, matching_services, warnings))
+    truncated = any(
+        len(items) > LIST_LIMIT for items in (matching_pdbs, matching_services, warnings)
+    )
     return {
         "pods": {
             "ready_now": ready_now,

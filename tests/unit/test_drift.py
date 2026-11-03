@@ -74,13 +74,17 @@ def test_association_defaults_to_read_only():
     assert association_classifications(response) == {"a___x": READ_ONLY, "b___z": MUTATIVE}
 
 
-@pytest.mark.parametrize("response", [{}, {"association": None}, {"association": {"configuration": []}}])
+@pytest.mark.parametrize(
+    "response", [{}, {"association": None}, {"association": {"configuration": []}}]
+)
 def test_unreadable_association(response):
     with pytest.raises(UnexpectedResponse):
         association_classifications(response)
 
 
-@pytest.mark.parametrize("response", [{}, {"agentSpace": {"preferences": {"elevatedActionsEnabled": "true"}}}])
+@pytest.mark.parametrize(
+    "response", [{}, {"agentSpace": {"preferences": {"elevatedActionsEnabled": "true"}}}]
+)
 def test_unreadable_agent_space(response):
     with pytest.raises(UnexpectedResponse):
         elevated_actions(response)
@@ -90,7 +94,9 @@ def test_gateway_target_tools():
     response = {
         "name": "k8sw",
         "status": "READY",
-        "targetConfiguration": {"mcp": {"lambda": {"toolSchema": {"inlinePayload": [{"name": "apply"}]}}}},
+        "targetConfiguration": {
+            "mcp": {"lambda": {"toolSchema": {"inlinePayload": [{"name": "apply"}]}}}
+        },
     }
     assert gateway_target_tools(response) == {"k8sw___apply"}
 
@@ -103,7 +109,10 @@ def test_compare_association_allows_stricter_read_tool():
     # A read tool classified MUTATIVE only adds an approval; it is not drift.
     expected = {"a___x": READ_ONLY, "b___z": MUTATIVE}
     assert compare_association(expected, {"a___x": MUTATIVE, "b___z": MUTATIVE}) == []
-    assert compare_association(expected, {"a___x": READ_ONLY, "b___z": "DESTRUCTIVE"})[0]["issue"] == "not_mutative"
+    assert (
+        compare_association(expected, {"a___x": READ_ONLY, "b___z": "DESTRUCTIVE"})[0]["issue"]
+        == "not_mutative"
+    )
 
 
 class RecordingClient:
@@ -114,7 +123,11 @@ class RecordingClient:
     def get_association(self, agentSpaceId, associationId):
         tools = sorted(self.classifications)
         details = [{"name": t, "toolClassification": c} for t, c in self.classifications.items()]
-        return {"association": {"configuration": {"mcpserver": {"tools": tools, "toolDetails": details}}}}
+        return {
+            "association": {
+                "configuration": {"mcpserver": {"tools": tools, "toolDetails": details}}
+            }
+        }
 
     def update_association(self, agentSpaceId, associationId, configuration):
         self.updates.append(configuration)
@@ -129,7 +142,9 @@ class RecordingClient:
 
 
 def test_enable_write_classifies_from_file(capsys):
-    client = RecordingClient({"k8sr___get_workload_status": READ_ONLY, "k8sr___plan_scale_deployment": READ_ONLY})
+    client = RecordingClient(
+        {"k8sr___get_workload_status": READ_ONLY, "k8sr___plan_scale_deployment": READ_ONLY}
+    )
     args = type("Args", (), {"agent_space_id": "s", "association_id": "a"})()
     register.enable_write(client, args)
     [configuration] = client.updates

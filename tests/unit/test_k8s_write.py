@@ -901,9 +901,7 @@ def test_client_mode_needs_no_approval(rt):
     assert response["ok"] is True and response["data"]["approved"] is False
 
 
-@pytest.mark.parametrize(
-    "change", [{"namespace": "other"}, {"name": "api"}, {"replicas_to": 2}]
-)
+@pytest.mark.parametrize("change", [{"namespace": "other"}, {"name": "api"}, {"replicas_to": 2}])
 def test_a_record_altered_in_the_table_cannot_redirect_the_apply(rt, change):
     """Matching args_hash is not enough: the record itself must describe the request."""
     runtime_, apps = rt

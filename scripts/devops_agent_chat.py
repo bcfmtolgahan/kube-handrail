@@ -28,21 +28,30 @@ def user_id() -> str:
     return boto3.client("sts").get_caller_identity()["Arn"].rsplit("/", 1)[-1]
 
 
-def send(client: Any, space: str, execution: str, content: str, context: dict | None = None) -> dict[str, Any]:
-    params: dict[str, Any] = {"agentSpaceId": space, "executionId": execution, "content": content, "userId": user_id()}
+def send(
+    client: Any, space: str, execution: str, content: str, context: dict | None = None
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "agentSpaceId": space,
+        "executionId": execution,
+        "content": content,
+        "userId": user_id(),
+    }
     if context:
         params["context"] = context
     text: list[str] = []
     blocks: dict[int, str] = {}
     failure = None
     for event in client.send_message(**params)["events"]:
-        (kind, value), = event.items()
+        ((kind, value),) = event.items()
         if kind == "contentBlockDelta":
             delta = value["delta"]
             if "textDelta" in delta:
                 text.append(delta["textDelta"]["text"])
             elif "jsonDelta" in delta:
-                blocks[value["index"]] = blocks.get(value["index"], "") + delta["jsonDelta"]["partialJson"]
+                blocks[value["index"]] = (
+                    blocks.get(value["index"], "") + delta["jsonDelta"]["partialJson"]
+                )
         elif kind == "responseFailed":
             failure = value
     approval = None
@@ -53,7 +62,9 @@ def send(client: Any, space: str, execution: str, content: str, context: dict | 
 
 
 def pending_approval(client: Any, space: str, execution: str) -> dict[str, Any]:
-    records = client.list_journal_records(agentSpaceId=space, executionId=execution, limit=100, order="DESC")["records"]
+    records = client.list_journal_records(
+        agentSpaceId=space, executionId=execution, limit=100, order="DESC"
+    )["records"]
     for record in records:
         content = record["content"]
         if '"approval_id"' in content and '"interrupt_id"' in content:
@@ -64,20 +75,27 @@ def pending_approval(client: Any, space: str, execution: str) -> dict[str, Any]:
 def print_result(execution: str, result: dict[str, Any]) -> None:
     print(result["text"])
     if result["failure"]:
-        print(f"\nresponse failed: {result['failure'].get('errorCode')}: {result['failure'].get('errorMessage')}")
+        print(
+            f"\nresponse failed: {result['failure'].get('errorCode')}: {result['failure'].get('errorMessage')}"
+        )
     if result["approval"]:
         data = result["approval"]["data"]
         print("\napproval requested")
         print(f"  tool:      {data['tool']}")
         print(f"  arguments: {json.dumps(data.get('argument_pins'))}")
-        print(f"  summary:   {data.get('structured_summary', {}).get('human_readable_summary', '')}")
+        print(
+            f"  summary:   {data.get('structured_summary', {}).get('human_readable_summary', '')}"
+        )
     print(f"\nexecution id: {execution}")
 
 
 def ask(client: Any, args: argparse.Namespace) -> None:
-    execution = args.execution_id or client.create_chat(
-        agentSpaceId=args.agent_space_id, userId=user_id(), userType="IAM"
-    )["executionId"]
+    execution = (
+        args.execution_id
+        or client.create_chat(agentSpaceId=args.agent_space_id, userId=user_id(), userType="IAM")[
+            "executionId"
+        ]
+    )
     print_result(execution, send(client, args.agent_space_id, execution, args.text))
 
 
@@ -85,7 +103,11 @@ def decide(client: Any, args: argparse.Namespace, action: str) -> None:
     request = pending_approval(client, args.agent_space_id, args.execution_id)
     data = request["data"]
     option = data["options"][0]
-    decision: dict[str, Any] = {"agentSpaceId": args.agent_space_id, "approvalId": data["approval_id"], "action": action}
+    decision: dict[str, Any] = {
+        "agentSpaceId": args.agent_space_id,
+        "approvalId": data["approval_id"],
+        "action": action,
+    }
     if action == "APPROVED":
         # Pin exactly the arguments shown to the operator; never widen them.
         decision["finalPattern"] = {"tool": data["tool"], "argumentPins": option["argument_pins"]}
@@ -103,13 +125,22 @@ def decide(client: Any, args: argparse.Namespace, action: str) -> None:
             "action": action,
         },
     }
-    print_result(args.execution_id, send(client, args.agent_space_id, args.execution_id, option["display_text"], context))
+    print_result(
+        args.execution_id,
+        send(client, args.agent_space_id, args.execution_id, option["display_text"], context),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--region", default=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"))
-    parser.add_argument("--agent-space-id", default=os.environ.get("AGENT_SPACE_ID"), required=not os.environ.get("AGENT_SPACE_ID"))
+    parser.add_argument(
+        "--region", default=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    )
+    parser.add_argument(
+        "--agent-space-id",
+        default=os.environ.get("AGENT_SPACE_ID"),
+        required=not os.environ.get("AGENT_SPACE_ID"),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("ask")
     p.add_argument("text")

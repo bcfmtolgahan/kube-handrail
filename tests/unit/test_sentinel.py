@@ -30,7 +30,9 @@ def schema_names(directory: str) -> list[str]:
 
 
 def throttled(operation: str) -> ClientError:
-    return ClientError({"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, operation)
+    return ClientError(
+        {"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, operation
+    )
 
 
 class FakeGateway:
@@ -55,7 +57,10 @@ class FakeGateway:
 
     def get_gateway_target(self, gatewayIdentifier, targetId):
         name = targetId.removeprefix("id-")
-        payload = [{"name": n, "description": "", "inputSchema": {"type": "object"}} for n in self.targets[name]]
+        payload = [
+            {"name": n, "description": "", "inputSchema": {"type": "object"}}
+            for n in self.targets[name]
+        ]
         return {
             "name": name,
             "status": self.status,
@@ -159,7 +164,12 @@ def test_write_tool_downgraded_turns_kill_switch_off(ssm):
     assert result["status"] == "drift"
     assert result["kill_switch"] == "turned_off"
     assert result["findings"] == [
-        {"check": "association", "issue": "not_mutative", "subject": WRITE_TOOL, "actual": "READ_ONLY"}
+        {
+            "check": "association",
+            "issue": "not_mutative",
+            "subject": WRITE_TOOL,
+            "actual": "READ_ONLY",
+        }
     ]
     assert kill_switch(ssm)[0] == "false"
     [message] = rt.sns.messages
@@ -191,7 +201,11 @@ def test_drift_when_already_off_still_alerts(ssm):
     "change, issue, subject",
     [
         (lambda t: t["k8sw"].append("delete_deployment"), "extra_tool", "k8sw___delete_deployment"),
-        (lambda t: t["k8sr"].remove("get_workload_status"), "missing_tool", "k8sr___get_workload_status"),
+        (
+            lambda t: t["k8sr"].remove("get_workload_status"),
+            "missing_tool",
+            "k8sr___get_workload_status",
+        ),
         (lambda t: t.update(evil=["run"]), "extra_target", "evil"),
         (lambda t: t.pop("k8sw"), "missing_target", "k8sw"),
     ],
@@ -283,7 +297,9 @@ def test_association_drift_is_acted_on_when_the_agent_space_cannot_be_read(ssm):
     "mutate",
     [
         lambda gw: setattr(gw, "status", "UPDATING"),
-        lambda gw: setattr(gw, "get_gateway_target", lambda **kw: {"name": "k8sr", "status": "READY"}),
+        lambda gw: setattr(
+            gw, "get_gateway_target", lambda **kw: {"name": "k8sr", "status": "READY"}
+        ),
     ],
 )
 def test_unreadable_or_transitional_target_is_unknown(ssm, mutate):

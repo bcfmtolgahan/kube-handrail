@@ -54,8 +54,9 @@ from pathlib import Path
 from typing import Any
 
 import boto3
-from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+
+from mcp import ClientSession
 
 NAMESPACE = "kube-handrail-sandbox"
 WEB = {"namespace": NAMESPACE, "name": "web"}
@@ -90,11 +91,16 @@ async def cool_down() -> None:
 
 def report(name: str, ok: bool, detail: Any = "") -> None:
     results.append(ok)
-    print(f"{'PASS' if ok else 'FAIL'} {name}{f' ({detail})' if detail not in ('', None) else ''}", flush=True)
+    print(
+        f"{'PASS' if ok else 'FAIL'} {name}{f' ({detail})' if detail not in ('', None) else ''}",
+        flush=True,
+    )
 
 
 def kubectl(*args: str, stdin: str | None = None) -> str:
-    return subprocess.run(["kubectl", "-n", NAMESPACE, *args], check=True, capture_output=True, text=True, input=stdin).stdout
+    return subprocess.run(
+        ["kubectl", "-n", NAMESPACE, *args], check=True, capture_output=True, text=True, input=stdin
+    ).stdout
 
 
 def fixture(name: str) -> dict[str, Any]:
@@ -112,13 +118,25 @@ def fixture(name: str) -> dict[str, Any]:
                 "metadata": {"labels": labels},
                 "spec": {
                     "automountServiceAccountToken": False,
-                    "securityContext": {"runAsNonRoot": True, "runAsUser": 101, "runAsGroup": 101, "seccompProfile": {"type": "RuntimeDefault"}},
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 101,
+                        "runAsGroup": 101,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
                     "containers": [
                         {
                             "name": "nginx",
                             "image": "nginxinc/nginx-unprivileged:1.27.5-alpine",
-                            "resources": {"requests": {"cpu": "5m", "memory": "16Mi"}, "limits": {"cpu": "50m", "memory": "64Mi"}},
-                            "securityContext": {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]}},
+                            "resources": {
+                                "requests": {"cpu": "5m", "memory": "16Mi"},
+                                "limits": {"cpu": "50m", "memory": "64Mi"},
+                            },
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "readOnlyRootFilesystem": True,
+                                "capabilities": {"drop": ["ALL"]},
+                            },
                             "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
                         }
                     ],
@@ -137,8 +155,15 @@ def target_service() -> dict[str, Any]:
     return {
         "apiVersion": "v1",
         "kind": "Service",
-        "metadata": {"name": TARGET["name"], "namespace": NAMESPACE, "labels": {"app.kubernetes.io/part-of": NAMESPACE}},
-        "spec": {"selector": target_labels(), "ports": [{"name": "http", "port": 80, "targetPort": 8080}]},
+        "metadata": {
+            "name": TARGET["name"],
+            "namespace": NAMESPACE,
+            "labels": {"app.kubernetes.io/part-of": NAMESPACE},
+        },
+        "spec": {
+            "selector": target_labels(),
+            "ports": [{"name": "http", "port": 80, "targetPort": 8080}],
+        },
     }
 
 
@@ -146,7 +171,11 @@ def target_pdb(min_available: int) -> dict[str, Any]:
     return {
         "apiVersion": "policy/v1",
         "kind": "PodDisruptionBudget",
-        "metadata": {"name": TARGET["name"], "namespace": NAMESPACE, "labels": {"app.kubernetes.io/part-of": NAMESPACE}},
+        "metadata": {
+            "name": TARGET["name"],
+            "namespace": NAMESPACE,
+            "labels": {"app.kubernetes.io/part-of": NAMESPACE},
+        },
         "spec": {"minAvailable": min_available, "selector": {"matchLabels": target_labels()}},
     }
 
@@ -169,21 +198,35 @@ def create_fixtures() -> None:
 
 
 def web_spec() -> str:
-    return kubectl("get", "deploy/web", "-o", "jsonpath={.metadata.uid}/{.metadata.generation}/{.spec.replicas}")
+    return kubectl(
+        "get",
+        "deploy/web",
+        "-o",
+        "jsonpath={.metadata.uid}/{.metadata.generation}/{.spec.replicas}",
+    )
 
 
 def set_kill_switch(value: str) -> None:
     param = os.environ["KILL_SWITCH_PARAM"]
-    subprocess.run(["aws", "ssm", "put-parameter", "--overwrite", "--name", param, "--value", value], check=True, capture_output=True)
+    subprocess.run(
+        ["aws", "ssm", "put-parameter", "--overwrite", "--name", param, "--value", value],
+        check=True,
+        capture_output=True,
+    )
 
 
 def fetch_token() -> str:
     body = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
-    basic = base64.b64encode(f"{os.environ['CLIENT_ID']}:{os.environ['CLIENT_SECRET']}".encode()).decode()
+    basic = base64.b64encode(
+        f"{os.environ['CLIENT_ID']}:{os.environ['CLIENT_SECRET']}".encode()
+    ).decode()
     request = urllib.request.Request(
         os.environ["TOKEN_URL"],
         data=body,
-        headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Authorization": f"Basic {basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
     )
     return json.load(urllib.request.urlopen(request))["access_token"]
 
@@ -194,7 +237,9 @@ def list_tools_status(token: str | None) -> int:
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        return urllib.request.urlopen(urllib.request.Request(os.environ["GATEWAY_URL"], data=body, headers=headers)).status
+        return urllib.request.urlopen(
+            urllib.request.Request(os.environ["GATEWAY_URL"], data=body, headers=headers)
+        ).status
     except urllib.error.HTTPError as error:
         return error.code
 
@@ -235,7 +280,9 @@ class Gateway:
             raise RuntimeError(f"plan failed: {envelope}")
         return envelope["data"]["plan_id"]
 
-    async def apply(self, target: dict[str, str], plan_id: str, replicas: int, **extra: Any) -> dict[str, Any]:
+    async def apply(
+        self, target: dict[str, str], plan_id: str, replicas: int, **extra: Any
+    ) -> dict[str, Any]:
         return await self.call(APPLY, {"plan_id": plan_id, **target, "replicas": replicas, **extra})
 
 
@@ -243,7 +290,9 @@ def code(envelope: dict[str, Any]) -> str | None:
     return (envelope.get("error") or {}).get("code")
 
 
-async def expect(gw: Gateway, name: str, tool: str, arguments: dict[str, Any], expected: str) -> None:
+async def expect(
+    gw: Gateway, name: str, tool: str, arguments: dict[str, Any], expected: str
+) -> None:
     envelope = await gw.call(tool, arguments)
     report(name, code(envelope) == expected, code(envelope) or "ok")
 
@@ -266,12 +315,36 @@ def reset_target() -> None:
 
 
 async def validation_tests(gw: Gateway) -> None:
-    await expect(gw, "namespace outside allowlist", PLAN, {"namespace": "kube-system", "name": "coredns", "replicas": 2}, "forbidden_namespace")
+    await expect(
+        gw,
+        "namespace outside allowlist",
+        PLAN,
+        {"namespace": "kube-system", "name": "coredns", "replicas": 2},
+        "forbidden_namespace",
+    )
     await expect(gw, "replicas above maximum", PLAN, {**WEB, "replicas": 1000}, "out_of_bounds")
     await expect(gw, "replicas below minimum", PLAN, {**WEB, "replicas": -1}, "out_of_bounds")
-    await expect(gw, "invalid name", PLAN, {**WEB, "name": "web;kubectl delete ns x", "replicas": 2}, "invalid_argument")
-    await expect(gw, "invalid namespace", PLAN, {"namespace": "../x", "name": "web", "replicas": 2}, "invalid_argument")
-    await expect(gw, "missing deployment", PLAN, {**WEB, "name": "does-not-exist", "replicas": 2}, "not_found")
+    await expect(
+        gw,
+        "invalid name",
+        PLAN,
+        {**WEB, "name": "web;kubectl delete ns x", "replicas": 2},
+        "invalid_argument",
+    )
+    await expect(
+        gw,
+        "invalid namespace",
+        PLAN,
+        {"namespace": "../x", "name": "web", "replicas": 2},
+        "invalid_argument",
+    )
+    await expect(
+        gw,
+        "missing deployment",
+        PLAN,
+        {**WEB, "name": "does-not-exist", "replicas": 2},
+        "not_found",
+    )
     for bad in ("2", 2.5, True):
         envelope = await gw.call(PLAN, {**WEB, "replicas": bad})
         report(f"replicas={bad!r} is rejected", not envelope.get("ok"), code(envelope))
@@ -279,7 +352,13 @@ async def validation_tests(gw: Gateway) -> None:
 
 async def ownership_tests(gw: Gateway) -> None:
     kubectl("apply", "-f", str(FIXTURE))
-    await expect(gw, "GitOps-managed deployment", PLAN, {"namespace": NAMESPACE, "name": "argo-managed", "replicas": 1}, "gitops_managed")
+    await expect(
+        gw,
+        "GitOps-managed deployment",
+        PLAN,
+        {"namespace": NAMESPACE, "name": "argo-managed", "replicas": 1},
+        "gitops_managed",
+    )
     hpa = {
         "apiVersion": "autoscaling/v2",
         "kind": "HorizontalPodAutoscaler",
@@ -288,35 +367,64 @@ async def ownership_tests(gw: Gateway) -> None:
             "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "e2e-target"},
             "minReplicas": 1,
             "maxReplicas": 1,
-            "metrics": [{"type": "Resource", "resource": {"name": "cpu", "target": {"type": "Utilization", "averageUtilization": 90}}}],
+            "metrics": [
+                {
+                    "type": "Resource",
+                    "resource": {
+                        "name": "cpu",
+                        "target": {"type": "Utilization", "averageUtilization": 90},
+                    },
+                }
+            ],
         },
     }
     kubectl("apply", "-f", "-", stdin=json.dumps(hpa))
     try:
-        await expect(gw, "deployment targeted by an HPA", PLAN, {**TARGET, "replicas": 2}, "conflict")
+        await expect(
+            gw, "deployment targeted by an HPA", PLAN, {**TARGET, "replicas": 2}, "conflict"
+        )
     finally:
         kubectl("delete", "hpa", "e2e-target", "--ignore-not-found")
 
 
 async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
-    await expect(gw, "apply with unknown plan", APPLY, {"plan_id": UNKNOWN_PLAN, **TARGET, "replicas": 2}, "plan_not_found")
+    await expect(
+        gw,
+        "apply with unknown plan",
+        APPLY,
+        {"plan_id": UNKNOWN_PLAN, **TARGET, "replicas": 2},
+        "plan_not_found",
+    )
 
     planned = await gw.call(PLAN, {**TARGET, "replicas": 2})
     if not planned.get("ok"):
         raise RuntimeError(f"plan failed: {planned}")
     plan_id = planned["data"]["plan_id"]
-    await expect(gw, "apply with arguments that differ from the plan", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 3}, "plan_mismatch")
+    await expect(
+        gw,
+        "apply with arguments that differ from the plan",
+        APPLY,
+        {"plan_id": plan_id, **TARGET, "replicas": 3},
+        "plan_mismatch",
+    )
     try:
         # Label-only change: resourceVersion moves, generation and spec.replicas do not.
         # (An annotation change would bump a Deployment's generation.)
         kubectl("label", "deploy/e2e-target", "kube-handrail.io/e2e-touch=1", "--overwrite")
         envelope = await gw.apply(TARGET, plan_id, 2)
-        report("apply after a label-only change succeeds", envelope.get("ok") is True, code(envelope) or "ok")
+        report(
+            "apply after a label-only change succeeds",
+            envelope.get("ok") is True,
+            code(envelope) or "ok",
+        )
         applied_id = (envelope.get("data") or {}).get("correlation_id")
         planned_id = planned["data"].get("correlation_id")
         report(
             "correlation: the Deployment carries the apply's correlation id, which differs from the plan's",
-            bool(applied_id) and annotation(TARGET["name"], CORRELATION_ANNOTATION) == applied_id and bool(planned_id) and planned_id != applied_id,
+            bool(applied_id)
+            and annotation(TARGET["name"], CORRELATION_ANNOTATION) == applied_id
+            and bool(planned_id)
+            and planned_id != applied_id,
             f"plan {planned_id}, apply {applied_id}",
         )
     finally:
@@ -337,7 +445,13 @@ async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
     try:
         # The GitOps marker is a label, so only the re-check at apply time catches it.
         kubectl("label", "deploy/e2e-target", "app.kubernetes.io/instance=e2e", "--overwrite")
-        await expect(gw, "apply after a GitOps label was added", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 2}, "gitops_managed")
+        await expect(
+            gw,
+            "apply after a GitOps label was added",
+            APPLY,
+            {"plan_id": plan_id, **TARGET, "replicas": 2},
+            "gitops_managed",
+        )
     finally:
         kubectl("label", "deploy/e2e-target", "app.kubernetes.io/instance-")
         reset_target()
@@ -352,14 +466,24 @@ async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
     plan_id = await gw.plan(TARGET, 2)
     first, second = await asyncio.gather(*(gw.apply(TARGET, plan_id, 2) for _ in range(2)))
     outcomes = sorted([code(first) or "ok", code(second) or "ok"])
-    report("concurrent applies of one plan: exactly one succeeds", outcomes == ["ok", "plan_used"], outcomes)
+    report(
+        "concurrent applies of one plan: exactly one succeeds",
+        outcomes == ["ok", "plan_used"],
+        outcomes,
+    )
     reset_target()
     await cool_down()
 
     plan_id = await gw.plan(TARGET, 2)
     set_kill_switch("false")
     try:
-        await expect(gw, "kill switch off takes effect immediately", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 2}, "remediation_disabled")
+        await expect(
+            gw,
+            "kill switch off takes effect immediately",
+            APPLY,
+            {"plan_id": plan_id, **TARGET, "replicas": 2},
+            "remediation_disabled",
+        )
     finally:
         set_kill_switch("true")
 
@@ -368,7 +492,13 @@ async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
         ttl = int(os.environ.get("PLAN_TTL_SECONDS", "300"))
         print(f"waiting {ttl + 5}s for the plan to expire", flush=True)
         await asyncio.sleep(ttl + 5)
-        await expect(gw, "apply after the plan expired", APPLY, {"plan_id": plan_id, **TARGET, "replicas": 2}, "plan_expired")
+        await expect(
+            gw,
+            "apply after the plan expired",
+            APPLY,
+            {"plan_id": plan_id, **TARGET, "replicas": 2},
+            "plan_expired",
+        )
 
 
 def wait_for(name: str, condition: Any, timeout: int = 120) -> None:
@@ -382,7 +512,9 @@ def wait_for(name: str, condition: Any, timeout: int = 120) -> None:
 
 
 def ready_endpoints() -> int:
-    out = kubectl("get", "endpointslices", "-l", f"kubernetes.io/service-name={TARGET['name']}", "-o", "json")
+    out = kubectl(
+        "get", "endpointslices", "-l", f"kubernetes.io/service-name={TARGET['name']}", "-o", "json"
+    )
     return sum(
         1
         for item in json.loads(out)["items"]
@@ -408,12 +540,14 @@ async def impact_tests(gw: Gateway) -> None:
     pdbs = impact.get("pod_disruption_budgets") or []
     report(
         "impact: plan 1 -> 2 reports the Service with its ready endpoints",
-        services == [{"name": TARGET["name"], "ready_endpoints_now": 1, "projected_ready_endpoints": 2}],
+        services
+        == [{"name": TARGET["name"], "ready_endpoints_now": 1, "projected_ready_endpoints": 2}],
         code(envelope) or services,
     )
     report(
         "impact: plan 1 -> 2 reports the PodDisruptionBudget, no warnings",
-        [(p.get("name"), p.get("min_available"), p.get("disruptions_allowed")) for p in pdbs] == [(TARGET["name"], 1, 0)]
+        [(p.get("name"), p.get("min_available"), p.get("disruptions_allowed")) for p in pdbs]
+        == [(TARGET["name"], 1, 0)]
         and impact.get("pods", {}).get("added") == 1
         and impact.get("warnings") == [],
         code(envelope) or pdbs,
@@ -423,7 +557,8 @@ async def impact_tests(gw: Gateway) -> None:
     details = (envelope.get("error") or {}).get("details") or {}
     report(
         "blast radius: plan 1 -> 3 is refused",
-        code(envelope) == "blast_radius_exceeded" and details == {"from": 1, "to": 3, "max_step": 1, "max_step_percent": 100},
+        code(envelope) == "blast_radius_exceeded"
+        and details == {"from": 1, "to": 3, "max_step": 1, "max_step_percent": 100},
         code(envelope) or "ok",
     )
 
@@ -456,7 +591,13 @@ def injection_event(name: str, uid: str) -> dict[str, Any]:
         "apiVersion": "v1",
         "kind": "Event",
         "metadata": {"name": name, "namespace": NAMESPACE},
-        "involvedObject": {"apiVersion": "apps/v1", "kind": "Deployment", "name": TARGET["name"], "namespace": NAMESPACE, "uid": uid},
+        "involvedObject": {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "name": TARGET["name"],
+            "namespace": NAMESPACE,
+            "uid": uid,
+        },
         "type": "Warning",
         "reason": "E2EInjection",
         # No eventTime: with it set, core/v1 validation also caps message at 1024 characters and this is a 422.
@@ -498,7 +639,11 @@ async def event_tests(gw: Gateway) -> None:
         view: dict[str, Any] = {}
         for _ in range(10):
             envelope = await gw.call(EVENTS, {**TARGET, "limit": 50})
-            found = [e for e in (envelope.get("data") or {}).get("events") or [] if e.get("reason") == f"{OPEN}E2EInjection{CLOSE}"]
+            found = [
+                e
+                for e in (envelope.get("data") or {}).get("events") or []
+                if e.get("reason") == f"{OPEN}E2EInjection{CLOSE}"
+            ]
             if found:
                 view = found[0]
                 break
@@ -509,15 +654,32 @@ async def event_tests(gw: Gateway) -> None:
             code(envelope) or ("found" if view else "not found"),
         )
         message = view.get("message") or ""
-        inner = message[len(OPEN) : -len(CLOSE)] if message.startswith(OPEN) and message.endswith(CLOSE) else None
-        report("events: the message is wrapped and cannot close its wrapper", inner is not None and CLOSE not in inner and "&lt;/untrusted>" in inner, message[:80])
+        inner = (
+            message[len(OPEN) : -len(CLOSE)]
+            if message.startswith(OPEN) and message.endswith(CLOSE)
+            else None
+        )
+        report(
+            "events: the message is wrapped and cannot close its wrapper",
+            inner is not None and CLOSE not in inner and "&lt;/untrusted>" in inner,
+            message[:80],
+        )
         report(
             "events: the message is truncated to the field limit",
-            inner is not None and len(inner) <= FIELD_MAX_CHARS and "[truncated " in inner and envelope.get("truncated") is True,
+            inner is not None
+            and len(inner) <= FIELD_MAX_CHARS
+            and "[truncated " in inner
+            and envelope.get("truncated") is True,
             len(inner or ""),
         )
-        report("events: the access key ID is redacted", FAKE_ACCESS_KEY_ID not in message and "[redacted:aws_access_key_id]" in message)
-        report("events: control and format characters are removed", not any(ch in message for ch in "\u0007\u001b\u202e\u200b"))
+        report(
+            "events: the access key ID is redacted",
+            FAKE_ACCESS_KEY_ID not in message and "[redacted:aws_access_key_id]" in message,
+        )
+        report(
+            "events: control and format characters are removed",
+            not any(ch in message for ch in "\u0007\u001b\u202e\u200b"),
+        )
         await asyncio.sleep(HISTORY_SETTLE_SECONDS)
         after = plans_since(object_key, started)
         report("events: reading the event created no plan", after == before, f"{before} -> {after}")
@@ -525,7 +687,9 @@ async def event_tests(gw: Gateway) -> None:
         kubectl("delete", "event", name, "--ignore-not-found")
 
 
-async def plan_and_apply(gw: Gateway, name: str, target: dict[str, str], replicas: int, **extra: Any) -> None:
+async def plan_and_apply(
+    gw: Gateway, name: str, target: dict[str, str], replicas: int, **extra: Any
+) -> None:
     envelope = await gw.apply(target, await gw.plan(target, replicas, **extra), replicas, **extra)
     report(name, envelope.get("ok") is True, code(envelope) or "ok")
     await asyncio.sleep(HISTORY_SETTLE_SECONDS)
@@ -535,7 +699,11 @@ async def breaker_tests(gw: Gateway) -> None:
     await plan_and_apply(gw, "breaker: scale up 1 -> 2 is applied", FLAP, 2)
     envelope = await gw.call(PLAN, {**FLAP, "replicas": 1})
     retry_after = ((envelope.get("error") or {}).get("details") or {}).get("retry_after")
-    report("cooldown: a change right after an apply is refused", code(envelope) == "cooldown" and bool(retry_after), code(envelope) or "ok")
+    report(
+        "cooldown: a change right after an apply is refused",
+        code(envelope) == "cooldown" and bool(retry_after),
+        code(envelope) or "ok",
+    )
     await cool_down()
     await plan_and_apply(gw, "breaker: scale back down 2 -> 1 is applied (single revert)", FLAP, 1)
     await cool_down()
@@ -543,7 +711,8 @@ async def breaker_tests(gw: Gateway) -> None:
     history = ((envelope.get("error") or {}).get("details") or {}).get("history") or []
     report(
         "breaker: scaling up again within the window is flapping",
-        code(envelope) == "flapping" and [(h.get("from"), h.get("to")) for h in history] == [(1, 2), (2, 1)],
+        code(envelope) == "flapping"
+        and [(h.get("from"), h.get("to")) for h in history] == [(1, 2), (2, 1)],
         code(envelope) or "ok",
     )
 
@@ -559,18 +728,34 @@ async def breaker_tests(gw: Gateway) -> None:
         code(envelope) or "ok",
     )
     envelope = await gw.call(PLAN, {**MANUAL, "replicas": 1, "override_manual_change": True})
-    report("manual change: plan with override_manual_change succeeds", envelope.get("ok") is True, code(envelope) or "ok")
+    report(
+        "manual change: plan with override_manual_change succeeds",
+        envelope.get("ok") is True,
+        code(envelope) or "ok",
+    )
     if not envelope.get("ok"):
         return
     plan_id = envelope["data"]["plan_id"]
-    await expect(gw, "manual change: apply without the planned override", APPLY, {"plan_id": plan_id, **MANUAL, "replicas": 1}, "plan_mismatch")
+    await expect(
+        gw,
+        "manual change: apply without the planned override",
+        APPLY,
+        {"plan_id": plan_id, **MANUAL, "replicas": 1},
+        "plan_mismatch",
+    )
     envelope = await gw.apply(MANUAL, plan_id, 1, override_manual_change=True)
-    report("manual change: apply with the planned override succeeds", envelope.get("ok") is True, code(envelope) or "ok")
+    report(
+        "manual change: apply with the planned override succeeds",
+        envelope.get("ok") is True,
+        code(envelope) or "ok",
+    )
 
 
 def approve_script() -> Any:
     """scripts/approve.py, for its SigV4 signing: the test signs exactly as an operator would."""
-    spec = importlib.util.spec_from_file_location("approve", Path(__file__).parents[2] / "scripts" / "approve.py")
+    spec = importlib.util.spec_from_file_location(
+        "approve", Path(__file__).parents[2] / "scripts" / "approve.py"
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -604,14 +789,26 @@ async def approval_tests(gw: Gateway, token: str) -> None:
     plan_id = await gw.plan(TARGET, 2)
     envelope = await gw.apply(TARGET, plan_id, 2)
     details = (envelope.get("error") or {}).get("details")
-    report("approval: apply without approval is approval_required", code(envelope) == "approval_required" and details == {"status": "planned"}, code(envelope) or "ok")
+    report(
+        "approval: apply without approval is approval_required",
+        code(envelope) == "approval_required" and details == {"status": "planned"},
+        code(envelope) or "ok",
+    )
 
     envelope = await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
     data = envelope.get("data") or {}
-    report("approval: request_approval notifies", data.get("status") == "awaiting_approval" and data.get("notified") is True, code(envelope) or data)
+    report(
+        "approval: request_approval notifies",
+        data.get("status") == "awaiting_approval" and data.get("notified") is True,
+        code(envelope) or data,
+    )
     envelope = await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
     data = envelope.get("data") or {}
-    report("approval: a second request within the cooldown notifies nobody", data.get("notified") is False and bool(data.get("retry_after")), code(envelope) or data)
+    report(
+        "approval: a second request within the cooldown notifies nobody",
+        data.get("notified") is False and bool(data.get("retry_after")),
+        code(envelope) or data,
+    )
 
     show_url = f"{url.rstrip('/')}/?{urllib.parse.urlencode({'plan_id': plan_id})}"
     status = url_status(show_url, {"Authorization": f"Bearer {token}"})
@@ -623,18 +820,32 @@ async def approval_tests(gw: Gateway, token: str) -> None:
     view = envelope.get("data") or {}
     report(
         "approval: show renders the server record",
-        status == 200 and view.get("status") == "awaiting_approval" and view.get("replicas") == {"from": 1, "to": 2} and bool(view.get("impact")),
+        status == 200
+        and view.get("status") == "awaiting_approval"
+        and view.get("replicas") == {"from": 1, "to": 2}
+        and bool(view.get("impact")),
         status,
     )
 
     status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
     applied = (envelope.get("data") or {}).get("apply") or {}
-    report("approval: an approval signed by an approver applies the plan", status == 200 and applied.get("ok") is True, (applied.get("error") or {}).get("code") or status)
-    report("approval: the Deployment carries the approved plan", last_plan_id(TARGET["name"]) == plan_id)
+    report(
+        "approval: an approval signed by an approver applies the plan",
+        status == 200 and applied.get("ok") is True,
+        (applied.get("error") or {}).get("code") or status,
+    )
+    report(
+        "approval: the Deployment carries the approved plan",
+        last_plan_id(TARGET["name"]) == plan_id,
+    )
     status, envelope = approve.show(url, region, plan_id)
     view = envelope.get("data") or {}
     approver = (view.get("approval") or {}).get("approved_by")
-    report("approval: the record is applied and names the approver", view.get("status") == "applied" and approver == operator_arn(), approver)
+    report(
+        "approval: the record is applied and names the approver",
+        view.get("status") == "applied" and approver == operator_arn(),
+        approver,
+    )
     ids = view.get("correlation_ids") or {}
     report(
         "correlation: the record holds each step's id, and the decision, its apply and the annotation share one",
@@ -644,22 +855,36 @@ async def approval_tests(gw: Gateway, token: str) -> None:
     )
 
     status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
-    report("approval: an applied plan cannot be approved again", status == 409 and code(envelope) == "plan_used", code(envelope))
+    report(
+        "approval: an applied plan cannot be approved again",
+        status == 409 and code(envelope) == "plan_used",
+        code(envelope),
+    )
     reset_target()
     await cool_down()
 
     plan_id = await gw.plan(TARGET, 2)
     status, envelope = approve.decide(url, region, plan_id, "reject", "e2e rejection", False)
-    report("approval: a plan can be rejected", status == 200 and (envelope.get("data") or {}).get("plan", {}).get("status") == "rejected", status)
+    report(
+        "approval: a plan can be rejected",
+        status == 200 and (envelope.get("data") or {}).get("plan", {}).get("status") == "rejected",
+        status,
+    )
     envelope = await gw.apply(TARGET, plan_id, 2)
     details = (envelope.get("error") or {}).get("details")
-    report("approval: a rejected plan cannot be applied", code(envelope) == "approval_required" and details == {"status": "rejected"}, code(envelope) or "ok")
+    report(
+        "approval: a rejected plan cannot be applied",
+        code(envelope) == "approval_required" and details == {"status": "rejected"},
+        code(envelope) or "ok",
+    )
 
 
 async def run(with_expiry: bool, approval_mode: str) -> None:
     token = fetch_token()
     auth_tests(token)
-    async with streamablehttp_client(os.environ["GATEWAY_URL"], headers={"Authorization": f"Bearer {token}"}) as (read, write, _):
+    async with streamablehttp_client(
+        os.environ["GATEWAY_URL"], headers={"Authorization": f"Bearer {token}"}
+    ) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             gw = Gateway(session)
@@ -667,7 +892,10 @@ async def run(with_expiry: bool, approval_mode: str) -> None:
             await ownership_tests(gw)
             await event_tests(gw)
             if approval_mode == "server":
-                print("server approval mode: skipping the cases that apply through the gateway", flush=True)
+                print(
+                    "server approval mode: skipping the cases that apply through the gateway",
+                    flush=True,
+                )
                 await impact_tests(gw)
                 await approval_tests(gw, token)
                 return
