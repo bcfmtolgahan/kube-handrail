@@ -10,6 +10,7 @@ from handrail_common.envelope import PLAN_EXPIRED, PLAN_MISMATCH, PLAN_NOT_FOUND
 from handrail_common.plans import (
     RESTART_ANNOTATION,
     RESTART_DEPLOYMENT,
+    ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
@@ -19,6 +20,7 @@ from handrail_common.plans import (
     plan_args_hash,
     restart_args,
     restart_template,
+    rollback_args,
     scale_args,
     scale_args_hash,
     template_hash,
@@ -369,3 +371,49 @@ def test_global_budget_counter_is_not_a_plan(store):
     assert item["retain_until"] == NOW - NOW % 3600 + 7200
     with pytest.raises(GuardError):
         require_plan_id(global_budget_key(NOW))
+
+
+def test_rollback_args_take_the_override_only_when_true():
+    assert rollback_args("sandbox", "web", 3) == {
+        "namespace": "sandbox",
+        "name": "web",
+        "revision": 3,
+    }
+    assert rollback_args("sandbox", "web", 3, True)["override_manual_change"] is True
+
+
+def test_rollback_record_round_trips(store):
+    images = [
+        {
+            "container": "nginx",
+            "init": False,
+            "from": None,
+            "to": "<untrusted>nginx:1</untrusted>",
+            "changed": True,
+            "pinned_by_digest": False,
+        }
+    ]
+    plan = dataclasses.replace(
+        make_plan(),
+        action=ROLLBACK_DEPLOYMENT,
+        replicas_to=1,
+        args_hash=plan_args_hash(ROLLBACK_DEPLOYMENT, rollback_args("sandbox", "web", 3)),
+        args=rollback_args("sandbox", "web", 3),
+        template_from="sha256:a",
+        template_to="sha256:b",
+        revision_from=5,
+        revision_to=3,
+        target_rs_name="web-7d5b9c6f8",
+        target_rs_uid="uid-3",
+        images=images,
+        fields_changed=["spec.containers[nginx].image"],
+    )
+    store.create(plan)
+    restored = Plan.from_item(store.get(plan.plan_id))
+    assert restored == plan
+    assert type(restored.revision_to) is int and type(restored.args["revision"]) is int
+    item = make_plan().to_item()
+    assert not {"revision_to", "target_rs_name", "target_rs_uid", "images", "fields_changed"} & set(
+        item
+    )
+    assert Plan.from_item(item).images is None and Plan.from_item(item).fields_changed is None

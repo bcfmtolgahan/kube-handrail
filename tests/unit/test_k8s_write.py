@@ -1,5 +1,6 @@
 import dataclasses
 import importlib.util
+import json
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,13 +16,16 @@ from handrail_common.killswitch import KillSwitch
 from handrail_common.plans import (
     RESTART_ANNOTATION,
     RESTART_DEPLOYMENT,
+    ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
     plan_args_hash,
     restart_args,
+    rollback_args,
     scale_args,
     scale_args_hash,
+    template_hash,
 )
 
 # Load by path: both Lambda directories contain a module named `handler`.
@@ -1158,4 +1162,379 @@ def test_server_mode_restart_after_approval(server_rt):
     plan = create_restart_plan(runtime_.store)
     runtime_.store.approve(plan.plan_id, HUMAN, NOW, 120)
     response = apply_restart(plan.plan_id)
+    assert response["ok"] is True and response["data"]["approved"] is True
+
+
+# --- apply_rollback_deployment --------------------------------------------------
+
+ROLLBACK_CONTEXT = SimpleNamespace(
+    client_context=SimpleNamespace(
+        custom={
+            "bedrockAgentCoreToolName": "k8sw___apply_rollback_deployment",
+            "bedrockAgentCoreAwsRequestId": GATEWAY_REQUEST_ID,
+        }
+    ),
+    aws_request_id="lambda-request-id",
+)
+RS_UID = "8f7c1a2e-0000-4000-8000-0000000000aa"
+# The template of the target ReplicaSet as the API server returns it, with a field the
+# client models do not know: the patch must carry it unchanged.
+TARGET_TEMPLATE = {
+    "metadata": {"labels": {"app": "web"}},
+    "spec": {
+        "containers": [
+            {
+                "name": "nginx",
+                "image": "nginx:1.27.4",
+                "env": [{"name": "MODE", "value": "old"}],
+                "futureField": {"x": 1},
+            }
+        ]
+    },
+}
+TARGET_HASH = template_hash(TARGET_TEMPLATE)
+
+
+def target_rs(template: dict | None = None, uid: str = RS_UID, owner: str = UID) -> SimpleNamespace:
+    """The ReplicaSet as read with _preload_content=False."""
+    tmpl = json.loads(json.dumps(template or TARGET_TEMPLATE))
+    tmpl["metadata"]["labels"]["pod-template-hash"] = "7d5b9c6f8"
+    rs = {
+        "metadata": {
+            "name": "web-7d5b9c6f8",
+            "uid": uid,
+            "annotations": {"deployment.kubernetes.io/revision": "3"},
+            "ownerReferences": [{"kind": "Deployment", "uid": owner, "controller": True}],
+        },
+        "spec": {"replicas": 0, "template": tmpl},
+    }
+    return SimpleNamespace(data=json.dumps(rs).encode())
+
+
+def create_rollback_plan(store: PlanStore, override: bool = False, **overrides) -> Plan:
+    plan = Plan(
+        plan_id=str(uuid.uuid4()),
+        action=ROLLBACK_DEPLOYMENT,
+        namespace="sandbox",
+        name="web",
+        replicas_from=1,
+        replicas_to=1,
+        args_hash=plan_args_hash(ROLLBACK_DEPLOYMENT, rollback_args("sandbox", "web", 3, override)),
+        args=rollback_args("sandbox", "web", 3, override),
+        override_manual_change=override,
+        resource_version="12345",
+        generation=4,
+        uid=UID,
+        created_at=NOW,
+        expires_at=NOW + 300,
+        template_from="sha256:current",
+        template_to=TARGET_HASH,
+        revision_from=5,
+        revision_to=3,
+        target_rs_name="web-7d5b9c6f8",
+        target_rs_uid=RS_UID,
+        images=[{"container": "nginx", "init": False, "from": "a", "to": "b", "changed": True}],
+        fields_changed=["spec.containers[nginx].image"],
+    )
+    plan = dataclasses.replace(plan, **overrides)
+    store.create(plan)
+    return plan
+
+
+def apply_rollback(plan_id: str, **overrides) -> dict:
+    event = {"plan_id": plan_id, "namespace": "sandbox", "name": "web", "revision": 3}
+    return handler.lambda_handler({**event, **overrides}, ROLLBACK_CONTEXT)
+
+
+@pytest.fixture
+def rollback_rt(rt):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={"deployment.kubernetes.io/revision": "5"}
+    )
+    apps.read_namespaced_replica_set.return_value = target_rs()
+    return runtime_, apps
+
+
+def test_rollback_writes_exactly_the_checked_template_as_a_json_patch(rollback_rt):
+    runtime_, apps = rollback_rt
+    plan = create_rollback_plan(runtime_.store)
+
+    response = apply_rollback(plan.plan_id)
+
+    assert response["ok"] is True
+    assert response["data"] == {
+        "plan_id": plan.plan_id,
+        "namespace": "sandbox",
+        "name": "web",
+        "revision_requested": 3,
+        "template": TARGET_HASH,
+        "images": plan.images,
+        "resource_version": "12346",
+        "approved": False,
+        "correlation_id": GATEWAY_REQUEST_ID,
+    }
+    apps.read_namespaced_replica_set.assert_called_once_with(
+        "web-7d5b9c6f8", "sandbox", _preload_content=False
+    )
+    dry, real = apps.patch_namespaced_deployment.call_args_list
+    assert dry.kwargs == {"dry_run": "All"} and real.kwargs == {}
+    assert dry.args == real.args
+    # A list body: the client sends it as a JSON Patch. The resourceVersion op is first.
+    assert real.args == (
+        "web",
+        "sandbox",
+        [
+            {"op": "replace", "path": "/metadata/resourceVersion", "value": "12345"},
+            {"op": "replace", "path": "/spec/template", "value": TARGET_TEMPLATE},
+            {
+                "op": "add",
+                "path": "/metadata/annotations/kube-handrail.io~1last-plan-id",
+                "value": plan.plan_id,
+            },
+            {
+                "op": "add",
+                "path": "/metadata/annotations/kube-handrail.io~1correlation-id",
+                "value": GATEWAY_REQUEST_ID,
+            },
+        ],
+    )
+    record = item(plan.plan_id)
+    assert record["used"] is True and record["result"] == "applied"
+
+
+def test_rollback_patch_adds_the_annotation_map_when_there_is_none():
+    ops = handler.rollback_patch({"spec": {}}, "9", "p-1", "c-1", has_annotations=False)
+    assert ops[-1] == {
+        "op": "add",
+        "path": "/metadata/annotations",
+        "value": {handler.LAST_PLAN_ANNOTATION: "p-1", "kube-handrail.io/correlation-id": "c-1"},
+    }
+    assert len(ops) == 3
+
+
+def test_rollback_patch_escapes_json_pointer_tokens():
+    assert handler._pointer("a/b~c") == "a~1b~0c"
+    ops = handler.rollback_patch({"spec": {}}, "9", "p-1")
+    assert [op["path"] for op in ops] == [
+        "/metadata/resourceVersion",
+        "/spec/template",
+        "/metadata/annotations/kube-handrail.io~1last-plan-id",
+    ]
+
+
+def test_rollback_on_a_deployment_without_annotations(rollback_rt):
+    runtime_, apps = rollback_rt
+    apps.read_namespaced_deployment.return_value = deployment()
+    apply_rollback(create_rollback_plan(runtime_.store).plan_id)
+    body = apps.patch_namespaced_deployment.call_args.args[2]
+    assert body[-1]["path"] == "/metadata/annotations"
+
+
+def test_rollback_kill_switch_off_makes_no_kubernetes_call(aws, monkeypatch):
+    runtime_, apps = runtime(enabled="false")
+    monkeypatch.setattr(handler, "get_runtime", lambda: runtime_)
+    plan = create_rollback_plan(runtime_.store)
+    assert error_code(apply_rollback(plan.plan_id)) == "remediation_disabled"
+    apps.read_namespaced_deployment.assert_not_called()
+    apps.read_namespaced_replica_set.assert_not_called()
+    assert item(plan.plan_id)["used"] is False
+
+
+def test_rollback_of_a_removed_replica_set_is_revision_not_found(rollback_rt):
+    runtime_, apps = rollback_rt
+    apps.read_namespaced_replica_set.side_effect = ApiException(status=404, reason="Not Found")
+    plan = create_rollback_plan(runtime_.store)
+    response = apply_rollback(plan.plan_id)
+    assert error_code(response) == "revision_not_found"
+    assert response["error"]["details"] == {"revision": 3, "replica_set": "web-7d5b9c6f8"}
+    apps.patch_namespaced_deployment.assert_not_called()
+    record = item(plan.plan_id)
+    assert record["used"] is True and record["result"] == "revision_not_found"
+
+
+def test_rollback_replica_set_read_error_is_kubernetes_error(rollback_rt):
+    runtime_, apps = rollback_rt
+    apps.read_namespaced_replica_set.side_effect = ApiException(status=403, reason="Forbidden")
+    assert error_code(apply_rollback(create_rollback_plan(runtime_.store).plan_id)) == (
+        "kubernetes_error"
+    )
+
+
+@pytest.mark.parametrize(
+    "rs", [target_rs(uid="8f7c1a2e-0000-4000-8000-0000000000bb"), target_rs(owner="other")]
+)
+def test_rollback_to_a_replaced_replica_set_is_conflict(rollback_rt, rs):
+    runtime_, apps = rollback_rt
+    apps.read_namespaced_replica_set.return_value = rs
+    response = apply_rollback(create_rollback_plan(runtime_.store).plan_id)
+    assert error_code(response) == "conflict"
+    current = json.loads(rs.data)["metadata"]["uid"]
+    assert response["error"]["details"] == {"replica_set": {"planned": RS_UID, "current": current}}
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_rollback_to_an_edited_replica_set_is_conflict(rollback_rt):
+    runtime_, apps = rollback_rt
+    edited = json.loads(json.dumps(TARGET_TEMPLATE))
+    edited["spec"]["containers"][0]["image"] = "evil:1"
+    apps.read_namespaced_replica_set.return_value = target_rs(edited)
+    response = apply_rollback(create_rollback_plan(runtime_.store).plan_id)
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"] == {
+        "template": {"planned": TARGET_HASH, "current": template_hash(edited)}
+    }
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_rollback_after_a_spec_change_is_conflict(rollback_rt):
+    runtime_, apps = rollback_rt
+    apps.read_namespaced_deployment.return_value = deployment(generation=5)
+    assert error_code(apply_rollback(create_rollback_plan(runtime_.store).plan_id)) == "conflict"
+    apps.read_namespaced_replica_set.assert_not_called()
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_rollback_of_a_paused_rollout_is_conflict(rollback_rt):
+    runtime_, apps = rollback_rt
+    paused = deployment()
+    paused.spec.paused = True
+    apps.read_namespaced_deployment.return_value = paused
+    response = apply_rollback(create_rollback_plan(runtime_.store).plan_id)
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"] == {"paused": True}
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_rollback_conflict_retry_rereads_both_objects(rollback_rt):
+    runtime_, apps = rollback_rt
+    apps.read_namespaced_deployment.side_effect = [
+        deployment(resource_version="1"),
+        deployment(resource_version="2"),
+    ]
+    apps.patch_namespaced_deployment.side_effect = [
+        conflict(),
+        None,
+        SimpleNamespace(metadata=SimpleNamespace(resource_version="3")),
+    ]
+    response = apply_rollback(create_rollback_plan(runtime_.store).plan_id)
+    assert response["ok"] is True
+    assert apps.read_namespaced_deployment.call_count == 2
+    assert apps.read_namespaced_replica_set.call_count == 2
+    versions = [c.args[2][0]["value"] for c in apps.patch_namespaced_deployment.call_args_list]
+    assert versions == ["1", "2", "2"]
+
+
+def test_rollback_retry_sees_a_replica_set_edited_in_between(rollback_rt):
+    runtime_, apps = rollback_rt
+    edited = json.loads(json.dumps(TARGET_TEMPLATE))
+    edited["metadata"]["annotations"] = {"touched": "1"}
+    apps.read_namespaced_replica_set.side_effect = [target_rs(), target_rs(edited)]
+    apps.patch_namespaced_deployment.side_effect = conflict()
+    response = apply_rollback(create_rollback_plan(runtime_.store).plan_id)
+    assert error_code(response) == "conflict" and "template" in response["error"]["details"]
+    assert apps.patch_namespaced_deployment.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"revision_to": 4},
+        {"target_rs_uid": None},
+        {"target_rs_name": None},
+        {"template_to": None},
+        {"template_from": None},
+        {"replicas_to": 2},
+        {"name": "other"},
+    ],
+)
+def test_an_altered_rollback_record_cannot_be_applied(rollback_rt, change):
+    runtime_, apps = rollback_rt
+    plan = create_rollback_plan(runtime_.store, **change)
+    assert error_code(apply_rollback(plan.plan_id)) == "plan_mismatch"
+    apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_rollback_with_another_revision_is_plan_mismatch(rollback_rt):
+    runtime_, apps = rollback_rt
+    plan = create_rollback_plan(runtime_.store)
+    assert error_code(apply_rollback(plan.plan_id, revision=4)) == "plan_mismatch"
+    assert item(plan.plan_id)["used"] is False
+    assert apply_rollback(plan.plan_id)["ok"] is True
+
+
+def test_rollback_record_cannot_hide_the_override(rollback_rt):
+    runtime_, apps = rollback_rt
+    plan = create_rollback_plan(runtime_.store, override=True, override_manual_change=False)
+    assert error_code(apply_rollback(plan.plan_id, override_manual_change=True)) == "plan_mismatch"
+
+
+def rollback_seed(template_from: str, template_to: str) -> str:
+    plan_id = seed(1, 1, NOW - 500)
+    boto3.resource("dynamodb", region_name=REGION).Table(TABLE).update_item(
+        Key={"plan_id": plan_id},
+        UpdateExpression="SET template_from = :f, template_to = :t",
+        ExpressionAttributeValues={":f": template_from, ":t": template_to},
+    )
+    return plan_id
+
+
+def test_rollback_apply_refuses_to_undo_a_template_change_made_by_hand(rollback_rt):
+    runtime_, apps = rollback_rt
+    last = rollback_seed("sha256:before", "sha256:applied")
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    plan = create_rollback_plan(runtime_.store)
+    response = apply_rollback(plan.plan_id)
+    assert error_code(response) == "manual_change"
+    assert response["error"]["details"] == {
+        "last_applied_template": "sha256:applied",
+        "current_template": "sha256:current",
+    }
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "manual_change"
+
+
+def test_rollback_apply_with_the_planned_override(rollback_rt):
+    runtime_, apps = rollback_rt
+    last = rollback_seed("sha256:before", "sha256:applied")
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    plan = create_rollback_plan(runtime_.store, override=True)
+    assert apply_rollback(plan.plan_id, override_manual_change=True)["ok"] is True
+
+
+def test_rollback_apply_after_its_own_template_change(rollback_rt):
+    runtime_, apps = rollback_rt
+    last = rollback_seed("sha256:before", "sha256:current")
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    # The Deployment's template is still the one the last apply left: no manual change.
+    assert apply_rollback(create_rollback_plan(runtime_.store).plan_id)["ok"] is True
+
+
+def test_rollback_within_the_cooldown_is_refused(rollback_rt):
+    runtime_, apps = rollback_rt
+    seed(1, 1, NOW - 30)
+    assert error_code(apply_rollback(create_rollback_plan(runtime_.store).plan_id)) == "cooldown"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_rollback_takes_one_unit_of_the_global_budget(rollback_rt):
+    runtime_, _ = rollback_rt
+    apply_rollback(create_rollback_plan(runtime_.store).plan_id)
+    assert runtime_.store.global_applies(NOW) == 1
+
+
+def test_server_mode_rollback_after_approval(server_rt):
+    runtime_, apps = server_rt
+    apps.read_namespaced_replica_set.return_value = target_rs()
+    plan = create_rollback_plan(runtime_.store)
+    assert error_code(apply_rollback(plan.plan_id)) == "approval_required"
+    plan = create_rollback_plan(runtime_.store)
+    runtime_.store.approve(plan.plan_id, HUMAN, NOW, 120)
+    response = apply_rollback(plan.plan_id)
     assert response["ok"] is True and response["data"]["approved"] is True

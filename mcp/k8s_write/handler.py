@@ -1,5 +1,6 @@
 """k8s_write Lambda: apply a previously planned Deployment change."""
 
+import json
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -14,6 +15,7 @@ from handrail_common.breaker import (
     LAST_PLAN_ANNOTATION,
     check_history,
     check_manual_change,
+    check_template_manual_change,
     last_applied_plan,
     replica_baseline,
 )
@@ -29,6 +31,7 @@ from handrail_common.envelope import (
     PLAN_EXPIRED,
     PLAN_MISMATCH,
     REMEDIATION_DISABLED,
+    REVISION_NOT_FOUND,
     Envelope,
     ok,
 )
@@ -39,13 +42,17 @@ from handrail_common.plans import (
     RESTART_ANNOTATION,
     RESTART_DEPLOYMENT,
     RESULT_APPLIED,
+    ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
     plan_args_hash,
     restart_args,
+    rollback_args,
     scale_args,
+    template_hash,
 )
+from handrail_common.rollout import is_controlled_by, require_revision, template_of
 from handrail_common.validation import (
     GuardError,
     check_not_paused,
@@ -113,12 +120,14 @@ class Action:
     # History checks (manual change, cooldown, flapping, object budget); the generic path
     # takes the global budget unit after them.
     breaker: Callable[[Runtime, Plan, Any, bool, int], None]
-    # The patch body for the Deployment just read and checked.
-    body: Callable[[Plan, Mapping[str, Any], Any, str | None], Any]
+    # The patch body for the Deployment just read and checked, and what extra_checks
+    # returned for it.
+    body: Callable[[Plan, Mapping[str, Any], Any, Any, str | None], Any]
     # Action-specific fields of the response data.
     result: Callable[[Plan, Mapping[str, Any]], dict[str, Any]]
-    # Further checks on the live Deployment, after the generic ones, before every attempt.
-    extra_checks: Callable[[Plan, Any], None] = _no_checks
+    # Further checks on the live Deployment, after the generic ones, before every attempt;
+    # returns what the body needs besides the Deployment (rollback: the template it checked).
+    extra_checks: Callable[[k8s.AppsV1Api, Plan, Any], Any] = _no_checks
 
 
 def _patch_metadata(
@@ -150,6 +159,38 @@ def restart_patch(
         "metadata": _patch_metadata(resource_version, plan_id, correlation_id),
         "spec": {"template": {"metadata": {"annotations": {RESTART_ANNOTATION: plan_id}}}},
     }
+
+
+def _pointer(key: str) -> str:
+    """An annotation key as a JSON Pointer token (RFC 6901): `~` and `/` escaped."""
+    return key.replace("~", "~0").replace("/", "~1")
+
+
+def rollback_patch(
+    template: Mapping[str, Any],
+    resource_version: str,
+    plan_id: str,
+    correlation_id: str | None = None,
+    has_annotations: bool = True,
+) -> list[dict[str, Any]]:
+    """A JSON Patch (the client sends a list body as application/json-patch+json) that
+    writes exactly `template` as the pod template. The resourceVersion op comes first: a
+    stale value makes the API server reject the patch with 409, as in the merge patches."""
+    annotations = {LAST_PLAN_ANNOTATION: plan_id}
+    if correlation_id is not None:
+        annotations[CORRELATION_ANNOTATION] = correlation_id
+    ops: list[dict[str, Any]] = [
+        {"op": "replace", "path": "/metadata/resourceVersion", "value": resource_version},
+        {"op": "replace", "path": "/spec/template", "value": template},
+    ]
+    if not has_annotations:
+        # `add` on a key needs the map to exist.
+        return [*ops, {"op": "add", "path": "/metadata/annotations", "value": annotations}]
+    # `add` on an existing key replaces its value (RFC 6902).
+    return ops + [
+        {"op": "add", "path": f"/metadata/annotations/{_pointer(key)}", "value": value}
+        for key, value in annotations.items()
+    ]
 
 
 def _api_error(exc: ApiException) -> GuardError:
@@ -253,11 +294,11 @@ def _patch(
     for attempt in range(1, PATCH_ATTEMPTS + 1):
         deployment = _read(apps, plan.namespace, plan.name)
         check_target(plan, deployment)
-        action.extra_checks(plan, deployment)
+        extra = action.extra_checks(apps, plan, deployment)
         if attempt == 1:
             # A retry only follows a 409 on an unchanged spec, so history is checked once.
             after_first_check(deployment)
-        body = action.body(plan, args, deployment, correlation_id)
+        body = action.body(plan, args, deployment, extra, correlation_id)
         try:
             apps.patch_namespaced_deployment(plan.name, plan.namespace, body, dry_run="All")
             return apps.patch_namespaced_deployment(plan.name, plan.namespace, body)
@@ -372,7 +413,7 @@ SCALE = Action(
     ),
     check_plan=_check_scale_plan,
     breaker=_scale_breaker,
-    body=lambda plan, args, deployment, correlation_id: scale_patch(
+    body=lambda plan, args, deployment, extra, correlation_id: scale_patch(
         args["replicas"], deployment.metadata.resource_version, plan.plan_id, correlation_id
     ),
     result=lambda plan, args: {
@@ -422,11 +463,11 @@ RESTART = Action(
     # No blast-radius step: replicas do not change (docs/guards.md).
     check_plan=_no_checks,
     breaker=_restart_breaker,
-    body=lambda plan, args, deployment, correlation_id: restart_patch(
+    body=lambda plan, args, deployment, extra, correlation_id: restart_patch(
         deployment.metadata.resource_version, plan.plan_id, correlation_id
     ),
     result=lambda plan, args: {"pods_replaced": plan.replicas_to, "template": plan.template_to},
-    extra_checks=lambda plan, deployment: check_not_paused(deployment),
+    extra_checks=lambda apps, plan, deployment: check_not_paused(deployment),
 )
 
 
@@ -434,9 +475,108 @@ def apply_restart_deployment(args: Mapping[str, Any]) -> Envelope:
     return _apply(RESTART, args)
 
 
+# --- rollback_deployment ------------------------------------------------------
+
+
+def _validate_rollback(
+    args: Mapping[str, Any], settings: Settings
+) -> tuple[str, str, dict[str, Any]]:
+    namespace, name = validate_target_args(args, settings.allowed_namespaces)
+    revision = require_revision(args.get("revision"))
+    override = require_override_flag(args)
+    return namespace, name, rollback_args(namespace, name, revision, override)
+
+
+def _read_target_template(apps: k8s.AppsV1Api, plan: Plan, deployment: Any) -> dict[str, Any]:
+    """Re-read the pinned ReplicaSet as raw JSON and return its template, minus the
+    pod-template-hash label, only if it is still the one the plan pinned and approved."""
+    check_not_paused(deployment)
+    name = str(plan.target_rs_name)
+    try:
+        response = apps.read_namespaced_replica_set(name, plan.namespace, _preload_content=False)
+    except ApiException as exc:
+        if exc.status == 404:
+            raise GuardError(
+                REVISION_NOT_FOUND,
+                f"ReplicaSet {name} of revision {plan.revision_to} no longer exists",
+                {"revision": plan.revision_to, "replica_set": name},
+            ) from None
+        raise _api_error(exc) from None
+    rs = json.loads(response.data)
+    uid = str((rs.get("metadata") or {}).get("uid") or "")
+    if uid != plan.target_rs_uid or not is_controlled_by(rs, plan.uid):
+        raise GuardError(
+            CONFLICT,
+            f"ReplicaSet {name} is no longer the one the plan pinned",
+            {"replica_set": {"planned": plan.target_rs_uid, "current": uid}},
+        )
+    template = template_of(rs)
+    current = template_hash(template)
+    if current != plan.template_to:
+        raise GuardError(
+            CONFLICT,
+            f"the template of ReplicaSet {name} changed since the plan was made",
+            {"template": {"planned": plan.template_to, "current": current}},
+        )
+    # Exactly what was hashed and compared is what the patch writes.
+    return template
+
+
+def _rollback_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now: int) -> None:
+    """check_spec_unchanged has confirmed that generation is unchanged, so the Deployment's
+    template is still the one hashed as template_from."""
+    last_applied = last_applied_plan(rt.store, deployment)
+    check_template_manual_change(last_applied, str(plan.template_from), override)
+    check_history(
+        rt.store,
+        plan.object_key,
+        now,
+        rt.settings,
+        plan.replicas_from,
+        plan.replicas_to,
+        plan_rate=False,
+        last_applied=last_applied,
+    )
+
+
+ROLLBACK = Action(
+    name=ROLLBACK_DEPLOYMENT,
+    validate=_validate_rollback,
+    # A rollback record keeps the replica count, pins the ReplicaSet and its template, and
+    # carries the override the approval view shows.
+    record_matches=lambda plan, args: (
+        plan.revision_to == args["revision"]
+        and plan.replicas_to == plan.replicas_from
+        and None not in (plan.target_rs_name, plan.target_rs_uid, plan.template_from)
+        and plan.template_to is not None
+        and plan.override_manual_change == (args.get("override_manual_change") is True)
+    ),
+    check_plan=_no_checks,
+    breaker=_rollback_breaker,
+    body=lambda plan, args, deployment, template, correlation_id: rollback_patch(
+        template,
+        deployment.metadata.resource_version,
+        plan.plan_id,
+        correlation_id,
+        has_annotations=bool(deployment.metadata.annotations),
+    ),
+    result=lambda plan, args: {
+        "revision_requested": args["revision"],
+        "template": plan.template_to,
+        "images": plan.images,
+    },
+    extra_checks=_read_target_template,
+)
+
+
+def apply_rollback_deployment(args: Mapping[str, Any]) -> Envelope:
+    return _apply(ROLLBACK, args)
+
+
 HANDLERS = {
     "apply_scale_deployment": apply_scale_deployment,
     "apply_restart_deployment": apply_restart_deployment,
+    "apply_rollback_deployment": apply_rollback_deployment,
 }
 
 

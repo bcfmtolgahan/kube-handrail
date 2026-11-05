@@ -11,6 +11,7 @@ from handrail_common.envelope import INVALID_ARGUMENT
 from handrail_common.plans import (
     RESTART_ANNOTATION,
     RESTART_DEPLOYMENT,
+    ROLLBACK_DEPLOYMENT,
     STATUS_PLANNED,
     STATUS_REJECTED,
 )
@@ -53,6 +54,15 @@ def change_view(record: Mapping[str, Any]) -> dict[str, Any]:
         return {
             "restart": {"pods_replaced": record.get("replicas_from")},
             "template": {"from": record.get("template_from"), "to": record.get("template_to")},
+        }
+    if record.get("action") == ROLLBACK_DEPLOYMENT:
+        return {
+            "revision": {"from": record.get("revision_from"), "to": record.get("revision_to")},
+            "template": {"from": record.get("template_from"), "to": record.get("template_to")},
+            "replica_set": record.get("target_rs_name"),
+            "images": record.get("images") or [],
+            "fields_changed": record.get("fields_changed") or [],
+            "truncated": record.get("diff_truncated") is True,
         }
     return {"replicas": {"from": record.get("replicas_from"), "to": record.get("replicas_to")}}
 
@@ -137,25 +147,49 @@ def _impact_lines(impact: Mapping[str, Any] | None) -> list[str]:
     return lines
 
 
+def _rollback_lines(change: Mapping[str, Any]) -> list[str]:
+    """The revision, each image change, the other changed fields and whether they were cut.
+    Images are shown as the record stores them, wrapped as untrusted text: they come from
+    the cluster."""
+    revision = change.get("revision") or {}
+    lines = [
+        f"Rollback: revision {revision.get('from')} -> {revision.get('to')} "
+        f"(ReplicaSet {change.get('replica_set')}); replicas stay as they are"
+    ]
+    for image in change.get("images") or []:
+        if image.get("changed"):
+            kind = "init container" if image.get("init") else "container"
+            lines.append(
+                f"Image of {kind} {image.get('container')}: {image.get('from')} -> {image.get('to')}"
+            )
+    fields = [f for f in change.get("fields_changed") or [] if not f.endswith("].image")]
+    lines.append(f"Other changed fields: {', '.join(fields) if fields else 'none'}")
+    if change.get("truncated"):
+        lines.append("(image or field list truncated)")
+    return lines
+
+
 def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
     """The approval request sent to approvers, built from plan_view only."""
     plan_id = view["plan_id"]
     url = approval_url or "<approval_url output>"
     replicas = view["replicas"]
     if view.get("action") == RESTART_DEPLOYMENT:
-        change = (
+        change = [
             f"Restart: every pod replaced, replicas stay at {replicas['from']}; "
             f"pods get the annotation {RESTART_ANNOTATION}={plan_id}"
-        )
+        ]
+    elif view.get("action") == ROLLBACK_DEPLOYMENT:
+        change = _rollback_lines(view.get("change") or {})
     else:
-        change = f"Replicas: {replicas['from']} -> {replicas['to']}"
+        change = [f"Replicas: {replicas['from']} -> {replicas['to']}"]
     return "\n".join(
         [
             "kube-handrail: a plan is waiting for approval.",
             "",
             f"Plan: {plan_id}",
             f"Deployment: {view['namespace']}/{view['name']}",
-            change,
+            *change,
             f"Override manual change: {'yes' if view['override_manual_change'] else 'no'}",
             f"Requested by: {view['requested_by']}",
             f"Expires at (epoch seconds): {view['expires_at']}",

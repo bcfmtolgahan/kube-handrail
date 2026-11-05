@@ -257,3 +257,33 @@ def check_manual_change(baseline: int | None, current: int, override: bool) -> b
         "plan with override_manual_change=true to change them anyway",
         {"last_applied_to": baseline, "current": current},
     )
+
+
+def check_template_manual_change(
+    last_applied: Plan | None, current_template: str, override: bool
+) -> bool:
+    """Reject rolling back over a pod template change made outside kube-handrail since its
+    last apply, typically a human or CI rolling forward to a fix.
+
+    It applies only when that apply changed the template (a rollback or restart): after a
+    scale, rolling back a deploy made by someone else is the main use of a rollback, and
+    requiring the override there would make it routine. `current_template` is the
+    template_hash of the Deployment's template. Returns True when a change was found and
+    `override` allowed it.
+    """
+    if (
+        last_applied is None
+        or last_applied.template_from is None
+        or last_applied.template_to is None
+        or last_applied.template_from == last_applied.template_to
+        or last_applied.template_to == current_template
+    ):
+        return False
+    if override:
+        return True
+    raise GuardError(
+        MANUAL_CHANGE,
+        "the pod template was changed outside kube-handrail since its last apply; "
+        "plan with override_manual_change=true to roll back anyway",
+        {"last_applied_template": last_applied.template_to, "current_template": current_template},
+    )

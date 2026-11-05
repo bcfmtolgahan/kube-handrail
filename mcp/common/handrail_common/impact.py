@@ -227,15 +227,17 @@ def rollout_impact(
     pdbs: Sequence[Obj],
     services: Sequence[Obj],
     slices: Sequence[Obj],
+    action_warnings: Sequence[Mapping[str, str]] = (),
 ) -> dict[str, Any]:
     """Pods, PodDisruptionBudgets and Services affected by rolling out a new pod template to
     a Deployment with `replicas` desired pods, and warnings for the approver. Every pod is
-    replaced at the pace of the Deployment's own strategy. Warnings never block the plan."""
+    replaced at the pace of the Deployment's own strategy. `action_warnings` (a rollback's)
+    come first, so a cut never drops them. Warnings never block the plan."""
     rollout = rollout_strategy(deployment, replicas)
     recreate = rollout["strategy"] == RECREATE
     # Pods below the desired count at the lowest point of the rollout.
     down = replicas if recreate else min(rollout["max_unavailable"], replicas)
-    warnings: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = [dict(w) for w in action_warnings]
     if recreate:
         warnings.append(
             {

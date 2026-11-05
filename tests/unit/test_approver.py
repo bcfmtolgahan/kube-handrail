@@ -17,13 +17,16 @@ from handrail_common.killswitch import KillSwitch
 from handrail_common.plans import (
     RESTART_ANNOTATION,
     RESTART_DEPLOYMENT,
+    ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
     plan_args_hash,
     restart_args,
+    rollback_args,
     scale_args,
     scale_args_hash,
+    template_hash,
 )
 
 
@@ -304,6 +307,58 @@ def test_approve_runs_the_restart_apply_with_the_plans_own_arguments(env):
     assert patch["spec"] == {
         "template": {"metadata": {"annotations": {RESTART_ANNOTATION: plan.plan_id}}}
     }
+    assert body["data"]["plan"]["status"] == "applied"
+
+
+def test_approve_runs_the_rollback_apply_with_the_plans_own_arguments(env):
+    template = {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": []}}
+    rs = {
+        "metadata": {
+            "uid": "rs-uid",
+            "ownerReferences": [{"uid": UID, "controller": True}],
+        },
+        "spec": {"template": {"metadata": {"labels": {"app": "web", "pod-template-hash": "h"}}}},
+    }
+    rs["spec"]["template"]["spec"] = template["spec"]
+    env.apps.read_namespaced_replica_set.return_value = SimpleNamespace(
+        data=json.dumps(rs).encode()
+    )
+    plan = Plan(
+        plan_id=str(uuid.uuid4()),
+        action=ROLLBACK_DEPLOYMENT,
+        namespace="sandbox",
+        name="web",
+        replicas_from=1,
+        replicas_to=1,
+        args_hash=plan_args_hash(ROLLBACK_DEPLOYMENT, rollback_args("sandbox", "web", 3)),
+        args=rollback_args("sandbox", "web", 3),
+        resource_version="10",
+        generation=4,
+        uid=UID,
+        created_at=NOW,
+        expires_at=NOW + 300,
+        template_from="sha256:a",
+        template_to=template_hash(template),
+        revision_to=3,
+        target_rs_name="web-h",
+        target_rs_uid="rs-uid",
+    )
+    env.store.create(plan)
+
+    status, body = approve(env, plan)
+
+    assert status == 200 and body["data"]["apply"]["ok"] is True
+    (invoke,) = env.lam.calls
+    custom = json.loads(base64.b64decode(invoke["ClientContext"]))["custom"]
+    assert custom["bedrockAgentCoreToolName"] == "k8sw___apply_rollback_deployment"
+    assert json.loads(invoke["Payload"]) == {
+        "plan_id": plan.plan_id,
+        "namespace": "sandbox",
+        "name": "web",
+        "revision": 3,
+    }
+    patch = env.apps.patch_namespaced_deployment.call_args.args[2]
+    assert patch[1] == {"op": "replace", "path": "/spec/template", "value": template}
     assert body["data"]["plan"]["status"] == "applied"
 
 

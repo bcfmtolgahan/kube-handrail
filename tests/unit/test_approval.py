@@ -17,6 +17,7 @@ from handrail_common.plans import (
     APPROVAL_REQUEST_WINDOW_SECONDS,
     REQUESTER_GATEWAY,
     RESTART_DEPLOYMENT,
+    ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     STATUS_AWAITING,
     STATUS_PLANNED,
@@ -25,6 +26,7 @@ from handrail_common.plans import (
     approval_request_key,
     plan_args_hash,
     restart_args,
+    rollback_args,
     scale_args_hash,
 )
 from handrail_common.validation import GuardError, require_plan_id
@@ -495,6 +497,94 @@ def test_recreate_notification_says_every_pod_stops_first(store):
     plan = make_restart_plan(store, impact)
     message = notification(plan_view(item(store, plan.plan_id), NOW), None)
     assert "Rollout: Recreate, every pod stops first" in message
+
+
+def make_rollback_plan(store: PlanStore, **fields) -> Plan:
+    plan = Plan(
+        plan_id=str(uuid.uuid4()),
+        action=ROLLBACK_DEPLOYMENT,
+        namespace="sandbox",
+        name="web",
+        replicas_from=2,
+        replicas_to=2,
+        args_hash=plan_args_hash(ROLLBACK_DEPLOYMENT, rollback_args("sandbox", "web", 3)),
+        args=rollback_args("sandbox", "web", 3),
+        resource_version="1",
+        generation=4,
+        uid=UID,
+        created_at=NOW,
+        expires_at=NOW + 300,
+        impact={
+            **ROLLOUT_IMPACT,
+            "warnings": [{"code": "mutable_image_tag", "message": "not pinned by digest"}],
+        },
+        template_from="sha256:a",
+        template_to="sha256:b",
+        revision_from=5,
+        revision_to=3,
+        target_rs_name="web-7d5b9c6f8",
+        target_rs_uid="uid-3",
+        images=[
+            {
+                "container": "nginx",
+                "init": False,
+                "from": "<untrusted>nginx:1.27.5</untrusted>",
+                "to": "<untrusted>nginx:1.27.4</untrusted>",
+                "changed": True,
+                "pinned_by_digest": False,
+            },
+            {
+                "container": "setup",
+                "init": True,
+                "from": "<untrusted>busybox:1</untrusted>",
+                "to": "<untrusted>busybox:1</untrusted>",
+                "changed": False,
+                "pinned_by_digest": False,
+            },
+        ],
+        fields_changed=["spec.containers[nginx].env", "spec.containers[nginx].image"],
+        **fields,
+    )
+    store.create(plan)
+    return plan
+
+
+def test_rollback_view_shows_the_revision_replica_set_images_and_fields(store):
+    plan = make_rollback_plan(store)
+    view = plan_view(item(store, plan.plan_id), NOW)
+    assert view["action"] == "rollback_deployment"
+    assert view["change"] == {
+        "revision": {"from": 5, "to": 3},
+        "template": {"from": "sha256:a", "to": "sha256:b"},
+        "replica_set": "web-7d5b9c6f8",
+        "images": plan.images,
+        "fields_changed": ["spec.containers[nginx].env", "spec.containers[nginx].image"],
+        "truncated": False,
+    }
+
+
+def test_rollback_notification_lists_image_changes_and_other_fields(store):
+    plan = make_rollback_plan(store)
+    message = notification(plan_view(item(store, plan.plan_id), NOW), None)
+    assert (
+        "Rollback: revision 5 -> 3 (ReplicaSet web-7d5b9c6f8); replicas stay as they are"
+    ) in message
+    assert (
+        "Image of container nginx: <untrusted>nginx:1.27.5</untrusted> -> "
+        "<untrusted>nginx:1.27.4</untrusted>"
+    ) in message
+    assert "setup" not in message
+    assert "Other changed fields: spec.containers[nginx].env" in message
+    assert "- mutable_image_tag: not pinned by digest" in message
+    assert "Replicas:" not in message
+    assert "truncated" not in message
+
+
+def test_rollback_notification_says_when_the_change_lists_were_cut(store):
+    plan = make_rollback_plan(store, diff_truncated=True)
+    view = plan_view(item(store, plan.plan_id), NOW)
+    assert view["change"]["truncated"] is True
+    assert "(image or field list truncated)" in notification(view, None)
 
 
 def test_sanitize_reason():

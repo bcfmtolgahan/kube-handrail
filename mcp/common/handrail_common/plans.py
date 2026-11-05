@@ -3,7 +3,7 @@
 import copy
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -27,6 +27,7 @@ from handrail_common.validation import GuardError
 
 SCALE_DEPLOYMENT = "scale_deployment"
 RESTART_DEPLOYMENT = "restart_deployment"
+ROLLBACK_DEPLOYMENT = "rollback_deployment"
 # Pod-template annotation a restart sets to its plan id: the template it leaves is known when
 # the plan is made, and every pod it creates names the plan.
 RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
@@ -97,6 +98,16 @@ def scale_args_hash(
 def restart_args(namespace: str, name: str) -> dict[str, Any]:
     """The argument payload of a restart plan: the apply arguments without plan_id."""
     return {"namespace": namespace, "name": name}
+
+
+def rollback_args(
+    namespace: str, name: str, revision: int, override_manual_change: bool = False
+) -> dict[str, Any]:
+    """The argument payload of a rollback plan: the apply arguments without plan_id."""
+    args: dict[str, Any] = {"namespace": namespace, "name": name, "revision": revision}
+    if override_manual_change:
+        args["override_manual_change"] = True
+    return args
 
 
 def template_hash(template: Mapping[str, Any]) -> str:
@@ -170,6 +181,18 @@ class Plan:
     # The Deployment's revision annotation at plan time, for a change that rolls out a new
     # pod template; information only.
     revision_from: int | None = None
+    # Rollback only: the requested revision (the approved argument) and the ReplicaSet it
+    # resolved to, which apply re-reads; template_to is the hash of its template.
+    revision_to: int | None = None
+    target_rs_name: str | None = None
+    target_rs_uid: str | None = None
+    # Rollback only: the image change per container, as untrusted text, and the names of
+    # the other template fields that change (never their values).
+    images: Sequence[Mapping[str, Any]] | None = None
+    fields_changed: Sequence[str] | None = None
+    # Rollback only: whether images or fields_changed was cut, so the approval channel can
+    # say that more changes than it shows.
+    diff_truncated: bool | None = None
 
     @property
     def object_key(self) -> str:
@@ -199,6 +222,12 @@ class Plan:
             item["impact"] = self.impact
         if self.args is not None:
             item["args"] = dict(self.args)
+        if self.images is not None:
+            item["images"] = [dict(image) for image in self.images]
+        if self.fields_changed is not None:
+            item["fields_changed"] = list(self.fields_changed)
+        if self.diff_truncated is not None:
+            item["diff_truncated"] = self.diff_truncated
         for field in (*_OPTIONAL_INTS, *_OPTIONAL_STRS):
             value = getattr(self, field)
             if value is not None:
@@ -228,6 +257,13 @@ class Plan:
             override_manual_change=item.get("override_manual_change") is True,
             impact=item.get("impact"),
             args=_args(item.get("args")),
+            images=_images(item.get("images")),
+            fields_changed=(
+                [str(f) for f in item["fields_changed"]]
+                if isinstance(item.get("fields_changed"), list)
+                else None
+            ),
+            diff_truncated=(item["diff_truncated"] is True if "diff_truncated" in item else None),
             **{f: int(item[f]) for f in _OPTIONAL_INTS if item.get(f) is not None},
             **{f: str(item[f]) for f in _OPTIONAL_STRS if item.get(f) is not None},
         )
@@ -241,6 +277,7 @@ _OPTIONAL_INTS = (
     "approval_expires_at",
     "rejected_at",
     "revision_from",
+    "revision_to",
 )
 _OPTIONAL_STRS = (
     "result",
@@ -255,6 +292,8 @@ _OPTIONAL_STRS = (
     "apply_correlation_id",
     "template_from",
     "template_to",
+    "target_rs_name",
+    "target_rs_uid",
 )
 
 
@@ -263,6 +302,13 @@ def _args(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
     return {str(k): int(v) if isinstance(v, Decimal) else v for k, v in value.items()}
+
+
+def _images(value: Any) -> list[dict[str, Any]] | None:
+    """The stored image change: strings, booleans and nulls only, so nothing to convert."""
+    if not isinstance(value, list):
+        return None
+    return [{str(k): v for k, v in image.items()} for image in value if isinstance(image, Mapping)]
 
 
 def _with_correlation(
