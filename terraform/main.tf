@@ -248,8 +248,9 @@ data "aws_iam_policy_document" "lambda" {
     }
   }
 
-  # The read role cannot write approval attributes, even if its code is compromised. Not on
-  # the write role: its consume condition reads these attributes.
+  # The read role cannot write approval attributes, or the verification and revert
+  # attributes, even if its code is compromised. Not on the write role: its consume
+  # condition reads the approval attributes, and it writes the others.
   dynamic "statement" {
     for_each = each.value.approval_requests ? [1] : []
     content {
@@ -260,7 +261,7 @@ data "aws_iam_policy_document" "lambda" {
       condition {
         test     = "ForAnyValue:StringEquals"
         variable = "dynamodb:Attributes"
-        values   = local.approval_attributes
+        values   = concat(local.approval_attributes, local.verify_attributes)
       }
     }
   }

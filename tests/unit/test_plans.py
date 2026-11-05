@@ -507,6 +507,20 @@ def test_a_refused_consume_schedules_nothing(store):
     assert "verify_at" not in store.get(plan.plan_id)
 
 
+def test_consume_pins_the_revert_target_only_when_asked(store):
+    plan = make_plan()
+    store.create(plan)
+    assert store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW).revert_to is None
+    assert "revert_to" not in store.get(plan.plan_id)
+
+    plan = make_plan()
+    store.create(plan)
+    consumed = store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, pin_revert=True)
+    # In the same write that marks it used, from the replicas_from the apply then checks.
+    assert (consumed.used, consumed.revert_to) == (True, plan.replicas_from)
+    assert store.get(plan.plan_id)["revert_to"] == plan.replicas_from
+
+
 def test_due_plans_reads_the_index_longest_due_first(store):
     ids = []
     for window in (90, 30, 600, 60):

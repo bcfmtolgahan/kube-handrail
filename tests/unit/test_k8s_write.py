@@ -2103,9 +2103,11 @@ def create_reverting_plan(store: PlanStore, window: int = 60, **overrides) -> Pl
 
 
 def applied_with_revert(runtime_, apps, **overrides) -> Plan:
-    """A plan with revert_on_failure applied at NOW (1 -> 3), degraded when read at NOW + 61."""
+    """A plan with revert_on_failure applied at NOW (1 -> 3), degraded when read at NOW + 61;
+    returns the record as the apply left it."""
     plan = create_reverting_plan(runtime_.store, **overrides)
     assert apply(plan.plan_id, verify_window_seconds=60, revert_on_failure=True)["ok"] is True
+    plan = Plan.from_item(item(plan.plan_id))
     apps.read_namespaced_deployment.reset_mock()
     apps.patch_namespaced_deployment.reset_mock()
     apps.read_namespaced_deployment.return_value = live(plan.plan_id, available=1)
@@ -2429,6 +2431,45 @@ def test_a_deployment_deleted_before_a_retried_revert_is_refused(verify_rt):
         "revert_plan_id": None,
         "at": NOW + 61,
     }
+
+
+def test_the_revert_target_is_the_count_the_apply_checked(verify_rt):
+    """replicas_from can be changed in the table after the apply; revert_to cannot (the read
+    role is denied it), so the revert still restores the count the apply replaced."""
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    assert plan.revert_to == 1
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET replicas_from = :n",
+        ExpressionAttributeValues={":n": 2},
+    )
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    assert apps.patch_namespaced_deployment.call_args.args[2]["spec"] == {"replicas": 1}
+    assert item(handler.revert_plan_id(plan.plan_id))["replicas_to"] == 1
+
+
+def test_revert_on_failure_added_to_the_record_after_the_apply_never_reverts(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied(runtime_, apps)
+    args = {**plan.args, "revert_on_failure": True}
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET args = :a, args_hash = :h",
+        ExpressionAttributeValues={":a": args, ":h": plan_args_hash(SCALE_DEPLOYMENT, args)},
+    )
+    apps.read_namespaced_deployment.return_value = live(plan.plan_id, available=1)
+    at(runtime_, NOW + 61)
+    assert verify(plan.plan_id)["data"]["revert"] == "refused"
+    assert item(plan.plan_id)["revert"] == {
+        "status": "refused",
+        "reason": "plan_mismatch",
+        "revert_plan_id": None,
+        "at": NOW + 61,
+    }
+    apps.patch_namespaced_deployment.assert_not_called()
+    with pytest.raises(KeyError):
+        item(handler.revert_plan_id(plan.plan_id))
 
 
 def test_a_second_run_after_a_revert_changes_nothing(verify_rt):

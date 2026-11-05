@@ -392,6 +392,7 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
         requester=expected_requester,
         channel=current_channel(),
         verify_window=s.verify_window_default_seconds if s.verify_enabled else None,
+        pin_revert=request.get("revert_on_failure") is True,
     )
 
     try:
@@ -699,11 +700,15 @@ def _revert_state(
 
 
 def revert_record(rt: Runtime, plan: Plan, now: int) -> Plan:
-    """The record of the revert of `plan`: a full plan record that restores replicas_from,
-    so history, the manual-change check and the next plan see it as the last apply. It can
+    """The record of the revert of `plan`: a full plan record that restores revert_to (the
+    replicas_from its apply checked), so history, the manual-change check and the next plan
+    see it as the last apply. It can
     never be requested, approved or applied (used, status revert, a system requester), and
     it is verified one window later but never reverted (no revert_on_failure)."""
-    args = scale_args(plan.namespace, plan.name, plan.replicas_from)
+    target = plan.revert_to
+    if target is None:
+        raise ValueError(f"plan {plan.plan_id} has no pinned revert target")
+    args = scale_args(plan.namespace, plan.name, target)
     window = plan.verify_window_seconds or rt.settings.verify_window_default_seconds
     return Plan(
         plan_id=revert_plan_id(plan.plan_id),
@@ -711,7 +716,7 @@ def revert_record(rt: Runtime, plan: Plan, now: int) -> Plan:
         namespace=plan.namespace,
         name=plan.name,
         replicas_from=plan.replicas_to,
-        replicas_to=plan.replicas_from,
+        replicas_to=target,
         args_hash=plan_args_hash(SCALE_DEPLOYMENT, args),
         args=args,
         resource_version=plan.resource_version,
@@ -740,7 +745,7 @@ def revert_record(rt: Runtime, plan: Plan, now: int) -> Plan:
 def _patch_revert(
     apps: k8s.AppsV1Api, plan: Plan, revert: Plan, deployment: Any, correlation_id: str | None
 ) -> Any:
-    """Patch replicas back to the parent's replicas_from, only on the spec the parent's
+    """Patch replicas back to the parent's revert_to, only on the spec the parent's
     apply left: same uid, still annotated with the parent, generation + 1, replicas_to (the
     revert record's own generation and replicas_from), and not GitOps-managed, with the
     resourceVersion of that same reading. A Deployment already annotated with the revert
@@ -776,6 +781,10 @@ def _revert(rt: Runtime, plan: Plan, now: int, deployment: Any) -> dict[str, Any
     takes no budget unit and runs no history check (mcp/CONTRACT.md, Verification and
     revert). Returns the final revert state, or None to try again on the next run; any
     other failure also leaves the plan due, and verify_applied_plan ends it once late."""
+    if plan.revert_to is None:
+        # Only the consume of an apply with revert_on_failure pins the target; the read role
+        # cannot write it, so revert_on_failure added to the record later never reverts.
+        return _revert_state(verify.REVERT_REFUSED, PLAN_MISMATCH, now)
     revert_id = revert_plan_id(plan.plan_id)
     if deployment is None:
         try:
@@ -802,7 +811,7 @@ def _revert(rt: Runtime, plan: Plan, now: int, deployment: Any) -> dict[str, Any
         # Final: by the time the switch is back on, the approved window has long passed.
         return _revert_state(verify.REVERT_SKIPPED, REMEDIATION_DISABLED, now)
     minimum, maximum = rt.settings.bounds_for(plan.namespace)
-    if not minimum <= plan.replicas_from <= maximum:
+    if not minimum <= plan.revert_to <= maximum:
         return _revert_state(verify.REVERT_REFUSED, OUT_OF_BOUNDS, now)
     revert = revert_record(rt, plan, now)
     rt.store.create_revert(revert)

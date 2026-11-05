@@ -272,6 +272,10 @@ class Plan:
     verify_at: int | None = None
     # The Deployment's generation after a successful apply, from the patch response.
     applied_generation: int | None = None
+    # With revert_on_failure: replicas_from, copied by the consume, so the count a revert
+    # restores is the one the apply checked against the cluster. The read role cannot
+    # write it (terraform: NeverApprove).
+    revert_to: int | None = None
     # Written once each by the verifier channel (mcp/CONTRACT.md, Verification and revert).
     verification: Mapping[str, Any] | None = None
     revert: Mapping[str, Any] | None = None
@@ -377,6 +381,7 @@ _OPTIONAL_INTS = (
     "verify_window_seconds",
     "verify_at",
     "applied_generation",
+    "revert_to",
 )
 _OPTIONAL_STRS = (
     "result",
@@ -492,6 +497,7 @@ class PlanStore:
         requester: str | None = None,
         channel: str | None = None,
         verify_window: int | None = None,
+        pin_revert: bool = False,
     ) -> Plan:
         """Atomically mark the plan used; raise GuardError with the precise reason otherwise.
 
@@ -500,7 +506,8 @@ class PlanStore:
         With `requester`, it requires that the plan was requested by exactly that requester.
         `channel` is recorded in the same write. With `verify_window` (the default window),
         the same write also schedules the verification, `verify_window_seconds` after now, or
-        `verify_window` for a plan made before it had one.
+        `verify_window` for a plan made before it had one. With `pin_revert` (the request
+        has revert_on_failure), it copies replicas_from to revert_to.
         """
         # A rejection also ends the plan's validity; this holds even if clocks disagree.
         condition = (
@@ -539,6 +546,10 @@ class PlanStore:
             )
             values[":window"] = verify_window
             values[":due"] = VERIFY_DUE
+        if pin_revert:
+            # The returned record's replicas_from is what the apply then checks against the
+            # cluster; a later change to it cannot move the revert.
+            update += ", revert_to = replicas_from"
         try:
             response = self._table.update_item(
                 Key={"plan_id": plan_id},

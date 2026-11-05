@@ -13,6 +13,20 @@ locals {
   verifier_metric_namespace = "${var.name_prefix}/verifier"
   # The alarms notify the alert topic, which the drift sentinel creates, so they need both.
   verifier_alarm_count = var.verify_enabled && var.sentinel_enabled ? 1 : 0
+
+  # Written only by the write role: the schedule and the pinned revert target by the
+  # consume, the rest by the verifier channel. Denied to the read role with the approval
+  # attributes, so a changed record cannot trigger or redirect a revert. Constant whether
+  # or not verification is enabled.
+  verify_attributes = [
+    "verify_at",
+    "verify_queue",
+    "verification",
+    "revert",
+    "revert_to",
+    "kind",
+    "reverts_plan_id",
+  ]
 }
 
 resource "aws_iam_role" "verifier" {

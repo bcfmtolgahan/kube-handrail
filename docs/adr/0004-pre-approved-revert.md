@@ -20,6 +20,7 @@ ADR 0002 makes every change a human approval pinned to exact arguments. An autom
 - **What stops a revert:** the global kill switch, the replica bounds, GitOps ownership and the precondition. Not the agent's own kill switch, the blast-radius budget, the oscillation breaker, the budgets or the manual-change check. A revert takes no budget unit.
 - **A revert is never reverted.** Its record never carries `revert_on_failure`, and the verifier skips records of kind `revert`. The revert is verified like any change, for the record.
 - **A revert counts as a change afterwards.** It is an applied record in the history, so planning the reverted change again right after it is refused with `cooldown`, then `flapping`.
+- **The target is pinned at apply.** The write that consumes the plan copies `replicas_from` to `revert_to`, and the apply then confirms it is the Deployment's current count. The read role cannot write `revert_to`, the schedule or the verdict, so a record changed in the table can neither trigger a revert nor move its target. The count matches the approver's view unless both the record and the Deployment changed between the approval and the apply.
 - **Records the server makes name a system requester** (`system:revert`). The approver refuses to decide on them.
 
 ## Consequences
