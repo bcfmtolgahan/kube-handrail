@@ -84,3 +84,9 @@ Terraform stops at plan time when:
 - `name_prefix` contains `aws`, `amazon` or `cognito`, or any of the existing checks fails (replica bounds, approvers, TTLs, tool names, classification).
 
 It warns, and continues, when the public endpoint is limited to `public_access_cidrs` and the Lambdas are outside a VPC, when `lambda_subnet_ids` are in another VPC than the cluster, when `lambda_subnet_ids` is set and the cluster has no private endpoint access (the Lambdas then need a NAT gateway whose address is in `public_access_cidrs`), and when the VPC of a private-endpoint cluster lacks DNS support or DNS hostnames.
+
+## Upgrading
+
+Plans open across an upgrade may have to be planned again; their expiry is short, so waiting for them to expire also works.
+
+- **Plan argument record.** Plans now store the arguments they cover (`args`). A plan made before this change has none: its apply and its approval are refused with `plan_expired`, and the agent plans again.

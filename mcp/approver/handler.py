@@ -18,7 +18,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 
-from handrail_common.approval import plan_view, sanitize_reason
+from handrail_common.approval import plain, plan_view, sanitize_reason
 from handrail_common.config import SERVER, ConfigError, approval_mode, int_env, required_env
 from handrail_common.envelope import (
     CONFLICT,
@@ -34,13 +34,14 @@ from handrail_common.envelope import (
     ok,
 )
 from handrail_common.observability import APPROVER_CORRELATION_KEY, emit
-from handrail_common.plans import PlanStore
+from handrail_common.plans import SCALE_DEPLOYMENT, PlanStore
 from handrail_common.validation import GuardError, require_plan_id
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-APPLY_TOOL = "k8sw___apply_scale_deployment"
+# The write tool that applies each plan action, as the gateway names it.
+APPLY_TOOLS = {SCALE_DEPLOYMENT: "k8sw___apply_scale_deployment"}
 APPROVE = "approve"
 REJECT = "reject"
 BODY_FIELDS = frozenset({"plan_id", "decision", "reason", "apply"})
@@ -164,17 +165,18 @@ class Runtime:
     clock: Callable[[], float] = time.time
 
 
+def check_appliable(item: Mapping[str, Any]) -> None:
+    """Refuse, before any decision is recorded, a plan that no apply tool could run."""
+    if item.get("action") not in APPLY_TOOLS:
+        raise GuardError(INTERNAL, "no apply tool for this plan's action")
+    if not isinstance(item.get("args"), Mapping):
+        raise GuardError(PLAN_EXPIRED, "plan predates the argument record; plan again")
+
+
 def apply_arguments(item: Mapping[str, Any]) -> dict[str, Any]:
-    """The plan's own arguments, from the record; the write guard re-checks all of them."""
-    args: dict[str, Any] = {
-        "plan_id": item["plan_id"],
-        "namespace": item["namespace"],
-        "name": item["name"],
-        "replicas": int(item["replicas_to"]),
-    }
-    if item.get("override_manual_change") is True:
-        args["override_manual_change"] = True
-    return args
+    """The plan's own argument payload from the record, unchanged, plus its plan_id; the
+    write guard re-checks all of it."""
+    return {"plan_id": item["plan_id"], **plain(item["args"])}
 
 
 def trigger_apply(
@@ -182,7 +184,7 @@ def trigger_apply(
 ) -> Envelope:
     """Run the apply through the write Lambda, as the gateway would call it. The apply
     takes this request's correlation id, so the decision and the apply share one."""
-    custom = {"bedrockAgentCoreToolName": APPLY_TOOL}
+    custom = {"bedrockAgentCoreToolName": APPLY_TOOLS[item["action"]]}
     if correlation_id is not None:
         custom[APPROVER_CORRELATION_KEY] = correlation_id
     context = {"custom": custom}
@@ -237,6 +239,10 @@ def decide(
     now = int(rt.clock())
     s = rt.settings
     if decision == APPROVE:
+        current = rt.store.get(plan_id)
+        # A missing plan is left to the approval itself, which says why it cannot be approved.
+        if current is not None:
+            check_appliable(current)
         item = rt.store.approve(
             plan_id, approver, now, s.apply_after_approval_ttl_seconds, correlation_id
         )

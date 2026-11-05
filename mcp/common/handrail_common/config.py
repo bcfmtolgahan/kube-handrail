@@ -47,6 +47,11 @@ class Settings:
         """In both mode the client approval is invisible here, so the server acts as in server."""
         return self.approval_mode != CLIENT
 
+    def bounds_for(self, namespace: str) -> tuple[int, int]:
+        """(minimum, maximum) replicas in an allowed namespace. Every replica bounds check
+        reads them through here; today the same bounds apply to every namespace."""
+        return self.min_replicas, self.max_replicas
+
 
 def required_env(env: Mapping[str, str], key: str) -> str:
     value = env.get(key, "").strip()

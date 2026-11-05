@@ -57,24 +57,42 @@ def approval_request_key(now: int) -> str:
     return f"{APPROVAL_REQUEST_PREFIX}{now - now % APPROVAL_REQUEST_WINDOW_SECONDS}"
 
 
+def _canonical(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 def args_hash(payload: Mapping[str, Any]) -> str:
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_canonical(payload)).hexdigest()
+
+
+def plan_args_hash(action: str, args: Mapping[str, Any]) -> str:
+    """The hash an approval pins: the action and the plan's argument payload (`args`)."""
+    return args_hash({"action": action, **args})
+
+
+def scale_args(
+    namespace: str, name: str, replicas: int, override_manual_change: bool = False
+) -> dict[str, Any]:
+    """The argument payload of a scale plan: the apply arguments without plan_id."""
+    args: dict[str, Any] = {"namespace": namespace, "name": name, "replicas": replicas}
+    # Only a true override enters the payload, so hashes without it are unchanged.
+    if override_manual_change:
+        args["override_manual_change"] = True
+    return args
 
 
 def scale_args_hash(
     namespace: str, name: str, replicas: int, override_manual_change: bool = False
 ) -> str:
-    payload: dict[str, Any] = {
-        "action": SCALE_DEPLOYMENT,
-        "namespace": namespace,
-        "name": name,
-        "replicas": replicas,
-    }
-    # Only a true override enters the hash, so hashes without it are unchanged.
-    if override_manual_change:
-        payload["override_manual_change"] = True
-    return args_hash(payload)
+    return plan_args_hash(
+        SCALE_DEPLOYMENT, scale_args(namespace, name, replicas, override_manual_change)
+    )
+
+
+def template_hash(template: Mapping[str, Any]) -> str:
+    """Hash of a pod template as the API server returned it (raw JSON, not client models,
+    which drop fields the client does not know)."""
+    return "sha256:" + hashlib.sha256(_canonical(template)).hexdigest()
 
 
 def object_key(namespace: str, name: str, uid: str) -> str:
@@ -123,6 +141,13 @@ class Plan:
     approval_request_correlation_id: str | None = None
     decision_correlation_id: str | None = None
     apply_correlation_id: str | None = None
+    # The argument payload args_hash covers, without the action: the apply arguments
+    # without plan_id. Plans made before it was recorded have none and cannot be applied.
+    args: Mapping[str, Any] | None = None
+    # template_hash of the Deployment's pod template at plan time, and of the template the
+    # change leaves; equal for a scale.
+    template_from: str | None = None
+    template_to: str | None = None
 
     @property
     def object_key(self) -> str:
@@ -150,6 +175,8 @@ class Plan:
         }
         if self.impact is not None:
             item["impact"] = self.impact
+        if self.args is not None:
+            item["args"] = dict(self.args)
         for field in (*_OPTIONAL_INTS, *_OPTIONAL_STRS):
             value = getattr(self, field)
             if value is not None:
@@ -178,6 +205,7 @@ class Plan:
             status=str(item.get("status", "")),
             override_manual_change=item.get("override_manual_change") is True,
             impact=item.get("impact"),
+            args=_args(item.get("args")),
             **{f: int(item[f]) for f in _OPTIONAL_INTS if item.get(f) is not None},
             **{f: str(item[f]) for f in _OPTIONAL_STRS if item.get(f) is not None},
         )
@@ -202,7 +230,16 @@ _OPTIONAL_STRS = (
     "approval_request_correlation_id",
     "decision_correlation_id",
     "apply_correlation_id",
+    "template_from",
+    "template_to",
 )
+
+
+def _args(value: Any) -> dict[str, Any] | None:
+    """The stored argument payload with DynamoDB's Decimal numbers back as integers."""
+    if not isinstance(value, Mapping):
+        return None
+    return {str(k): int(v) if isinstance(v, Decimal) else v for k, v in value.items()}
 
 
 def _with_correlation(

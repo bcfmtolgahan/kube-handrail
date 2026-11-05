@@ -12,7 +12,13 @@ from moto import mock_aws
 
 from handrail_common.config import load_settings
 from handrail_common.killswitch import KillSwitch
-from handrail_common.plans import SCALE_DEPLOYMENT, Plan, PlanStore, scale_args_hash
+from handrail_common.plans import (
+    SCALE_DEPLOYMENT,
+    Plan,
+    PlanStore,
+    scale_args,
+    scale_args_hash,
+)
 
 # Load by path: both Lambda directories contain a module named `handler`.
 _SPEC = importlib.util.spec_from_file_location(
@@ -123,6 +129,8 @@ def create_plan(
         replicas_from=1,
         replicas_to=replicas,
         args_hash=scale_args_hash("sandbox", "web", replicas, override),
+        args=scale_args("sandbox", "web", replicas, override),
+        override_manual_change=override,
         resource_version="12345",
         generation=4,
         uid=UID,
@@ -912,6 +920,42 @@ def test_a_record_altered_in_the_table_cannot_redirect_the_apply(rt, change):
         UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in change),
         ExpressionAttributeNames=names,
         ExpressionAttributeValues={f":{k}": v for k, v in change.items()},
+    )
+    assert error_code(apply(plan.plan_id)) == "plan_mismatch"
+    apps.read_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "plan_mismatch"
+
+
+def test_a_record_cannot_hide_the_override_from_the_approver(rt):
+    """The approval view shows the record field; an override only in args is refused."""
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store, override=True)
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET override_manual_change = :f",
+        ExpressionAttributeValues={":f": False},
+    )
+    assert error_code(apply(plan.plan_id, override_manual_change=True)) == "plan_mismatch"
+    apps.read_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "plan_mismatch"
+
+
+def test_a_record_without_args_cannot_be_applied(rt):
+    """Plans made before the argument payload was recorded must be planned again."""
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    runtime_.store._table.update_item(Key={"plan_id": plan.plan_id}, UpdateExpression="REMOVE args")
+    assert error_code(apply(plan.plan_id)) == "plan_expired"
+    apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_a_record_with_altered_args_cannot_be_applied(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET args.override_manual_change = :t",
+        ExpressionAttributeValues={":t": True},
     )
     assert error_code(apply(plan.plan_id)) == "plan_mismatch"
     apps.read_namespaced_deployment.assert_not_called()
