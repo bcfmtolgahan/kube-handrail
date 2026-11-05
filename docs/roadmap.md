@@ -206,6 +206,9 @@ Not committed; listed for discussion.
 - An example thin client and a scenario/eval suite with fault injection.
 - Multi-cluster support with a cluster allowlist in policy.
 - A published cost breakdown.
+- Revert of a rollback (a rollback to the previous template, by hash).
+- An agent-facing evidence tool, weekly freeze windows and per-agent Cedar permits.
+- Moving the scheduled sentinel and sweeper to EventBridge Scheduler.
 
 ## Open questions
 
