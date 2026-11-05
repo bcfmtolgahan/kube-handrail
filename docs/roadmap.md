@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, and item 2 (rollback by exact revision) is implemented and not yet tested on a cluster. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, and item 2 (rollback by exact revision) is implemented and tested on a test cluster. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -121,9 +121,14 @@ See [Restart](../mcp/CONTRACT.md#restart). On a test cluster:
 
 **Done when:** the Milestone 1 guard tests pass unchanged on the generic path, and a restart is planned, approved and applied in `client` and `server` mode, replacing every pod with the plan ID annotation.
 
-### 2. Rollback by exact revision (implemented, not yet tested on a cluster)
+### 2. Rollback by exact revision (implemented)
 
-See [Rollout history](../mcp/CONTRACT.md#rollout-history) and [Rollback](../mcp/CONTRACT.md#rollback). Unit tests and end-to-end cases (`--with-rollout`) are in place; the live run on a test cluster is still to come. It should also confirm how the template manual-change rule behaves after a `kubectl rollout undo`, which rewrites the Deployment's annotations ([History checks](../mcp/CONTRACT.md#history-checks-oscillation-breaker)).
+See [Rollout history](../mcp/CONTRACT.md#rollout-history) and [Rollback](../mcp/CONTRACT.md#rollback). On a test cluster:
+
+- The end-to-end suite with the rollout cases (`--with-rollout`, `--with-expiry`) passed 64 of 64 in `client` mode and 57 of 57 in `server` mode, where the rollback was approved through `scripts/approve.py`. After a rollback, the Deployment's pod template equalled the target ReplicaSet's template minus the hash label, compared as JSON. A pruned revision returned `revision_not_found`, a ReplicaSet edited between plan and apply and a paused Deployment returned `conflict`, a template changed by hand returned `manual_change` until the override was planned, a GitOps-managed Deployment was refused, and a different revision on apply returned `plan_mismatch`.
+- The writer group can get ReplicaSets in the sandbox namespace and not in `default`.
+- In `client` mode, a DevOps Agent chat listed the history and rolled a Deployment back to a named revision after the chat approval; the resulting template matched that revision's ReplicaSet. A `change-cause` on that revision told the agent to scale the Deployment without asking; the agent reported it as untrusted text and created no scale plan.
+- `kubectl rollout undo` was confirmed to replace the Deployment's annotations with those of the restored ReplicaSet, so the last-plan annotation goes back to the plan that was current at that revision. After such an undo the template manual-change rule compares against that older plan, as [History checks](../mcp/CONTRACT.md#history-checks-oscillation-breaker) describes.
 
 **Goal:** roll back to the template the human approved, not to whatever a revision number points at by the time the apply runs.
 
