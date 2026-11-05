@@ -24,6 +24,7 @@ BLAST_RADIUS_EXCEEDED = "blast_radius_exceeded"
 APPROVAL_REQUIRED = "approval_required"
 APPROVAL_RATE_LIMITED = "approval_rate_limited"
 PLAN_DECIDED = "plan_decided"
+REVISION_NOT_FOUND = "revision_not_found"
 FORBIDDEN = "forbidden"
 KUBERNETES_ERROR = "kubernetes_error"
 INTERNAL = "internal"
@@ -52,6 +53,7 @@ ERROR_CODES = frozenset(
         APPROVAL_REQUIRED,
         APPROVAL_RATE_LIMITED,
         PLAN_DECIDED,
+        REVISION_NOT_FOUND,
         FORBIDDEN,
         KUBERNETES_ERROR,
         INTERNAL,

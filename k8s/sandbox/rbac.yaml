@@ -24,7 +24,8 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list"]
-  # get_workload_events. Events name Pods; the reader still cannot read them.
+  # get_workload_events and get_rollout_history. Events name Pods; the reader still
+  # cannot read them.
   - apiGroups: ["apps"]
     resources: ["replicasets"]
     verbs: ["list"]

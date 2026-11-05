@@ -55,6 +55,14 @@ from handrail_common.plans import (
     scale_args,
     template_hash,
 )
+from handrail_common.rollout import (
+    CHANGE_CAUSE_ANNOTATION,
+    REVISION_ANNOTATION,
+    container_images,
+    owned_revisions,
+    parse_revision,
+    template_of,
+)
 from handrail_common.untrusted import fit_list, untrusted_text
 from handrail_common.validation import (
     GuardError,
@@ -70,9 +78,6 @@ from handrail_common.validation import (
     validate_target_args,
 )
 
-REVISION_ANNOTATION = "deployment.kubernetes.io/revision"
-# A revision is an int64 in the Deployment controller.
-MAX_REVISION_DIGITS = 18
 APPROVAL_SUBJECT = "kube-handrail: approval requested"
 # The API server defaults spec.replicas to 1 when it is omitted.
 DEFAULT_REPLICAS = 1
@@ -189,15 +194,8 @@ def _impact(
 
 
 def _revision(deployment: Any) -> int | None:
-    """The Deployment's revision annotation as an integer, or None when it is not one.
-
-    The annotation is untrusted text: isdigit() alone accepts digits int() rejects, such as
-    "²", and the length cap keeps the number within what the record can store.
-    """
-    value = (deployment.metadata.annotations or {}).get(REVISION_ANNOTATION)
-    if not (isinstance(value, str) and value.isascii() and value.isdigit()):
-        return None
-    return int(value) if len(value) <= MAX_REVISION_DIGITS else None
+    """The Deployment's revision annotation as an integer, or None when it is not one."""
+    return parse_revision((deployment.metadata.annotations or {}).get(REVISION_ANNOTATION))
 
 
 def _desired_replicas(deployment: Any) -> int:
@@ -424,12 +422,7 @@ def get_workload_events(args: dict[str, Any], settings: Settings, clients: Clien
     check_namespace_allowed(namespace, settings.allowed_namespaces)
     deployment = _read_deployment(clients.apps, namespace, name)
     uid = str(deployment.metadata.uid)
-    replica_sets = _owned_replica_sets(
-        _list(
-            "ReplicaSets", partial(clients.apps.list_namespaced_replica_set, namespace=namespace)
-        ),
-        uid,
-    )
+    replica_sets = _owned_replica_sets(_replica_sets(clients, namespace), uid)
     events = _list("Events", partial(clients.core.list_namespaced_event, namespace=namespace))
     matched = []
     for event in events:
@@ -450,6 +443,55 @@ def get_workload_events(args: dict[str, Any], settings: Settings, clients: Clien
     )
     data["truncated"] = dropped
     field_cut = any(cut for _, cut in views[: len(data["events"])])
+    return ok(data, truncated=dropped or field_cut)
+
+
+def _replica_sets(clients: Clients, namespace: str) -> list[dict[str, Any]]:
+    return _list(
+        "ReplicaSets", partial(clients.apps.list_namespaced_replica_set, namespace=namespace)
+    )
+
+
+def _revision_view(revision: int, rs: Mapping[str, Any], current: int | None) -> tuple[dict, bool]:
+    """One revision of get_rollout_history, and whether a field was cut."""
+    meta = rs.get("metadata") or {}
+    images, images_cut = container_images(template_of(rs))
+    cause, cause_cut = untrusted_text((meta.get("annotations") or {}).get(CHANGE_CAUSE_ANNOTATION))
+    created = _timestamp(meta.get("creationTimestamp"))
+    view = {
+        "revision": revision,
+        "current": revision == current,
+        "replica_set": meta.get("name"),
+        "created_at": created[1] if created else None,
+        "replicas": (rs.get("spec") or {}).get("replicas"),
+        "ready_replicas": (rs.get("status") or {}).get("readyReplicas") or 0,
+        "images": images,
+        "change_cause": cause,
+    }
+    return view, images_cut or cause_cut
+
+
+def get_rollout_history(args: dict[str, Any], settings: Settings, clients: Clients) -> Envelope:
+    """The revisions a rollback can target, newest first: each ReplicaSet the Deployment
+    controls, with its images and change-cause as untrusted text. Env values, commands and
+    args are never returned."""
+    namespace, name = validate_target_args(args, settings.allowed_namespaces)
+    deployment = _read_deployment(clients.apps, namespace, name)
+    current = _revision(deployment)
+    owned = owned_revisions(_replica_sets(clients, namespace), str(deployment.metadata.uid))
+    views = [_revision_view(revision, rs, current) for revision, rs in owned]
+    data, dropped = fit_list(
+        {
+            "namespace": namespace,
+            "name": name,
+            "current_revision": current,
+            "revisions": [view for view, _ in views],
+            "truncated": False,
+        },
+        "revisions",
+    )
+    data["truncated"] = dropped
+    field_cut = any(cut for _, cut in views[: len(data["revisions"])])
     return ok(data, truncated=dropped or field_cut)
 
 
@@ -767,6 +809,9 @@ HANDLERS = {
     ),
     "plan_restart_deployment": lambda args: plan_restart_deployment(
         args, _settings(), Clients(_settings()), int(time.time())
+    ),
+    "get_rollout_history": lambda args: get_rollout_history(
+        args, _settings(), Clients(_settings())
     ),
     "request_approval": lambda args: request_approval(
         args, _settings(), Clients(_settings()), int(time.time())

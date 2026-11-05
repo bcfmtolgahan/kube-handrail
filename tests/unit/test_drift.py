@@ -27,6 +27,7 @@ _SPEC.loader.exec_module(register)
 
 def test_repository_classification():
     assert load_classification(REPO / "mcp" / "classification.json") == {
+        "k8sr___get_rollout_history": READ_ONLY,
         "k8sr___get_workload_events": READ_ONLY,
         "k8sr___get_workload_status": READ_ONLY,
         "k8sr___plan_restart_deployment": READ_ONLY,
@@ -164,6 +165,7 @@ def test_associate_read_uses_read_only_tools():
     client = Client()
     register.associate_read(client, type("Args", (), {"agent_space_id": "s", "service_id": "v"})())
     assert client.configuration["mcpserver"]["toolDetails"] == [
+        {"name": "k8sr___get_rollout_history", "toolClassification": READ_ONLY},
         {"name": "k8sr___get_workload_events", "toolClassification": READ_ONLY},
         {"name": "k8sr___get_workload_status", "toolClassification": READ_ONLY},
         {"name": "k8sr___plan_restart_deployment", "toolClassification": READ_ONLY},

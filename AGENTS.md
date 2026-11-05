@@ -11,6 +11,7 @@ Names are `<target>___<tool>`; a client may add its own prefix (AWS DevOps Agent
 |---|---|---|
 | `k8sr___get_workload_status` | no | Summarize a Deployment: replicas, conditions, revision, GitOps ownership. |
 | `k8sr___get_workload_events` | no | Recent Kubernetes Events about a Deployment and the objects it owns (optional `limit`, 1-50). |
+| `k8sr___get_rollout_history` | no | The revisions a rollback can target, newest first, with the images of each. |
 | `k8sr___plan_scale_deployment` | no | Check a replica change and record a single-use plan. Changes nothing in the cluster. |
 | `k8sr___plan_restart_deployment` | no | Check a restart (every pod replaced, replicas unchanged) and record a single-use plan. Changes nothing in the cluster. |
 | `k8sr___request_approval` | no | Ask the server's human approvers to decide on a plan. Approves nothing. |
@@ -69,6 +70,7 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 | `approval_required` | No valid server approval. `details.status` says why. | `planned` or `awaiting_approval`: call `request_approval` if not done, then wait. `rejected`, `approval_expired`, `approval_invalid`: stop. |
 | `approval_rate_limited` | Too many approval requests. | Wait until `details.retry_after`. |
 | `plan_decided` | Plan already approved or rejected (`details.status`). | Do not request again. `rejected`: stop. `approved`: check `get_workload_status`; apply only in `both` mode or when the human says the approval did not apply it. |
+| `revision_not_found` | The revision has no ReplicaSet of the Deployment any more (`details.available` lists those that exist). | Call `get_rollout_history`. The revision may have been pruned by `revisionHistoryLimit` or renumbered by a rollback. Ask the human which revision to use. |
 | `forbidden` | Caller not allowed (approval API only). | Stop. |
 | `kubernetes_error`, `internal` | Cluster or server error. | Retry a read or re-plan once, then stop. |
 

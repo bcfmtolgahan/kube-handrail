@@ -6,10 +6,10 @@ Single source of truth for handlers, infrastructure code and tests. Change this 
 
 | Gateway target | Lambda | Classification | Tools (schema file) |
 |---|---|---|---|
-| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `get_workload_events`, `plan_scale_deployment`, `plan_restart_deployment`, `request_approval` (`mcp/k8s_read/tools.json`) |
+| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `get_workload_events`, `get_rollout_history`, `plan_scale_deployment`, `plan_restart_deployment`, `request_approval` (`mcp/k8s_read/tools.json`) |
 | `k8sw` | `k8s_write` | `MUTATIVE` | `apply_scale_deployment`, `apply_restart_deployment` (`mcp/k8s_write/tools.json`) |
 
-Each action has one `plan_<action>` tool and one `apply_<action>` tool; apply takes the plan's arguments plus `plan_id`. `plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`). See [History checks](#history-checks-oscillation-breaker). `plan_restart_deployment` and `apply_restart_deployment` take `namespace` and `name`; see [Restart](#restart). `request_approval` takes only `plan_id`; see [Server-side approval](#server-side-approval). `get_workload_status` takes `namespace` and `name`; `get_workload_events` also takes an optional `limit`; see [Workload events](#workload-events).
+Each action has one `plan_<action>` tool and one `apply_<action>` tool; apply takes the plan's arguments plus `plan_id`. `plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`). See [History checks](#history-checks-oscillation-breaker). `plan_restart_deployment` and `apply_restart_deployment` take `namespace` and `name`; see [Restart](#restart). `request_approval` takes only `plan_id`; see [Server-side approval](#server-side-approval). `get_workload_status` takes `namespace` and `name`; `get_workload_events` also takes an optional `limit`; see [Workload events](#workload-events). `get_rollout_history` takes `namespace` and `name`; see [Rollout history](#rollout-history).
 
 Clients see `<target>___<tool>`, for example `k8sw___apply_scale_deployment`. Full names must be at most 64 characters and match `^[a-z0-9_]+$`.
 
@@ -112,7 +112,7 @@ Every handler returns a JSON object (not wrapped in `statusCode`/`body`):
 
 `replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. For `conflict` because the Deployment's rollout is paused (restart, on plan and apply), `details` is `{ "paused": true }`. A `conflict` from a 409 that persists after all patch attempts has no `details`. The history checks below also return `details`; every value in them is an integer or a string.
 
-Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `forbidden`, `kubernetes_error`, `internal`.
+Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `revision_not_found`, `forbidden`, `kubernetes_error`, `internal`.
 
 ## Untrusted output
 
@@ -184,6 +184,49 @@ Both lists are read as raw JSON (`_preload_content=False`), like the impact prev
 `type`, `reason` and `message` are untrusted text. `object` is the matched object, so it holds only names kube-handrail derived itself. `count` is `count`, else `series.count`, else 1. `first_timestamp` is `firstTimestamp`, else `eventTime`; `last_timestamp` is the timestamp the event was sorted by; each is the API server's RFC 3339 string, or `null` when absent or not a valid timestamp. `matched` is the number of Events kept in step 3, before `limit` and the response limit.
 
 `get_workload_status` passes each condition's `reason` and `message` through the same function; its `data` is otherwise unchanged.
+
+## Rollout history
+
+`get_rollout_history(namespace, name)` lists the revisions of a Deployment that a rollback can target. `namespace` and `name` are validated and the namespace checked against `ALLOWED_NAMESPACES` as for the other tools.
+
+1. Read the Deployment (`not_found` if it does not exist).
+2. List the ReplicaSets in the namespace (`apps/v1`, raw JSON) and keep those the Deployment controls, with an `ownerReferences` entry whose `controller` is `true` and whose `uid` is the Deployment's `uid` (stricter than [Workload events](#workload-events), which also counts an owner reference without `controller`), and whose `deployment.kubernetes.io/revision` annotation is an integer (ASCII digits, at most 18).
+3. Sort newest first by revision, then apply the response limit below.
+
+A failed read of the list is `kubernetes_error`, never an empty list.
+
+```json
+{
+  "namespace": "sandbox",
+  "name": "web",
+  "current_revision": 5,
+  "revisions": [
+    {
+      "revision": 5,
+      "current": true,
+      "replica_set": "web-6c9f8d7b4",
+      "created_at": "2026-01-01T12:00:00Z",
+      "replicas": 2,
+      "ready_replicas": 2,
+      "images": [
+        { "container": "nginx", "init": false, "image": "<untrusted>nginxinc/nginx-unprivileged:1.27.5-alpine</untrusted>", "pinned_by_digest": false }
+      ],
+      "change_cause": null
+    }
+  ],
+  "truncated": false
+}
+```
+
+- `current_revision` is the Deployment's own revision annotation as an integer (`null` when it is not one); `current` is true for the revision equal to it.
+- `replica_set` is the ReplicaSet's name; `created_at` its `creationTimestamp` (`null` when absent or not a valid timestamp); `replicas` its `spec.replicas`; `ready_replicas` its `status.readyReplicas` (0 when unset).
+- `images` lists the containers and init containers of the ReplicaSet's template, sorted by `init` and then name: `container` (returned plain, because the API server validates container names as DNS-1123 labels), `init`, `image` as untrusted text, and `pinned_by_digest` (the image contains `@sha256:`). At most 20 per revision; more set the envelope's `truncated`.
+- `change_cause` is the ReplicaSet's `kubernetes.io/change-cause` annotation as untrusted text, or `null`.
+- Nothing else from the template is returned: no env values, commands or args.
+
+Images and the change-cause are untrusted: anyone who can write the Deployment or its ReplicaSets sets them. The response is limited to 32768 bytes of serialized `data` as for events: whole revisions are dropped from the end of the list, the oldest first, until it fits, and `truncated` is then true in `data` and in the envelope. A field cut at its limit also sets the envelope's `truncated`.
+
+Revision numbers last only until the next rollout. A rollback makes the Deployment controller reuse the old ReplicaSet and give it a new number (the highest plus one), so the old number no longer exists, and `revisionHistoryLimit` deletes the oldest ReplicaSets. A revision missing from the list cannot be rolled back to.
 
 ## Plan record (DynamoDB)
 

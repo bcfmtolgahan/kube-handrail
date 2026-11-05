@@ -3,6 +3,7 @@
   "k8sr___get_workload_events": "READ_ONLY",
   "k8sr___plan_scale_deployment": "READ_ONLY",
   "k8sr___plan_restart_deployment": "READ_ONLY",
+  "k8sr___get_rollout_history": "READ_ONLY",
   "k8sr___request_approval": "READ_ONLY",
   "k8sw___apply_scale_deployment": "MUTATIVE",
   "k8sw___apply_restart_deployment": "MUTATIVE"
