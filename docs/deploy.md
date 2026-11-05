@@ -53,6 +53,7 @@ Each agent is one OAuth client ([Agent identity](../mcp/CONTRACT.md#agent-identi
   ```
 
   The global kill switch still stops every agent. The drift sentinel never writes the agent switches.
+- **Rotate the caller key.** `terraform apply -replace='terraform_data.caller_key[0]'` generates a new `CALLER_KEY` and sets it on the interceptor and both tool Lambdas. Writes in the moment they disagree are refused with `agent_unknown`.
 - **Legacy mode.** `caller_interceptor_enabled = false` removes the interceptor: plans then name no agent and the per-agent limits do not apply. Terraform warns when it is set. Use it only where gateway interceptors are not available.
 
 The end-to-end identity cases (`tests/e2e/e2e_gateway.py --with-identity`) need a second agent that only the test uses, with a budget the test can exhaust, and enough budget for the smoke test agent to run the whole suite:

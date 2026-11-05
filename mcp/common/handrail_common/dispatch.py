@@ -64,6 +64,10 @@ def pop_caller(args: dict[str, Any], env: Mapping[str, str] | None = None) -> st
     key = env.get("CALLER_KEY", "")
     if env.get("CALLER_INTERCEPTOR") != "true" or not key or not isinstance(value, str):
         return None
+    # Client IDs and signatures are ASCII; compare_digest raises on other text, outside the
+    # handler's error handling, so such a value is no caller rather than a failed invocation.
+    if not value.isascii():
+        return None
     caller, _, signature = value.rpartition(".")
     if not caller or not hmac.compare_digest(signature, caller_signature(key, caller)):
         return None

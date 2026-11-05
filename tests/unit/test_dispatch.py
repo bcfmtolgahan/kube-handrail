@@ -286,6 +286,9 @@ def test_a_forged_caller_is_ignored_in_legacy_mode(capsys):
         f"client-2.{caller_signature(KEY, 'client-1')}",
         f"client-1.{caller_signature('another-key', 'client-1')}",
         f".{caller_signature(KEY, '')}",
+        "client-1.\u00e9",
+        f"client-1.{'0' * 63}\u00e9",
+        "client-1.\ud800",
         ["client-1"],
     ],
 )
