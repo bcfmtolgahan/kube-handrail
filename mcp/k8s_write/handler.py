@@ -338,7 +338,11 @@ def _scale_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now
 SCALE = Action(
     name=SCALE_DEPLOYMENT,
     validate=_validate_scale,
-    record_matches=lambda plan, args: plan.replicas_to == args["replicas"],
+    # The override the approval view shows is the record field, so it must agree with args.
+    record_matches=lambda plan, args: (
+        plan.replicas_to == args["replicas"]
+        and plan.override_manual_change == (args.get("override_manual_change") is True)
+    ),
     check_plan=_check_scale_plan,
     breaker=_scale_breaker,
     body=lambda plan, args, deployment, correlation_id: scale_patch(

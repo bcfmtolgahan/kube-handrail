@@ -130,6 +130,7 @@ def create_plan(
         replicas_to=replicas,
         args_hash=scale_args_hash("sandbox", "web", replicas, override),
         args=scale_args("sandbox", "web", replicas, override),
+        override_manual_change=override,
         resource_version="12345",
         generation=4,
         uid=UID,
@@ -921,6 +922,20 @@ def test_a_record_altered_in_the_table_cannot_redirect_the_apply(rt, change):
         ExpressionAttributeValues={f":{k}": v for k, v in change.items()},
     )
     assert error_code(apply(plan.plan_id)) == "plan_mismatch"
+    apps.read_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "plan_mismatch"
+
+
+def test_a_record_cannot_hide_the_override_from_the_approver(rt):
+    """The approval view shows the record field; an override only in args is refused."""
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store, override=True)
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET override_manual_change = :f",
+        ExpressionAttributeValues={":f": False},
+    )
+    assert error_code(apply(plan.plan_id, override_manual_change=True)) == "plan_mismatch"
     apps.read_namespaced_deployment.assert_not_called()
     assert item(plan.plan_id)["result"] == "plan_mismatch"
 
