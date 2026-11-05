@@ -19,6 +19,7 @@ from handrail_common.breaker import (
     check_history,
     check_manual_change,
     last_applied_plan,
+    replica_baseline,
     retention_seconds,
 )
 from handrail_common.config import Settings, load_settings
@@ -579,7 +580,9 @@ def _scale_breaker(
 ) -> bool:
     last_applied = last_applied_plan(clients.store, deployment)
     overridden = check_manual_change(
-        last_applied, current, args.get("override_manual_change", False) is True
+        replica_baseline(clients.store, settings, last_applied, now),
+        current,
+        args.get("override_manual_change", False) is True,
     )
     check_history(
         clients.store,
@@ -656,8 +659,9 @@ def _restart_breaker(
     args: Mapping[str, Any],
     now: int,
 ) -> bool:
-    # No manual-change check: a restart undoes no change. Replicas stay as they are, so the
-    # change has no direction and is never flapping.
+    # No manual-change check: a restart undoes no change, and a later scale still compares
+    # against the count kube-handrail set before it (replica_baseline). Replicas stay as
+    # they are, so the change has no direction and is never flapping.
     check_history(
         clients.store,
         object_key(args["namespace"], args["name"], str(deployment.metadata.uid)),

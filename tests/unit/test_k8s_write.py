@@ -640,6 +640,31 @@ def test_apply_rejects_manual_change(rt):
     assert item(plan.plan_id)["result"] == "manual_change"
 
 
+def test_apply_rejects_a_manual_change_made_before_a_restart(rt):
+    runtime_, apps = rt
+    seed(1, 2, NOW - 600)
+    last = seed(1, 1, NOW - 300)  # set back to 1 by hand, then restarted at 1
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "manual_change"
+    assert response["error"]["details"] == {"last_applied_to": 2, "current": 1}
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_apply_after_a_restart_compares_against_the_restart(rt):
+    runtime_, apps = rt
+    last = seed(2, 2, NOW - 300)  # no earlier scale; the Deployment now has 1
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    assert error_code(apply(create_plan(runtime_.store).plan_id)) == "manual_change"
+
+
 def test_apply_rejects_manual_change_when_the_apply_result_was_not_recorded(rt):
     runtime_, apps = rt
     last = seed(3, 2, NOW - 100, result=None)  # patched to 2, then record_result failed

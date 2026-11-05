@@ -15,6 +15,7 @@ from handrail_common.breaker import (
     check_history,
     check_manual_change,
     last_applied_plan,
+    replica_baseline,
 )
 from handrail_common.config import ConfigError, Settings, load_settings
 from handrail_common.dispatch import dispatch
@@ -347,7 +348,8 @@ def _check_scale_plan(rt: Runtime, plan: Plan) -> None:
 def _scale_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now: int) -> None:
     """check_spec_unchanged has confirmed that the current replica count is replicas_from."""
     last_applied = last_applied_plan(rt.store, deployment)
-    check_manual_change(last_applied, plan.replicas_from, override)
+    baseline = replica_baseline(rt.store, rt.settings, last_applied, now)
+    check_manual_change(baseline, plan.replicas_from, override)
     check_history(
         rt.store,
         plan.object_key,

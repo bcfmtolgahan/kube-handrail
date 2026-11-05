@@ -543,6 +543,34 @@ def test_plan_rejects_manual_change(clients, table):
     assert table.scan()["Count"] == 1
 
 
+def test_plan_rejects_a_manual_change_made_before_a_restart(clients, table):
+    seed(table, 1, 3, NOW - 600, NOW - 590)
+    # Set back to 2 by hand, then restarted at 2: the restart does not hide the change.
+    last = seed(table, 2, 2, NOW - 300, NOW - 290)
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    with pytest.raises(GuardError) as exc:
+        plan(clients, replicas=3)
+    assert exc.value.code == "manual_change"
+    assert exc.value.details == {"last_applied_to": 3, "current": 2}
+
+
+def test_plan_after_a_restart_compares_against_the_restart(clients, table):
+    # No earlier scale: the restart's count is the baseline.
+    last = seed(table, 3, 3, NOW - 300, NOW - 290)
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    with pytest.raises(GuardError) as exc:
+        plan(clients, replicas=3)
+    assert exc.value.details == {"last_applied_to": 3, "current": 2}
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        replicas=3, annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    assert plan(clients, replicas=4)["ok"] is True
+
+
 def test_plan_with_override_allows_manual_change_and_pins_it(clients, table):
     last = seed(table, 1, 3, NOW - 100, NOW - 90)
     clients.apps.read_namespaced_deployment.return_value = deployment(
