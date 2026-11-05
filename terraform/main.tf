@@ -335,6 +335,7 @@ resource "aws_lambda_function" "this" {
       local.common_env,
       each.value.kill_switch ? { REMEDIATION_ENABLED_PARAM = aws_ssm_parameter.kill_switch.name } : {},
       { CALLER_INTERCEPTOR = tostring(var.caller_interceptor_enabled) },
+      local.caller_key_env,
       each.value.approval_requests ? {
         APPROVAL_TOPIC_ARN = aws_sns_topic.approvals.arn
         APPROVAL_URL       = aws_lambda_function_url.approver.function_url

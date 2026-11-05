@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from handrail_common.dispatch import dispatch, tool_name
+from handrail_common.dispatch import caller_signature, dispatch, tool_name
 from handrail_common.envelope import (
     CONFLICT,
     FORBIDDEN_NAMESPACE,
@@ -21,6 +21,13 @@ from handrail_common.observability import (
     current_correlation_id,
 )
 from handrail_common.validation import GuardError
+
+KEY = "test-caller-key"
+
+
+def signed(caller: str) -> str:
+    """The reserved argument as the interceptor sets it."""
+    return f"{caller}.{caller_signature(KEY, caller)}"
 
 
 def ctx(name):
@@ -155,8 +162,8 @@ def test_handler_sees_the_correlation_id(capsys):
 
 def test_one_record_per_successful_call(capsys):
     handlers = {"x": lambda args: ok({"plan_id": PLAN_ID})}
-    env = {"CALLER_INTERCEPTOR": "true", "METRIC_NAMESPACE": "kh/tools"}
-    event = {"_kube_handrail_caller": "client-1"}
+    env = {"CALLER_INTERCEPTOR": "true", "CALLER_KEY": KEY, "METRIC_NAMESPACE": "kh/tools"}
+    event = {"_kube_handrail_caller": signed("client-1")}
     dispatch(handlers, event, full_ctx({"bedrockAgentCoreAwsRequestId": "gw-req"}), env)
 
     (record,) = records(capsys)
@@ -255,8 +262,8 @@ def test_unverified_caller_is_null(capsys):
 def test_caller_and_channel_are_bound_only_during_the_call(capsys):
     seen = []
     handlers = {"x": lambda args: seen.append((current_caller(), current_channel())) or ok({})}
-    env = {"CALLER_INTERCEPTOR": "true"}
-    dispatch(handlers, {"_kube_handrail_caller": "client-1"}, full_ctx(), env)
+    env = {"CALLER_INTERCEPTOR": "true", "CALLER_KEY": KEY}
+    dispatch(handlers, {"_kube_handrail_caller": signed("client-1")}, full_ctx(), env)
     custom = {"kubeHandrailChannel": "approval-api"}
     dispatch(handlers, {}, full_ctx(custom), env)
     assert seen == [("client-1", "gateway"), (None, "approval-api")]
@@ -266,8 +273,39 @@ def test_caller_and_channel_are_bound_only_during_the_call(capsys):
 def test_a_forged_caller_is_ignored_in_legacy_mode(capsys):
     seen = []
     handlers = {"x": lambda args: seen.append((current_caller(), args)) or ok({})}
-    dispatch(handlers, {"_kube_handrail_caller": "forged", "a": 1}, full_ctx(), {})
+    dispatch(handlers, {"_kube_handrail_caller": signed("forged"), "a": 1}, full_ctx(), {})
     assert seen == [(None, {"a": 1})]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "client-1",  # a gateway without its interceptor passes the client's own value
+        "client-1.",
+        f"client-1.{'0' * 64}",
+        f"client-2.{caller_signature(KEY, 'client-1')}",
+        f"client-1.{caller_signature('another-key', 'client-1')}",
+        f".{caller_signature(KEY, '')}",
+        ["client-1"],
+    ],
+)
+def test_an_unsigned_or_forged_caller_is_not_trusted_in_identity_mode(capsys, value):
+    seen = []
+    handlers = {"x": lambda args: seen.append((current_caller(), args)) or ok({})}
+    env = {"CALLER_INTERCEPTOR": "true", "CALLER_KEY": KEY}
+    dispatch(handlers, {"_kube_handrail_caller": value, "a": 1}, full_ctx(), env)
+    assert seen == [(None, {"a": 1})]
+    (record,) = records(capsys)
+    assert record["caller"] is None
+
+
+def test_without_a_key_no_caller_is_trusted(capsys):
+    seen = []
+    handlers = {"x": lambda args: seen.append(current_caller()) or ok({})}
+    env = {"CALLER_INTERCEPTOR": "true"}
+    dispatch(handlers, {"_kube_handrail_caller": signed("client-1")}, full_ctx(), env)
+    dispatch(handlers, {"_kube_handrail_caller": "client-1"}, full_ctx(), env)
+    assert seen == [None, None]
 
 
 @pytest.mark.parametrize("value", ["verifier", "APPROVAL-API", "", 1, None])

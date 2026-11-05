@@ -67,6 +67,8 @@ agents = {
 
 Then, next to the variables the end-to-end tests already need, set `CLIENT_ID_B` to `agent_client_ids["e2e_peer"]` and `CLIENT_SECRET_B` to that client's secret. `AGENT_NAME` (default `smoke_test`, the agent of `CLIENT_ID`), `AGENT_NAME_B` (default `e2e_peer`) and `AGENT_BUDGET_B` (default 2) must match the variables when they differ. The test derives the agent switch of `e2e_peer` from `KILL_SWITCH_PARAM` and turns it off and on again, so the operator's credentials need `ssm:PutParameter` on it. Budgets count per clock hour: a server-mode run right after a client-mode run waits for the next hour if `e2e_peer`'s budget is spent.
 
+The end-to-end tests do not remove the interceptor from the gateway. That case is a manual live test: with the interceptor detached, a plan whose `_kube_handrail_caller` the client set itself, to its own or another agent's `client_id`, must be refused with `forbidden`, `agent_unknown`, and the next sentinel run must report `missing_interceptor`.
+
 ## Network
 
 The tool Lambdas (`k8s_read` and `k8s_write`) call the cluster's API server, `eks:DescribeCluster`, DynamoDB, SSM (the kill switches) and SNS (read), all over HTTPS. They never call STS or CloudWatch Logs. The approver, sentinel and interceptor Lambdas do not talk to the cluster and always run outside any VPC. Details are in the [contract](../mcp/CONTRACT.md#network).
@@ -123,6 +125,7 @@ Plans open across an upgrade may have to be planned again; their expiry is short
   - If `caller_interceptor_enabled` was `false`, the plan adds the interceptor Lambda, its role and log group, and changes the gateway's interceptor configuration. Check that the plan shows `aws_bedrockagentcore_gateway.this` as an update in place, not a replacement: a replaced gateway has a new URL, and DevOps Agent would have to be registered again.
   - The `agents` keys default to `devops_agent` and `smoke_test`, the keys of the existing Cognito clients, so the plan must show no change to `aws_cognito_user_pool_client.this[...]` and no change to the gateway's allowed clients. If you renamed or removed an agent key, its client is replaced or deleted.
   - Plans open during the upgrade name `mcp-gateway` and are refused (`forbidden`); the agent plans again. They expire within minutes anyway.
+  - The plan adds `terraform_data.caller_key` and sets `CALLER_KEY` on the interceptor and both tool Lambdas (an update in place). While the apply updates them one by one, the interceptor and a tool Lambda can briefly disagree on the key; writes in that moment are refused with `agent_unknown`, and the agent plans again.
   - New on the first apply, not yet confirmed on a deployment: the sentinel's `bedrock-agentcore:GetGateway` permission (if the action name is wrong, every run is `unknown` and the unknown-result alarm fires) and the tool roles' `ssm:GetParameter` on `parameter/<prefix>/agents/*` (if it does not match, every agent counts as switched off and its plans are refused with `remediation_disabled`). After the apply, run the smoke test and check that a plan's `requested_by` is `agent:smoke_test`, and wait for a sentinel run that reports `ok`.
 
   The tool set does not change, so the sentinel's association check sees no drift and `enable-write` is not needed. Re-run `install-guidance` so agents get the new error rows in `AGENTS.md`.

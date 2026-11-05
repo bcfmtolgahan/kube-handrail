@@ -12,6 +12,7 @@ from kubernetes.client.exceptions import ApiException
 from moto import mock_aws
 
 from handrail_common.config import load_settings
+from handrail_common.dispatch import caller_signature
 from handrail_common.killswitch import KillSwitch
 from handrail_common.plans import (
     RESTART_ANNOTATION,
@@ -1545,6 +1546,7 @@ def test_server_mode_rollback_after_approval(server_rt):
 
 AGENTS = '{"client-a": {"name": "smoke_test"}, "client-b": {"name": "devops_agent"}}'
 SWITCHES = "/handrail/agents/"
+CALLER_KEY = "test-caller-key"
 IDENTITY_ENV = ENV | {
     "CALLER_INTERCEPTOR": "true",
     "AGENTS": AGENTS,
@@ -1563,8 +1565,9 @@ APPROVAL_CONTEXT = SimpleNamespace(
 
 @pytest.fixture
 def identity_rt(aws, monkeypatch):
-    # dispatch trusts the caller argument only with the interceptor, as in the Lambda.
+    # dispatch trusts the caller argument only with the interceptor and its key, as in the Lambda.
     monkeypatch.setenv("CALLER_INTERCEPTOR", "true")
+    monkeypatch.setenv("CALLER_KEY", CALLER_KEY)
     rt, apps = runtime()
     rt.settings = load_settings(IDENTITY_ENV, write=True)
     rt.ssm = boto3.client("ssm", region_name=REGION)
@@ -1596,7 +1599,7 @@ def create_agent_plan(store: PlanStore, agent: str | None = "smoke_test") -> Pla
 def apply_as(plan_id: str, client: str | None, context=CONTEXT) -> dict:
     event = {"plan_id": plan_id, "namespace": "sandbox", "name": "web", "replicas": 3}
     if client is not None:
-        event["_kube_handrail_caller"] = client
+        event["_kube_handrail_caller"] = f"{client}.{caller_signature(CALLER_KEY, client)}"
     return handler.lambda_handler(event, context)
 
 
@@ -1633,6 +1636,20 @@ def test_identity_apply_through_the_gateway_needs_a_known_caller(identity_rt, cl
         {"reason": "agent_unknown"},
     )
     assert item(plan.plan_id)["used"] is False
+
+
+def test_identity_apply_with_an_unsigned_caller_is_forbidden(identity_rt):
+    """A gateway that lost its interceptor passes the client's own value: never trusted."""
+    runtime_, apps = identity_rt
+    plan = create_agent_plan(runtime_.store)
+    event = {"plan_id": plan.plan_id, "namespace": "sandbox", "name": "web", "replicas": 3}
+    response = handler.lambda_handler({**event, "_kube_handrail_caller": "client-a"}, CONTEXT)
+    assert (error_code(response), response["error"]["details"]) == (
+        "forbidden",
+        {"reason": "agent_unknown"},
+    )
+    assert item(plan.plan_id)["used"] is False
+    apps.patch_namespaced_deployment.assert_not_called()
 
 
 def test_identity_apply_of_a_legacy_plan_is_forbidden(identity_rt):

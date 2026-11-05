@@ -3,7 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 
-from handrail_common.dispatch import CALLER_ARGUMENT, pop_caller
+from handrail_common.dispatch import CALLER_ARGUMENT, caller_signature, pop_caller
 
 _SPEC = importlib.util.spec_from_file_location(
     "interceptor_handler", Path(__file__).parents[2] / "mcp" / "interceptor" / "handler.py"
@@ -82,15 +82,48 @@ def test_other_methods_pass_through_unchanged():
     )
 
 
-def test_pop_caller_trusts_the_argument_only_with_the_interceptor_enabled():
-    args = {"replicas": 2, CALLER_ARGUMENT: "abc"}
-    assert pop_caller(dict(args), {"CALLER_INTERCEPTOR": "true"}) == "abc"
-    assert pop_caller(dict(args), {"CALLER_INTERCEPTOR": "false"}) is None
+KEY = "test-caller-key"
+IDENTITY = {"CALLER_INTERCEPTOR": "true", "CALLER_KEY": KEY}
+
+
+def test_with_a_key_the_caller_is_signed(monkeypatch):
+    monkeypatch.setenv("CALLER_KEY", KEY)
+    body = transformed(
+        interceptor.lambda_handler(
+            event(call({CALLER_ARGUMENT: "attacker"}), token({"client_id": "abc"})), None
+        )
+    )
+    assert body["params"]["arguments"][CALLER_ARGUMENT] == f"abc.{caller_signature(KEY, 'abc')}"
+    body = transformed(interceptor.lambda_handler(event(call({}), None), None))
+    assert (
+        body["params"]["arguments"][CALLER_ARGUMENT]
+        == f"unknown.{caller_signature(KEY, 'unknown')}"
+    )
+
+
+def test_interceptor_output_round_trips_through_pop_caller(monkeypatch):
+    monkeypatch.setenv("CALLER_KEY", KEY)
+    body = transformed(
+        interceptor.lambda_handler(event(call({"a": 1}), token({"client_id": "abc"})), None)
+    )
+    arguments = dict(body["params"]["arguments"])
+    assert pop_caller(arguments, IDENTITY) == "abc"
+    assert arguments == {"a": 1}
+
+
+def test_pop_caller_trusts_only_a_signed_argument_with_the_interceptor_enabled():
+    args = {"replicas": 2, CALLER_ARGUMENT: f"abc.{caller_signature(KEY, 'abc')}"}
+    assert pop_caller(dict(args), IDENTITY) == "abc"
+    assert pop_caller(dict(args), {"CALLER_INTERCEPTOR": "true"}) is None
+    assert pop_caller(dict(args), {**IDENTITY, "CALLER_INTERCEPTOR": "false"}) is None
     assert pop_caller(dict(args), {}) is None
     stripped = dict(args)
     pop_caller(stripped, {})
     assert stripped == {"replicas": 2}
-    assert pop_caller({CALLER_ARGUMENT: 5}, {"CALLER_INTERCEPTOR": "true"}) is None
+    # What a client sends itself when the gateway lost its interceptor.
+    assert pop_caller({CALLER_ARGUMENT: "abc"}, IDENTITY) is None
+    assert pop_caller({CALLER_ARGUMENT: "abc.0123"}, IDENTITY) is None
+    assert pop_caller({CALLER_ARGUMENT: 5}, IDENTITY) is None
 
 
 def test_dispatch_never_hands_the_reserved_argument_to_a_tool():

@@ -1,5 +1,7 @@
 """Route a Gateway Lambda invocation to a tool handler."""
 
+import hashlib
+import hmac
 import logging
 import os
 import time
@@ -26,9 +28,10 @@ logger = logging.getLogger(__name__)
 
 TOOL_NAME_KEY = "bedrockAgentCoreToolName"
 TARGET_DELIMITER = "___"
-# Reserved argument the gateway request interceptor sets to the verified caller (CONTRACT.md,
-# Agent identity). It is trusted only when CALLER_INTERCEPTOR is "true"; otherwise a client
-# could have sent it.
+# Reserved argument the gateway request interceptor sets to the verified caller, signed with
+# CALLER_KEY (CONTRACT.md, Agent identity): "<client_id>.<hex HMAC-SHA256 of client_id>". It is
+# trusted only when CALLER_INTERCEPTOR is "true" and the signature matches; a client can send
+# the argument itself, but without the key it cannot sign it.
 CALLER_ARGUMENT = "_kube_handrail_caller"
 
 Handler = Callable[[dict[str, Any]], Envelope]
@@ -47,13 +50,24 @@ def tool_name(context: Any) -> str | None:
     return name or None
 
 
+def caller_signature(key: str, caller: str) -> str:
+    """The interceptor's signature of a caller; mcp/interceptor computes the same."""
+    return hmac.new(key.encode(), caller.encode(), hashlib.sha256).hexdigest()
+
+
 def pop_caller(args: dict[str, Any], env: Mapping[str, str] | None = None) -> str | None:
-    """Remove the reserved caller argument; return it only when the interceptor is enabled."""
+    """Remove the reserved caller argument; return the caller only when the interceptor is
+    enabled and signed it. Anything else, including a gateway without its interceptor that
+    passes a client's own value through, gives None, which identity mode refuses."""
     env = os.environ if env is None else env
     value = args.pop(CALLER_ARGUMENT, None)
-    if env.get("CALLER_INTERCEPTOR") != "true":
+    key = env.get("CALLER_KEY", "")
+    if env.get("CALLER_INTERCEPTOR") != "true" or not key or not isinstance(value, str):
         return None
-    return value if isinstance(value, str) and value else None
+    caller, _, signature = value.rpartition(".")
+    if not caller or not hmac.compare_digest(signature, caller_signature(key, caller)):
+        return None
+    return caller
 
 
 def _detail(envelope: Envelope, key: str) -> str | None:

@@ -14,8 +14,8 @@ The caller identity spike (Milestone 1, item 6) showed that a gateway REQUEST in
 
 ## Decision
 
-- **An agent is an OAuth client.** Terraform's `agents` map names each agent with its own Cognito app client (or an existing client of the user pool). The tool Lambdas get the mapping as `AGENTS`, and the interceptor passes the verified `client_id`.
-- **On by default, fail closed.** The interceptor is attached unless `caller_interceptor_enabled = false`. With it, every path that can lead to a change (`plan_*`, `request_approval`, a gateway `apply_*`) needs a caller listed in `AGENTS`; without one it is refused. Read tools stay open to any client the gateway accepts. Turning the interceptor off is a documented legacy mode for gateways without interceptors, with no per-agent attribution or limits.
+- **An agent is an OAuth client.** Terraform's `agents` map names each agent with its own Cognito app client (or an existing client of the user pool). The tool Lambdas get the mapping as `AGENTS`, and the interceptor passes the verified `client_id`, signed with a key that only it and the tool Lambdas hold.
+- **On by default, fail closed.** The interceptor is attached unless `caller_interceptor_enabled = false`. With it, every path that can lead to a change (`plan_*`, `request_approval`, a gateway `apply_*`) needs a caller listed in `AGENTS`, signed by the interceptor; without one it is refused. The signature is what makes this fail closed: a gateway that lost its interceptor passes a client's own caller argument through, and only the signature tells that value apart. Read tools stay open to any client the gateway accepts. Turning the interceptor off is a documented legacy mode for gateways without interceptors, with no per-agent attribution or limits.
 - **Plans name their agent**, as `requested_by = agent:<name>` with the verified `client_id`. Only that agent can request an approval for its plan or apply it through the gateway; the apply's conditional write checks it together with everything else.
 - **One channel marker for non-gateway callers.** The approver marks the apply it runs as the `approval-api` channel. That apply carries no caller, is attributed to the plan's agent, and still needs the human approval in the same write. Anything that is not exactly a known channel counts as the gateway, which requires a caller.
 - **Per-agent hourly apply budgets and a per-agent kill switch**, next to the global ones. The budget is charged to the plan's agent whichever channel applies it. The switch is an SSM parameter per agent that only operators write; the drift sentinel never does.
@@ -25,7 +25,7 @@ The caller identity spike (Milestone 1, item 6) showed that a gateway REQUEST in
 
 - Separation of duties is between a specific agent and a human approver. `approved_by <> requested_by` is unchanged.
 - One agent cannot spend another agent's approved plan, or the budget behind it.
-- If the interceptor goes missing, writes stop (fail closed) and the sentinel reports it. That makes the interceptor part of the write path: one more Lambda per request, and a broken interceptor stops all writes.
+- If the interceptor goes missing, writes stop (fail closed), because no client can sign its own caller argument, and the sentinel reports it. That makes the interceptor part of the write path: one more Lambda per request, and a broken interceptor stops all writes.
 - Plans that are open when a deployment is upgraded to identity mode name `mcp-gateway` and must be planned again; their expiry is minutes.
 - Two agents that share a client are one agent. Nothing enforces one client per agent.
 
