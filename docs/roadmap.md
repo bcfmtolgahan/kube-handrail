@@ -102,15 +102,82 @@ The identity is per OAuth client, not per agent session: two agents sharing a cl
 
 ## Milestone 2: Verified changes, more actions, accountable agents
 
-**Goal:** confirm that changes worked, extend the action set, and make every change attributable and provable.
+**Goal:** confirm that changes worked, extend the action set, and make every change attributable and provable. Items are listed in implementation order. Spikes on the assumptions they depend on (Cedar with the caller interceptor, JSON Patch resourceVersion preconditions, template hashing, interceptor failure behavior) run first.
 
-- **Verify and revert.** A `READ_ONLY` tool reports the outcome of an applied plan (`healthy`, `degraded`, `unknown`) from an asynchronous check. Optionally, revert-on-failure and the verification window are part of the approved arguments, so the human approves the change and its revert together. Reverts use the spec-level precondition; `unknown` never triggers a revert; a revert is never reverted; the kill switch also stops reverts.
-- **Rollback by exact revision, and restart.** Rollback targets a specific revision, pins the pod template and image of that revision, and shows the image change per container. Restart follows the same plan/apply pattern.
-- **Per-agent identity, budgets and kill switch.** Plans record the requesting agent; per-agent hourly budgets and a per-agent kill switch. Builds on the caller identity interceptor (Milestone 1, item 6), which identifies callers per OAuth client.
-- **Tamper-evident audit ledger and evidence export.** Append-only audit records, hash-chained and signed, linking requesting agent, approving human and executing role; per-plan evidence export. The executor cannot rewrite its own records.
-- **Single-source policy.** One policy file compiled to Cedar at the gateway, ValidatingAdmissionPolicy in the cluster, and guard configuration, with a CI check that all three agree on the same test cases. Cedar rolls out in log-only mode and admission policy in audit mode before enforcement ([Policy enforcement modes](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-enforcement-modes.html), [ValidatingAdmissionPolicy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/)). Includes change-freeze windows enforced by the guard and a break-glass path that requires a ticket reference and a second approver.
+### 1. Action framework and restart
 
-**Done when:** a degraded change is detected and, if approved with revert, reverted; a rollback to a named revision applies exactly that template; each change can be exported with its full approval chain; and the three policy layers agree on the shared test cases.
+**Goal:** add actions without copying the guarded write path.
+
+- Plan and apply run through one generic path. Each action supplies its validation, record match, checks, breaker rules and patch body. Scale moves onto it unchanged.
+- Plan records store the exact argument payload that the approval pins. The approval channel forwards it as the apply arguments, and apply compares against it, for every action.
+- Plans pin a hash of the pod template, for every action.
+- `plan_restart_deployment` / `apply_restart_deployment` set a pod-template annotation that carries the plan ID, so the resulting template is known and approved at plan time. Restart has no replica direction and no step budget; the impact preview shows the rollout strategy, PDB headroom and Service endpoints during the rollout.
+
+**Done when:** the Milestone 1 guard tests pass unchanged on the generic path, and a restart is planned, approved and applied in `client` and `server` mode, replacing every pod with the plan ID annotation.
+
+### 2. Rollback by exact revision
+
+**Goal:** roll back to the template the human approved, not to whatever a revision number points at by the time the apply runs.
+
+- `get_rollout_history` lists the owned revisions, with images per container as untrusted text.
+- The plan resolves a revision to exactly one ReplicaSet owned by the Deployment. It pins that ReplicaSet's UID and template hash, and shows the image change per container and the names of other changed fields, never values.
+- Apply re-reads the ReplicaSet, re-hashes its template, and writes exactly the template it checked, with a resourceVersion precondition. A pruned revision returns `revision_not_found`; an edited target or a spec change since the plan returns `conflict`.
+- Rolling back over a template change made by someone else since the last kube-handrail template change requires the manual-change override. The writer gains read access to ReplicaSets in allowed namespaces only.
+
+**Done when:** a rollback to a named revision writes exactly that revision's template, and a target edited, pruned or renumbered after the plan is refused.
+
+### 3. Per-agent identity, budgets and kill switch
+
+**Goal:** know which agent asked for each change, and limit or stop one agent without stopping the others. Builds on the caller identity interceptor (Milestone 1, item 6), which identifies callers per OAuth client.
+
+- The interceptor is on by default and the write path fails closed without a verified caller. Agents are configured in Terraform, one OAuth client each.
+- Plans record the requesting agent. Only that agent can request approval for its plan or apply it through the gateway; an approval-triggered apply is attributed to the plan's agent.
+- Per-agent hourly apply budgets alongside the global budget, and a per-agent kill switch, checked on plan, `request_approval` and apply.
+- The drift sentinel checks that the gateway still has its interceptor and only the expected clients.
+
+**Done when:** every plan names its agent from the verified OAuth client and a client cannot change it; an agent over its budget or with its kill switch off is refused while other agents keep working; one agent cannot apply another's plan; and a gateway that lost its interceptor cannot be used to write and is reported by the sentinel.
+
+### 4. Verify and revert
+
+**Goal:** confirm that an applied change worked, and undo it if the human approved that in advance.
+
+- A verification window, and for scale revert-on-failure, are optional plan arguments pinned in the approval, so the human approves the change and its revert together.
+- The apply schedules the check in the same write that consumes the plan. A scheduled sweeper runs it through an internal entry point of the write Lambda that the gateway cannot reach.
+- A `READ_ONLY` tool, `get_plan_outcome`, reports `healthy`, `degraded` or `unknown`, and the revert state.
+- A revert uses the spec-level precondition and restores exactly the approved starting state. `unknown` never triggers a revert, a revert is never reverted, and the kill switch also stops reverts. A revert counts as a change for later breaker checks, so re-planning the same change right after its revert is refused.
+
+**Done when:** a degraded change is detected and, if approved with revert, reverted, the revert itself is verified and never reverted, and an `unknown` outcome or a turned-off kill switch leaves the object as it is.
+
+### 5. Single-source policy, change freezes and break-glass
+
+**Goal:** one reviewed policy file that the gateway, the cluster and the guard all enforce the same way.
+
+- `policy/policy.json` (namespaces with replica bounds, allowed actions, freeze windows, break-glass, rollout state) is compiled to Cedar at the gateway and to a ValidatingAdmissionPolicy that applies only to the kube-handrail writer in allowed namespaces. The guard reads the same file. A CI check shows that all three agree on shared test cases.
+- Cedar rolls out in log-only mode and admission policy in audit mode before enforcement ([Policy enforcement modes](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-enforcement-modes.html), [ValidatingAdmissionPolicy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/)). The drift sentinel reports a detached engine, a mode change or a policy switched to log-only.
+- Change-freeze windows are enforced by the guard on plan, `request_approval` and apply, including approval-triggered applies that Cedar never sees.
+- A break-glass path lifts only a freeze. It requires a ticket reference pinned in the plan arguments and a second approver from a different approver entry, and is available in `server` and `both` approval modes.
+
+**Done when:** CI shows the three policy layers agreeing on the shared test cases; on a test deployment Cedar ran in log-only mode and admission policy in audit mode before both were enforced; a freeze refuses changes; and a break-glass change needs a ticket and two distinct approvers.
+
+### 6. Tamper-evident audit ledger and evidence export
+
+**Goal:** prove afterwards who asked for each change, who approved it, and what ran it, even if the executor is compromised.
+
+- Every change to a plan record is captured from the table's stream by a separate writer and appended as a signed, hash-chained entry to write-once storage. The executor writes no ledger records and cannot alter them.
+- The approval channel writes a write-once receipt for each decision. An approval, consume or result that does not match its receipts or the expected transitions is flagged as an anomaly and alerts.
+- `scripts/ledger.py` verifies the chain and signatures offline and exports one plan's evidence: the requesting agent, the approver or approvers, the executing role and channel, and the verification and revert outcome.
+
+**Done when:** a forged approval or rewritten result written with the executor's own credentials is detected, and a change can be exported with its full approval chain and verified offline.
+
+### Deferred from this milestone
+
+These move to "Later ideas":
+
+- Revert of a rollback (a rollback to the previous template, by hash).
+- Agent-facing evidence tool; weekly freeze windows; per-agent Cedar permits.
+- Moving the scheduled sentinel and sweeper to EventBridge Scheduler.
+
+**Done when (milestone):** a degraded change is detected and, if approved with revert, reverted; a rollback to a named revision applies exactly that template; each change can be exported with its full approval chain; and the three policy layers agree on the shared test cases.
 
 ## Milestone 3: Prometheus SLO tools and alert-triggered investigations
 
