@@ -123,7 +123,7 @@ See [Restart](../mcp/CONTRACT.md#restart). On a test cluster:
 
 ### 2. Rollback by exact revision (implemented, not yet tested on a cluster)
 
-See [Rollout history](../mcp/CONTRACT.md#rollout-history) and [Rollback](../mcp/CONTRACT.md#rollback). Unit tests and end-to-end cases (`--with-rollout`) are in place; the live run on a test cluster is still to come.
+See [Rollout history](../mcp/CONTRACT.md#rollout-history) and [Rollback](../mcp/CONTRACT.md#rollback). Unit tests and end-to-end cases (`--with-rollout`) are in place; the live run on a test cluster is still to come. It should also confirm how the template manual-change rule behaves after a `kubectl rollout undo`, which rewrites the Deployment's annotations ([History checks](../mcp/CONTRACT.md#history-checks-oscillation-breaker)).
 
 **Goal:** roll back to the template the human approved, not to whatever a revision number points at by the time the apply runs.
 
