@@ -8,7 +8,9 @@ change), the blast-radius budget, the impact preview, the correlation id and unt
 
 Environment: GATEWAY_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET, KILL_SWITCH_PARAM,
 PLANS_TABLE (the plans_table_name output), KUBECONFIG, the usual AWS variables,
-and APPROVAL_URL with --approval-mode server.
+APPROVAL_URL with --approval-mode server, and CLIENT_ID_B and CLIENT_SECRET_B with
+--with-identity (AGENT_NAME, AGENT_NAME_B and AGENT_BUDGET_B when they differ from
+smoke_test, e2e_peer and 2).
 Pass --with-expiry to also wait out a plan TTL (PLAN_TTL_SECONDS, default 300). APPLY_COOLDOWN_SECONDS (default 60) must
 match the deployment: the test waits it out after each apply. The blast-radius
 case expects MAX_REPLICA_STEP_PERCENT=100 (the default) and MAX_REPLICAS >= 3.
@@ -52,6 +54,24 @@ manual_change, and the override plans it. In client mode, a ReplicaSet edited
 with kubectl patch between plan and apply is a conflict, and the override plan
 is applied.
 
+With --with-identity, the per-agent identity cases also run, with a second
+gateway session for another agent (client B), against fixture Deployments
+e2e-identity-1 to -3 created for this run. Client A is CLIENT_ID (the smoke_test
+agent); client B is CLIENT_ID_B / CLIENT_SECRET_B, the OAuth client of an agent
+used only by this test (AGENT_NAME_B, default e2e_peer), whose hourly apply budget
+must be AGENT_BUDGET_B (default 2). In both modes: A's plan names A in the plan
+record (read from PLANS_TABLE), a caller argument A sends naming B's client is
+ignored, and B applying A's plan is forbidden (not_requester). In client mode: with
+B's kill switch off (derived from KILL_SWITCH_PARAM as /<prefix>/agents/<B>/enabled)
+B's plan and its apply of a plan made before are remediation_disabled (scope
+agent) while A still plans; B uses up what is left of its budget for this clock
+hour and its next apply is agent_budget_exceeded, while A still applies. In server
+mode: B's request_approval for A's plan is forbidden; B's plan approved after its
+kill switch was turned off is refused by the approval's apply and consumed, and
+with the switch back on an approved plan of B's is applied and counted against
+B's budget. A must have a budget (smoke_test's hourly_apply_budget) of at least the
+applies of the whole run, 30 in the test setup.
+
 The per-object and global hourly budgets and the plan rate limit are covered by
 unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
 scale_to_zero and service_without_endpoints warnings: they need a plan to 0
@@ -85,6 +105,7 @@ FLAP = {"namespace": NAMESPACE, "name": "e2e-flap"}
 MANUAL = {"namespace": NAMESPACE, "name": "e2e-manual"}
 RESTART = {"namespace": NAMESPACE, "name": "e2e-restart"}
 ROLLBACK = {"namespace": NAMESPACE, "name": "e2e-rollback"}
+IDENTITY = [{"namespace": NAMESPACE, "name": f"e2e-identity-{i}"} for i in (1, 2, 3)]
 FIXTURES = (TARGET["name"], FLAP["name"], MANUAL["name"])
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
 RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
@@ -223,16 +244,19 @@ def delete_fixtures() -> None:
         *FIXTURES,
         RESTART["name"],
         ROLLBACK["name"],
+        *(target["name"] for target in IDENTITY),
         "--ignore-not-found",
         "--wait=true",
     )
 
 
-def create_fixtures(with_rollout: bool) -> None:
+def create_fixtures(with_rollout: bool, with_identity: bool = False) -> None:
     # Delete leftovers from an aborted run first: a new object (new uid) has no history.
     delete_fixtures()
     names = [*FIXTURES]
-    for name in FIXTURES:
+    if with_identity:
+        names += [target["name"] for target in IDENTITY]
+    for name in names:
         kubectl("create", "-f", "-", stdin=json.dumps(fixture(name)))
     if with_rollout:
         kubectl("create", "-f", "-", stdin=json.dumps(fixture(RESTART["name"], replicas=2)))
@@ -291,11 +315,11 @@ def set_kill_switch(value: str) -> None:
     )
 
 
-def fetch_token() -> str:
+def fetch_token(client_id: str | None = None, client_secret: str | None = None) -> str:
     body = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
-    basic = base64.b64encode(
-        f"{os.environ['CLIENT_ID']}:{os.environ['CLIENT_SECRET']}".encode()
-    ).decode()
+    client_id = client_id or os.environ["CLIENT_ID"]
+    client_secret = client_secret or os.environ["CLIENT_SECRET"]
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     request = urllib.request.Request(
         os.environ["TOKEN_URL"],
         data=body,
@@ -685,11 +709,15 @@ def injection_event(name: str, uid: str) -> dict[str, Any]:
     }
 
 
-def plans_since(object_key: str, since: int) -> int:
-    """Plan records for one object created at or after `since`, read with the operator's credentials."""
+def plans_table() -> Any:
     # boto3 reads AWS_DEFAULT_REGION but not AWS_REGION.
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-    table = boto3.resource("dynamodb", region_name=region).Table(os.environ["PLANS_TABLE"])
+    return boto3.resource("dynamodb", region_name=region).Table(os.environ["PLANS_TABLE"])
+
+
+def plans_since(object_key: str, since: int) -> int:
+    """Plan records for one object created at or after `since`, read with the operator's credentials."""
+    table = plans_table()
     response = table.query(
         IndexName="object-history",
         KeyConditionExpression="object_key = :k AND created_at >= :t",
@@ -1254,7 +1282,211 @@ async def rollback_tests(gw: Gateway, approval_mode: str) -> None:
     )
 
 
-async def run(with_expiry: bool, approval_mode: str, with_rollout: bool) -> None:
+AGENT_A = os.environ.get("AGENT_NAME", "smoke_test")
+AGENT_B = os.environ.get("AGENT_NAME_B", "e2e_peer")
+AGENT_BUDGET_B = int(os.environ.get("AGENT_BUDGET_B", "2"))
+
+
+def plan_record(plan_id: str) -> dict[str, Any]:
+    return plans_table().get_item(Key={"plan_id": plan_id}, ConsistentRead=True).get("Item") or {}
+
+
+def agent_applies(name: str) -> int:
+    """The agent's apply counter for the current clock hour (mcp/CONTRACT.md, Plan record)."""
+    now = int(time.time())
+    item = (
+        plans_table()
+        .get_item(Key={"plan_id": f"budget#agent#{name}#{now - now % 3600}"}, ConsistentRead=True)
+        .get("Item")
+    )
+    return int(item.get("applies", 0)) if item else 0
+
+
+def set_agent_switch(name: str, value: str) -> None:
+    prefix = os.environ["KILL_SWITCH_PARAM"].rsplit("/", 1)[0]
+    subprocess.run(
+        [
+            "aws",
+            "ssm",
+            "put-parameter",
+            "--overwrite",
+            "--name",
+            f"{prefix}/agents/{name}/enabled",
+            "--value",
+            value,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def details(envelope: dict[str, Any]) -> dict[str, Any]:
+    return (envelope.get("error") or {}).get("details") or {}
+
+
+async def wait_for_a_whole_window(seconds: int = 300, budget_left: bool = False) -> None:
+    """Counters are per clock hour: start a budget case well inside one, and with
+    `budget_left` in one where B has a unit left (a client-mode run this hour may have
+    spent them)."""
+    left = 3600 - int(time.time()) % 3600
+    if left < seconds or (budget_left and agent_applies(AGENT_B) >= AGENT_BUDGET_B):
+        print(f"waiting {left + 5}s for the next clock hour", flush=True)
+        await asyncio.sleep(left + 5)
+
+
+async def identity_tests(gw_a: Gateway, gw_b: Gateway, approval_mode: str) -> None:
+    first = IDENTITY[0]
+    planned = await gw_a.call(PLAN, {**first, "replicas": 2})
+    plan_id = (planned.get("data") or {}).get("plan_id")
+    record = plan_record(plan_id) if plan_id else {}
+    report(
+        "identity: the plan record names the requesting agent and its client",
+        record.get("requested_by") == f"agent:{AGENT_A}"
+        and record.get("agent") == AGENT_A
+        and record.get("requested_client_id") == os.environ["CLIENT_ID"]
+        and (planned.get("data") or {}).get("requested_by") == f"agent:{AGENT_A}",
+        code(planned) or record.get("requested_by"),
+    )
+    if not plan_id:
+        return
+    spoofed = await gw_a.call(
+        PLAN, {**first, "replicas": 2, "_kube_handrail_caller": os.environ["CLIENT_ID_B"]}
+    )
+    spoofed_id = (spoofed.get("data") or {}).get("plan_id")
+    report(
+        "identity: a caller argument sent by the client is ignored",
+        bool(spoofed_id) and plan_record(spoofed_id).get("agent") == AGENT_A,
+        code(spoofed) or plan_record(spoofed_id).get("agent"),
+    )
+    envelope = await gw_b.apply(first, plan_id, 2)
+    report(
+        "identity: another agent cannot apply the plan",
+        code(envelope) == "forbidden" and details(envelope) == {"reason": "not_requester"},
+        code(envelope) or "ok",
+    )
+    report(
+        "identity: the refused apply left the plan unused", plan_record(plan_id)["used"] is False
+    )
+    if approval_mode == "server":
+        envelope = await gw_b.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+        report(
+            "identity: another agent cannot request the approval",
+            code(envelope) == "forbidden" and details(envelope) == {"reason": "not_requester"},
+            code(envelope) or "ok",
+        )
+        await identity_approval_tests(gw_b)
+    else:
+        await agent_switch_tests(gw_a, gw_b)
+        await agent_budget_tests(gw_a, gw_b)
+
+
+async def agent_switch_tests(gw_a: Gateway, gw_b: Gateway) -> None:
+    target = IDENTITY[1]
+    plan_id = await gw_b.plan(target, 2)
+    set_agent_switch(AGENT_B, "false")
+    try:
+        disabled = {"scope": "agent", "agent": AGENT_B}
+        envelope = await gw_b.apply(target, plan_id, 2)
+        report(
+            "agent switch: the agent's apply is refused and its plan consumed",
+            code(envelope) == "remediation_disabled"
+            and details(envelope) == disabled
+            and plan_record(plan_id).get("used") is True,
+            code(envelope) or "ok",
+        )
+        envelope = await gw_b.call(PLAN, {**target, "replicas": 2})
+        report(
+            "agent switch: the agent's plan is refused",
+            code(envelope) == "remediation_disabled" and details(envelope) == disabled,
+            code(envelope) or "ok",
+        )
+        envelope = await gw_a.call(PLAN, {**target, "replicas": 2})
+        report(
+            "agent switch: another agent still plans", envelope.get("ok") is True, code(envelope)
+        )
+    finally:
+        set_agent_switch(AGENT_B, "true")
+
+
+async def agent_budget_tests(gw_a: Gateway, gw_b: Gateway) -> None:
+    await wait_for_a_whole_window()
+    remaining = AGENT_BUDGET_B - agent_applies(AGENT_B)
+    if not 0 <= remaining < len(IDENTITY):
+        report("agent budget: AGENT_BUDGET_B fits the fixtures", False, remaining)
+        return
+    # Plan every change first: a plan only reads the counter, so all of them pass.
+    plans = []
+    for target in IDENTITY[: remaining + 1]:
+        envelope = await gw_b.call(PLAN, {**target, "replicas": 2})
+        if remaining == 0:
+            # Spent already (an earlier run this hour): the plan itself is refused.
+            report(
+                "agent budget: the agent over its budget is refused",
+                code(envelope) == "agent_budget_exceeded"
+                and details(envelope).get("limit") == AGENT_BUDGET_B,
+                code(envelope) or "ok",
+            )
+            break
+        plans.append((target, (envelope.get("data") or {}).get("plan_id")))
+    for i, (target, plan_id) in enumerate(plans):
+        envelope = await gw_b.apply(target, plan_id, 2)
+        if i < remaining:
+            report(f"agent budget: apply {i + 1} within the budget", envelope.get("ok") is True)
+        else:
+            report(
+                "agent budget: the apply over the budget is refused",
+                code(envelope) == "agent_budget_exceeded"
+                and details(envelope).get("agent") == AGENT_B,
+                code(envelope) or "ok",
+            )
+    report("agent budget: the counter is at the limit", agent_applies(AGENT_B) == AGENT_BUDGET_B)
+    # The last fixture was not applied by B, so it has no cooldown.
+    target = IDENTITY[-1]
+    envelope = await gw_a.apply(target, await gw_a.plan(target, 2), 2)
+    report("agent budget: another agent still applies", envelope.get("ok") is True, code(envelope))
+
+
+async def identity_approval_tests(gw_b: Gateway) -> None:
+    approve = approve_script()
+    url = os.environ["APPROVAL_URL"]
+    region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
+    await wait_for_a_whole_window(budget_left=True)
+    target = IDENTITY[1]
+    plan_id = await gw_b.plan(target, 2)
+    await gw_b.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+    set_agent_switch(AGENT_B, "false")
+    try:
+        status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
+    finally:
+        set_agent_switch(AGENT_B, "true")
+    applied = (envelope.get("data") or {}).get("apply") or {}
+    report(
+        "agent switch: an approval's apply is refused for the disabled agent and the plan consumed",
+        status == 200
+        and code(applied) == "remediation_disabled"
+        and details(applied) == {"scope": "agent", "agent": AGENT_B}
+        and plan_record(plan_id).get("used") is True,
+        code(applied) or status,
+    )
+    before = agent_applies(AGENT_B)
+    target = IDENTITY[2]
+    plan_id = await gw_b.plan(target, 2)
+    await gw_b.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+    status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
+    applied = (envelope.get("data") or {}).get("apply") or {}
+    record = plan_record(plan_id)
+    report(
+        "identity: an approval's apply is charged to the plan's agent",
+        applied.get("ok") is True
+        and record.get("channel") == "approval-api"
+        and agent_applies(AGENT_B) == before + 1,
+        code(applied) or status,
+    )
+
+
+async def run(
+    with_expiry: bool, approval_mode: str, with_rollout: bool, with_identity: bool = False
+) -> None:
     token = fetch_token()
     auth_tests(token)
     async with streamablehttp_client(
@@ -1280,6 +1512,19 @@ async def run(with_expiry: bool, approval_mode: str, with_rollout: bool) -> None
             if with_rollout:
                 await rollout_tests(gw, approval_mode)
                 await rollback_tests(gw, approval_mode)
+            if with_identity:
+                await run_identity(gw, approval_mode)
+
+
+async def run_identity(gw_a: Gateway, approval_mode: str) -> None:
+    """The identity cases, with a second session as client B."""
+    token = fetch_token(os.environ["CLIENT_ID_B"], os.environ["CLIENT_SECRET_B"])
+    async with streamablehttp_client(
+        os.environ["GATEWAY_URL"], headers={"Authorization": f"Bearer {token}"}
+    ) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            await identity_tests(gw_a, Gateway(session), approval_mode)
 
 
 def describe(exc: BaseException) -> str:
@@ -1297,6 +1542,11 @@ def main() -> None:
         "--with-rollout", action="store_true", help="also run the restart and rollback cases"
     )
     parser.add_argument(
+        "--with-identity",
+        action="store_true",
+        help="also run the per-agent identity cases (needs CLIENT_ID_B and CLIENT_SECRET_B)",
+    )
+    parser.add_argument(
         "--approval-mode",
         choices=["client", "server"],
         default="client",
@@ -1306,8 +1556,10 @@ def main() -> None:
     started = time.time()
     web_before = web_spec()
     try:
-        create_fixtures(args.with_rollout)
-        asyncio.run(run(args.with_expiry, args.approval_mode, args.with_rollout))
+        create_fixtures(args.with_rollout, args.with_identity)
+        asyncio.run(
+            run(args.with_expiry, args.approval_mode, args.with_rollout, args.with_identity)
+        )
     except Exception as exc:
         # A case that raised (for example a plan that failed unexpectedly) still gets the
         # fixtures deleted and the summary printed.

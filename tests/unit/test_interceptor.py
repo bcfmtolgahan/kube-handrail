@@ -108,3 +108,13 @@ def test_dispatch_never_hands_the_reserved_argument_to_a_tool():
         context,
     )
     assert seen == {"a": 1}
+
+
+def test_a_retried_request_gives_the_same_result():
+    """The gateway may retry an interceptor; the result must not depend on earlier calls."""
+    request = event(call({"replicas": 2}), token({"client_id": "abc"}))
+    first = interceptor.lambda_handler(request, None)
+    assert interceptor.lambda_handler(request, None) == first
+    # Re-running it on its own output changes nothing either.
+    again = event(transformed(first), token({"client_id": "abc"}))
+    assert transformed(interceptor.lambda_handler(again, None)) == transformed(first)

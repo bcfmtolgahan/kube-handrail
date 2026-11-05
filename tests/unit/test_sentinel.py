@@ -23,6 +23,8 @@ REGION = "us-east-1"
 PARAM = "/handrail/remediation-enabled"
 TOPIC = "alert-topic-arn"
 WRITE_TOOL = "k8sw___apply_scale_deployment"
+INTERCEPTOR = "arn:aws:lambda:us-east-1:123456789012:function:kube-handrail-interceptor"
+CLIENTS = ("client-a", "client-b")
 
 
 def schema_names(directory: str) -> list[str]:
@@ -43,6 +45,28 @@ class FakeGateway:
         }
         self.status = "READY"
         self.error: Exception | None = None
+        self.config_error: Exception | None = None
+        self.interceptors = [
+            {
+                "interceptor": {"lambda": {"arn": INTERCEPTOR}},
+                "interceptionPoints": ["REQUEST"],
+                "inputConfiguration": {"passRequestHeaders": True},
+            }
+        ]
+        self.allowed_clients: list[str] | None = list(CLIENTS)
+
+    def get_gateway(self, gatewayIdentifier):
+        if self.config_error:
+            raise self.config_error
+        authorizer = {"discoveryUrl": "https://idp.example/.well-known/openid-configuration"}
+        if self.allowed_clients is not None:
+            authorizer["allowedClients"] = self.allowed_clients
+        return {
+            "gatewayId": gatewayIdentifier,
+            "authorizerType": "CUSTOM_JWT",
+            "authorizerConfiguration": {"customJWTAuthorizer": authorizer},
+            "interceptorConfigurations": self.interceptors,
+        }
 
     def list_gateway_targets(self, gatewayIdentifier, nextToken=None):
         if self.error:
@@ -107,7 +131,9 @@ class FakeSNS:
         return {"MessageId": "m"}
 
 
-def settings(devops: bool = True, expect_elevated: bool = True) -> handler.SentinelSettings:
+def settings(
+    devops: bool = True, expect_elevated: bool = True, interceptor: str | None = INTERCEPTOR
+) -> handler.SentinelSettings:
     return handler.SentinelSettings(
         gateway_id="gw",
         kill_switch_param=PARAM,
@@ -117,6 +143,8 @@ def settings(devops: bool = True, expect_elevated: bool = True) -> handler.Senti
         agent_space_id="space" if devops else None,
         association_id="assoc" if devops else None,
         expect_elevated_actions=expect_elevated,
+        expect_interceptor_arn=interceptor,
+        expect_allowed_clients=frozenset(CLIENTS),
     )
 
 
@@ -340,6 +368,7 @@ ENV = {
     "ALERT_TOPIC_ARN": TOPIC,
     "METRIC_NAMESPACE": "ns",
     "TOOL_CLASSIFICATION": json.dumps(CLASSIFICATION),
+    "EXPECT_ALLOWED_CLIENTS": json.dumps(list(CLIENTS)),
 }
 
 
@@ -347,6 +376,9 @@ def test_settings_parse():
     s = handler.load_sentinel_settings(ENV)
     assert s.classification == CLASSIFICATION
     assert (s.agent_space_id, s.association_id, s.expect_elevated_actions) == (None, None, True)
+    assert (s.expect_interceptor_arn, s.expect_allowed_clients) == (None, frozenset(CLIENTS))
+    s = handler.load_sentinel_settings(ENV | {"EXPECT_INTERCEPTOR_ARN": INTERCEPTOR})
+    assert s.expect_interceptor_arn == INTERCEPTOR
     s = handler.load_sentinel_settings(
         ENV | {"AGENT_SPACE_ID": "a", "ASSOCIATION_ID": "b", "EXPECT_ELEVATED_ACTIONS": "false"}
     )
@@ -362,6 +394,10 @@ def test_settings_parse():
         {"TOOL_CLASSIFICATION": "{}"},
         {"TOOL_CLASSIFICATION": json.dumps({WRITE_TOOL: "DESTRUCTIVE"})},
         {"TOOL_CLASSIFICATION": "not json"},
+        {"EXPECT_ALLOWED_CLIENTS": ""},
+        {"EXPECT_ALLOWED_CLIENTS": "[]"},
+        {"EXPECT_ALLOWED_CLIENTS": '"client-a"'},
+        {"EXPECT_ALLOWED_CLIENTS": "[1]"},
     ],
 )
 def test_settings_invalid(override):
@@ -373,3 +409,100 @@ def test_configuration_error_is_unknown(monkeypatch):
     monkeypatch.setattr(handler, "_runtime", None)
     monkeypatch.delenv("GATEWAY_ID", raising=False)
     assert handler.lambda_handler({}, None)["status"] == "unknown"
+
+
+# --- Gateway configuration --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "interceptors",
+    [
+        [],
+        [
+            {
+                "interceptor": {"lambda": {"arn": INTERCEPTOR + "-other"}},
+                "interceptionPoints": ["REQUEST"],
+                "inputConfiguration": {"passRequestHeaders": True},
+            }
+        ],
+        [
+            {
+                "interceptor": {"lambda": {"arn": INTERCEPTOR}},
+                "interceptionPoints": ["RESPONSE"],
+                "inputConfiguration": {"passRequestHeaders": True},
+            }
+        ],
+        [
+            {
+                "interceptor": {"lambda": {"arn": INTERCEPTOR}},
+                "interceptionPoints": ["REQUEST"],
+                "inputConfiguration": {"passRequestHeaders": False},
+            }
+        ],
+        [{"interceptor": {"lambda": {"arn": INTERCEPTOR}}, "interceptionPoints": ["REQUEST"]}],
+    ],
+)
+def test_a_missing_or_changed_interceptor_is_drift(ssm, interceptors):
+    rt = runtime(ssm)
+    rt.gateway.interceptors = interceptors
+    result = handler.run(rt)
+    assert result["status"] == "drift"
+    assert result["findings"] == [
+        {
+            "check": "gateway_config",
+            "issue": "missing_interceptor",
+            "subject": "REQUEST interceptor",
+        }
+    ]
+    assert kill_switch(ssm)[0] == "false"
+    [message] = rt.sns.messages
+    # The alert names no ARN: those carry account IDs.
+    assert "missing_interceptor" in message["Message"] and INTERCEPTOR not in message["Message"]
+
+
+def test_an_extra_client_is_drift(ssm):
+    rt = runtime(ssm)
+    rt.gateway.allowed_clients = [*CLIENTS, "client-z"]
+    result = handler.run(rt)
+    assert result["findings"] == [
+        {"check": "gateway_config", "issue": "unexpected_client", "subject": "client-z"}
+    ]
+    assert kill_switch(ssm)[0] == "false"
+
+
+def test_a_gateway_that_allows_any_client_is_drift(ssm):
+    rt = runtime(ssm)
+    rt.gateway.allowed_clients = None
+    assert handler.run(rt)["findings"][0]["subject"] == "any client"
+
+
+def test_a_client_missing_from_the_gateway_is_not_drift(ssm):
+    rt = runtime(ssm)
+    rt.gateway.allowed_clients = ["client-a"]
+    assert handler.run(rt)["status"] == "ok"
+
+
+def test_without_an_expected_interceptor_only_the_clients_are_checked(ssm):
+    rt = runtime(ssm, interceptor=None)
+    rt.gateway.interceptors = []
+    assert handler.run(rt)["status"] == "ok"
+    rt.gateway.allowed_clients = [*CLIENTS, "client-z"]
+    assert handler.run(rt)["status"] == "drift"
+
+
+def test_a_get_gateway_error_is_unknown(ssm):
+    rt = runtime(ssm)
+    rt.gateway.config_error = throttled("GetGateway")
+    result = handler.run(rt)
+    assert result == {
+        "status": "unknown",
+        "findings": [],
+        "errors": ["GetGateway: ThrottlingException"],
+    }
+    assert kill_switch(ssm) == ("true", 1)
+
+
+def test_an_unreadable_interceptor_configuration_is_unknown(ssm):
+    rt = runtime(ssm)
+    rt.gateway.interceptors = [{"interceptionPoints": ["REQUEST"]}]
+    assert handler.run(rt)["status"] == "unknown"

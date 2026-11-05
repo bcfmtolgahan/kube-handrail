@@ -1,5 +1,6 @@
 """Drift sentinel Lambda: turns the kill switch off when the deployed tools or their
-classification no longer match mcp/classification.json. Not a gateway target.
+classification no longer match mcp/classification.json, or the gateway lost the caller
+interceptor or allows a client that is not an agent's. Not a gateway target.
 """
 
 import json
@@ -20,6 +21,7 @@ from handrail_common.drift import (
     compare_association,
     compare_elevated,
     compare_gateway,
+    compare_gateway_configuration,
     elevated_actions,
     gateway_target_tools,
     parse_classification,
@@ -32,7 +34,7 @@ OK = "ok"
 DRIFT = "drift"
 UNKNOWN = "unknown"
 DISABLED = "false"
-ALERT_SUBJECT = "kube-handrail: classification drift, remediation disabled"
+ALERT_SUBJECT = "kube-handrail: drift, remediation disabled"
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,10 @@ class SentinelSettings:
     agent_space_id: str | None
     association_id: str | None
     expect_elevated_actions: bool
+    # The REQUEST interceptor's Lambda ARN; None when none is deployed (legacy mode).
+    expect_interceptor_arn: str | None = None
+    # The agents' OAuth clients: the only ones the gateway may allow.
+    expect_allowed_clients: frozenset[str] = frozenset()
 
 
 def _required(env: Mapping[str, str], key: str) -> str:
@@ -67,6 +73,12 @@ def load_sentinel_settings(env: Mapping[str, str] | None = None) -> SentinelSett
     elevated = env.get("EXPECT_ELEVATED_ACTIONS", "true").strip()
     if elevated not in ("true", "false"):
         raise ConfigError("EXPECT_ELEVATED_ACTIONS must be true or false")
+    try:
+        clients = json.loads(_required(env, "EXPECT_ALLOWED_CLIENTS"))
+    except ValueError:
+        clients = None
+    if not isinstance(clients, list) or not clients or not all(isinstance(c, str) for c in clients):
+        raise ConfigError("EXPECT_ALLOWED_CLIENTS must be a non-empty JSON list of client IDs")
     return SentinelSettings(
         gateway_id=_required(env, "GATEWAY_ID"),
         kill_switch_param=_required(env, "REMEDIATION_ENABLED_PARAM"),
@@ -76,6 +88,8 @@ def load_sentinel_settings(env: Mapping[str, str] | None = None) -> SentinelSett
         agent_space_id=space,
         association_id=association,
         expect_elevated_actions=elevated == "true",
+        expect_interceptor_arn=env.get("EXPECT_INTERCEPTOR_ARN", "").strip() or None,
+        expect_allowed_clients=frozenset(clients),
     )
 
 
@@ -120,6 +134,12 @@ def check(rt: Runtime) -> tuple[list[Finding], list[str]]:
         actual, others = deployed_tools(rt.gateway, s.gateway_id, set(expected))
         return compare_gateway(expected, actual, others)
 
+    def gateway_config() -> list[Finding]:
+        response = rt.gateway.get_gateway(gatewayIdentifier=s.gateway_id)
+        return compare_gateway_configuration(
+            s.expect_interceptor_arn, s.expect_allowed_clients, response
+        )
+
     def association() -> list[Finding]:
         response = rt.devops.get_association(
             agentSpaceId=s.agent_space_id, associationId=s.association_id
@@ -130,7 +150,9 @@ def check(rt: Runtime) -> tuple[list[Finding], list[str]]:
         space = rt.devops.get_agent_space(agentSpaceId=s.agent_space_id)
         return compare_elevated(s.expect_elevated_actions, elevated_actions(space))
 
-    checks = [gateway] if rt.devops is None else [gateway, association, elevated]
+    checks = [gateway, gateway_config]
+    if rt.devops is not None:
+        checks += [association, elevated]
     findings: list[Finding] = []
     errors: list[str] = []
     for one in checks:
@@ -166,15 +188,16 @@ def disable_remediation(ssm: Any, name: str) -> str:
 def alert_message(findings: list[Finding], kill_switch: str) -> str:
     lines = [
         "The kube-handrail drift sentinel found deployed tools or classifications that do not "
-        "match mcp/classification.json.",
+        "match mcp/classification.json, or a gateway configuration that does not match the "
+        "deployment (caller interceptor, allowed clients).",
         f"Kill switch: {kill_switch}.",
         "",
         "Findings:",
         *(f"- {f['check']} {f['issue']}: {f['subject']}" for f in findings),
         "",
-        "Restore: fix the registration, re-run devops_agent_register.py enable-write (it verifies "
-        "the classification), then set the kill switch parameter back to true by hand. "
-        "See mcp/CONTRACT.md, Drift sentinel.",
+        "Restore: fix the registration and re-run devops_agent_register.py enable-write (it "
+        "verifies the classification), or re-apply Terraform for gateway drift, then set the "
+        "kill switch parameter back to true by hand. See mcp/CONTRACT.md, Drift sentinel.",
     ]
     return "\n".join(lines)
 

@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, and item 2 (rollback by exact revision) is implemented and tested on a test cluster. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, item 2 (rollback by exact revision) is implemented and tested on a test cluster, and item 3 (per-agent identity, budgets and kill switch) is implemented and not yet tested on a cluster. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -139,7 +139,9 @@ See [Rollout history](../mcp/CONTRACT.md#rollout-history) and [Rollback](../mcp/
 
 **Done when:** a rollback to a named revision writes exactly that revision's template, and a target edited, pruned or renumbered after the plan is refused.
 
-### 3. Per-agent identity, budgets and kill switch
+### 3. Per-agent identity, budgets and kill switch (implemented, not yet tested on a cluster)
+
+See [Agent identity](../mcp/CONTRACT.md#agent-identity) and [ADR 0003](adr/0003-agent-identity.md). Unit tests and end-to-end cases (`--with-identity`) are in place; the live run on a test cluster is still to come.
 
 **Goal:** know which agent asked for each change, and limit or stop one agent without stopping the others. Builds on the caller identity interceptor (Milestone 1, item 6), which identifies callers per OAuth client.
 
