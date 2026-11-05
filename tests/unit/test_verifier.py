@@ -175,6 +175,14 @@ def test_a_failed_verification_is_counted_and_the_run_goes_on(store, capsys):
     assert store.due_plans(NOW + 100, 10) == ids
 
 
+def test_a_degraded_plan_whose_revert_is_pending_is_counted_once_it_is_final(store, capsys):
+    plan_id = due_plan(store, 60)
+    rt = runtime(store, {plan_id: envelope("degraded", "pending")})
+    assert handler.run(rt)["Degraded"] == 0
+    rt = runtime(store, {plan_id: envelope("degraded", "skipped")})
+    assert handler.run(rt)["Degraded"] == 1
+
+
 def test_an_empty_queue_still_counts_the_run(store, capsys):
     record = handler.run(runtime(store, {}))
     assert (record["Runs"], record["Due"], record["Processed"]) == (1, 0, 0)

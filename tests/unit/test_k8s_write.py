@@ -2022,14 +2022,17 @@ def test_a_failed_read_is_unknown(verify_rt, status, reason):
     }
 
 
-def test_a_second_run_keeps_the_first_verdict(verify_rt):
+def test_a_finished_verification_is_not_due_again(verify_rt):
+    """The eventually consistent index can return a plan that has just left it; reporting
+    it again would count its outcome and revert twice."""
     runtime_, apps = verify_rt
     plan = applied(runtime_, apps)
     apps.read_namespaced_deployment.return_value = live(plan.plan_id, available=1)
     at(runtime_, NOW + 61)
     verify(plan.plan_id)
     apps.read_namespaced_deployment.return_value = live(plan.plan_id)
-    assert verify(plan.plan_id)["data"]["outcome"] == "degraded"
+    assert verify(plan.plan_id)["data"] == {"plan_id": plan.plan_id, "due": False}
+    assert item(plan.plan_id)["verification"]["outcome"] == "degraded"
     assert apps.read_namespaced_deployment.call_count == 1
 
 
@@ -2231,7 +2234,7 @@ def test_with_the_kill_switch_off_the_revert_is_skipped_for_good(verify_rt):
     apps.patch_namespaced_deployment.assert_not_called()
     # Back on: the approved window has passed, so nothing happens any more.
     runtime_.kill_switch._ssm.put_parameter(Name=PARAM, Value="true", Overwrite=True)
-    assert verify(plan.plan_id)["data"]["revert"] == "skipped"
+    assert verify(plan.plan_id)["data"]["due"] is False
     apps.patch_namespaced_deployment.assert_not_called()
     with pytest.raises(KeyError):
         item(handler.revert_plan_id(plan.plan_id))
@@ -2477,7 +2480,8 @@ def test_a_second_run_after_a_revert_changes_nothing(verify_rt):
     plan = applied_with_revert(runtime_, apps)
     verify(plan.plan_id)
     apps.patch_namespaced_deployment.reset_mock()
-    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    assert verify(plan.plan_id)["data"]["due"] is False
+    assert item(plan.plan_id)["revert"]["status"] == "reverted"
     apps.patch_namespaced_deployment.assert_not_called()
 
 

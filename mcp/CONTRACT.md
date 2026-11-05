@@ -578,7 +578,7 @@ A scheduled Lambda (`mcp/verifier/`, EventBridge `rate(1 minute)`, the shortest 
 
 The verifier writes nothing itself: a failed invoke leaves the plan due for the next run. A check therefore runs up to a minute after `verify_at`, later when the queue is long, which is what `VERIFY_GRACE_SECONDS` absorbs.
 
-Each run prints one JSON line, also a CloudWatch embedded metric record in `<name_prefix>/verifier` (no dimensions): `Runs` (1), `Due` (plans read), `Processed`, `InvokeErrors` (an invoke that failed, a function error or an error envelope), `Degraded` and `Reverts` (verifications that reported `degraded` or reverted), plus `correlation_id` and `results`, one `{plan_id, outcome, reason, revert}` or `{plan_id, error}` per plan, where `error` is an exception class or an error code. Terraform creates these alarms on the alert topic, with `sentinel_enabled` and `verify_enabled`:
+Each run prints one JSON line, also a CloudWatch embedded metric record in `<name_prefix>/verifier` (no dimensions): `Runs` (1), `Due` (plans read), `Processed`, `InvokeErrors` (an invoke that failed, a function error or an error envelope), `Degraded` and `Reverts` (verifications that reported `degraded` with a final revert state, or reverted, so each plan counts once), plus `correlation_id` and `results`, one `{plan_id, outcome, reason, revert}` or `{plan_id, error}` per plan, where `error` is an exception class or an error code. Terraform creates these alarms on the alert topic, with `sentinel_enabled` and `verify_enabled`:
 
 - `<name_prefix>-verifier-stalled`: sum of `Runs` below 1 for 3 consecutive 5-minute periods, missing data breaching.
 - `<name_prefix>-verifier-errors`: `AWS/Lambda` `Errors` of the verifier, sum over 5 minutes at least 1.
@@ -589,7 +589,7 @@ Each run prints one JSON line, also a CloudWatch embedded metric record in `<nam
 
 The internal handler in the write Lambda ([Dispatch](#dispatch)). The verification changes nothing in the cluster, so it reads no kill switch, runs no agent check and takes no budget unit; only a revert reads the kill switch. Every write it makes is conditional, so a run that repeats or overlaps an earlier one changes nothing.
 
-1. Read the record consistently. If it does not exist, has no `verify_at`, or `verify_at` is later than now, return `ok` with `{"plan_id", "due": false}` and change nothing.
+1. Read the record consistently. If it does not exist, has no `verify_at`, `verify_at` is later than now, or it has no `verify_queue` (its verification is final; the index is eventually consistent and can still return it), return `ok` with `{"plan_id", "due": false}` and change nothing.
 2. If it already has a `verification`, keep it and go to step 5.
 3. Decide the outcome:
    - not consumed (`used = false`): `not_applied`;

@@ -23,7 +23,7 @@ from handrail_common.config import ConfigError, int_env, required_env
 from handrail_common.dispatch import INTERNAL_TARGET, TARGET_DELIMITER, TOOL_NAME_KEY
 from handrail_common.observability import APPROVER_CORRELATION_KEY, CHANNEL_KEY, CHANNEL_VERIFIER
 from handrail_common.plans import PlanStore
-from handrail_common.verify import DEGRADED, REVERTED
+from handrail_common.verify import DEGRADED, REVERT_PENDING, REVERTED
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -112,7 +112,10 @@ def run(rt: Runtime, correlation_id: str | None = None) -> dict[str, Any]:
         "Due": len(due),
         "Processed": sum(1 for r in results if "error" not in r),
         "InvokeErrors": sum(1 for r in results if "error" in r),
-        "Degraded": sum(1 for r in results if r.get("outcome") == DEGRADED),
+        # Once per plan: a degraded plan is reported again while its revert is pending.
+        "Degraded": sum(
+            1 for r in results if r.get("outcome") == DEGRADED and r.get("revert") != REVERT_PENDING
+        ),
         "Reverts": sum(1 for r in results if r.get("revert") == REVERTED),
         "correlation_id": correlation_id,
         "results": results,

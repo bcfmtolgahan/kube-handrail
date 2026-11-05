@@ -57,6 +57,7 @@ from handrail_common.plans import (
     ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     STATUS_REVERT,
+    VERIFY_DUE,
     Plan,
     PlanStore,
     plan_args_hash,
@@ -836,7 +837,9 @@ def verify_applied_plan(args: Mapping[str, Any]) -> Envelope:
     now = int(rt.clock())
     item = rt.store.get(plan_id)
     plan = Plan.from_item(item) if item is not None else None
-    if plan is None or plan.verify_at is None or plan.verify_at > now:
+    # Out of the queue means final: the eventually consistent index can still return it.
+    queued = item is not None and item.get("verify_queue") == VERIFY_DUE
+    if plan is None or plan.verify_at is None or plan.verify_at > now or not queued:
         return ok({"plan_id": plan_id, "due": False})
     verification, deployment = plan.verification, None
     if verification is None:

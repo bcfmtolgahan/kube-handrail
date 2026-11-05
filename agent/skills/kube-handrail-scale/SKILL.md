@@ -53,7 +53,7 @@ Call `apply_scale_deployment` with the same `plan_id`, `namespace`, `name`, `rep
 
 ## Step 6: Verify
 
-The server checks the change once its window has passed (counted from the apply). After the window, call `get_plan_outcome(plan_id)`, again every minute or so while `verification.status` is `pending`, and report:
+The server checks the change once its window has passed (counted from the apply). After the window, call `get_plan_outcome(plan_id)`, again every minute or so while `verification.status` or `revert.status` is `pending` (a revert of a degraded change can still follow its verdict), and report:
 
 - `healthy`: the Deployment reached the new count.
 - `degraded`, with `verification.reason` (`target_not_reached`, `replica_failure` or `progress_deadline_exceeded`) and the counts in `verification.observed`. Read `revert`: `reverted` means the server set replicas back to `revert_to` (its own plan, `revert.revert_plan_id`, is verified too); `skipped` (remediation was turned off, or the check came too late) or `refused` (with `revert.reason`) means it did not; `not_requested` means no revert was approved. Read `get_workload_events` for the cause.
