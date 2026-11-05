@@ -2,7 +2,7 @@
 
 What a deployment needs from the account, the cluster and the network, and the order of the steps. The commands for each step, and what the tests check, are in [Milestone 0](milestone-0.md). The runtime calls and IAM permissions are in the [contract](../mcp/CONTRACT.md#network).
 
-Status: implemented. The VPC placement (`lambda_subnet_ids` with a NAT gateway and `allow_lambda_to_cluster_endpoint`) is tested against the private endpoint of a test cluster that also has public access, including moving the Lambdas into and out of the VPC. `create_vpc_endpoints`, a private-only cluster and a fresh account have not been run.
+Status: implemented and tested. A fresh deployment with its own prefix and state ran against a test cluster with only a private endpoint, with the Lambdas in subnets without a route out of the VPC and `create_vpc_endpoints` in a VPC shared with other workloads; `lambda_subnet_ids` with a NAT gateway and moving the Lambdas into and out of a VPC were tested on another deployment. A brand-new AWS account has not been used: the fresh deployment shared its account with another one.
 
 ## Prerequisites
 
