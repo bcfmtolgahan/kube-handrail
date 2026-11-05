@@ -6,10 +6,10 @@ Single source of truth for handlers, infrastructure code and tests. Change this 
 
 | Gateway target | Lambda | Classification | Tools (schema file) |
 |---|---|---|---|
-| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `get_workload_events`, `plan_scale_deployment`, `request_approval` (`mcp/k8s_read/tools.json`) |
-| `k8sw` | `k8s_write` | `MUTATIVE` | `apply_scale_deployment` (`mcp/k8s_write/tools.json`) |
+| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `get_workload_events`, `plan_scale_deployment`, `plan_restart_deployment`, `request_approval` (`mcp/k8s_read/tools.json`) |
+| `k8sw` | `k8s_write` | `MUTATIVE` | `apply_scale_deployment`, `apply_restart_deployment` (`mcp/k8s_write/tools.json`) |
 
-`plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`); apply also takes `plan_id`. See [History checks](#history-checks-oscillation-breaker). `request_approval` takes only `plan_id`; see [Server-side approval](#server-side-approval). `get_workload_status` takes `namespace` and `name`; `get_workload_events` also takes an optional `limit`; see [Workload events](#workload-events).
+Each action has one `plan_<action>` tool and one `apply_<action>` tool; apply takes the plan's arguments plus `plan_id`. `plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`). See [History checks](#history-checks-oscillation-breaker). `plan_restart_deployment` and `apply_restart_deployment` take `namespace` and `name`; see [Restart](#restart). `request_approval` takes only `plan_id`; see [Server-side approval](#server-side-approval). `get_workload_status` takes `namespace` and `name`; `get_workload_events` also takes an optional `limit`; see [Workload events](#workload-events).
 
 Clients see `<target>___<tool>`, for example `k8sw___apply_scale_deployment`. Full names must be at most 64 characters and match `^[a-z0-9_]+$`.
 
@@ -18,6 +18,7 @@ The classification of every tool is in `mcp/classification.json`, a map from ful
 - every tool in `mcp/*/tools.json` has a classification, and every classified tool exists;
 - every tool of the write target `k8sw` (`mcp/k8s_write/tools.json`), and every `apply_*` tool on any target, is `MUTATIVE`. The sentinel and the registration script refuse a classification that breaks this rule as well, so a tampered `TOOL_CLASSIFICATION` cannot make a downgraded write tool look expected;
 - every full name is at most 64 characters and matches `^[a-z0-9_]+$`;
+- every `plan_<action>` tool has an `apply_<action>` tool and every `apply_<action>` tool a `plan_<action>` tool;
 - `terraform/main.tf` loads each `mcp/<function>/tools.json` under the target name used in the classification.
 
 ## Dispatch
@@ -48,7 +49,7 @@ The ID is carried to:
 - the tool record below, for every tool invocation;
 - the plan record: `plan_correlation_id` (plan), `approval_request_correlation_id` (the `request_approval` call that notified), `decision_correlation_id` (the approver's request that approved or rejected) and `apply_correlation_id` (the apply that recorded its `result`, whether it succeeded or not). See [Plan record](#plan-record-dynamodb);
 - the Deployment: the apply's patch sets the annotation `kube-handrail.io/correlation-id` to the apply's ID, next to `kube-handrail.io/last-plan-id`. Both are set by the same patch, which bumps `generation` once, as before;
-- `data.correlation_id` in successful `plan_scale_deployment`, `request_approval` and `apply_scale_deployment` responses (`null` only outside a Lambda).
+- `data.correlation_id` in successful `plan_*`, `request_approval` and `apply_*` responses (`null` only outside a Lambda).
 
 In `server` mode the approver passes its own request ID to the write Lambda as `kubeHandrailCorrelationId`, so the decision, the apply it runs, `apply_correlation_id` and the annotation share one ID, also when the apply fails.
 
@@ -109,7 +110,7 @@ Every handler returns a JSON object (not wrapped in `statusCode`/`body`):
 }
 ```
 
-`replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. A `conflict` from a 409 that persists after all patch attempts has no `details`. The history checks below also return `details`; every value in them is an integer or a string.
+`replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. For `conflict` because the Deployment's rollout is paused (restart, on plan and apply), `details` is `{ "paused": true }`. A `conflict` from a 409 that persists after all patch attempts has no `details`. The history checks below also return `details`; every value in them is an integer or a string.
 
 Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `forbidden`, `kubernetes_error`, `internal`.
 
@@ -189,12 +190,13 @@ Both lists are read as raw JSON (`_preload_content=False`), like the impact prev
 | Attribute | Type | Notes |
 |---|---|---|
 | `plan_id` | S | partition key, random UUID |
-| `action` | S | `scale_deployment` |
+| `action` | S | `scale_deployment` or `restart_deployment` |
 | `namespace`, `name` | S | target |
-| `replicas_from`, `replicas_to` | N | |
-| `args_hash` | S | SHA-256 of `json.dumps({"action": action, **args}, sort_keys=True, separators=(",", ":"))`. For a scale that is `{action, namespace, name, replicas}`; the object gains `"override_manual_change": true` only when the override is true, so a hash without the override is the same as before the flag existed |
-| `args` | M | the argument payload `args_hash` covers, without `action`: the apply arguments without `plan_id`, optional arguments only when given (scale: `namespace`, `name`, `replicas`, and `override_manual_change: true` only when the override is true). The approval channel forwards it unchanged as the apply arguments, and apply compares the request's arguments with it. Records made before it have none; they can be neither approved nor applied and must be planned again |
-| `template_from`, `template_to` | S | `sha256:` and the hex SHA-256 of `json.dumps(template, sort_keys=True, separators=(",", ":"))`, where `template` is the Deployment's `spec.template` as the API server returned it at plan time (raw JSON, not client models, which drop fields the client does not know), and the template the change leaves. A scale does not change the template, so both are the current hash. Recorded for every action; nothing checks them yet. Records made before them have neither |
+| `replicas_from`, `replicas_to` | N | for a restart both are the current `spec.replicas` (unset counts as 1) |
+| `args_hash` | S | SHA-256 of `json.dumps({"action": action, **args}, sort_keys=True, separators=(",", ":"))`. For a scale that is `{action, namespace, name, replicas}`, for a restart `{action, namespace, name}`; the scale object gains `"override_manual_change": true` only when the override is true, so a hash without the override is the same as before the flag existed |
+| `args` | M | the argument payload `args_hash` covers, without `action`: the apply arguments without `plan_id`, optional arguments only when given (scale: `namespace`, `name`, `replicas`, and `override_manual_change: true` only when the override is true; restart: `namespace`, `name`). The approval channel forwards it unchanged as the apply arguments, and apply compares the request's arguments with it. Records made before it have none; they can be neither approved nor applied and must be planned again |
+| `template_from`, `template_to` | S | `sha256:` and the hex SHA-256 of `json.dumps(template, sort_keys=True, separators=(",", ":"))`, where `template` is the Deployment's `spec.template` as the API server returned it at plan time (raw JSON, not client models, which drop fields the client does not know), and the template the change leaves. A scale does not change the template, so both are the current hash. A restart's `template_to` is the hash of the current template with the pod-template annotation `kube-handrail.io/restart-plan-id` set to the plan's own `plan_id` ([Restart](#restart)), so the template it leaves is pinned when the plan is made. Recorded for every action; nothing reads them back yet. Records made before them have neither |
+| `revision_from` | N | the Deployment's `deployment.kubernetes.io/revision` annotation at plan time, only for an action that changes the template (restart) and only when the annotation is an integer. Information only |
 | `resource_version` | S | Deployment `metadata.resourceVersion` at plan time (informational) |
 | `generation` | N | Deployment `metadata.generation` at plan time; a record without it is treated as `-1` and never matches |
 | `uid` | S | Deployment `metadata.uid` at plan time; a record without it is treated as `""` and never matches |
@@ -218,6 +220,8 @@ Global secondary index `object-history`: partition key `object_key` (S), sort ke
 The table also holds one global budget counter per clock hour: `plan_id = "budget#global#<hour start, epoch seconds>"` (never a UUID, so it cannot be named as a plan), `applies` (N), and `retain_until` two hours after the hour starts; and one approval request counter per 600-second clock window: `plan_id = "approval#global#<window start>"`, `requests` (N), `retain_until` two windows after the window starts. They have no `object_key`, so they are not in the index.
 
 ## Guard checks
+
+The steps below are those of a scale. A restart runs the same generic path with the differences listed under [Restart](#restart).
 
 Plan (`k8s_read`):
 1. Arguments valid: namespace and name match DNS-1123; `replicas` integer.
@@ -251,6 +255,38 @@ Apply (`k8s_write`), all re-checked independently of the plan step:
 
 The kill switch is read on every apply (no caching), so turning it off takes effect immediately.
 
+## Restart
+
+`plan_restart_deployment(namespace, name)` and `apply_restart_deployment(plan_id, namespace, name)` replace every pod of a Deployment and leave its replica count as it is. The restart sets the pod-template annotation `kube-handrail.io/restart-plan-id` to the plan's `plan_id`: the template the restart leaves is therefore known when the plan is made, pinned in `template_to` and approved with the plan, and every pod the restart creates names the plan. kubectl's `kubectl.kubernetes.io/restartedAt` is not used, so tools that look for it do not see a kube-handrail restart.
+
+Plan, differences from the scale steps above:
+
+- Checks 1-2 only (`namespace`, `name`, the namespace allowlist); there are no replica bounds.
+- Check 4 as for a scale. Then a Deployment with `spec.paused: true` is refused with `conflict`, `details: {"paused": true}`: its rollout would not start, so the plan would replace no pod.
+- No HorizontalPodAutoscaler check (an autoscaler owns `spec.replicas`, which a restart does not touch) and no blast-radius budget (see [Guards](../docs/guards.md#blast-radius-budget)).
+- History checks: cooldown, flapping (never triggered: the change has no direction), object budget, plan rate limit. No manual-change check: a restart undoes no change.
+- The impact preview is the rollout preview ([Impact preview](#impact-preview)).
+- The record has `replicas_from = replicas_to = ` the current count, `template_to` as above, and `revision_from`.
+
+`data.diff` is `{"restart": {"pods_replaced": <current replicas>}, "template": {"from": "sha256:...", "to": "sha256:..."}}` and `preflight` lists `arguments`, `namespace_allowed`, `not_gitops_managed`, `not_paused`, `cooldown`, `object_budget`, `plan_rate`, `global_budget`.
+
+Apply, differences from the scale steps above:
+
+- Step 2: checks 1-2 only. Step 3: no blast-radius budget. After the consume the record must keep the replica count (`replicas_from = replicas_to`), carry `template_to` and have no override (`plan_mismatch` otherwise).
+- Step 4: the same object, GitOps, `generation` and `spec.replicas` checks on every attempt, plus `spec.paused` (`conflict`, `details: {"paused": true}`). An unchanged `generation` means the pod template is still the one the plan hashed.
+- Step 7: cooldown, flapping and object budget, then the global budget; no manual-change check.
+- The patch is a merge patch (the Python client sends a dict body as `application/strategic-merge-patch+json`) with only `metadata.resourceVersion`, the two annotations of step 6 and the restart annotation:
+
+  ```json
+  { "metadata": { "resourceVersion": "<from the read>",
+                  "annotations": { "kube-handrail.io/last-plan-id": "<plan_id>", "kube-handrail.io/correlation-id": "<id>" } },
+    "spec": { "template": { "metadata": { "annotations": { "kube-handrail.io/restart-plan-id": "<plan_id>" } } } } }
+  ```
+
+  The only change to the pod template is the annotation, so the template written is the one hashed as `template_to`.
+
+A successful apply's `data` is `plan_id`, `namespace`, `name`, `pods_replaced` (the planned replica count), `template` (`template_to`), `resource_version`, `approved` and `correlation_id`. The rollout itself is the Deployment controller's: follow it with `get_workload_status`.
+
 ## Impact preview
 
 `data.impact` in the plan response, computed from objects read when the plan is made. Nothing in it blocks the plan; it is there for the approver. Values that depend on what happens after the change are named `projected_*`.
@@ -277,6 +313,32 @@ The kill switch is read on every apply (no caching), so turning it off takes eff
   - `scale_to_zero`: `to` is 0.
   - `pdb_headroom`: `removed` is greater than `disruptions_allowed` of a matching PodDisruptionBudget (unset counts as 0). A scale-down is not an eviction, so the PodDisruptionBudget will not stop it.
   - `service_without_endpoints`: a matching Service's `projected_ready_endpoints` is 0.
+
+A restart's preview describes the rollout instead of a change in the replica count:
+
+```json
+{
+  "pods": { "ready_now": 2, "from": 2, "to": 2, "added": 0, "removed": 0, "replaced": 2 },
+  "rollout": { "strategy": "RollingUpdate", "max_unavailable": 0, "max_surge": 1 },
+  "pod_disruption_budgets": [ ... ],
+  "services": [ { "name": "web", "ready_endpoints_now": 2, "projected_min_ready_endpoints": 2 } ],
+  "warnings": [],
+  "truncated": false
+}
+```
+
+- `pods`: `from` and `to` are the current replica count, `added` and `removed` are 0, and `replaced` is the replica count: every pod is replaced.
+- `rollout`: `strategy` is `Recreate` or `RollingUpdate` (also when the strategy is unset). For `RollingUpdate`, `max_unavailable` and `max_surge` are pod counts resolved as the Deployment controller resolves them: an integer is used as given, a percentage of the replica count rounds down for `maxUnavailable` and up for `maxSurge`, an unset value is 25 %, and if both resolve to 0, `max_unavailable` is 1. For `Recreate` both are `null`. A value that cannot be resolved fails the plan with `kubernetes_error`.
+- `pod_disruption_budgets`: as above.
+- `services`: as above, except that `projected_min_ready_endpoints = max(0, ready_endpoints_now - ready_now) + replicas - down` is the lowest point during the rollout, where `down` is `min(max_unavailable, replicas)`, or the replica count for `Recreate`. It assumes the new pods become ready; if they do not, the rollout stops at that point.
+- `warnings`, in this order:
+  - `recreate_strategy`: the strategy is `Recreate`; every pod is stopped before new ones start.
+  - `pdb_headroom`: `down` is greater than `disruptions_allowed` of a matching PodDisruptionBudget (unset counts as 0). A rollout is not an eviction, so the PodDisruptionBudget will not stop it.
+  - `service_without_endpoints`: a matching Service's `projected_min_ready_endpoints` is 0.
+  - `rollout_in_progress`: `status.observedGeneration` is below `metadata.generation`, or `status.updatedReplicas` (unset counts as 0) is below the replica count. Information only.
+  - `no_pods`: the replica count is 0; the template changes but no pod restarts.
+
+`strategy`, `generation` and the status fields are read from the same raw Deployment as `template_from`.
 
 `truncated` is true when any of the three lists had more than 20 entries; each list then holds the first 20 (sorted), warnings having been computed over all of them, and the envelope's `truncated` is true as well. An object the preview cannot interpret, such as a selector with an unknown operator, fails the plan with `kubernetes_error`.
 
@@ -409,7 +471,7 @@ Approval, argument match, separation of duties, expiry and single use are one at
 6. not approved (server and both): `approval_required`, `details: {"status": "planned" | "awaiting_approval"}`;
 7. approved by the requester, or an approval of other arguments (only possible by writing the table directly): `approval_required`, `details: {"status": "approval_invalid"}`.
 
-After the consume, the record's `args` must equal the request's arguments without `plan_id` (an absent or `false` override counts as not given), and its `namespace`, `name`, `replicas_to` and `override_manual_change` must match them (`plan_mismatch` otherwise; a record without `args` is `plan_expired`, as at the approver), so a record altered in the table cannot redirect an apply even with a matching `args_hash`. A successful apply's `data` is `plan_id`, `namespace`, `name`, `replicas_from`, `replicas_to`, `resource_version`, `approved: true | false` and `correlation_id`; the approver's identity stays in the plan record and the logs. Everything after the consume (blast radius, live object checks, history checks, global budget, dry run) is unchanged: an approval never lifts a guard.
+After the consume, the record's `args` must equal the request's arguments without `plan_id` (an absent or `false` override counts as not given), and its `namespace`, `name`, `replicas_to` and `override_manual_change` must match them (for a restart: `namespace` and `name`, plus the record checks in [Restart](#restart)) (`plan_mismatch` otherwise; a record without `args` is `plan_expired`, as at the approver), so a record altered in the table cannot redirect an apply even with a matching `args_hash`. A successful scale apply's `data` is `plan_id`, `namespace`, `name`, `replicas_from`, `replicas_to`, `resource_version`, `approved: true | false` and `correlation_id` (a restart's is in [Restart](#restart)); the approver's identity stays in the plan record and the logs. Everything after the consume (blast radius, live object checks, history checks, global budget, dry run) is unchanged: an approval never lifts a guard.
 
 ### `request_approval(plan_id)`
 
@@ -420,7 +482,7 @@ After the consume, the record's `args` must equal the request's arguments withou
 3. If it already notified less than `APPROVAL_REQUEST_COOLDOWN_SECONDS` ago, nothing changes and nobody is notified: `ok` with `notified: false` and `retry_after`.
 4. One conditional update adds 1 to the current window's approval request counter only while it is below `APPROVAL_REQUEST_LIMIT` (`approval_rate_limited`, `details: {"limit", "window_seconds": 600, "window_start", "retry_after"}`). Clock windows, so up to twice the limit can pass across a window boundary.
 5. One conditional update sets `status = awaiting_approval`, `approval_requested_at = now`, `approval_request_correlation_id` and `expires_at = created_at + APPROVAL_WAIT_TTL_SECONDS` (from creation, so asking again never extends a plan). If the record changed between the read and this update and the cooldown does not explain it, the call fails with `conflict` ("plan changed concurrently; try again"); calling it again is safe.
-6. The notification is published to the server's SNS topic, rendered from the record: Deployment, replica change, override flag, requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
+6. The notification is published to the server's SNS topic, rendered from the record: Deployment, the change (the replica change for a scale; for a restart, that every pod is replaced with the replica count unchanged and the annotation the pods get), override flag, requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
 
 Response `data`: `plan_id`, `status` (`awaiting_approval`), `expires_at`, `notified`, `approval_mode`, `correlation_id`, and `retry_after` when `notified` is false.
 
@@ -436,18 +498,18 @@ Authorization, before anything else:
 
 Requests (responses are the JSON envelope in the body):
 
-- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `override_manual_change`, `impact`, `requested_by`, `created_at`, `expires_at`, and when present `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
+- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `change` (what the plan changes, in the shape of the plan response's `diff`: `{"replicas": {from, to}}` for a scale, `{"restart": {"pods_replaced"}, "template": {from, to}}` for a restart), `override_manual_change`, `impact`, `requested_by`, `created_at`, `expires_at`, and when present `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
 - `POST /` with a JSON object of at most 4096 bytes and only these fields: `plan_id` (UUID), `decision` (`approve` or `reject`), optional `reason` (string, at most 500 characters, control characters removed), optional `apply` (boolean, default `true`). Any other field is `invalid_argument`.
   - `approve`: first the record is read; if its `action` has no apply tool the request fails with `internal`, and if it has no `args` with `plan_expired` ("plan again"), before any decision is recorded, so an approval never names a plan that nothing can apply. Then one conditional update, `status IN (planned, awaiting_approval) AND used = false AND expires_at > now AND requested_by <> caller`, sets `status = approved`, `approved_by`, `approved_at`, `approved_args_hash = args_hash` (copied from the record in the same update), `approval_channel = api`, `approval_expires_at = expires_at = now + APPLY_AFTER_APPROVAL_TTL_SECONDS` and `decision_correlation_id` (the approver's request ID).
   - `reject`: the same condition; sets `status = rejected`, `rejected_by`, `rejected_at`, `reject_reason`, `decision_correlation_id`, `expires_at = now`.
   - Refusals: `plan_not_found`, `plan_used`, `plan_decided`, `plan_expired`, `forbidden` (the requester), `conflict` (changed concurrently).
-  - In `server` mode only, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id` and the record's `args`, unchanged) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "<apply tool>", "kubeHandrailCorrelationId": "<approver request ID>"}}`, where the apply tool is the one for the plan's `action` (`scale_deployment`: `k8sw___apply_scale_deployment`), as the gateway calls it except that the correlation ID is the approver's ([Observability](#observability)). The write guard is unchanged and authoritative.
+  - In `server` mode only, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id` and the record's `args`, unchanged) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "<apply tool>", "kubeHandrailCorrelationId": "<approver request ID>"}}`, where the apply tool is the one for the plan's `action` (`scale_deployment`: `k8sw___apply_scale_deployment`, `restart_deployment`: `k8sw___apply_restart_deployment`), as the gateway calls it except that the correlation ID is the approver's ([Observability](#observability)). The write guard is unchanged and authoritative.
   - Response `data`: `plan` (the view above, read again after the apply), `apply` (the write Lambda's envelope, or `null` when no apply ran, as always in `client` and `both` mode) and `approval_mode`. If the write Lambda cannot be invoked at all, `apply` is `internal` with the message `approval recorded; apply could not be started: <error code>`. A failed apply does not undo the approval: an approval whose apply was refused before the consume (for example `remediation_disabled`) can still be applied through the gateway until it expires.
 - Any other method: `invalid_argument`.
 
 HTTP status: 200 for `ok` (also when the triggered apply failed; see `data.apply`), 400 `invalid_argument`, 403 `forbidden`, 404 `plan_not_found`, 409 `plan_used`, `plan_expired`, `plan_decided`, `conflict`, 500 otherwise. Each decision is logged as one JSON line with the caller ARN, `plan_id` and correlation ID ([Observability](#observability)); each `forbidden` refusal is logged with the caller ARN.
 
-`scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and asks for confirmation unless `--yes`. When an approval ran no apply, it says that the client must now apply the plan.
+`scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and a one-line summary of the change (action, Deployment, and the replica change or the pods a restart replaces) and asks for confirmation unless `--yes`. When an approval ran no apply, it says that the client must now apply the plan.
 
 ### MFA and who can reach the URL
 
@@ -469,7 +531,7 @@ Known limits:
 Instructions for agents, derived from this contract; where they disagree, this contract is right.
 
 - `AGENTS.md` (repository root): the tools, the plan, approval and apply flow, what to do on each error code, and the handling of untrusted text in tool output. Its first line is `<!-- kube-handrail:agents-md -->`. `scripts/check_contract.py` fails unless it names every code in the `Error codes` list above.
-- `agent/skills/<name>/SKILL.md`: one directory per skill, holding only `SKILL.md`, with frontmatter of exactly a one-line `name` (the directory name, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, at most 64 characters) and a one-line `description` (at most 1024 characters), then the line `<!-- kube-handrail:skill -->` right after the frontmatter. Files and directories whose names start with `.` are ignored. Today: `kube-handrail-scale`.
+- `agent/skills/<name>/SKILL.md`: one directory per skill, holding only `SKILL.md`, with frontmatter of exactly a one-line `name` (the directory name, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, at most 64 characters) and a one-line `description` (at most 1024 characters), then the line `<!-- kube-handrail:skill -->` right after the frontmatter. Files and directories whose names start with `.` are ignored. Today: `kube-handrail-scale` and `kube-handrail-rollout` (restart).
 
 `scripts/devops_agent_register.py install-guidance` installs them as DevOps Agent assets in an agent space, after validating every file locally:
 
@@ -492,7 +554,7 @@ Existing assets are found with `ListAssets` and checked before the first write; 
 - Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations. The group names are fixed, not derived from `name_prefix`: deployments that share a cluster share the groups and their RoleBindings. The cluster's authentication mode must be `API` or `API_AND_CONFIG_MAP`; Terraform checks it before creating the entries.
 - RBAC in the sandbox namespace only:
   - reader: `get`, `list` on `deployments` and `horizontalpodautoscalers`; `list` only on `poddisruptionbudgets` (`policy`), `services` and `endpointslices` (`discovery.k8s.io`), and, for `get_workload_events`, `replicasets` (`apps`) and `events` (core). No access to pods: the impact preview takes ready counts from the Deployment status and readiness from EndpointSlices, and events name pods without the reader reading them, so the reader never sees pod specs or environment variables;
-  - writer: `get`, `patch` on `deployments`.
+  - writer: `get`, `patch` on `deployments`, which covers both the scale and the restart patch.
 
 ## Network
 
