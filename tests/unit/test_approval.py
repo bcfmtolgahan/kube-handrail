@@ -116,6 +116,106 @@ def test_new_plan_is_planned_by_the_gateway_with_its_impact(store):
     assert Plan.from_item(record).to_item() == record
 
 
+# --- Requester binding (identity mode) -----------------------------------------
+
+AGENT_A, AGENT_B = "agent:smoke_test", "agent:devops_agent"
+
+
+def agent_plan(store: PlanStore, requested_by: str = AGENT_A) -> Plan:
+    plan = make_plan(store)
+    record = {**item(store, plan.plan_id), "requested_by": requested_by, "agent": "smoke_test"}
+    store._table.put_item(Item=record)
+    return Plan.from_item(record)
+
+
+def test_consume_by_the_requester_records_the_channel(store):
+    plan = agent_plan(store)
+    consumed = store.consume(
+        plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, requester=AGENT_A, channel="gateway"
+    )
+    assert consumed.used and consumed.channel == "gateway" and consumed.agent == "smoke_test"
+    assert item(store, plan.plan_id)["channel"] == "gateway"
+
+
+def test_consume_by_another_agent_is_forbidden_and_leaves_the_plan_usable(store):
+    plan = agent_plan(store)
+    assert code_of(
+        store.consume, plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, requester=AGENT_B
+    ) == ("forbidden", {"reason": "not_requester"})
+    assert item(store, plan.plan_id)["used"] is False
+    assert "channel" not in item(store, plan.plan_id)
+
+
+def test_a_plan_of_the_gateway_class_is_forbidden_to_an_agent(store):
+    """A plan made in legacy mode, open across the upgrade, must be planned again."""
+    plan = make_plan(store)
+    assert code_of(
+        store.consume, plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, requester=AGENT_A
+    ) == ("forbidden", {"reason": "not_requester"})
+
+
+def test_requester_is_checked_after_the_arguments_and_before_the_approval(store):
+    plan = agent_plan(store)
+    assert (
+        code_of(store.consume, plan.plan_id, "other", SCALE_DEPLOYMENT, NOW, requester=AGENT_B)[0]
+        == "plan_mismatch"
+    )
+    assert code_of(
+        store.consume,
+        plan.plan_id,
+        plan.args_hash,
+        SCALE_DEPLOYMENT,
+        NOW,
+        require_approval=True,
+        requester=AGENT_B,
+    ) == ("forbidden", {"reason": "not_requester"})
+    assert code_of(
+        store.consume,
+        plan.plan_id,
+        plan.args_hash,
+        SCALE_DEPLOYMENT,
+        NOW,
+        require_approval=True,
+        requester=AGENT_A,
+    ) == ("approval_required", {"status": "planned"})
+
+
+def test_the_approval_channel_consumes_an_agents_approved_plan(store):
+    plan = agent_plan(store)
+    store.approve(plan.plan_id, HUMAN, NOW, APPLY_TTL)
+    consumed = store.consume(
+        plan.plan_id,
+        plan.args_hash,
+        SCALE_DEPLOYMENT,
+        NOW,
+        require_approval=True,
+        channel="approval-api",
+    )
+    assert consumed.channel == "approval-api" and consumed.requested_by == AGENT_A
+
+
+def test_request_approval_only_by_the_requester(store):
+    plan = agent_plan(store)
+    assert code_of(
+        store.request_approval, plan.plan_id, NOW, WAIT, COOLDOWN, LIMIT, requester=AGENT_B
+    ) == ("forbidden", {"reason": "not_requester"})
+    record = item(store, plan.plan_id)
+    assert record["status"] == STATUS_PLANNED and "approval_requested_at" not in record
+    assert store.get(approval_request_key(NOW)) is None
+    updated, retry = store.request_approval(
+        plan.plan_id, NOW, WAIT, COOLDOWN, LIMIT, requester=AGENT_A
+    )
+    assert updated["status"] == STATUS_AWAITING and retry is None
+
+
+def test_request_approval_by_another_agent_learns_nothing_of_a_used_plan(store):
+    plan = agent_plan(store)
+    store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW)
+    assert code_of(
+        store.request_approval, plan.plan_id, NOW, WAIT, COOLDOWN, LIMIT, requester=AGENT_B
+    ) == ("forbidden", {"reason": "not_requester"})
+
+
 # --- Consume in server mode ----------------------------------------------------
 
 

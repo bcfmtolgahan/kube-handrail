@@ -80,6 +80,7 @@ def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
         "override_manual_change": record.get("override_manual_change") is True,
         "impact": record.get("impact"),
         "requested_by": record.get("requested_by"),
+        "agent": record.get("agent"),
         "created_at": record.get("created_at"),
         "expires_at": record.get("expires_at"),
     }

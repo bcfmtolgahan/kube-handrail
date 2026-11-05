@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, and item 2 (rollback by exact revision) is implemented and tested on a test cluster. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, item 2 (rollback by exact revision) is implemented and tested on a test cluster, and item 3 (per-agent identity, budgets and kill switch) is implemented and tested on a test cluster. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -72,7 +72,7 @@ See [Server-side approval](../mcp/CONTRACT.md#server-side-approval). Implemented
 
 ### 6. Caller identity spike (done)
 
-Verified on a test deployment with the experimental interceptor in `mcp/interceptor/` (off by default; see [Caller identity](../mcp/CONTRACT.md#caller-identity-experimental)):
+Verified on a test deployment with the then experimental interceptor in `mcp/interceptor/` (off by default at the time; it is now the basis of [Agent identity](../mcp/CONTRACT.md#agent-identity)):
 
 - A request interceptor with `passRequestHeaders` receives the validated bearer token and can rewrite `tools/call` arguments. The tool Lambda received the token's `client_id`.
 - A client that sent the reserved argument itself (`attacker`) still arrived as its real `client_id`, because the interceptor overwrites the argument unconditionally.
@@ -139,7 +139,15 @@ See [Rollout history](../mcp/CONTRACT.md#rollout-history) and [Rollback](../mcp/
 
 **Done when:** a rollback to a named revision writes exactly that revision's template, and a target edited, pruned or renumbered after the plan is refused.
 
-### 3. Per-agent identity, budgets and kill switch
+### 3. Per-agent identity, budgets and kill switch (implemented)
+
+See [Agent identity](../mcp/CONTRACT.md#agent-identity) and [ADR 0003](adr/0003-agent-identity.md). On a test cluster:
+
+- The deployment upgraded in place: no Cognito client and no gateway was replaced, and DevOps Agent kept working without registering again. The first apply needs the caller key created on its own ([Upgrading](deploy.md#upgrading)).
+- The end-to-end suite with the identity cases (`--with-identity`, a second client) passed 76 of 76 in `client` mode and 64 of 64 in `server` mode: plans name `agent:smoke_test`, a client's own `_kube_handrail_caller` is ignored, a second agent applying or requesting approval for the first agent's plan gets `forbidden`, a second agent with its switch off gets `remediation_disabled` and over its budget gets `agent_budget_exceeded` while the first keeps working, and in `server` mode an approval for a switched-off agent consumes the plan and is refused.
+- A DevOps Agent chat restart recorded `agent:devops_agent` on the plan and in the Deployment's `kube-handrail.io/requested-by` annotation.
+- An interceptor that fails (a broken handler) made the gateway return HTTP 500 for every request, `initialize` included: the request fails closed.
+- With the interceptor detached from the gateway, reads still worked, a plan carrying a self-set caller (unsigned, or with a made-up signature) was refused with `forbidden` (`agent_unknown`), and the sentinel reported `missing_interceptor` and turned the kill switch off. `terraform apply` restored the gateway.
 
 **Goal:** know which agent asked for each change, and limit or stop one agent without stopping the others. Builds on the caller identity interceptor (Milestone 1, item 6), which identifies callers per OAuth client.
 

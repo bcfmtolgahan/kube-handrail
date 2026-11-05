@@ -12,6 +12,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from handrail_common.envelope import (
+    AGENT_BUDGET_EXCEEDED,
     APPROVAL_RATE_LIMITED,
     APPROVAL_REQUIRED,
     CONFLICT,
@@ -37,13 +38,19 @@ OBJECT_HISTORY_INDEX = "object-history"
 # Global apply counters share the plan table under keys that can never be a plan id (a UUID).
 GLOBAL_BUDGET_PREFIX = "budget#global#"
 GLOBAL_BUDGET_WINDOW_SECONDS = 3600
+# Per-agent apply counters, per clock hour like the global one. `#` cannot occur in an
+# agent name, so one agent's key can never be another's.
+AGENT_BUDGET_PREFIX = "budget#agent#"
 # Approval requests (notifications) across all plans, counted per clock window like the budget.
 APPROVAL_REQUEST_PREFIX = "approval#global#"
 APPROVAL_REQUEST_WINDOW_SECONDS = 600
 
-# Until per-agent identity reaches the server, every plan is requested by the gateway's
-# machine principal class; approvals come only from human IAM principals.
+# Without the caller interceptor (legacy mode) every plan is requested by the gateway's
+# machine principal class; with it, by agent:<name> (handrail_common.agents). Approvals come
+# only from human IAM principals.
 REQUESTER_GATEWAY = "mcp-gateway"
+# details.reason of the forbidden code when an agent names another agent's plan.
+NOT_REQUESTER = "not_requester"
 STATUS_PLANNED = "planned"
 STATUS_AWAITING = "awaiting_approval"
 STATUS_APPROVED = "approved"
@@ -57,6 +64,10 @@ CHANNEL_API = "api"
 def global_budget_key(now: int) -> str:
     """Counter for the clock hour that contains `now`."""
     return f"{GLOBAL_BUDGET_PREFIX}{now - now % GLOBAL_BUDGET_WINDOW_SECONDS}"
+
+
+def agent_budget_key(name: str, now: int) -> str:
+    return f"{AGENT_BUDGET_PREFIX}{name}#{now - now % GLOBAL_BUDGET_WINDOW_SECONDS}"
 
 
 def approval_request_key(now: int) -> str:
@@ -193,6 +204,12 @@ class Plan:
     # Rollback only: whether images or fields_changed was cut, so the approval channel can
     # say that more changes than it shows.
     diff_truncated: bool | None = None
+    # Identity mode only: the requesting agent's name and the verified OAuth client_id it
+    # planned with (requested_by is then agent:<name>).
+    agent: str | None = None
+    requested_client_id: str | None = None
+    # Written by the consume: the channel the apply ran under (gateway or approval-api).
+    channel: str | None = None
 
     @property
     def object_key(self) -> str:
@@ -294,6 +311,9 @@ _OPTIONAL_STRS = (
     "template_to",
     "target_rs_name",
     "target_rs_uid",
+    "agent",
+    "requested_client_id",
+    "channel",
 )
 
 
@@ -374,11 +394,15 @@ class PlanStore:
         action: str,
         now: int,
         require_approval: bool = False,
+        requester: str | None = None,
+        channel: str | None = None,
     ) -> Plan:
         """Atomically mark the plan used; raise GuardError with the precise reason otherwise.
 
         With `require_approval`, the same conditional write also requires a server approval
         of exactly these arguments, by someone other than the requester, that has not expired.
+        With `requester`, it requires that the plan was requested by exactly that requester.
+        `channel` is recorded in the same write.
         """
         # A rejection also ends the plan's validity; this holds even if clocks disagree.
         condition = (
@@ -393,6 +417,9 @@ class PlanStore:
             ":h": expected_hash,
             ":a": action,
         }
+        if requester is not None:
+            condition += " AND requested_by = :rb"
+            values[":rb"] = requester
         if require_approval:
             condition += (
                 " AND #status = :approved AND attribute_exists(approved_by)"
@@ -401,10 +428,15 @@ class PlanStore:
             )
             names["#status"] = "status"
             values[":approved"] = STATUS_APPROVED
+        update = "SET #used = :true"
+        if channel is not None:
+            update += ", #channel = :channel"
+            names["#channel"] = "channel"
+            values[":channel"] = channel
         try:
             response = self._table.update_item(
                 Key={"plan_id": plan_id},
-                UpdateExpression="SET #used = :true",
+                UpdateExpression=update,
                 ConditionExpression=condition,
                 ExpressionAttributeNames=names,
                 ExpressionAttributeValues=values,
@@ -413,7 +445,9 @@ class PlanStore:
         except ClientError as exc:
             if not _is_conditional_failure(exc):
                 raise
-            raise self._rejection(plan_id, expected_hash, action, now, require_approval) from None
+            raise self._rejection(
+                plan_id, expected_hash, action, now, require_approval, requester
+            ) from None
         return Plan.from_item(response["Attributes"])
 
     def get(self, plan_id: str) -> dict[str, Any] | None:
@@ -428,15 +462,17 @@ class PlanStore:
         cooldown: int,
         limit: int,
         correlation_id: str | None = None,
+        requester: str | None = None,
     ) -> tuple[dict[str, Any], int | None]:
         """Move a plan to awaiting_approval and give it `wait_ttl` seconds from its creation.
 
         Returns the record and None when approvers should be notified now. When this plan
         already asked less than `cooldown` seconds ago, nothing changes and the second value
         is the time it may ask again. A notification takes one unit of the global limit first.
+        With `requester`, only a plan requested by exactly that requester can ask.
         """
         current = self.get(plan_id)
-        retry_after = _request_state(current, now, cooldown)
+        retry_after = _request_state(current, now, cooldown, requester)
         if current is not None and retry_after is not None:
             return current, retry_after
         window_start = now - now % APPROVAL_REQUEST_WINDOW_SECONDS
@@ -478,7 +514,7 @@ class PlanStore:
             if not _is_conditional_failure(exc):
                 raise
             item = self.get(plan_id)
-            retry_after = _request_state(item, now, cooldown)
+            retry_after = _request_state(item, now, cooldown, requester)
             if retry_after is None:
                 raise GuardError(CONFLICT, "plan changed concurrently; try again") from None
             return item or {}, retry_after
@@ -632,6 +668,26 @@ class PlanStore:
             global_budget_error(start, limit),
         )
 
+    def agent_applies(self, name: str, now: int) -> int:
+        """Applies counted for one agent so far in the current clock hour, read consistently."""
+        item = self._table.get_item(
+            Key={"plan_id": agent_budget_key(name, now)}, ConsistentRead=True
+        ).get("Item")
+        return int(item.get("applies", 0)) if item else 0
+
+    def take_agent_budget(self, name: str, now: int, limit: int) -> None:
+        """Count one apply against the agent's hourly budget, or raise if it is spent. Taken
+        before the global unit, as a separate conditional update: if the global budget is
+        spent, this unit is not given back."""
+        start = now - now % GLOBAL_BUDGET_WINDOW_SECONDS
+        self._take_counter(
+            agent_budget_key(name, now),
+            "applies",
+            limit,
+            start + 2 * GLOBAL_BUDGET_WINDOW_SECONDS,
+            agent_budget_error(name, start, limit),
+        )
+
     def _take_counter(
         self, key: str, attribute: str, limit: int, retain_until: int, error: GuardError
     ) -> None:
@@ -650,7 +706,13 @@ class PlanStore:
             raise error from None
 
     def _rejection(
-        self, plan_id: str, expected_hash: str, action: str, now: int, require_approval: bool
+        self,
+        plan_id: str,
+        expected_hash: str,
+        action: str,
+        now: int,
+        require_approval: bool,
+        requester: str | None = None,
     ) -> GuardError:
         item = self.get(plan_id)
         if item is None:
@@ -672,6 +734,8 @@ class PlanStore:
             return GuardError(PLAN_EXPIRED, "plan expired")
         if item.get("action") != action or item.get("args_hash") != expected_hash:
             return GuardError(PLAN_MISMATCH, "arguments do not match the plan")
+        if requester is not None and item.get("requested_by") != requester:
+            return not_requester_error()
         if require_approval:
             if status != STATUS_APPROVED or "approved_by" not in item:
                 return _approval_required(
@@ -699,6 +763,19 @@ def global_budget_error(window_start: int, limit: int) -> GuardError:
     )
 
 
+def agent_budget_error(name: str, window_start: int, limit: int) -> GuardError:
+    return GuardError(
+        AGENT_BUDGET_EXCEEDED,
+        f"agent {name} has reached its limit of {limit} applies in this clock hour",
+        {
+            "agent": name,
+            "limit": limit,
+            "window_start": window_start,
+            "retry_after": window_start + GLOBAL_BUDGET_WINDOW_SECONDS,
+        },
+    )
+
+
 def approval_rate_error(window_start: int, limit: int) -> GuardError:
     return GuardError(
         APPROVAL_RATE_LIMITED,
@@ -713,6 +790,15 @@ def approval_rate_error(window_start: int, limit: int) -> GuardError:
     )
 
 
+def not_requester_error() -> GuardError:
+    # The other agent's name is not returned.
+    return GuardError(
+        FORBIDDEN,
+        "the plan was requested by another agent; plan the change yourself",
+        {"reason": NOT_REQUESTER},
+    )
+
+
 def _approval_required(status: str, message: str) -> GuardError:
     return GuardError(APPROVAL_REQUIRED, message, {"status": status})
 
@@ -724,11 +810,16 @@ def _decided(item: Mapping[str, Any]) -> GuardError | None:
     return None
 
 
-def _request_state(item: Mapping[str, Any] | None, now: int, cooldown: int) -> int | None:
+def _request_state(
+    item: Mapping[str, Any] | None, now: int, cooldown: int, requester: str | None = None
+) -> int | None:
     """Raise if the plan cannot await approval; return when it may notify again if it asked
     within the cooldown, otherwise None."""
     if item is None:
         raise GuardError(PLAN_NOT_FOUND, "plan not found")
+    # Before anything else about the plan, so another agent learns nothing of its state.
+    if requester is not None and item.get("requested_by") != requester:
+        raise not_requester_error()
     if item.get("used") is True:
         raise GuardError(PLAN_USED, "plan already used")
     decided = _decided(item)

@@ -1,8 +1,10 @@
 # --- Drift sentinel (mcp/CONTRACT.md, Drift sentinel) -------------------------
 #
 # A scheduled Lambda that compares the gateway targets and, when configured, the
-# DevOps Agent association with mcp/classification.json. On drift it turns the
-# kill switch off and alerts; it never turns it back on.
+# DevOps Agent association with mcp/classification.json, and checks that the gateway
+# keeps its caller interceptor and allows only the agents' clients. On drift it turns
+# the kill switch off and alerts; it never turns it back on, and never writes the
+# per-agent kill switches.
 
 locals {
   sentinel_count = var.sentinel_enabled ? 1 : 0
@@ -74,6 +76,12 @@ data "aws_iam_policy_document" "sentinel" {
     resources = [aws_bedrockagentcore_gateway.this.gateway_arn]
   }
 
+  statement {
+    sid       = "GatewayConfiguration"
+    actions   = ["bedrock-agentcore:GetGateway"]
+    resources = [aws_bedrockagentcore_gateway.this.gateway_arn]
+  }
+
   dynamic "statement" {
     for_each = local.devops_agent_checks ? [1] : []
     content {
@@ -118,6 +126,8 @@ resource "aws_lambda_function" "sentinel" {
       AGENT_SPACE_ID            = local.devops_agent_checks ? var.devops_agent_space_id : ""
       ASSOCIATION_ID            = local.devops_agent_checks ? var.devops_agent_association_id : ""
       EXPECT_ELEVATED_ACTIONS   = tostring(var.expect_elevated_actions)
+      EXPECT_INTERCEPTOR_ARN    = var.caller_interceptor_enabled ? aws_lambda_function.interceptor[0].arn : ""
+      EXPECT_ALLOWED_CLIENTS    = jsonencode(local.allowed_clients)
     }
   }
 

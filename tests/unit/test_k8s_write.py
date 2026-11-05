@@ -12,6 +12,7 @@ from kubernetes.client.exceptions import ApiException
 from moto import mock_aws
 
 from handrail_common.config import load_settings
+from handrail_common.dispatch import caller_signature
 from handrail_common.killswitch import KillSwitch
 from handrail_common.plans import (
     RESTART_ANNOTATION,
@@ -27,6 +28,7 @@ from handrail_common.plans import (
     scale_args_hash,
     template_hash,
 )
+from handrail_common.validation import GuardError
 
 # Load by path: both Lambda directories contain a module named `handler`.
 _SPEC = importlib.util.spec_from_file_location(
@@ -1538,3 +1540,235 @@ def test_server_mode_rollback_after_approval(server_rt):
     runtime_.store.approve(plan.plan_id, HUMAN, NOW, 120)
     response = apply_rollback(plan.plan_id)
     assert response["ok"] is True and response["data"]["approved"] is True
+
+
+# --- Agent identity -----------------------------------------------------------
+
+AGENTS = '{"client-a": {"name": "smoke_test"}, "client-b": {"name": "devops_agent"}}'
+SWITCHES = "/handrail/agents/"
+CALLER_KEY = "test-caller-key"
+IDENTITY_ENV = ENV | {
+    "CALLER_INTERCEPTOR": "true",
+    "AGENTS": AGENTS,
+    "AGENT_KILL_SWITCH_PREFIX": SWITCHES,
+}
+APPROVAL_CONTEXT = SimpleNamespace(
+    client_context=SimpleNamespace(
+        custom={
+            "bedrockAgentCoreToolName": "k8sw___apply_scale_deployment",
+            "kubeHandrailChannel": "approval-api",
+        }
+    ),
+    aws_request_id="approver-request-id",
+)
+
+
+@pytest.fixture
+def identity_rt(aws, monkeypatch):
+    # dispatch trusts the caller argument only with the interceptor and its key, as in the Lambda.
+    monkeypatch.setenv("CALLER_INTERCEPTOR", "true")
+    monkeypatch.setenv("CALLER_KEY", CALLER_KEY)
+    rt, apps = runtime()
+    rt.settings = load_settings(IDENTITY_ENV, write=True)
+    rt.ssm = boto3.client("ssm", region_name=REGION)
+    for name in ("smoke_test", "devops_agent"):
+        set_agent_switch(rt, name, "true")
+    monkeypatch.setattr(handler, "get_runtime", lambda: rt)
+    return rt, apps
+
+
+def set_agent_switch(rt, name: str, value: str) -> None:
+    rt.ssm.put_parameter(
+        Name=f"{SWITCHES}{name}/enabled", Value=value, Type="String", Overwrite=True
+    )
+
+
+def create_agent_plan(store: PlanStore, agent: str | None = "smoke_test") -> Plan:
+    plan = create_plan(store)
+    plan = dataclasses.replace(
+        plan,
+        plan_id=str(uuid.uuid4()),
+        requested_by=f"agent:{agent}" if agent else "mcp-gateway",
+        agent=agent,
+        requested_client_id="client-a" if agent else None,
+    )
+    store.create(plan)
+    return plan
+
+
+def apply_as(plan_id: str, client: str | None, context=CONTEXT) -> dict:
+    event = {"plan_id": plan_id, "namespace": "sandbox", "name": "web", "replicas": 3}
+    if client is not None:
+        event["_kube_handrail_caller"] = f"{client}.{caller_signature(CALLER_KEY, client)}"
+    return handler.lambda_handler(event, context)
+
+
+def test_identity_apply_by_the_requesting_agent(identity_rt):
+    runtime_, apps = identity_rt
+    plan = create_agent_plan(runtime_.store)
+
+    assert apply_as(plan.plan_id, "client-a")["ok"] is True
+    record = item(plan.plan_id)
+    assert (record["used"], record["channel"], record["result"]) == (True, "gateway", "applied")
+    annotations = apps.patch_namespaced_deployment.call_args.args[2]["metadata"]["annotations"]
+    assert annotations[handler.REQUESTED_BY_ANNOTATION] == "agent:smoke_test"
+
+
+def test_identity_apply_by_another_agent_is_forbidden(identity_rt):
+    runtime_, apps = identity_rt
+    plan = create_agent_plan(runtime_.store)
+
+    response = apply_as(plan.plan_id, "client-b")
+    assert error_code(response) == "forbidden"
+    assert response["error"]["details"] == {"reason": "not_requester"}
+    assert item(plan.plan_id)["used"] is False
+    apps.read_namespaced_deployment.assert_not_called()
+
+
+@pytest.mark.parametrize("client", [None, "unknown", "client-z"])
+def test_identity_apply_through_the_gateway_needs_a_known_caller(identity_rt, client):
+    runtime_, apps = identity_rt
+    plan = create_agent_plan(runtime_.store)
+
+    response = apply_as(plan.plan_id, client)
+    assert (error_code(response), response["error"]["details"]) == (
+        "forbidden",
+        {"reason": "agent_unknown"},
+    )
+    assert item(plan.plan_id)["used"] is False
+
+
+def test_identity_apply_with_an_unsigned_caller_is_forbidden(identity_rt):
+    """A gateway that lost its interceptor passes the client's own value: never trusted."""
+    runtime_, apps = identity_rt
+    plan = create_agent_plan(runtime_.store)
+    event = {"plan_id": plan.plan_id, "namespace": "sandbox", "name": "web", "replicas": 3}
+    response = handler.lambda_handler({**event, "_kube_handrail_caller": "client-a"}, CONTEXT)
+    assert (error_code(response), response["error"]["details"]) == (
+        "forbidden",
+        {"reason": "agent_unknown"},
+    )
+    assert item(plan.plan_id)["used"] is False
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_identity_apply_of_a_legacy_plan_is_forbidden(identity_rt):
+    """A plan made before identity mode names the gateway class; it must be planned again."""
+    runtime_, _ = identity_rt
+    plan = create_plan(runtime_.store)
+    response = apply_as(plan.plan_id, "client-a")
+    assert response["error"]["details"] == {"reason": "not_requester"}
+    assert item(plan.plan_id)["used"] is False
+
+
+def test_identity_apply_on_the_approval_channel_needs_no_caller(identity_rt):
+    runtime_, _ = identity_rt
+    plan = create_agent_plan(runtime_.store)
+
+    # A caller argument on this channel is not consulted.
+    assert apply_as(plan.plan_id, "client-b", APPROVAL_CONTEXT)["ok"] is True
+    assert item(plan.plan_id)["channel"] == "approval-api"
+
+
+def test_identity_approval_channel_refuses_a_plan_without_an_agent(identity_rt):
+    runtime_, apps = identity_rt
+    plan = create_plan(runtime_.store)
+    response = apply_as(plan.plan_id, None, APPROVAL_CONTEXT)
+    assert response["error"]["details"] == {"reason": "agent_unknown"}
+    record = item(plan.plan_id)
+    assert (record["used"], record["result"]) == (True, "forbidden")
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_legacy_apply_records_the_channel_and_no_agent_annotation(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    assert apply(plan.plan_id, _kube_handrail_caller="client-a")["ok"] is True
+    assert item(plan.plan_id)["channel"] == "gateway"
+    annotations = apps.patch_namespaced_deployment.call_args.args[2]["metadata"]["annotations"]
+    assert handler.REQUESTED_BY_ANNOTATION not in annotations
+
+
+def test_rollback_patch_sets_the_requested_by_annotation():
+    ops = handler.rollback_patch({"spec": {}}, "7", "p", "c", requested_by="agent:smoke_test")
+    assert ops[-1] == {
+        "op": "add",
+        "path": "/metadata/annotations/kube-handrail.io~1requested-by",
+        "value": "agent:smoke_test",
+    }
+
+
+@pytest.mark.parametrize("tool", sorted(handler.HANDLERS))
+def test_every_apply_tool_runs_the_agent_guard(rt, monkeypatch, tool):
+    runtime_, apps = rt
+
+    def refuse(*args):
+        raise GuardError("forbidden", "guard ran", {"reason": "agent_unknown"})
+
+    monkeypatch.setattr(handler, "guard_apply", refuse)
+    with pytest.raises(GuardError, match="guard ran"):
+        handler.HANDLERS[tool]({"plan_id": str(uuid.uuid4())})
+    apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_identity_apply_of_an_agent_switched_off_consumes_the_plan(identity_rt):
+    runtime_, apps = identity_rt
+    plan = create_agent_plan(runtime_.store)
+    set_agent_switch(runtime_, "smoke_test", "false")
+
+    response = apply_as(plan.plan_id, "client-a")
+    assert (error_code(response), response["error"]["details"]) == (
+        "remediation_disabled",
+        {"scope": "agent", "agent": "smoke_test"},
+    )
+    record = item(plan.plan_id)
+    assert (record["used"], record["result"]) == (True, "remediation_disabled")
+    apps.read_namespaced_deployment.assert_not_called()
+    assert runtime_.store.agent_applies("smoke_test", NOW) == 0
+
+
+def test_identity_apply_takes_one_unit_of_the_agents_and_the_global_budget(identity_rt):
+    runtime_, _ = identity_rt
+    assert apply_as(create_agent_plan(runtime_.store).plan_id, "client-a")["ok"] is True
+    assert runtime_.store.agent_applies("smoke_test", NOW) == 1
+    assert runtime_.store.agent_applies("devops_agent", NOW) == 0
+    assert runtime_.store.global_applies(NOW) == 1
+
+
+def test_identity_apply_over_the_agent_budget_leaves_the_global_budget(identity_rt):
+    runtime_, apps = identity_rt
+    runtime_.settings = dataclasses.replace(
+        runtime_.settings,
+        agents={
+            cid: dataclasses.replace(a, hourly_apply_budget=1)
+            for cid, a in runtime_.settings.agents.items()
+        },
+    )
+    runtime_.store.take_agent_budget("smoke_test", NOW, 1)
+    plan = create_agent_plan(runtime_.store)
+
+    response = apply_as(plan.plan_id, "client-a")
+    assert error_code(response) == "agent_budget_exceeded"
+    assert response["error"]["details"]["agent"] == "smoke_test"
+    assert item(plan.plan_id)["result"] == "agent_budget_exceeded"
+    assert runtime_.store.global_applies(NOW) == 0
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_identity_apply_loses_the_agent_unit_when_the_global_budget_is_spent(identity_rt):
+    """Documented: the two units are separate updates, and the agent's is taken first."""
+    runtime_, _ = identity_rt
+    runtime_.settings = dataclasses.replace(runtime_.settings, global_hourly_apply_budget=1)
+    runtime_.store.take_global_budget(NOW, 1)
+    response = apply_as(create_agent_plan(runtime_.store).plan_id, "client-a")
+    assert error_code(response) == "global_budget_exceeded"
+    assert runtime_.store.agent_applies("smoke_test", NOW) == 1
+
+
+def test_identity_apply_refused_by_another_check_takes_no_agent_unit(identity_rt):
+    runtime_, apps = identity_rt
+    apps.read_namespaced_deployment.return_value = deployment(generation=5)
+    assert error_code(apply_as(create_agent_plan(runtime_.store).plan_id, "client-a")) == (
+        "conflict"
+    )
+    assert runtime_.store.agent_applies("smoke_test", NOW) == 0

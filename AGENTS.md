@@ -65,17 +65,18 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 | `plan_used` | Plan already consumed, possibly by the approval's own apply. | Check `get_workload_status`; do not re-plan unless the human asks. |
 | `plan_mismatch` | Apply arguments differ from the plan. | Apply again with exactly the plan's arguments, or re-plan. |
 | `conflict` | On plan or apply with `details.paused`: a human paused the rollout. On apply: the Deployment changed since the plan (`details` shows what, when the server knows it), or for a rollback the pinned ReplicaSet was replaced (`details.replica_set`) or edited (`details.template`). On a scale plan, without `details`: a HorizontalPodAutoscaler owns the replica count. On `request_approval`: the plan record changed concurrently. | `paused`: stop; a human paused the rollout. Apply: read status, then re-plan if the change is still wanted. Plan: stop; change the autoscaler, not the Deployment. `request_approval`: call it once more. |
-| `remediation_disabled` | Kill switch is off. | Stop. Do not retry. |
+| `remediation_disabled` | An operator stopped remediation, globally or for your agent only (`details.scope` is `agent`). | Stop. Do not retry and do not try another path. |
 | `manual_change` | Someone changed replicas (`details.last_applied_to`, `current`) or, on a rollback, the pod template (`details.last_applied_template`, `current_template`) outside kube-handrail since its last apply. | Stop and ask the human; see Never. |
 | `cooldown` | Too soon after the last apply. | Wait until `details.retry_after` (epoch seconds), then re-plan. |
 | `flapping` | Would reverse direction a second time (`details.history`). | Stop. |
 | `object_budget_exceeded`, `plan_rate_limited` | Per-object limits reached. | Stop. |
 | `global_budget_exceeded` | Hourly budget for all objects reached. | Stop; not before `details.retry_after`. |
+| `agent_budget_exceeded` | Your agent's hourly apply budget is spent (`details.limit`). | Wait until `details.retry_after`, or hand over to a human. |
 | `approval_required` | No valid server approval. `details.status` says why. | `planned` or `awaiting_approval`: call `request_approval` if not done, then wait. `rejected`, `approval_expired`, `approval_invalid`: stop. |
 | `approval_rate_limited` | Too many approval requests. | Wait until `details.retry_after`. |
 | `plan_decided` | Plan already approved or rejected (`details.status`). | Do not request again. `rejected`: stop. `approved`: check `get_workload_status`; apply only in `both` mode or when the human says the approval did not apply it. |
 | `revision_not_found` | The revision has no ReplicaSet of the Deployment any more (`details.available` lists those that exist). | Call `get_rollout_history`. The revision may have been pruned by `revisionHistoryLimit` or renumbered by a rollback. Ask the human which revision to use. |
-| `forbidden` | Caller not allowed (approval API only). | Stop. |
+| `forbidden` | Caller not allowed; `details.reason` says why. `not_requester`: the plan was made by another agent (on apply or `request_approval`). `agent_unknown`: the server does not know your OAuth client. Without a reason: the approval API refused the caller. | `not_requester`: plan the change yourself and use your own plan. Otherwise stop and tell the human. |
 | `kubernetes_error`, `internal` | Cluster or server error. | Retry a read or re-plan once, then stop. |
 
 The guards behind these codes are in "Guard checks", "History checks (oscillation breaker)" and "Server-side approval".

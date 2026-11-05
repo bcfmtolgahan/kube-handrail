@@ -8,13 +8,15 @@ from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock
 
+import boto3
 import pytest
 from kubernetes import client as k8s
 from kubernetes.client.rest import ApiException
 from moto import mock_aws
 
 from handrail_common.breaker import LAST_PLAN_ANNOTATION, retention_seconds
-from handrail_common.config import Settings
+from handrail_common.config import Agent, Settings
+from handrail_common.observability import bind_caller, unbind_caller
 from handrail_common.plans import (
     PlanStore,
     object_key,
@@ -151,6 +153,7 @@ def clients(table):
         core=core,
         discovery=discovery,
         store=PlanStore(table),
+        ssm=boto3.client("ssm", region_name=REGION),
     )
 
 
@@ -187,13 +190,14 @@ def test_plan_stores_record_and_returns_diff(clients, table):
     assert item["object_key"] == "sandbox/web/8f7c1a2e-0000-4000-8000-000000000001"
     assert item["retain_until"] == NOW + retention_seconds(SETTINGS)
     assert data["override_manual_change"] is False
-    assert [check["check"] for check in data["preflight"]][-6:] == [
+    assert [check["check"] for check in data["preflight"]][-7:] == [
         "no_manual_change",
         "cooldown",
         "not_flapping",
         "object_budget",
         "plan_rate",
         "global_budget",
+        "agent_budget",
     ]
 
 
@@ -1305,6 +1309,7 @@ def test_restart_plan_pins_the_template_with_its_plan_id(clients, table):
     }
     assert [check["check"] for check in data["preflight"]] == [
         "arguments",
+        "agent_enabled",
         "namespace_allowed",
         "not_gitops_managed",
         "not_paused",
@@ -1312,6 +1317,7 @@ def test_restart_plan_pins_the_template_with_its_plan_id(clients, table):
         "object_budget",
         "plan_rate",
         "global_budget",
+        "agent_budget",
     ]
 
 
@@ -1631,6 +1637,7 @@ def test_rollback_plan_pins_the_replica_set_and_its_template(clients, table):
     assert item["diff_truncated"] is False
     assert [check["check"] for check in data["preflight"]] == [
         "arguments",
+        "agent_enabled",
         "namespace_allowed",
         "not_gitops_managed",
         "not_paused",
@@ -1641,6 +1648,7 @@ def test_rollback_plan_pins_the_replica_set_and_its_template(clients, table):
         "object_budget",
         "plan_rate",
         "global_budget",
+        "agent_budget",
     ]
 
 
@@ -1827,3 +1835,184 @@ def test_lambda_handler_plans_a_rollback_through_dispatch(wired):
         {"namespace": "sandbox", "name": "web", "revision": 5}, context("plan_rollback_deployment")
     )
     assert result["ok"] is True and result["data"]["diff"]["replica_set"] == "web-5"
+
+
+# --- Agent identity -----------------------------------------------------------
+
+SMOKE = Agent(name="smoke_test", client_id="client-a", hourly_apply_budget=2)
+DEVOPS = Agent(name="devops_agent", client_id="client-b", hourly_apply_budget=10)
+SWITCHES = "/handrail/agents/"
+IDENTITY_SETTINGS = dataclasses.replace(
+    APPROVAL_SETTINGS,
+    identity_required=True,
+    agents={"client-a": SMOKE, "client-b": DEVOPS},
+    agent_kill_switch_prefix=SWITCHES,
+)
+
+
+def set_agent_switch(clients, name: str, value: str) -> None:
+    clients.ssm.put_parameter(
+        Name=f"{SWITCHES}{name}/enabled", Value=value, Type="String", Overwrite=True
+    )
+
+
+@pytest.fixture
+def caller(clients):
+    """Bind the verified caller as dispatch does (the gateway channel); both agents'
+    kill switches are on."""
+    for agent in (SMOKE, DEVOPS):
+        set_agent_switch(clients, agent.name, "true")
+    bound = []
+
+    def bind(value: str | None) -> None:
+        bound.append(bind_caller(value, "gateway"))
+
+    yield bind
+    for tokens in reversed(bound):
+        unbind_caller(tokens)
+
+
+def test_identity_plan_records_the_agent_and_its_client(clients, table, caller):
+    caller("client-a")
+    data = handler.plan_scale_deployment(
+        {"namespace": "sandbox", "name": "web", "replicas": 3}, IDENTITY_SETTINGS, clients, NOW
+    )["data"]
+    assert data["requested_by"] == "agent:smoke_test"
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["requested_by"] == "agent:smoke_test"
+    assert (item["agent"], item["requested_client_id"]) == ("smoke_test", "client-a")
+    # The agent is bound by the consume condition, not by the approved arguments.
+    assert item["args_hash"] == scale_args_hash("sandbox", "web", 3)
+
+
+def test_legacy_plan_names_the_gateway_and_no_agent(clients, table, caller):
+    caller("client-a")
+    data = plan(clients)["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert data["requested_by"] == item["requested_by"] == "mcp-gateway"
+    assert "agent" not in item and "requested_client_id" not in item
+
+
+@pytest.mark.parametrize("value", [None, "unknown", "client-z"])
+def test_identity_plan_refuses_an_unknown_caller_before_any_cluster_read(
+    clients, table, caller, value
+):
+    caller(value)
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(
+            {"namespace": "sandbox", "name": "web", "replicas": 3}, IDENTITY_SETTINGS, clients, NOW
+        )
+    assert (exc.value.code, exc.value.details) == ("forbidden", {"reason": "agent_unknown"})
+    clients.apps.read_namespaced_deployment.assert_not_called()
+    assert table.scan()["Items"] == []
+
+
+def test_identity_request_approval_only_by_the_planning_agent(approvals, table, caller):
+    caller("client-a")
+    plan_id = handler.plan_scale_deployment(
+        {"namespace": "sandbox", "name": "web", "replicas": 3}, IDENTITY_SETTINGS, approvals, NOW
+    )["data"]["plan_id"]
+    caller("client-b")
+    with pytest.raises(GuardError) as exc:
+        request(approvals, plan_id, settings=IDENTITY_SETTINGS)
+    assert (exc.value.code, exc.value.details) == ("forbidden", {"reason": "not_requester"})
+    assert approvals.sns.messages == []
+    caller("client-z")
+    with pytest.raises(GuardError) as exc:
+        request(approvals, plan_id, settings=IDENTITY_SETTINGS)
+    assert exc.value.details == {"reason": "agent_unknown"}
+    caller("client-a")
+    assert request(approvals, plan_id, settings=IDENTITY_SETTINGS)["data"]["notified"] is True
+    (message,) = approvals.sns.messages
+    assert "Requested by: agent:smoke_test" in message["Message"]
+
+
+@pytest.mark.parametrize("tool", sorted(t for t in handler.HANDLERS if t.startswith("plan_")))
+def test_every_plan_tool_runs_the_agent_guard(wired, monkeypatch, tool):
+    def refuse(*args):
+        raise GuardError("forbidden", "guard ran", {"reason": "agent_unknown"})
+
+    monkeypatch.setattr(handler, "guard_plan", refuse)
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3, "revision": 5}
+    result = handler.lambda_handler(args, context(tool))
+    assert result["error"]["message"] == "guard ran"
+    wired.apps.read_namespaced_deployment.assert_not_called()
+
+
+def identity_plan(clients, **overrides):
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3, **overrides}
+    return handler.plan_scale_deployment(args, IDENTITY_SETTINGS, clients, NOW)
+
+
+def test_identity_plan_reports_the_agent_checks_in_preflight(clients, caller):
+    caller("client-a")
+    preflight = identity_plan(clients)["data"]["preflight"]
+    checks = [c["check"] for c in preflight]
+    assert checks[:3] == ["arguments", "agent_enabled", "namespace_allowed"]
+    assert checks[-2:] == ["global_budget", "agent_budget"]
+    assert all("skipped" not in c for c in preflight)
+
+
+def test_legacy_plan_reports_the_agent_checks_as_skipped(clients):
+    preflight = plan(clients)["data"]["preflight"]
+    skipped = [c["check"] for c in preflight if c.get("skipped")]
+    assert skipped == ["agent_enabled", "agent_budget"]
+    assert all(c["passed"] for c in preflight)
+
+
+def test_identity_plan_refuses_an_agent_switched_off_before_any_cluster_read(
+    clients, table, caller
+):
+    caller("client-a")
+    set_agent_switch(clients, "smoke_test", "false")
+    with pytest.raises(GuardError) as exc:
+        identity_plan(clients)
+    assert (exc.value.code, exc.value.details) == (
+        "remediation_disabled",
+        {"scope": "agent", "agent": "smoke_test"},
+    )
+    clients.apps.read_namespaced_deployment.assert_not_called()
+    # The other agent is not affected.
+    caller("client-b")
+    assert identity_plan(clients)["ok"] is True
+
+
+def test_identity_plan_refuses_an_agent_whose_budget_is_spent(clients, table, caller):
+    caller("client-a")
+    for _ in range(SMOKE.hourly_apply_budget):
+        clients.store.take_agent_budget("smoke_test", NOW, SMOKE.hourly_apply_budget)
+    with pytest.raises(GuardError) as exc:
+        identity_plan(clients)
+    window = NOW - NOW % 3600
+    assert (exc.value.code, exc.value.details) == (
+        "agent_budget_exceeded",
+        {"agent": "smoke_test", "limit": 2, "window_start": window, "retry_after": window + 3600},
+    )
+    # Read only: the plan takes no unit.
+    assert clients.store.agent_applies("smoke_test", NOW) == 2
+    caller("client-b")
+    assert identity_plan(clients)["ok"] is True
+
+
+def test_identity_plan_checks_the_global_budget_before_the_agent_budget(clients, caller):
+    caller("client-a")
+    for _ in range(SMOKE.hourly_apply_budget):
+        clients.store.take_agent_budget("smoke_test", NOW, SMOKE.hourly_apply_budget)
+    settings = dataclasses.replace(IDENTITY_SETTINGS, global_hourly_apply_budget=1)
+    clients.store.take_global_budget(NOW, 1)
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(
+            {"namespace": "sandbox", "name": "web", "replicas": 3}, settings, clients, NOW
+        )
+    assert exc.value.code == "global_budget_exceeded"
+
+
+def test_identity_request_approval_refuses_an_agent_switched_off(approvals, table, caller):
+    caller("client-a")
+    plan_id = identity_plan(approvals)["data"]["plan_id"]
+    set_agent_switch(approvals, "smoke_test", "false")
+    with pytest.raises(GuardError) as exc:
+        request(approvals, plan_id, settings=IDENTITY_SETTINGS)
+    assert exc.value.code == "remediation_disabled"
+    assert approvals.sns.messages == []
+    assert table.get_item(Key={"plan_id": plan_id})["Item"]["status"] == "planned"

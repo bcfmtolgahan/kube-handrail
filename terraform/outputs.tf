@@ -14,8 +14,18 @@ output "cognito_scopes" {
 }
 
 output "cognito_client_ids" {
-  description = "App client IDs by client name. Secrets are not output; read them from Cognito."
+  description = "IDs of the app clients created here, by agent name. Secrets are not output; read them from Cognito."
   value       = { for k, c in aws_cognito_user_pool_client.this : k => c.id }
+}
+
+output "agent_client_ids" {
+  description = "OAuth client ID of every agent, created or external, by agent name."
+  value       = local.agent_client_ids
+}
+
+output "agent_kill_switch_parameters" {
+  description = "Per-agent kill switch parameters by agent name; only the value \"true\" lets the agent act."
+  value       = { for name, p in aws_ssm_parameter.agent_enabled : name => p.name }
 }
 
 output "plans_table_name" {

@@ -33,7 +33,12 @@ from handrail_common.envelope import (
     err,
     ok,
 )
-from handrail_common.observability import APPROVER_CORRELATION_KEY, emit
+from handrail_common.observability import (
+    APPROVER_CORRELATION_KEY,
+    CHANNEL_APPROVAL_API,
+    CHANNEL_KEY,
+    emit,
+)
 from handrail_common.plans import (
     RESTART_DEPLOYMENT,
     ROLLBACK_DEPLOYMENT,
@@ -192,8 +197,12 @@ def trigger_apply(
     rt: Runtime, item: Mapping[str, Any], correlation_id: str | None = None
 ) -> Envelope:
     """Run the apply through the write Lambda, as the gateway would call it. The apply
-    takes this request's correlation id, so the decision and the apply share one."""
-    custom = {"bedrockAgentCoreToolName": APPLY_TOOLS[item["action"]]}
+    takes this request's correlation id, so the decision and the apply share one, and runs
+    on the approval channel, where no caller is expected and the plan's agent is charged."""
+    custom = {
+        "bedrockAgentCoreToolName": APPLY_TOOLS[item["action"]],
+        CHANNEL_KEY: CHANNEL_APPROVAL_API,
+    }
     if correlation_id is not None:
         custom[APPROVER_CORRELATION_KEY] = correlation_id
     context = {"custom": custom}

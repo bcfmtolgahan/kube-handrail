@@ -34,6 +34,17 @@ devops_agent_association_id = ""
 expect_elevated_actions     = true
 alert_email                 = ""
 
+# Agent identity (mcp/CONTRACT.md, Agent identity). One OAuth client per agent; an
+# entry without client_id gets a Cognito app client. The interceptor identifies the
+# caller; false is the legacy mode without per-agent attribution or limits. Per-agent
+# kill switches are /<name_prefix>/agents/<agent>/enabled (agent_kill_switch_parameters).
+caller_interceptor_enabled = true
+agents = {
+  devops_agent = {}
+  smoke_test   = { hourly_apply_budget = 30 } # the smoke and end-to-end tests
+}
+agent_hourly_apply_budget = 10
+
 # Server-side approval (mcp/CONTRACT.md, Server-side approval). client keeps the
 # DevOps Agent chat approval only; server and both require an approval through the
 # approval URL from one of approver_principals (IAM user or role ARNs).
@@ -61,4 +72,4 @@ allow_lambda_to_cluster_endpoint = false
 create_vpc_endpoints = false
 
 # build/ is gitignored. On a fresh checkout with existing state, rebuild before planning:
-#   terraform apply -replace='terraform_data.build["k8s_read"]' -replace='terraform_data.build["k8s_write"]' -replace='terraform_data.build["sentinel"]' -replace='terraform_data.build["approver"]'
+#   terraform apply -replace='terraform_data.build["k8s_read"]' -replace='terraform_data.build["k8s_write"]' -replace='terraform_data.build["sentinel"]' -replace='terraform_data.build["approver"]' -replace='terraform_data.build["interceptor"]'

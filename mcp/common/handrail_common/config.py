@@ -1,8 +1,10 @@
 """Typed settings from the environment variables listed in mcp/CONTRACT.md."""
 
+import json
 import os
+import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class ConfigError(Exception):
@@ -13,6 +15,17 @@ CLIENT = "client"
 SERVER = "server"
 BOTH = "both"
 APPROVAL_MODES = (CLIENT, SERVER, BOTH)
+# The keys of the Terraform agents map; also part of SSM parameter names and counter keys.
+AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+
+@dataclass(frozen=True)
+class Agent:
+    """One agent: an OAuth client listed in AGENTS (mcp/CONTRACT.md, Agent identity)."""
+
+    name: str
+    client_id: str
+    hourly_apply_budget: int
 
 
 @dataclass(frozen=True)
@@ -41,6 +54,15 @@ class Settings:
     # Read Lambda only: where request_approval notifies, and the URL shown in the message.
     approval_topic_arn: str | None = None
     approval_url: str | None = None
+    # CALLER_INTERCEPTOR is "true": callers are verified OAuth clients, and planning,
+    # request_approval and gateway applies need one listed in `agents`.
+    identity_required: bool = False
+    # client_id => Agent, from AGENTS; empty unless identity_required.
+    agents: Mapping[str, Agent] = field(default_factory=dict)
+    # Per-agent kill switches are SSM parameters <prefix><name>/enabled.
+    agent_kill_switch_prefix: str | None = None
+    # Applies per agent in one clock hour, unless AGENTS sets the agent's own.
+    agent_hourly_apply_budget: int = 10
 
     @property
     def approval_required(self) -> bool:
@@ -51,6 +73,12 @@ class Settings:
         """(minimum, maximum) replicas in an allowed namespace. Every replica bounds check
         reads them through here; today the same bounds apply to every namespace."""
         return self.min_replicas, self.max_replicas
+
+    def agent_budget(self, name: str) -> int:
+        """The hourly apply budget of the agent with this name. An agent no longer in AGENTS
+        (its plan was made before it was removed) gets the default."""
+        budgets = {a.name: a.hourly_apply_budget for a in self.agents.values()}
+        return budgets.get(name, self.agent_hourly_apply_budget)
 
 
 def required_env(env: Mapping[str, str], key: str) -> str:
@@ -77,6 +105,29 @@ def approval_mode(env: Mapping[str, str]) -> str:
     if mode not in APPROVAL_MODES:
         raise ConfigError(f"APPROVAL_MODE must be one of {', '.join(APPROVAL_MODES)}")
     return mode
+
+
+def parse_agents(raw: str, default_budget: int) -> dict[str, Agent]:
+    """AGENTS: a JSON object {"<client_id>": {"name": "<agent>", "hourly_apply_budget": N}},
+    at least one entry, with unique names; the budget is optional and positive."""
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        raise ConfigError("AGENTS must be a JSON object") from None
+    if not isinstance(value, dict) or not value:
+        raise ConfigError("AGENTS must list at least one agent")
+    agents: dict[str, Agent] = {}
+    for client_id, entry in value.items():
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if not client_id or not isinstance(name, str) or not AGENT_NAME.match(name):
+            raise ConfigError(f"AGENTS: each agent needs a name matching {AGENT_NAME.pattern}")
+        budget = entry.get("hourly_apply_budget", default_budget)
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+            raise ConfigError(f"AGENTS: {name}: hourly_apply_budget must be a positive integer")
+        agents[client_id] = Agent(name=name, client_id=client_id, hourly_apply_budget=budget)
+    if len({a.name for a in agents.values()}) != len(agents):
+        raise ConfigError("AGENTS: agent names must be unique")
+    return agents
 
 
 def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) -> Settings:
@@ -111,6 +162,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
             ("APPLY_AFTER_APPROVAL_TTL_SECONDS", 120),
             ("APPROVAL_REQUEST_COOLDOWN_SECONDS", 60),
             ("APPROVAL_REQUEST_LIMIT", 10),
+            ("AGENT_HOURLY_APPLY_BUDGET", 10),
         )
     }
     may_be_zero = ("APPLY_COOLDOWN_SECONDS", "APPROVAL_REQUEST_COOLDOWN_SECONDS")
@@ -125,6 +177,14 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
     param = env.get("REMEDIATION_ENABLED_PARAM", "").strip() or None
     if write and param is None:
         raise ConfigError("REMEDIATION_ENABLED_PARAM is required")
+
+    # Without the interceptor nobody is verified, so AGENTS would name nobody (legacy mode).
+    identity = env.get("CALLER_INTERCEPTOR") == "true"
+    default_budget = limits["AGENT_HOURLY_APPLY_BUDGET"]
+    agents = parse_agents(required_env(env, "AGENTS"), default_budget) if identity else {}
+    switch_prefix = env.get("AGENT_KILL_SWITCH_PREFIX", "").strip() or None
+    if identity and switch_prefix is None:
+        raise ConfigError("AGENT_KILL_SWITCH_PREFIX is required")
 
     return Settings(
         cluster_name=required_env(env, "CLUSTER_NAME"),
@@ -149,4 +209,8 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         approval_request_limit=limits["APPROVAL_REQUEST_LIMIT"],
         approval_topic_arn=env.get("APPROVAL_TOPIC_ARN", "").strip() or None,
         approval_url=env.get("APPROVAL_URL", "").strip() or None,
+        identity_required=identity,
+        agents=agents,
+        agent_kill_switch_prefix=switch_prefix,
+        agent_hourly_apply_budget=default_budget,
     )

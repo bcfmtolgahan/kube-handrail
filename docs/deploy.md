@@ -18,7 +18,7 @@ Status: implemented and tested. A fresh deployment with its own prefix and state
 
 ## Names
 
-Every AWS resource name starts with `name_prefix` (default `kube-handrail`): IAM roles and the approver policy (`<prefix>-k8s-read`, `-k8s-write`, `-gateway`, `-approver`, `-approver-invoke`, `-sentinel`, `-interceptor`), Lambda functions and their log groups (`/aws/lambda/<prefix>-...`), the plan table (`<prefix>-plans`), the kill switch (`/<prefix>/remediation-enabled`), SNS topics (`<prefix>-approvals`, `<prefix>-alerts`), the Cognito user pool and resource server, the gateway, the sentinel rule and alarms, and the security groups (`<prefix>-lambda`, `<prefix>-vpc-endpoints`).
+Every AWS resource name starts with `name_prefix` (default `kube-handrail`): IAM roles and the approver policy (`<prefix>-k8s-read`, `-k8s-write`, `-gateway`, `-approver`, `-approver-invoke`, `-sentinel`, `-interceptor`), Lambda functions and their log groups (`/aws/lambda/<prefix>-...`), the plan table (`<prefix>-plans`), the kill switch (`/<prefix>/remediation-enabled`) and the per-agent kill switches (`/<prefix>/agents/<agent>/enabled`), SNS topics (`<prefix>-approvals`, `<prefix>-alerts`), the Cognito user pool and resource server, the gateway, the sentinel rule and alarms, and the security groups (`<prefix>-lambda`, `<prefix>-vpc-endpoints`).
 
 - IAM names are global to the account. Two deployments in one account need different prefixes, also when they are in different Regions.
 - The Cognito domain is `<prefix>-<account ID>`, so it does not collide with other accounts. Cognito does not allow `aws`, `amazon` or `cognito` in a domain, so the prefix may not contain them either; Terraform rejects such a prefix.
@@ -39,9 +39,40 @@ sed 's/kube-handrail-sandbox/<namespace>/' k8s/sandbox/rbac.yaml | kubectl apply
 
 The end-to-end guard tests only run against `kube-handrail-sandbox`.
 
+## Agents
+
+Each agent is one OAuth client ([Agent identity](../mcp/CONTRACT.md#agent-identity)). The `agents` variable maps agent names (`^[a-z][a-z0-9_]{0,31}$`) to `{client_id = optional(string), hourly_apply_budget = optional(number)}`. An entry without `client_id` gets a Cognito app client with the `read` and `remediate` scopes; with `client_id`, that existing client of the user pool is allowed instead. The default is `{devops_agent = {}, smoke_test = { hourly_apply_budget = 30 }}`: one client for DevOps Agent and one for the smoke and end-to-end tests, whose runs apply more than the default budget of 10 in an hour. If you set `agents` yourself, keep that budget for `smoke_test`, or the smoke test followed by the end-to-end suite is refused with `agent_budget_exceeded`. The gateway allows exactly the agents' clients, and the drift sentinel reports any other.
+
+- **Add an agent.** Add a key, apply, read the new client's ID from the `agent_client_ids` output and its secret from Cognito (`aws cognito-idp describe-user-pool-client`), and give both only to that agent. To register it in DevOps Agent, run `scripts/devops_agent_register.py register-mcp` with its `CLIENT_ID` and `CLIENT_SECRET`. Give each agent its own client: two agents sharing one are one agent to the server.
+- **Budgets.** `hourly_apply_budget` on an entry, otherwise `agent_hourly_apply_budget` (default 10), is the agent's apply budget per clock hour; `global_hourly_apply_budget` still caps all agents together.
+- **Stop or restore one agent.** The `agent_kill_switch_parameters` output names each agent's switch. Terraform creates it as `true` and ignores later changes:
+
+  ```sh
+  aws ssm put-parameter --overwrite --name /<prefix>/agents/<agent>/enabled --value false   # stop
+  aws ssm put-parameter --overwrite --name /<prefix>/agents/<agent>/enabled --value true    # restore
+  ```
+
+  The global kill switch still stops every agent. The drift sentinel never writes the agent switches.
+- **Rotate the caller key.** `terraform apply -replace='terraform_data.caller_key[0]'` generates a new `CALLER_KEY` and sets it on the interceptor and both tool Lambdas. Writes in the moment they disagree are refused with `agent_unknown`.
+- **Legacy mode.** `caller_interceptor_enabled = false` removes the interceptor: plans then name no agent and the per-agent limits do not apply. Terraform warns when it is set. Use it only where gateway interceptors are not available.
+
+The end-to-end identity cases (`tests/e2e/e2e_gateway.py --with-identity`) need a second agent that only the test uses, with a budget the test can exhaust, and enough budget for the smoke test agent to run the whole suite:
+
+```hcl
+agents = {
+  devops_agent = {}
+  smoke_test   = { hourly_apply_budget = 30 } # at least the suite's applies
+  e2e_peer     = { hourly_apply_budget = 2 }  # used only by --with-identity
+}
+```
+
+Then, next to the variables the end-to-end tests already need, set `CLIENT_ID_B` to `agent_client_ids["e2e_peer"]` and `CLIENT_SECRET_B` to that client's secret. `AGENT_NAME` (default `smoke_test`, the agent of `CLIENT_ID`), `AGENT_NAME_B` (default `e2e_peer`) and `AGENT_BUDGET_B` (default 2) must match the variables when they differ. The test derives the agent switch of `e2e_peer` from `KILL_SWITCH_PARAM` and turns it off and on again, so the operator's credentials need `ssm:PutParameter` on it. Budgets count per clock hour: a server-mode run right after a client-mode run waits for the next hour if `e2e_peer`'s budget is spent.
+
+The end-to-end tests do not remove the interceptor from the gateway. That case is a manual live test: with the interceptor detached, a plan whose `_kube_handrail_caller` the client set itself, to its own or another agent's `client_id`, must be refused with `forbidden`, `agent_unknown`, and the next sentinel run must report `missing_interceptor`.
+
 ## Network
 
-The tool Lambdas (`k8s_read` and `k8s_write`) call the cluster's API server, `eks:DescribeCluster`, DynamoDB, SSM (write) and SNS (read), all over HTTPS. They never call STS or CloudWatch Logs. The approver, sentinel and interceptor Lambdas do not talk to the cluster and always run outside any VPC. Details are in the [contract](../mcp/CONTRACT.md#network).
+The tool Lambdas (`k8s_read` and `k8s_write`) call the cluster's API server, `eks:DescribeCluster`, DynamoDB, SSM (the kill switches) and SNS (read), all over HTTPS. They never call STS or CloudWatch Logs. The approver, sentinel and interceptor Lambdas do not talk to the cluster and always run outside any VPC. Details are in the [contract](../mcp/CONTRACT.md#network).
 
 | Cluster endpoint | Setting |
 |---|---|
@@ -64,7 +95,7 @@ On `terraform destroy`, Lambda releases the network interfaces of VPC functions 
 ## Order of steps
 
 1. **Sandbox RBAC.** Apply the namespace and RBAC (above). The bindings name the groups, not the roles, so they can exist before the roles do.
-2. **Variables.** Copy `terraform/terraform.tfvars.example` to `terraform/terraform.tfvars` and set at least `cluster_name`, `region` and, for a private endpoint, the network variables. For the first tests set `approval_mode = "client"`: the smoke test and the default guard tests apply through the gateway, which `server` mode refuses without an approval.
+2. **Variables.** Copy `terraform/terraform.tfvars.example` to `terraform/terraform.tfvars` and set at least `cluster_name`, `region` and, for a private endpoint, the network variables. Adjust `agents` if more than DevOps Agent and the tests will call the gateway ([Agents](#agents)). For the first tests set `approval_mode = "client"`: the smoke test and the default guard tests apply through the gateway, which `server` mode refuses without an approval.
 3. **Infrastructure.** `terraform -chdir=terraform init`, `plan`, `apply` ([Milestone 0, step 2](milestone-0.md#2-infrastructure)). The plan fails early if the authentication mode, the endpoint access or the network variables do not fit together.
 4. **Smoke and guard tests** through the gateway ([Milestone 0, step 3](milestone-0.md#3-smoke-test-through-the-gateway)). On a private-endpoint cluster, `kubectl` for the guard tests must reach the API server; the tool calls themselves go through the gateway and need no network access to the cluster from where they are run.
 5. **Register with AWS DevOps Agent**: `create-space`, `register-mcp`, `associate-read`, check in chat, then `enable-write` ([Milestone 0, step 4](milestone-0.md#4-register-with-aws-devops-agent)).
@@ -91,4 +122,19 @@ Plans open across an upgrade may have to be planned again; their expiry is short
 
 - **Plan argument record.** Plans now store the arguments they cover (`args`). A plan made before this change has none: its apply and its approval are refused with `plan_expired`, and the agent plans again.
 - **New tools** (`plan_restart_deployment`, `apply_restart_deployment`). Adding a tool changes the gateway's tool set before DevOps Agent's association knows it, so the drift sentinel reports drift and turns remediation off. With the DevOps Agent IDs configured, run `terraform apply`, then `scripts/devops_agent_register.py enable-write`, wait for a sentinel run that reports `ok`, then set the kill switch back to `true`. Re-run `install-guidance` so agents get the new `AGENTS.md` and the `kube-handrail-rollout` skill. The sandbox RBAC does not change: the writer's `patch` on Deployments covers the restart.
+- **Agent identity** (Milestone 2, item 3). The caller interceptor is now on by default, and the write path fails closed without a verified caller. Before applying:
+  - If `caller_interceptor_enabled` was `false`, the plan adds the interceptor Lambda, its role and log group, and changes the gateway's interceptor configuration. Check that the plan shows `aws_bedrockagentcore_gateway.this` as an update in place, not a replacement: a replaced gateway has a new URL, and DevOps Agent would have to be registered again.
+  - The `agents` keys default to `devops_agent` and `smoke_test`, the keys of the existing Cognito clients, so the plan must show no change to `aws_cognito_user_pool_client.this[...]` and no change to the gateway's allowed clients. If you renamed or removed an agent key, its client is replaced or deleted.
+  - Plans open during the upgrade name `mcp-gateway` and are refused (`forbidden`); the agent plans again. They expire within minutes anyway.
+  - Create the caller key on its own first, then apply the rest:
+
+    ```sh
+    terraform -chdir=terraform apply -target=terraform_data.caller_key
+    terraform -chdir=terraform apply
+    ```
+
+    The second apply sets `CALLER_KEY` on the interceptor and both tool Lambdas (an update in place). In a single apply the key is still unknown when the interceptor, which had no environment until now, is planned; the AWS provider then fails with `Provider produced inconsistent final plan` (`.environment: block count changed from 0 to 1`), and a second `terraform apply` completes it. A new deployment is not affected. While the apply updates them one by one, the interceptor and a tool Lambda can briefly disagree on the key; writes in that moment are refused with `agent_unknown`, and the agent plans again.
+  - New on the first apply: the sentinel's `bedrock-agentcore:GetGateway` permission (if it were missing, every run would be `unknown` and the unknown-result alarm would fire) and the tool roles' `ssm:GetParameter` on `parameter/<prefix>/agents/*` (if it did not match, every agent would count as switched off). Both were confirmed on a test deployment. After the apply, run the smoke test and check that a plan's `requested_by` is `agent:smoke_test`, and wait for a sentinel run that reports `ok`.
+
+  The tool set does not change, so the sentinel's association check sees no drift and `enable-write` is not needed. Re-run `install-guidance` so agents get the new error rows in `AGENTS.md`.
 - **Rollback** (`get_rollout_history`, `plan_rollback_deployment`, `apply_rollback_deployment`). Re-apply the sandbox RBAC first: the writer gains `get` on ReplicaSets, which a rollback apply needs to re-read the ReplicaSet its plan pinned (`kubectl apply -f k8s/sandbox/rbac.yaml`, or the `sed` command above for another namespace). Without it a rollback apply fails with `kubernetes_error` after consuming its plan. Then add the tools as above: `terraform apply`, `scripts/devops_agent_register.py enable-write`, wait for a sentinel run that reports `ok`, set the kill switch back to `true`, and re-run `install-guidance` so agents get the new `AGENTS.md` and the extended `kube-handrail-rollout` skill.

@@ -20,6 +20,7 @@ PLAN_RATE_LIMITED = "plan_rate_limited"
 MANUAL_CHANGE = "manual_change"
 COOLDOWN = "cooldown"
 GLOBAL_BUDGET_EXCEEDED = "global_budget_exceeded"
+AGENT_BUDGET_EXCEEDED = "agent_budget_exceeded"
 BLAST_RADIUS_EXCEEDED = "blast_radius_exceeded"
 APPROVAL_REQUIRED = "approval_required"
 APPROVAL_RATE_LIMITED = "approval_rate_limited"
@@ -49,6 +50,7 @@ ERROR_CODES = frozenset(
         MANUAL_CHANGE,
         COOLDOWN,
         GLOBAL_BUDGET_EXCEEDED,
+        AGENT_BUDGET_EXCEEDED,
         BLAST_RADIUS_EXCEEDED,
         APPROVAL_REQUIRED,
         APPROVAL_RATE_LIMITED,

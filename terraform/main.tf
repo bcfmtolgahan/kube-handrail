@@ -64,6 +64,10 @@ locals {
     APPROVAL_REQUEST_COOLDOWN_SECONDS = tostring(var.approval_request_cooldown_seconds)
     APPROVAL_REQUEST_LIMIT            = tostring(var.approval_request_limit)
 
+    AGENTS                    = local.agents_env
+    AGENT_KILL_SWITCH_PREFIX  = local.agent_kill_switch_prefix
+    AGENT_HOURLY_APPLY_BUDGET = tostring(var.agent_hourly_apply_budget)
+
     METRIC_NAMESPACE = local.tools_metric_namespace
   }
 
@@ -86,6 +90,24 @@ locals {
   }
 
   scopes = ["read", "remediate"]
+
+  # Agent name => OAuth client_id: the clients created below and the external ones named in
+  # var.agents. The gateway allows exactly these, and the tool Lambdas know them as AGENTS.
+  agent_client_ids = merge(
+    { for name, client in aws_cognito_user_pool_client.this : name => client.id },
+    { for name, agent in var.agents : name => agent.client_id if agent.client_id != null },
+  )
+  # Sorted by agent name; with the default agents this is the list earlier versions allowed.
+  allowed_clients = [for name in sort(keys(local.agent_client_ids)) : local.agent_client_ids[name]]
+  # client_id => {name, hourly_apply_budget}, as mcp/CONTRACT.md (Agent identity) defines AGENTS.
+  agents_env = jsonencode({
+    for name, client_id in local.agent_client_ids : client_id => {
+      name                = name
+      hourly_apply_budget = coalesce(var.agents[name].hourly_apply_budget, var.agent_hourly_apply_budget)
+    }
+  })
+  # Per-agent kill switches are <prefix><name>/enabled.
+  agent_kill_switch_prefix = "/${var.name_prefix}/agents/"
 
   cognito_domain        = "${var.name_prefix}-${local.account_id}"
   cognito_discovery_url = "https://cognito-idp.${local.region}.amazonaws.com/${aws_cognito_user_pool.this.id}/.well-known/openid-configuration"
@@ -201,6 +223,13 @@ data "aws_iam_policy_document" "lambda" {
     }
   }
 
+  # Both Lambdas read the per-agent kill switches: plan and request_approval as well as apply.
+  statement {
+    sid       = "AgentKillSwitches"
+    actions   = ["ssm:GetParameter"]
+    resources = ["arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${local.agent_kill_switch_prefix}*"]
+  }
+
   dynamic "statement" {
     for_each = each.value.approval_requests ? [1] : []
     content {
@@ -306,6 +335,7 @@ resource "aws_lambda_function" "this" {
       local.common_env,
       each.value.kill_switch ? { REMEDIATION_ENABLED_PARAM = aws_ssm_parameter.kill_switch.name } : {},
       { CALLER_INTERCEPTOR = tostring(var.caller_interceptor_enabled) },
+      local.caller_key_env,
       each.value.approval_requests ? {
         APPROVAL_TOPIC_ARN = aws_sns_topic.approvals.arn
         APPROVAL_URL       = aws_lambda_function_url.approver.function_url
@@ -406,6 +436,20 @@ resource "aws_ssm_parameter" "kill_switch" {
   }
 }
 
+# One kill switch per agent. Only operators write them; the drift sentinel never does.
+resource "aws_ssm_parameter" "agent_enabled" {
+  for_each = var.agents
+
+  name        = "${local.agent_kill_switch_prefix}${each.key}/enabled"
+  description = "Only the exact value \"true\" lets agent ${each.key} plan, request approval and apply."
+  type        = "String"
+  value       = "true"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 # --- EKS access (RBAC bindings live in the cluster) -------------------------
 
 resource "aws_eks_access_entry" "lambda" {
@@ -449,8 +493,10 @@ resource "aws_cognito_resource_server" "this" {
   }
 }
 
+# One client per agent without an external client_id. The keys are agent names, as the
+# fixed set (devops_agent, smoke_test) was before, so those clients keep their addresses.
 resource "aws_cognito_user_pool_client" "this" {
-  for_each = toset(["devops_agent", "smoke_test"])
+  for_each = { for name, agent in var.agents : name => agent if agent.client_id == null }
 
   name                                 = "${var.name_prefix}-${replace(each.key, "_", "-")}"
   user_pool_id                         = aws_cognito_user_pool.this.id
@@ -505,7 +551,7 @@ resource "aws_bedrockagentcore_gateway" "this" {
   authorizer_configuration {
     custom_jwt_authorizer {
       discovery_url   = local.cognito_discovery_url
-      allowed_clients = [for c in aws_cognito_user_pool_client.this : c.id]
+      allowed_clients = local.allowed_clients
     }
   }
 

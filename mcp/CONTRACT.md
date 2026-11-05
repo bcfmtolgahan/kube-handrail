@@ -25,13 +25,36 @@ The classification of every tool is in `mcp/classification.json`, a map from ful
 
 The tool name is the part after `___` in `context.client_context.custom["bedrockAgentCoreToolName"]`. The event is the tool arguments object. There is no `tool_name` argument and no fallback. An unknown tool returns error code `unknown_tool`.
 
-## Caller identity (experimental)
+## Agent identity
 
-Without an interceptor, a tool Lambda learns nothing about the caller: `client_context.custom` carries the gateway, target, tool name and request IDs only. With `caller_interceptor_enabled = true`, Terraform attaches a gateway REQUEST interceptor (`mcp/interceptor/`) with `passRequestHeaders`. The gateway runs it after validating the inbound JWT. For `tools/call` it sets the reserved argument `_kube_handrail_caller` to the token's `client_id` (`unknown` if the token cannot be read), overwriting whatever the client sent under that name. It never logs or forwards the token.
+An agent is an OAuth client (a Cognito app client): Terraform's `agents` map names each agent and creates its client, or names an existing `client_id` of the user pool. Two agents that share a client are one agent; nothing enforces one client per agent, so give each agent its own. See [ADR 0003](../docs/adr/0003-agent-identity.md).
 
-Before any handler runs, dispatch removes `_kube_handrail_caller` from the arguments. It trusts the value only when the Lambda's `CALLER_INTERCEPTOR` is `true` (without the interceptor, a client could have sent it) and logs it as `caller` in the [tool record](#observability) (`null` when not trusted). It is not yet used for any decision: plans still record `requested_by = "mcp-gateway"`. Per-agent attribution and budgets are Milestone 2.
+Without an interceptor, a tool Lambda learns nothing about the caller: `client_context.custom` carries the gateway, target, tool name and request IDs only. With `caller_interceptor_enabled = true` (the default), Terraform attaches a gateway REQUEST interceptor (`mcp/interceptor/`) with `passRequestHeaders`. The gateway runs it after validating the inbound JWT. For `tools/call` it sets the reserved argument `_kube_handrail_caller` to the token's `client_id` (`unknown` if the token cannot be read), signed as `<client_id>.<signature>`, where the signature is the hex HMAC-SHA256 of the `client_id` under `CALLER_KEY`, overwriting whatever the client sent under that name. `CALLER_KEY` is a random key Terraform generates once and sets on the interceptor and both tool Lambdas only; no client ever sees it. It keeps no state, so the gateway's retries are safe, and it never logs or forwards the token. The reserved name is not in any tool's `inputSchema`; the gateway passes it through to the interceptor and on to the target without rejecting it.
 
-The reserved name is not in any tool's `inputSchema`. The gateway passed it through to the interceptor and on to the target without rejecting it.
+Before any handler runs, dispatch removes `_kube_handrail_caller` from the arguments. It trusts the value only when the Lambda's `CALLER_INTERCEPTOR` is `true`, `CALLER_KEY` is set and the signature matches: a client can send the argument itself, and a gateway without the interceptor passes it through, but a client cannot sign it. The trusted value is the `client_id` without the signature. Dispatch logs it as `caller` in the [tool record](#observability) (`null` when not trusted), and gives it to the handler as the verified caller.
+
+**Identity mode** (`CALLER_INTERCEPTOR=true`). `AGENTS` maps each `client_id` to its agent. The caller's agent is `AGENTS[caller]`; a caller that is missing, `unknown` or not listed is refused with `forbidden`, `details: {"reason": "agent_unknown"}` (the `client_id` is in the tool record, not in the response), on every `plan_*` tool, on `request_approval` and on every `apply_*` through the gateway. Read tools are allowed for any caller the gateway let in, and the caller is logged. A plan records `requested_by = "agent:<name>"`, `agent` and `requested_client_id` ([Plan record](#plan-record-dynamodb)), and its response `data` has `requested_by`. The agent is not part of `args_hash`: the consume condition binds it instead, so argument hashes are the same in both modes.
+
+- `request_approval` only for a plan whose `requested_by` is the caller's: otherwise `forbidden`, `details: {"reason": "not_requester"}`, nobody is notified and nothing changes.
+- A gateway apply consumes the plan only if `requested_by` is the caller's, in the same conditional write that checks everything else ([Apply condition](#apply-condition)): another agent gets `forbidden` with `not_requester` and the plan stays usable. A plan made in legacy mode (`requested_by = "mcp-gateway"`) is therefore refused to every agent and must be planned again.
+- An apply on the approval channel (below) carries no caller and needs none. It is attributed to the plan's agent; a plan without one is refused after the consume with `forbidden`, `agent_unknown`.
+- Every apply of a plan that names its agent also sets the Deployment annotation `kube-handrail.io/requested-by` to `requested_by`, in the same patch as the other annotations, so humans and admission policy can see which agent asked.
+
+**Per-agent budget and kill switch** (identity mode). Each agent has an hourly apply budget (`hourly_apply_budget` in `AGENTS`, default `AGENT_HOURLY_APPLY_BUDGET`, 10) next to the global one, and its own kill switch, the SSM parameter `/<name_prefix>/agents/<name>/enabled`, next to the global one. Terraform creates each switch with the value `true` and ignores later changes to it, like the global switch.
+
+- The kill switch is read on every call, without caching: only the exact value `true` lets the agent act; another value, a missing parameter or a read error counts as off. It is checked on plan and `request_approval` right after the caller is resolved, and on apply right after the consume, because on the approval channel the agent is known only from the record. Off gives `remediation_disabled` with `details: {"scope": "agent", "agent": "<name>"}`; other agents are not affected, and the global kill switch still stops everyone. An apply refused this way leaves the plan consumed, so an approved plan of a disabled agent cannot be applied later.
+- The budget counts applies per clock hour in the plan table (`budget#agent#<name>#<hour start>`). A plan reads the counter after the global one; an apply takes a unit of its plan's agent's budget, whichever channel runs it, right before the global unit ([Guard checks](#guard-checks)). Spent gives `agent_budget_exceeded` with `details: {"agent", "limit", "window_start", "retry_after"}`.
+- The drift sentinel never writes an agent's switch: restoring one agent is always a deliberate operator step.
+
+**Legacy mode** (`caller_interceptor_enabled = false`, for gateways where interceptors are not available). No caller is verified and `AGENTS` is ignored. Every plan records `requested_by = "mcp-gateway"`, the class of the gateway's machine identities, without `agent`; there are no per-agent checks. Terraform warns (a `check` block) when this mode is chosen.
+
+**Channels.** The approver adds `"kubeHandrailChannel": "approval-api"` to the `ClientContext` of the apply it runs ([Approval API](#approval-api)), next to `kubeHandrailCorrelationId`. Dispatch reads it as the invocation's channel: exactly `approval-api`, or `gateway` for anything else, including no value. Gateway clients cannot set `client_context.custom`; anyone who can invoke the write Lambda directly can set it, and can already forge every argument, which is administrator-level access. The approval channel grants nothing that server mode does not: the consume condition still requires the human approval. The apply records its channel in the plan record (`channel`), in the same conditional write that consumes the plan.
+
+Known limits:
+
+- The identity is the OAuth client, not the agent session: two agents sharing a client cannot be told apart.
+- If the interceptor is missing or broken, gateway calls arrive without a signed caller: a caller argument the client sent itself fails the signature check, so every write path is refused (fail closed) and read tools log no caller. The [drift sentinel](#drift-sentinel) reports the gateway configuration.
+- `CALLER_KEY` is in the Lambda configuration and the Terraform state, like the rest of the environment: whoever can read either can sign a caller, which is administrator-level access.
 
 ## Observability
 
@@ -68,15 +91,16 @@ Every tool invocation, including `unknown_tool`, prints exactly one JSON line wh
       "Metrics": [ { "Name": "GuardRejections", "Unit": "Count" } ] } ] },
   "Tool": "apply_scale_deployment", "Code": "conflict",
   "ToolCalls": 1, "ToolErrors": 0, "GuardRejections": 1,
-  "tool": "apply_scale_deployment", "correlation_id": "...", "caller": null,
-  "plan_id": "...", "outcome": "conflict", "duration_ms": 412
+  "tool": "apply_scale_deployment", "correlation_id": "...", "caller": "<client_id>",
+  "plan_id": "...", "outcome": "conflict", "reason": null, "scope": null, "duration_ms": 412
 }
 ```
 
 - `tool`: the tool name, `null` for an unknown tool (whose `Tool` dimension is `unknown`).
-- `caller`: the verified caller ([Caller identity](#caller-identity-experimental)), otherwise `null`.
+- `caller`: the verified caller's `client_id` ([Agent identity](#agent-identity)), otherwise `null`.
 - `plan_id`: the `plan_id` of a successful response's `data`, otherwise the `plan_id` argument, and only if it is a UUID; otherwise `null`.
 - `outcome`: `ok` or the error code.
+- `reason` and `scope`: a rejection's `details.reason` (`forbidden`) and `details.scope` (`remediation_disabled`), otherwise `null`. They are fixed words set by the server, so the metrics keep `Code` as their only rejection dimension.
 - `ToolCalls` is 1. `ToolErrors` is 1 for `internal` and `kubernetes_error` (the tool could not do its job, for example the Kubernetes API refused its credentials or returned a server error). Any other error code is a guard rejection: the record then has `Code` and `GuardRejections = 1` and the second metric entry; an `ok`, `internal` or `kubernetes_error` record has neither. The empty dimension set gives `ToolCalls` and `ToolErrors` across all tools.
 
 The record has only these fields. Argument values, tokens and error messages are never in it. An internal error additionally logs its stack trace through the Lambda logger, in a line that names the correlation ID.
@@ -110,9 +134,9 @@ Every handler returns a JSON object (not wrapped in `statusCode`/`body`):
 }
 ```
 
-`replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. For `conflict` because the Deployment's rollout is paused (restart and rollback, on plan and apply), `details` is `{ "paused": true }`. For `conflict` because the ReplicaSet a rollback plan pinned was replaced, `details` is `{ "replica_set": { "planned": "<uid>", "current": "<uid>" } }`, and because its template changed, `{ "template": { "planned": "sha256:...", "current": "sha256:..." } }`. `revision_not_found` has `details` `{ "revision": 3, "available": [5, 4, 2] }` on a plan and `{ "revision": 3, "replica_set": "<name>" }` on an apply ([Rollback](#rollback)). A `conflict` from a 409 that persists after all patch attempts has no `details`. The history checks below also return `details`; every value in them is an integer or a string.
+`replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. For `conflict` because the Deployment's rollout is paused (restart and rollback, on plan and apply), `details` is `{ "paused": true }`. For `conflict` because the ReplicaSet a rollback plan pinned was replaced, `details` is `{ "replica_set": { "planned": "<uid>", "current": "<uid>" } }`, and because its template changed, `{ "template": { "planned": "sha256:...", "current": "sha256:..." } }`. `revision_not_found` has `details` `{ "revision": 3, "available": [5, 4, 2] }` on a plan and `{ "revision": 3, "replica_set": "<name>" }` on an apply ([Rollback](#rollback)). A `conflict` from a 409 that persists after all patch attempts has no `details`. `forbidden` from an agent check has `details` `{"reason": "agent_unknown" | "not_requester"}`, and `remediation_disabled` from an agent's own kill switch `{"scope": "agent", "agent": "<name>"}` (the global kill switch adds no `details`); see [Agent identity](#agent-identity). The history checks below also return `details`; every value in them is an integer or a string.
 
-Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `revision_not_found`, `forbidden`, `kubernetes_error`, `internal`.
+Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `agent_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `revision_not_found`, `forbidden`, `kubernetes_error`, `internal`.
 
 ## Untrusted output
 
@@ -251,7 +275,9 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `expires_at` | N | epoch seconds, end of plan validity: `created_at + PLAN_TTL_SECONDS` (default 300 s); `created_at + APPROVAL_WAIT_TTL_SECONDS` once an approval is requested; `approved_at + APPLY_AFTER_APPROVAL_TTL_SECONDS` once approved; `rejected_at` once rejected |
 | `retain_until` | N | epoch seconds, the table TTL attribute: `created_at + max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60`, the longest window plus the longest a plan can stay valid, so a record stays readable as history after the plan expired. A record without it is kept until deleted |
 | `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a AND attribute_not_exists(rejected_by)`, extended in `server` and `both` mode (see [Server-side approval](#server-side-approval)) |
-| `requested_by` | S | the requesting principal. Until per-agent identity reaches the server it is the constant `mcp-gateway`, the class of the gateway's machine identities |
+| `requested_by` | S | the requesting principal: `agent:<name>` in identity mode, the constant `mcp-gateway` (the class of the gateway's machine identities) in legacy mode and on records made before identity mode ([Agent identity](#agent-identity)) |
+| `agent`, `requested_client_id` | S, S | identity mode only: the requesting agent's name and the verified OAuth `client_id` it planned with, kept as evidence because the name-to-client mapping can change |
+| `channel` | S | the channel the apply ran under, `gateway` or `approval-api`, written by the conditional update that consumes the plan; absent until then |
 | `status` | S | `planned`, `awaiting_approval`, `approved` or `rejected`. `applied` (`used = true`) and `expired` (`expires_at <= now`) are derived, never stored. Records made before server approval have no `status` and `requested_by`; they can be applied in `client` mode until they expire but never requested or approved |
 | `override_manual_change` | BOOL | the value pinned in `args_hash` |
 | `impact` | M | the impact preview returned with the plan, so the approval channel renders the server's own record |
@@ -263,7 +289,7 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 
 Global secondary index `object-history`: partition key `object_key` (S), sort key `created_at` (N), projection `ALL`. It is eventually consistent, so a plan or apply from the last moment may not be visible yet.
 
-The table also holds one global budget counter per clock hour: `plan_id = "budget#global#<hour start, epoch seconds>"` (never a UUID, so it cannot be named as a plan), `applies` (N), and `retain_until` two hours after the hour starts; and one approval request counter per 600-second clock window: `plan_id = "approval#global#<window start>"`, `requests` (N), `retain_until` two windows after the window starts. They have no `object_key`, so they are not in the index.
+The table also holds one global budget counter per clock hour: `plan_id = "budget#global#<hour start, epoch seconds>"` (never a UUID, so it cannot be named as a plan), `applies` (N), and `retain_until` two hours after the hour starts; and one approval request counter per 600-second clock window: `plan_id = "approval#global#<window start>"`, `requests` (N), `retain_until` two windows after the window starts. In identity mode it also holds one apply counter per agent and clock hour: `plan_id = "budget#agent#<name>#<hour start>"` (`#` cannot occur in an agent name), `applies` (N), `retain_until` as for the global counter. They have no `object_key`, so they are not in the index.
 
 ## Guard checks
 
@@ -280,7 +306,9 @@ Plan (`k8s_read`):
 8. Global budget: the current hour's counter, read consistently, must be below `GLOBAL_HOURLY_APPLY_BUDGET`. Planning only reads it.
 9. Impact preview: list the PodDisruptionBudgets, Services and EndpointSlices in the namespace (below). Any error fails the plan with `kubernetes_error`, so the approver never sees a preview with gaps. Only then is the plan record written.
 
-The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact`, `expires_at` and `correlation_id`. `preflight` lists the checks that passed, in this order: `arguments`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`.
+In identity mode the caller is resolved to its agent right after checks 1-3, before the Deployment is read (`forbidden`, `agent_unknown`; [Agent identity](#agent-identity)), and the agent's kill switch must be on (`remediation_disabled`, `details.scope = "agent"`). After check 8, the agent's counter for the current hour, read consistently, must be below its budget (`agent_budget_exceeded`); planning only reads it.
+
+The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact`, `expires_at`, `requested_by` and `correlation_id`. `preflight` lists the checks that passed, in this order: `arguments`, `agent_enabled`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`, `agent_budget`. In legacy mode `agent_enabled` and `agent_budget` are `{"passed": true, "skipped": true}`, so a client can see that the per-agent checks did not run.
 
 `blast_radius_exceeded` `details`:
 
@@ -299,6 +327,8 @@ Apply (`k8s_write`), all re-checked independently of the plan step:
 6. The patch also sets the annotations `kube-handrail.io/last-plan-id` to the applied `plan_id` and `kube-handrail.io/correlation-id` to the apply's [correlation ID](#observability).
 7. History checks, after step 3 and after the first read in step 4 has passed: manual change, cooldown, flapping and object budget (not the plan rate limit), then the global budget: one conditional update adds 1 to the current hour's counter only if it is below `GLOBAL_HOURLY_APPLY_BUDGET`, so concurrent applies cannot overshoot it. The unit is taken before the patch and not returned if the patch then fails. They use the planned `replicas_from` and `replicas_to`; the check in step 4 has confirmed that `replicas_from` is the current count. A 409 retry re-runs step 4 but not the history checks. A rejection here leaves the plan consumed, with the error code as its `result`.
 
+In identity mode, a gateway apply resolves its caller to an agent between steps 1 and 2 (`forbidden`, `agent_unknown`), and step 3's conditional update also requires the plan's `requested_by` to be that agent's ([Apply condition](#apply-condition)). Step 3 records the apply's `channel` in the same update. Right after it, on every channel, a plan without `agent` is refused in identity mode (`forbidden`, `agent_unknown`; only the approval channel can get that far with one), and the kill switch of the plan's agent must be on (`remediation_disabled`, `details.scope = "agent"`); either refusal leaves the plan consumed with its code as `result`, like a blast-radius refusal. In step 7, one conditional update adds 1 to the plan's agent's counter for the current hour, only while it is below the agent's budget (`agent_budget_exceeded`), right before the global unit is taken, whichever channel applies the plan.
+
 The kill switch is read on every apply (no caching), so turning it off takes effect immediately.
 
 ## Restart
@@ -314,7 +344,7 @@ Plan, differences from the scale steps above:
 - The impact preview is the rollout preview ([Impact preview](#impact-preview)).
 - The record has `replicas_from = replicas_to = ` the current count, `template_to` as above, and `revision_from`.
 
-`data.diff` is `{"restart": {"pods_replaced": <current replicas>}, "template": {"from": "sha256:...", "to": "sha256:..."}}` and `preflight` lists `arguments`, `namespace_allowed`, `not_gitops_managed`, `not_paused`, `cooldown`, `object_budget`, `plan_rate`, `global_budget`.
+`data.diff` is `{"restart": {"pods_replaced": <current replicas>}, "template": {"from": "sha256:...", "to": "sha256:..."}}` and `preflight` lists `arguments`, `agent_enabled`, `namespace_allowed`, `not_gitops_managed`, `not_paused`, `cooldown`, `object_budget`, `plan_rate`, `global_budget`, `agent_budget`.
 
 Apply, differences from the scale steps above:
 
@@ -368,7 +398,7 @@ Plan, differences from the scale steps above:
 
 - `images` covers every container and init container in either template, matched by name and sorted by `init` and then name. `from` and `to` are the images as untrusted text, `null` for a container in only one of the two templates; `changed` says whether they differ; `pinned_by_digest` is about `to`. At most 20; more set the envelope's `truncated`, and the cut drops unchanged containers first, so a changed image is never hidden behind unchanged ones.
 - `fields_changed` names the paths whose values differ, at most two levels below the template's `metadata` and `spec`: `metadata.<key>`, `spec.<key>`, and per container matched by name `spec.containers[<name>].<key>` (likewise `initContainers`), or `spec.containers[<name>]` for a container in only one template, or `spec.containers` when only their order differs. Names only, never values. At most 50; more set the envelope's `truncated`.
-- `preflight` lists `arguments`, `namespace_allowed`, `not_gitops_managed`, `not_paused`, `revision_found`, `template_differs`, `no_manual_change` (with `"overridden": true` when the override was used), `cooldown`, `object_budget`, `plan_rate`, `global_budget`.
+- `preflight` lists `arguments`, `namespace_allowed`, `not_gitops_managed`, `not_paused`, `revision_found`, `template_differs`, `no_manual_change` (with `"overridden": true` when the override was used), `cooldown`, `object_budget`, `plan_rate`, `global_budget`, `agent_budget`, with `agent_enabled` after `arguments`.
 
 The template itself, env values, commands and args are never stored in the record or returned. The apply reads the template again from the cluster, so the plan table can never supply a pod spec.
 
@@ -487,6 +517,7 @@ The last apply is also taken from the Deployment itself: the plan named by its `
 { "code": "manual_change", "details": { "last_applied_template": "sha256:...", "current_template": "sha256:..." } }
 { "code": "cooldown", "details": { "cooldown_seconds": 60, "last_applied_at": 1700000060, "retry_after": 1700000120, "history": [ ... ] } }
 { "code": "global_budget_exceeded", "details": { "limit": 30, "window_start": 1699999200, "retry_after": 1700002800 } }
+{ "code": "agent_budget_exceeded", "details": { "agent": "smoke_test", "limit": 10, "window_start": 1699999200, "retry_after": 1700002800 } }
 ```
 
 `count` is the number of applies in the window (flapping, budget) or of plans (rate limit).
@@ -500,35 +531,37 @@ Known limits:
 - A request that keeps the count unchanged is allowed, has no direction, and once applied counts toward the budget.
 - Rejected plans are not stored, so the plan rate limit does not bound requests refused by an earlier check. Each of those costs one Deployment read, one HPA list and two table reads, and changes nothing.
 - Plans that are pending (created but not applied) do not count toward flapping, the cooldown or the budgets.
-- The global budget counts clock hours, not a sliding window, so up to twice the limit can be applied across an hour boundary.
+- The global and per-agent budgets count clock hours, not a sliding window, so up to twice the limit can be applied across an hour boundary.
+- The agent unit is taken before the global unit, as two separate conditional updates: an apply refused because the global budget is spent has already used a unit of its agent's budget, which is not given back (like the units of an apply whose patch fails).
 - The windows compare `applied_at` and `created_at`, written by one Lambda, with `now` on another; Lambda clocks are NTP-synchronised, so the skew is negligible against windows of minutes.
 
 ## Drift sentinel
 
-A write tool that loses its `MUTATIVE` classification runs without approval in DevOps Agent (an unclassified tool counts as `READ_ONLY`). The sentinel is a scheduled Lambda (`mcp/sentinel/`, every 5 minutes by default) that turns remediation off when that happens. It is not a gateway target and has no MCP tools.
+A write tool that loses its `MUTATIVE` classification runs without approval in DevOps Agent (an unclassified tool counts as `READ_ONLY`). The sentinel is a scheduled Lambda (`mcp/sentinel/`, every 5 minutes by default) that turns remediation off when that happens, or when the gateway no longer identifies agents as deployed. It is not a gateway target and has no MCP tools.
 
-Each run checks, against `mcp/classification.json`:
+Each run checks, against `mcp/classification.json` and the deployed configuration:
 
 1. **Gateway.** `ListGatewayTargets`, then `GetGatewayTarget` for each expected target: the tool names in the target's inline tool schema must be exactly the classified tools of that target. A missing or extra tool, a missing target, or a target that is not in the classification is drift.
-2. **DevOps Agent** (only when an agent space and association are configured). `GetAssociation`: the associated `mcpserver` tools must be exactly the classified tools, and every `MUTATIVE` tool must be associated as `MUTATIVE`; a tool without a `toolDetails` entry counts as `READ_ONLY`. A `READ_ONLY` tool associated as `MUTATIVE` only adds an approval and is not drift. `GetAgentSpace`: `elevatedActionsEnabled` (absent counts as `false`) must equal the configured expectation. Configure the IDs only after `enable-write`: before it, the write tool is not associated, which is reported as drift.
+2. **Gateway configuration.** `GetGateway`. When an interceptor is deployed (`EXPECT_INTERCEPTOR_ARN` is set), the gateway must have an interceptor configuration with the `REQUEST` interception point, that Lambda ARN and `inputConfiguration.passRequestHeaders = true`; otherwise `missing_interceptor`. `authorizerConfiguration.customJWTAuthorizer.allowedClients` may list only the agents' clients (`EXPECT_ALLOWED_CLIENTS`): each other client is `unexpected_client`, and a gateway that lists no clients at all is `unexpected_client` with the subject `any client`. A client missing from the list only locks that agent out and is not drift. Without the interceptor, gateway writes are refused anyway ([Agent identity](#agent-identity)); this check makes the failure loud and turns remediation off. Findings name the interceptor and clients without ARNs.
+3. **DevOps Agent** (only when an agent space and association are configured). `GetAssociation`: the associated `mcpserver` tools must be exactly the classified tools, and every `MUTATIVE` tool must be associated as `MUTATIVE`; a tool without a `toolDetails` entry counts as `READ_ONLY`. A `READ_ONLY` tool associated as `MUTATIVE` only adds an approval and is not drift. `GetAgentSpace`: `elevatedActionsEnabled` (absent counts as `false`) must equal the configured expectation. Configure the IDs only after `enable-write`: before it, the write tool is not associated, which is reported as drift.
 
-The gateway, association and agent-space checks run independently. Findings from one are acted on even if another fails, because the only action is turning remediation off; a run with errors and no findings is `unknown`.
+The gateway, gateway configuration, association and agent-space checks run independently. Findings from one are acted on even if another fails, because the only action is turning remediation off; a run with errors and no findings is `unknown`.
 
 Outcomes, returned and logged as one JSON line `{ "status": "ok" | "drift" | "unknown", "findings": [ { "check", "issue", "subject", ... } ], "errors": [ "<Operation>: <ErrorCode>" ] }` that is also a CloudWatch embedded metric record (namespace `<name_prefix>/sentinel`, metrics `Drift` and `Unknown`, 0 or 1 per run):
 
 | Status | When | Action |
 |---|---|---|
 | `ok` | No finding. | None. |
-| `drift` | At least one finding (issues `missing_tool`, `extra_tool`, `missing_target`, `extra_target`, `not_mutative`, `elevated_actions`). | Set the kill switch parameter to `false` (skipped if it already is), then publish an alert to the SNS topic listing the findings by tool name only. If either step fails, the run still does the other, then fails, so it is retried and the error alarm fires. |
+| `drift` | At least one finding (issues `missing_tool`, `extra_tool`, `missing_target`, `extra_target`, `missing_interceptor`, `unexpected_client`, `not_mutative`, `elevated_actions`). | Set the kill switch parameter to `false` (skipped if it already is), then publish an alert to the SNS topic listing the findings by tool name only. If either step fails, the run still does the other, then fails, so it is retried and the error alarm fires. |
 | `unknown` | Any API error (including throttling and missing permissions), a response that cannot be read, a gateway target that is not `READY`, or invalid configuration. | Log the error code and operation (not the message), emit `Unknown = 1`. The kill switch is never touched and no drift alert is sent. A CloudWatch alarm notifies the same topic after 3 consecutive 5-minute periods with an unknown result or with no run at all (missing data counts as breaching). |
 
-The sentinel only ever writes `false`. Restoring remediation is manual:
+The sentinel only ever writes `false`, and only to the global kill switch: it has no access to the per-agent switches, so a sentinel fault cannot silently lock out one agent. Restoring remediation is manual:
 
 1. Find the cause in the alert and fix it, for example a registration update that dropped `toolDetails`.
-2. Re-run `scripts/devops_agent_register.py enable-write`, which reclassifies from `mcp/classification.json` and exits non-zero unless the write tools are `MUTATIVE` and elevated actions are on. For gateway drift, re-apply Terraform.
+2. Re-run `scripts/devops_agent_register.py enable-write`, which reclassifies from `mcp/classification.json` and exits non-zero unless the write tools are `MUTATIVE` and elevated actions are on. For gateway drift, including a removed interceptor or an added client, re-apply Terraform.
 3. Wait for a sentinel run to report `ok` (or invoke the function), then set the kill switch parameter back to `true`: `aws ssm put-parameter --overwrite --name <kill_switch_parameter> --value true`.
 
-Configuration (environment variables, set by Terraform): `GATEWAY_ID`, `REMEDIATION_ENABLED_PARAM` (the write Lambda's kill switch), `ALERT_TOPIC_ARN`, `METRIC_NAMESPACE`, `TOOL_CLASSIFICATION` (the content of `mcp/classification.json`), `AGENT_SPACE_ID` and `ASSOCIATION_ID` (both or neither; empty skips the DevOps Agent checks), `EXPECT_ELEVATED_ACTIONS` (`true` or `false`, default `true`). Terraform variables: `sentinel_enabled`, `sentinel_schedule`, `devops_agent_space_id`, `devops_agent_association_id`, `expect_elevated_actions`, `alert_email`.
+Configuration (environment variables, set by Terraform): `GATEWAY_ID`, `REMEDIATION_ENABLED_PARAM` (the write Lambda's kill switch), `ALERT_TOPIC_ARN`, `METRIC_NAMESPACE`, `TOOL_CLASSIFICATION` (the content of `mcp/classification.json`), `AGENT_SPACE_ID` and `ASSOCIATION_ID` (both or neither; empty skips the DevOps Agent checks), `EXPECT_ELEVATED_ACTIONS` (`true` or `false`, default `true`), `EXPECT_INTERCEPTOR_ARN` (the interceptor's Lambda ARN, empty in legacy mode), `EXPECT_ALLOWED_CLIENTS` (JSON list of the agents' client IDs, required). Terraform variables: `sentinel_enabled`, `sentinel_schedule`, `devops_agent_space_id`, `devops_agent_association_id`, `expect_elevated_actions`, `alert_email`.
 
 Known limits:
 
@@ -569,7 +602,7 @@ A plan can be approved without a request (for example right after planning). Eve
 
 ### Apply condition
 
-In every mode the consume condition refuses a rejected plan (`attribute_not_exists(rejected_by)`), even if the rejecting and the applying clock disagree about `expires_at`. In `server` and `both` mode it becomes
+In every mode the consume condition refuses a rejected plan (`attribute_not_exists(rejected_by)`), even if the rejecting and the applying clock disagree about `expires_at`. In identity mode a gateway apply adds `AND requested_by = :rb`, the caller's `agent:<name>` ([Agent identity](#agent-identity)). In `server` and `both` mode it becomes
 
 ```
 used = false AND expires_at > :now AND args_hash = :h AND action = :a
@@ -586,8 +619,9 @@ Approval, argument match, separation of duties, expiry and single use are one at
 3. approved but `approval_expires_at <= now` (server and both): `approval_required`, `details: {"status": "approval_expired"}`;
 4. `expires_at <= now`: `plan_expired`;
 5. arguments differ: `plan_mismatch` (the approval is pinned to `args_hash`, including `override_manual_change`);
-6. not approved (server and both): `approval_required`, `details: {"status": "planned" | "awaiting_approval"}`;
-7. approved by the requester, or an approval of other arguments (only possible by writing the table directly): `approval_required`, `details: {"status": "approval_invalid"}`.
+6. identity mode, gateway apply, `requested_by` is not the caller's: `forbidden`, `details: {"reason": "not_requester"}`;
+7. not approved (server and both): `approval_required`, `details: {"status": "planned" | "awaiting_approval"}`;
+8. approved by the requester, or an approval of other arguments (only possible by writing the table directly): `approval_required`, `details: {"status": "approval_invalid"}`.
 
 After the consume, the record's `args` must equal the request's arguments without `plan_id` (an absent or `false` override counts as not given), and its `namespace`, `name`, `replicas_to` and `override_manual_change` must match them (for a restart: `namespace` and `name`, plus the record checks in [Restart](#restart); for a rollback: those in [Rollback](#rollback)) (`plan_mismatch` otherwise; a record without `args` is `plan_expired`, as at the approver), so a record altered in the table cannot redirect an apply even with a matching `args_hash`. A successful scale apply's `data` is `plan_id`, `namespace`, `name`, `replicas_from`, `replicas_to`, `resource_version`, `approved: true | false` and `correlation_id` (a restart's is in [Restart](#restart), a rollback's in [Rollback](#rollback)); the approver's identity stays in the plan record and the logs. Everything after the consume (blast radius, live object checks, history checks, global budget, dry run) is unchanged: an approval never lifts a guard.
 
@@ -596,11 +630,12 @@ After the consume, the record's `args` must equal the request's arguments withou
 `READ_ONLY` tool on `k8sr`. It approves nothing and only `plan_id` is read from the arguments, so no agent text reaches the approvers.
 
 1. `plan_id` must be a UUID, and the mode must be `server` or `both` (`invalid_argument` otherwise, so a plan's life is never extended in `client` mode). Without a configured `APPROVAL_TOPIC_ARN` the call fails with `internal` before the plan changes.
-2. The record is read consistently: `plan_not_found`, `plan_used`, `plan_decided` (approved or rejected), `plan_expired`.
-3. If it already notified less than `APPROVAL_REQUEST_COOLDOWN_SECONDS` ago, nothing changes and nobody is notified: `ok` with `notified: false` and `retry_after`.
-4. One conditional update adds 1 to the current window's approval request counter only while it is below `APPROVAL_REQUEST_LIMIT` (`approval_rate_limited`, `details: {"limit", "window_seconds": 600, "window_start", "retry_after"}`). Clock windows, so up to twice the limit can pass across a window boundary.
-5. One conditional update sets `status = awaiting_approval`, `approval_requested_at = now`, `approval_request_correlation_id` and `expires_at = created_at + APPROVAL_WAIT_TTL_SECONDS` (from creation, so asking again never extends a plan). If the record changed between the read and this update and the cooldown does not explain it, the call fails with `conflict` ("plan changed concurrently; try again"); calling it again is safe.
-6. The notification is published to the server's SNS topic, rendered from the record: Deployment, the change (the replica change for a scale; for a restart, that every pod is replaced with the replica count unchanged and the annotation the pods get; for a rollback, the revision and ReplicaSet, each image that changes, as stored, and the other changed field names), override flag, requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
+2. Identity mode: the caller must be a configured agent (`forbidden`, `agent_unknown`).
+3. The record is read consistently: `plan_not_found`; in identity mode `forbidden`, `not_requester` unless its `requested_by` is the caller's, checked before anything else about the plan; then `plan_used`, `plan_decided` (approved or rejected), `plan_expired`.
+4. If it already notified less than `APPROVAL_REQUEST_COOLDOWN_SECONDS` ago, nothing changes and nobody is notified: `ok` with `notified: false` and `retry_after`.
+5. One conditional update adds 1 to the current window's approval request counter only while it is below `APPROVAL_REQUEST_LIMIT` (`approval_rate_limited`, `details: {"limit", "window_seconds": 600, "window_start", "retry_after"}`). Clock windows, so up to twice the limit can pass across a window boundary.
+6. One conditional update sets `status = awaiting_approval`, `approval_requested_at = now`, `approval_request_correlation_id` and `expires_at = created_at + APPROVAL_WAIT_TTL_SECONDS` (from creation, so asking again never extends a plan). If the record changed between the read and this update and the cooldown does not explain it, the call fails with `conflict` ("plan changed concurrently; try again"); calling it again is safe.
+7. The notification is published to the server's SNS topic, rendered from the record: Deployment, the change (the replica change for a scale; for a restart, that every pod is replaced with the replica count unchanged and the annotation the pods get; for a rollback, the revision and ReplicaSet, each image that changes, as stored, and the other changed field names), override flag, requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
 
 Response `data`: `plan_id`, `status` (`awaiting_approval`), `expires_at`, `notified`, `approval_mode`, `correlation_id`, and `retry_after` when `notified` is false.
 
@@ -616,12 +651,12 @@ Authorization, before anything else:
 
 Requests (responses are the JSON envelope in the body):
 
-- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `change` (what the plan changes, in the shape of the plan response's `diff`: `{"replicas": {from, to}}` for a scale, `{"restart": {"pods_replaced"}, "template": {from, to}}` for a restart, `{"revision": {from, to}, "template": {from, to}, "replica_set", "images", "fields_changed", "truncated"}` for a rollback, where `truncated` is the record's `diff_truncated`), `override_manual_change`, `impact`, `requested_by`, `created_at`, `expires_at`, and when present `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
+- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `change` (what the plan changes, in the shape of the plan response's `diff`: `{"replicas": {from, to}}` for a scale, `{"restart": {"pods_replaced"}, "template": {from, to}}` for a restart, `{"revision": {from, to}, "template": {from, to}, "replica_set", "images", "fields_changed", "truncated"}` for a rollback, where `truncated` is the record's `diff_truncated`), `override_manual_change`, `impact`, `requested_by`, `agent` (`null` in legacy mode), `created_at`, `expires_at`, and when present `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
 - `POST /` with a JSON object of at most 4096 bytes and only these fields: `plan_id` (UUID), `decision` (`approve` or `reject`), optional `reason` (string, at most 500 characters, control characters removed), optional `apply` (boolean, default `true`). Any other field is `invalid_argument`.
   - `approve`: first the record is read; if its `action` has no apply tool the request fails with `internal`, and if it has no `args` with `plan_expired` ("plan again"), before any decision is recorded, so an approval never names a plan that nothing can apply. Then one conditional update, `status IN (planned, awaiting_approval) AND used = false AND expires_at > now AND requested_by <> caller`, sets `status = approved`, `approved_by`, `approved_at`, `approved_args_hash = args_hash` (copied from the record in the same update), `approval_channel = api`, `approval_expires_at = expires_at = now + APPLY_AFTER_APPROVAL_TTL_SECONDS` and `decision_correlation_id` (the approver's request ID).
   - `reject`: the same condition; sets `status = rejected`, `rejected_by`, `rejected_at`, `reject_reason`, `decision_correlation_id`, `expires_at = now`.
   - Refusals: `plan_not_found`, `plan_used`, `plan_decided`, `plan_expired`, `forbidden` (the requester), `conflict` (changed concurrently).
-  - In `server` mode only, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id` and the record's `args`, unchanged) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "<apply tool>", "kubeHandrailCorrelationId": "<approver request ID>"}}`, where the apply tool is the one for the plan's `action` (`scale_deployment`: `k8sw___apply_scale_deployment`, `restart_deployment`: `k8sw___apply_restart_deployment`, `rollback_deployment`: `k8sw___apply_rollback_deployment`), as the gateway calls it except that the correlation ID is the approver's ([Observability](#observability)). The write guard is unchanged and authoritative.
+  - In `server` mode only, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id` and the record's `args`, unchanged) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "<apply tool>", "kubeHandrailChannel": "approval-api", "kubeHandrailCorrelationId": "<approver request ID>"}}`, where the apply tool is the one for the plan's `action` (`scale_deployment`: `k8sw___apply_scale_deployment`, `restart_deployment`: `k8sw___apply_restart_deployment`, `rollback_deployment`: `k8sw___apply_rollback_deployment`), as the gateway calls it except that the correlation ID is the approver's ([Observability](#observability)). The write guard is unchanged and authoritative.
   - Response `data`: `plan` (the view above, read again after the apply), `apply` (the write Lambda's envelope, or `null` when no apply ran, as always in `client` and `both` mode) and `approval_mode`. If the write Lambda cannot be invoked at all, `apply` is `internal` with the message `approval recorded; apply could not be started: <error code>`. A failed apply does not undo the approval: an approval whose apply was refused before the consume (for example `remediation_disabled`) can still be applied through the gateway until it expires.
 - Any other method: `invalid_argument`.
 
@@ -640,7 +675,7 @@ Either way the allowlist in the approver's code is the gate that counts. Any sam
 
 Known limits:
 
-- Separation of duties is between principal classes: every plan is requested by `mcp-gateway` and only listed human principals approve. Per-agent `requested_by` needs caller identity on the server (Milestone 1, item 6).
+- Separation of duties is between principals: a plan is requested by an agent (`agent:<name>`, or `mcp-gateway` in legacy mode) and only listed human IAM principals approve, so `approved_by <> requested_by` always holds for a human approval.
 - The apply triggered by the approval channel does not pass through the gateway, so gateway policy (Cedar, once added) does not see it; the write guard and RBAC do.
 - Slack is not an approval channel yet; the implemented channel is this IAM-authenticated API and its CLI.
 
@@ -665,9 +700,9 @@ Existing assets are found with `ListAssets` and checked before the first write; 
 
 ## Identity
 
-- Two IAM roles, one per tool Lambda. On the plan table: read role `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:UpdateItem` (for `request_approval` and its counter); write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only. The read role also has `sns:Publish` on the approval topic, and an explicit deny of `PutItem` and `UpdateItem` that name any approval attribute (`approved_*`, `approval_channel`, `approval_expires_at`, `rejected_*`, `reject_reason`, `decision_correlation_id`, through `dynamodb:Attributes`). The write role has no such deny, because its consume condition reads those attributes; nothing in IAM keeps it from writing them. What is guaranteed: the read role cannot write an approval, the approver refuses the Lambda and gateway roles, and the write guard re-validates the consumed record against the request's arguments before it touches the cluster.
+- Two IAM roles, one per tool Lambda. On the plan table: read role `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:UpdateItem` (for `request_approval` and its counter); write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only. Both roles have `ssm:GetParameter` on the per-agent kill switches (`parameter/<name_prefix>/agents/*`); only the write role reads the global kill switch. The read role also has `sns:Publish` on the approval topic, and an explicit deny of `PutItem` and `UpdateItem` that name any approval attribute (`approved_*`, `approval_channel`, `approval_expires_at`, `rejected_*`, `reject_reason`, `decision_correlation_id`, through `dynamodb:Attributes`). The write role has no such deny, because its consume condition reads those attributes; nothing in IAM keeps it from writing them. What is guaranteed: the read role cannot write an approval, the approver refuses the Lambda and gateway roles, and the write guard re-validates the consumed record against the request's arguments before it touches the cluster.
 - Approver role: `dynamodb:GetItem` and `dynamodb:UpdateItem` on the plan table, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS access: the apply it triggers runs as the write Lambda.
-- Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the kill switch parameter only; `bedrock-agentcore:ListGatewayTargets` and `bedrock-agentcore:GetGatewayTarget` on this gateway; `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
+- Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the global kill switch parameter only; `bedrock-agentcore:ListGatewayTargets`, `bedrock-agentcore:GetGatewayTarget` and `bedrock-agentcore:GetGateway` on this gateway (a denial shows as `unknown`); `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
 - With `lambda_subnet_ids` set, both tool roles also have, in a separate role policy, the network interface actions Lambda needs to run in a VPC (`ec2:CreateNetworkInterface`, `ec2:DescribeNetworkInterfaces`, `ec2:DescribeSubnets`, `ec2:DeleteNetworkInterface`, `ec2:AssignPrivateIpAddresses`, `ec2:UnassignPrivateIpAddresses`, on `*`). This is the EC2 part of `AWSLambdaVPCAccessExecutionRole`, without its `logs` actions on every log group. A `Deny` on these actions and `ec2:DetachNetworkInterface`, conditioned on `lambda:SourceFunctionArn` being the function itself, keeps them from the function's code: only the Lambda service can use them.
 - Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations. The group names are fixed, not derived from `name_prefix`: deployments that share a cluster share the groups and their RoleBindings. The cluster's authentication mode must be `API` or `API_AND_CONFIG_MAP`; Terraform checks it before creating the entries.
 - RBAC in the sandbox namespace only:
@@ -683,7 +718,7 @@ Only the two tool Lambdas talk to the cluster. At runtime they make these calls,
 | `eks:DescribeCluster` (API server URL and CA, whenever a Kubernetes client is built: on a cold start and every 10 minutes after) | both | `eks.<region>.amazonaws.com` |
 | Kubernetes API | both | the cluster endpoint |
 | `dynamodb:GetItem`, `PutItem`, `UpdateItem`, `Query` | both (`PutItem` read only) | `dynamodb.<region>.amazonaws.com` |
-| `ssm:GetParameter` (kill switch) | write | `ssm.<region>.amazonaws.com` |
+| `ssm:GetParameter` (the global kill switch on apply; an agent's kill switch on plan, `request_approval` and apply, in identity mode) | write; both | `ssm.<region>.amazonaws.com` |
 | `sns:Publish` (`request_approval`) | read | `sns.<region>.amazonaws.com` |
 
 The EKS token is a presigned `sts:GetCallerIdentity` URL built locally; the Lambdas never call STS, the API server does. Lambda delivers function logs itself, outside the function's network. So neither STS nor CloudWatch Logs has to be reachable from the Lambdas' subnets. The approver, sentinel and interceptor Lambdas never run in a VPC.
@@ -693,6 +728,18 @@ The EKS token is a presigned `sts:GetCallerIdentity` URL built locally; the Lamb
 ## Configuration (environment variables)
 
 `CLUSTER_NAME`, `PLANS_TABLE`, `ALLOWED_NAMESPACES` (comma-separated), `MIN_REPLICAS`, `MAX_REPLICAS`, `PLAN_TTL_SECONDS`, `REMEDIATION_ENABLED_PARAM` (write only), `METRIC_NAMESPACE` (the [tool record](#observability)'s metric namespace; Terraform sets `<name_prefix>/tools`, default `kube-handrail/tools`). `AWS_REGION` is provided by Lambda.
+
+Agent identity, set on both tool Lambdas ([Agent identity](#agent-identity)):
+
+| Variable | Notes | Terraform variable |
+|---|---|---|
+| `CALLER_INTERCEPTOR` | `true` turns on identity mode; anything else is legacy mode | `caller_interceptor_enabled` (default `true`) |
+| `CALLER_KEY` | The key the interceptor signs the caller with, also set on the interceptor. Without it no caller is trusted, and identity mode refuses every write path with `agent_unknown` | generated once (`terraform_data.caller_key`), identity mode only |
+| `AGENTS` | JSON `{"<client_id>": {"name": "<agent>", "hourly_apply_budget": N}}`. Required in identity mode, with at least one agent; names match `^[a-z][a-z0-9_]{0,31}$` and are unique; the budget, when given, is a positive integer. Ignored in legacy mode | `agents`: a map from agent name to `{client_id = optional(string), hourly_apply_budget = optional(number)}`, default `{devops_agent = {}, smoke_test = {hourly_apply_budget = 30}}`; an entry without `client_id` gets a Cognito app client |
+| `AGENT_HOURLY_APPLY_BUDGET` | 10; a positive integer. The budget of an agent that `AGENTS` gives none, and of a plan's agent no longer in `AGENTS` | `agent_hourly_apply_budget` |
+| `AGENT_KILL_SWITCH_PREFIX` | `/<name_prefix>/agents/`; required in identity mode | set from `name_prefix` |
+
+Outputs: `agent_client_ids` (every agent's `client_id` by name), `cognito_client_ids` (the clients created here) and `agent_kill_switch_parameters` (every agent's kill switch parameter by name).
 
 Server-side approval, set on both tool Lambdas (the approver reads `APPROVAL_MODE` and `APPLY_AFTER_APPROVAL_TTL_SECONDS` as well):
 

@@ -1,15 +1,22 @@
 """Gateway request interceptor: passes the verified caller to the tool Lambdas.
 
-Experimental (Milestone 1, item 6). The gateway runs it after it has validated the inbound
-JWT, so the token's claims are trusted here without verifying the signature again. For
-tools/call it overwrites the reserved argument CALLER_ARGUMENT with the token's client_id,
-whatever the client sent under that name. The token itself is never logged or forwarded.
+On by default (mcp/CONTRACT.md, Agent identity): the tool Lambdas identify the agent by
+this client_id. The gateway runs it after it has validated the inbound JWT, so the token's
+claims are trusted here without verifying the signature again. For tools/call it overwrites
+the reserved argument CALLER_ARGUMENT with the token's client_id, signed with CALLER_KEY,
+whatever the client sent under that name. The tool Lambdas trust only a value with a valid
+signature, so a gateway that lost this interceptor cannot pass a client's own value off as a
+verified caller. It keeps no state, so the gateway may retry it. The token itself is never
+logged or forwarded.
 """
 
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import logging
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -39,7 +46,15 @@ def caller(headers: Mapping[str, Any]) -> str:
     return value if isinstance(value, str) and value else UNKNOWN_CALLER
 
 
-def transform(body: Any, headers: Mapping[str, Any]) -> Any:
+def signed(value: str, key: str) -> str:
+    """`<value>.<hex HMAC-SHA256>`, as handrail_common.dispatch.pop_caller verifies it. Without
+    a key the value goes unsigned, and the tool Lambdas refuse every write."""
+    if not key:
+        return value
+    return f"{value}.{hmac.new(key.encode(), value.encode(), hashlib.sha256).hexdigest()}"
+
+
+def transform(body: Any, headers: Mapping[str, Any], key: str = "") -> Any:
     if not isinstance(body, dict) or body.get("method") != "tools/call":
         return body
     params = body.get("params")
@@ -48,7 +63,7 @@ def transform(body: Any, headers: Mapping[str, Any]) -> Any:
     arguments = params.get("arguments")
     arguments = dict(arguments) if isinstance(arguments, dict) else {}
     # Unconditional overwrite: a value the client sent under this name never survives.
-    arguments[CALLER_ARGUMENT] = caller(headers)
+    arguments[CALLER_ARGUMENT] = signed(caller(headers), key)
     return {**body, "params": {**params, "arguments": arguments}}
 
 
@@ -57,5 +72,6 @@ def lambda_handler(event: Any, context: Any) -> dict[str, Any]:
         (event.get("mcp") or {}).get("gatewayRequest") or {} if isinstance(event, dict) else {}
     )
     headers = request.get("headers") or {}
-    body = transform(request.get("body"), headers if isinstance(headers, Mapping) else {})
+    headers = headers if isinstance(headers, Mapping) else {}
+    body = transform(request.get("body"), headers, os.environ.get("CALLER_KEY", ""))
     return {"interceptorOutputVersion": "1.0", "mcp": {"transformedGatewayRequest": {"body": body}}}

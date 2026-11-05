@@ -16,6 +16,11 @@ MUTATIVE = "MUTATIVE"
 # DevOps Agent never invokes DESTRUCTIVE tools, so no kube-handrail tool uses it.
 CLASSIFICATIONS = frozenset({READ_ONLY, MUTATIVE})
 ELEVATED_PREFERENCE = "elevatedActionsEnabled"
+REQUEST_INTERCEPTION = "REQUEST"
+# Subjects of the gateway configuration findings. They go into the alert, so they never
+# carry an ARN (account IDs).
+INTERCEPTOR_SUBJECT = "REQUEST interceptor"
+ANY_CLIENT = "any client"
 # Every tool of the write target, and every apply_* tool wherever it is, must be MUTATIVE.
 WRITE_TARGET = "k8sw"
 WRITE_TOOL_PREFIX = "apply_"
@@ -100,6 +105,55 @@ def gateway_target_tools(response: Mapping[str, Any]) -> set[str]:
     if status != READY:
         raise UnexpectedResponse(f"gateway target {name} is {status}")
     return tools
+
+
+def has_interceptor(response: Mapping[str, Any], arn: str) -> bool:
+    """Whether a GetGateway response has the REQUEST interceptor `arn`, receiving the
+    request headers, as Terraform attaches it."""
+    try:
+        configurations = response.get("interceptorConfigurations") or []
+        return any(
+            REQUEST_INTERCEPTION in (c.get("interceptionPoints") or [])
+            and c["interceptor"]["lambda"]["arn"] == arn
+            and (c.get("inputConfiguration") or {}).get("passRequestHeaders") is True
+            for c in configurations
+        )
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise UnexpectedResponse("unreadable interceptor configuration") from exc
+
+
+def allowed_clients(response: Mapping[str, Any]) -> list[str] | None:
+    """The OAuth clients a GetGateway response allows, or None when it does not limit them."""
+    try:
+        authorizer = (response.get("authorizerConfiguration") or {}).get("customJWTAuthorizer")
+        clients = (authorizer or {}).get("allowedClients")
+    except AttributeError as exc:
+        raise UnexpectedResponse("unreadable authorizer configuration") from exc
+    if clients is None:
+        return None
+    if not isinstance(clients, list) or not all(isinstance(c, str) for c in clients):
+        raise UnexpectedResponse("unreadable allowed clients")
+    return clients
+
+
+def compare_gateway_configuration(
+    expected_interceptor: str | None, expected_clients: Iterable[str], response: Mapping[str, Any]
+) -> list[Finding]:
+    """The gateway must keep the interceptor that identifies agents (when one is deployed)
+    and allow only the agents' clients. A client missing from the list only locks that agent
+    out, so it is not drift."""
+    findings = []
+    if expected_interceptor and not has_interceptor(response, expected_interceptor):
+        findings.append(finding("gateway_config", "missing_interceptor", INTERCEPTOR_SUBJECT))
+    clients = allowed_clients(response)
+    if clients is None:
+        findings.append(finding("gateway_config", "unexpected_client", ANY_CLIENT))
+    else:
+        findings += [
+            finding("gateway_config", "unexpected_client", c)
+            for c in sorted(set(clients) - set(expected_clients))
+        ]
+    return findings
 
 
 def finding(check: str, issue: str, subject: str, **extra: Any) -> Finding:

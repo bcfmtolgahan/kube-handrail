@@ -31,7 +31,7 @@ Call `plan_restart_deployment(namespace, name)`. Nothing changes in the cluster.
 
 Warnings do not block the plan. Never omit them. `recreate_strategy` and `service_without_endpoints` mean the workload is down during the restart; say so and do not continue without the human.
 
-On an error, follow the AGENTS.md error table. In short: `conflict` with `details.paused` means a human paused the rollout, so stop; `cooldown` means wait until `details.retry_after`; budgets, `gitops_managed` and `remediation_disabled` mean stop and report.
+On an error, follow the AGENTS.md error table. In short: `conflict` with `details.paused` means a human paused the rollout, so stop; `cooldown` means wait until `details.retry_after`; budgets, `gitops_managed` and `remediation_disabled` (also when it names only your agent) mean stop and report.
 
 ## Step 3: Get the approval
 
@@ -75,6 +75,6 @@ Call `plan_rollback_deployment(namespace, name, revision)`. Nothing changes in t
 
 Never omit the images, the changed fields or the warnings. If they make the rollback unsafe, say so and do not continue without the human.
 
-On an error, follow the AGENTS.md error table. In short: `revision_not_found` means read the history again and ask the human (`details.available` lists what exists); `invalid_argument` for the current template means choose another revision with the human; `manual_change` means someone changed the template since kube-handrail's last apply, so stop and ask; `conflict` with `details.paused`, budgets, `gitops_managed` and `remediation_disabled` mean stop and report; `cooldown` means wait until `details.retry_after`.
+On an error, follow the AGENTS.md error table. In short: `revision_not_found` means read the history again and ask the human (`details.available` lists what exists); `invalid_argument` for the current template means choose another revision with the human; `manual_change` means someone changed the template since kube-handrail's last apply, so stop and ask; `conflict` with `details.paused`, budgets, `gitops_managed` and `remediation_disabled` (also when it names only your agent) mean stop and report; `cooldown` means wait until `details.retry_after`.
 
 Then continue with Step 3 (approval), Step 4 (apply) and Step 5 (verify).

@@ -14,6 +14,7 @@ import boto3
 from kubernetes import client as k8s
 from kubernetes.client.rest import ApiException
 
+from handrail_common.agents import check_agent_budget, guard_plan, requester
 from handrail_common.approval import notification, plain, plan_view
 from handrail_common.breaker import (
     check_history,
@@ -41,7 +42,6 @@ from handrail_common.impact import rollout_impact, scale_impact
 from handrail_common.observability import current_correlation_id
 from handrail_common.plans import (
     GLOBAL_BUDGET_WINDOW_SECONDS,
-    REQUESTER_GATEWAY,
     RESTART_DEPLOYMENT,
     ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
@@ -402,6 +402,10 @@ class Clients:
     def sns(self) -> Any:
         return _sns(self._settings.region)
 
+    @property
+    def ssm(self) -> Any:
+        return _ssm(self._settings.region)
+
 
 @cache
 def _store(table: str, region: str | None) -> PlanStore:
@@ -411,6 +415,11 @@ def _store(table: str, region: str | None) -> PlanStore:
 @cache
 def _sns(region: str | None) -> Any:
     return boto3.client("sns", region_name=region)
+
+
+@cache
+def _ssm(region: str | None) -> Any:
+    return boto3.client("ssm", region_name=region)
 
 
 def get_workload_status(args: dict[str, Any], settings: Settings, clients: Clients) -> Envelope:
@@ -554,6 +563,7 @@ def _plan(
     action: PlanAction, args: Mapping[str, Any], settings: Settings, clients: Clients, now: int
 ) -> Envelope:
     namespace, name, request = action.validate(args, settings)
+    agent = guard_plan(settings, clients.ssm)
     override = request.get("override_manual_change", False) is True
     deployment, raw = _read_deployment_raw(clients.apps, namespace, name)
     if is_gitops_managed(deployment):
@@ -568,6 +578,7 @@ def _plan(
         raise global_budget_error(
             now - now % GLOBAL_BUDGET_WINDOW_SECONDS, settings.global_hourly_apply_budget
         )
+    check_agent_budget(clients.store, agent, now)
     replicas_to = action.replicas_to(current, request)
     # Last, after every check has passed, and before the plan is stored.
     impact = _impact(
@@ -592,7 +603,9 @@ def _plan(
         created_at=now,
         expires_at=now + settings.plan_ttl_seconds,
         retain_until=now + retention_seconds(settings),
-        requested_by=REQUESTER_GATEWAY,
+        requested_by=requester(agent),
+        agent=agent.name if agent else None,
+        requested_client_id=agent.client_id if agent else None,
         status=STATUS_PLANNED,
         override_manual_change=override,
         impact=impact,
@@ -604,11 +617,17 @@ def _plan(
         **resolved.record,
     )
     clients.store.create(plan)
-    preflight: list[dict[str, Any]] = [
-        {"check": check, "passed": True} for check in action.preflight
-    ]
-    if overridden:
-        preflight[action.preflight.index("no_manual_change")]["overridden"] = True
+    preflight: list[dict[str, Any]] = []
+    for check in action.preflight:
+        preflight.append({"check": check, "passed": True})
+        if overridden and check == "no_manual_change":
+            preflight[-1]["overridden"] = True
+        # The per-agent checks, after the checks they follow; skipped in legacy mode.
+        follows = {"arguments": "agent_enabled", "global_budget": "agent_budget"}.get(check)
+        if follows is not None:
+            preflight.append({"check": follows, "passed": True})
+            if agent is None:
+                preflight[-1]["skipped"] = True
     return ok(
         {
             "plan_id": plan.plan_id,
@@ -617,6 +636,7 @@ def _plan(
             "preflight": preflight,
             "impact": impact,
             "expires_at": plan.expires_at,
+            "requested_by": plan.requested_by,
             "correlation_id": correlation_id,
         },
         truncated=impact["truncated"] or resolved.truncated,
@@ -935,6 +955,9 @@ def request_approval(
     if settings.approval_topic_arn is None:
         # Fail before the plan changes state: an approval nobody hears about cannot come.
         raise GuardError(INTERNAL, "no approval destination is configured")
+    # Only the plan's own agent may ask, while its kill switch is on; in legacy mode every
+    # plan is the gateway's.
+    agent = guard_plan(settings, clients.ssm)
     correlation_id = current_correlation_id()
     item, retry_after = clients.store.request_approval(
         plan_id,
@@ -943,6 +966,7 @@ def request_approval(
         settings.approval_request_cooldown_seconds,
         settings.approval_request_limit,
         correlation_id,
+        requester(agent) if agent else None,
     )
     data: dict[str, Any] = {
         "plan_id": plan_id,
