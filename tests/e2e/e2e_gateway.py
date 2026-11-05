@@ -906,9 +906,9 @@ def restart_pods() -> dict[str, str]:
 
 
 async def restart_and_check(gw: Gateway, approval_mode: str) -> bool:
-    """Plan and apply a restart (through the approval URL in server mode), then check that
-    every pod was replaced, the count kept and the plan id put on the template and pods.
-    Returns whether the restart was applied."""
+    """Plan and apply a restart (through the approval URL in server mode), check that a
+    second restart is refused with cooldown, then that every pod was replaced, the count
+    kept and the plan id put on the template and pods. Returns whether it was applied."""
     before = restart_pods()
     planned = await gw.call(PLAN_RESTART, RESTART)
     data = planned.get("data") or {}
@@ -941,6 +941,14 @@ async def restart_and_check(gw: Gateway, approval_mode: str) -> bool:
         report("restart: apply succeeds", applied.get("ok") is True, code(applied) or "ok")
     if not applied.get("ok"):
         return False
+    # Right after the apply, so the rollout's duration cannot outlast the cooldown. The
+    # Deployment's last-plan annotation names the restart, so no index settle is needed.
+    envelope = await gw.call(PLAN_RESTART, RESTART)
+    report(
+        "restart: a second restart right after the first is refused with cooldown",
+        code(envelope) == "cooldown",
+        code(envelope) or "ok",
+    )
     await asyncio.sleep(HISTORY_SETTLE_SECONDS)
     kubectl("rollout", "status", f"deploy/{RESTART['name']}", "--timeout=180s")
     wait_for(
@@ -965,14 +973,8 @@ async def restart_and_check(gw: Gateway, approval_mode: str) -> bool:
 
 async def rollout_tests(gw: Gateway, approval_mode: str) -> None:
     if not await restart_and_check(gw, approval_mode):
-        # The cooldown case needs an applied restart; its failure is already reported.
+        # The kill switch case needs an applied restart; its failure is already reported.
         return
-    envelope = await gw.call(PLAN_RESTART, RESTART)
-    report(
-        "restart: a second restart right after the first is refused with cooldown",
-        code(envelope) == "cooldown",
-        code(envelope) or "ok",
-    )
     await cool_down()
     envelope = await gw.call(PLAN_RESTART, RESTART)
     if not envelope.get("ok"):
