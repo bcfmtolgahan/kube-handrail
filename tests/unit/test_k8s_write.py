@@ -945,7 +945,7 @@ def test_a_record_without_args_cannot_be_applied(rt):
     runtime_, apps = rt
     plan = create_plan(runtime_.store)
     runtime_.store._table.update_item(Key={"plan_id": plan.plan_id}, UpdateExpression="REMOVE args")
-    assert error_code(apply(plan.plan_id)) == "plan_mismatch"
+    assert error_code(apply(plan.plan_id)) == "plan_expired"
     apps.read_namespaced_deployment.assert_not_called()
 
 

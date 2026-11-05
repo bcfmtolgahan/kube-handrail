@@ -25,6 +25,7 @@ from handrail_common.envelope import (
     INTERNAL,
     KUBERNETES_ERROR,
     NOT_FOUND,
+    PLAN_EXPIRED,
     PLAN_MISMATCH,
     REMEDIATION_DISABLED,
     Envelope,
@@ -190,9 +191,11 @@ def check_record_matches(
 ) -> None:
     """The record must describe the requested change, not only carry its hash: a record
     altered in the table cannot redirect an apply to another object or change."""
+    if plan.args is None:
+        # Made before the argument payload was recorded; the approver says the same.
+        raise GuardError(PLAN_EXPIRED, "plan predates the argument record; plan again")
     if (
-        plan.args is None
-        or dict(plan.args) != dict(args)
+        dict(plan.args) != dict(args)
         or (plan.namespace, plan.name) != (namespace, name)
         or not action.record_matches(plan, args)
     ):
