@@ -192,49 +192,6 @@ data "aws_iam_policy_document" "lambda" {
     resources = ["${aws_dynamodb_table.plans.arn}/index/${local.history_index}"]
   }
 
-  # What AWSLambdaVPCAccessExecutionRole grants, without its logs:* on every log group.
-  dynamic "statement" {
-    for_each = local.lambda_in_vpc ? [1] : []
-    content {
-      sid = "VpcNetworkInterfaces"
-      actions = [
-        "ec2:CreateNetworkInterface",
-        "ec2:DescribeNetworkInterfaces",
-        "ec2:DescribeSubnets",
-        "ec2:DeleteNetworkInterface",
-        "ec2:AssignPrivateIpAddresses",
-        "ec2:UnassignPrivateIpAddresses",
-      ]
-      resources = ["*"]
-    }
-  }
-
-  # Lambda grants the role's network interface actions to the function's code as well. Only
-  # the Lambda service needs them; requests from the code carry lambda:SourceFunctionArn.
-  # The ARN is built from the name: referencing aws_lambda_function.this would be a cycle.
-  dynamic "statement" {
-    for_each = local.lambda_in_vpc ? [1] : []
-    content {
-      sid    = "VpcNetworkInterfacesNotFromCode"
-      effect = "Deny"
-      actions = [
-        "ec2:CreateNetworkInterface",
-        "ec2:DescribeNetworkInterfaces",
-        "ec2:DescribeSubnets",
-        "ec2:DetachNetworkInterface",
-        "ec2:DeleteNetworkInterface",
-        "ec2:AssignPrivateIpAddresses",
-        "ec2:UnassignPrivateIpAddresses",
-      ]
-      resources = ["*"]
-      condition {
-        test     = "ArnEquals"
-        variable = "lambda:SourceFunctionArn"
-        values   = ["arn:${local.partition}:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-${replace(each.key, "_", "-")}"]
-      }
-    }
-  }
-
   dynamic "statement" {
     for_each = each.value.kill_switch ? [1] : []
     content {
@@ -279,6 +236,58 @@ resource "aws_iam_role_policy" "lambda" {
   policy = data.aws_iam_policy_document.lambda[each.key].json
 }
 
+# The network interface permissions are a separate policy, which exists only while the tool
+# Lambdas are in a VPC. It is deleted after the security group: Lambda deletes its network
+# interfaces with these permissions, and the provider deletes leftover ones before the group.
+data "aws_iam_policy_document" "lambda_vpc" {
+  for_each = local.lambda_in_vpc ? local.functions : {}
+
+  # What AWSLambdaVPCAccessExecutionRole grants, without its logs:* on every log group.
+  statement {
+    sid = "VpcNetworkInterfaces"
+    actions = [
+      "ec2:CreateNetworkInterface",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DescribeSubnets",
+      "ec2:DeleteNetworkInterface",
+      "ec2:AssignPrivateIpAddresses",
+      "ec2:UnassignPrivateIpAddresses",
+    ]
+    resources = ["*"]
+  }
+
+  # Lambda grants the role's network interface actions to the function's code as well. Only
+  # the Lambda service needs them; requests from the code carry lambda:SourceFunctionArn.
+  # The ARN is built from the name: referencing aws_lambda_function.this would be a cycle.
+  statement {
+    sid    = "VpcNetworkInterfacesNotFromCode"
+    effect = "Deny"
+    actions = [
+      "ec2:CreateNetworkInterface",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DescribeSubnets",
+      "ec2:DetachNetworkInterface",
+      "ec2:DeleteNetworkInterface",
+      "ec2:AssignPrivateIpAddresses",
+      "ec2:UnassignPrivateIpAddresses",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "ArnEquals"
+      variable = "lambda:SourceFunctionArn"
+      values   = ["arn:${local.partition}:lambda:${local.region}:${local.account_id}:function:${var.name_prefix}-${replace(each.key, "_", "-")}"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "lambda_vpc" {
+  for_each = data.aws_iam_policy_document.lambda_vpc
+
+  name   = "vpc-network-interfaces"
+  role   = aws_iam_role.lambda[each.key].id
+  policy = each.value.json
+}
+
 resource "aws_lambda_function" "this" {
   for_each = local.functions
 
@@ -312,7 +321,7 @@ resource "aws_lambda_function" "this" {
     }
   }
 
-  depends_on = [aws_cloudwatch_log_group.lambda, aws_iam_role_policy.lambda]
+  depends_on = [aws_cloudwatch_log_group.lambda, aws_iam_role_policy.lambda, aws_iam_role_policy.lambda_vpc]
 
   lifecycle {
     precondition {

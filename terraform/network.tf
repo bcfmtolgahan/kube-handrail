@@ -55,8 +55,16 @@ resource "aws_security_group" "lambda" {
   vpc_id      = local.lambda_vpc_id
 
   # Lambda deletes its network interfaces with the role's permissions, and the provider
-  # deletes leftover ones before the group. Keep the role policy until the group is gone.
-  depends_on = [aws_iam_role_policy.lambda]
+  # deletes leftover ones before the group. Keep that policy until the group is gone.
+  depends_on = [aws_iam_role_policy.lambda_vpc]
+
+  # Terraform otherwise deletes a dependency before it updates the resources that use it.
+  # When one apply moves the Lambdas out of a VPC, the group (and after it the policy) must
+  # go only after the functions have been updated and released their network interfaces;
+  # deleting it first waits on those interfaces until the provider times out.
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Every call the tool Lambdas make is HTTPS. Terraform removes the default allow-all rule.
