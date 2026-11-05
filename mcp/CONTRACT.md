@@ -25,13 +25,29 @@ The classification of every tool is in `mcp/classification.json`, a map from ful
 
 The tool name is the part after `___` in `context.client_context.custom["bedrockAgentCoreToolName"]`. The event is the tool arguments object. There is no `tool_name` argument and no fallback. An unknown tool returns error code `unknown_tool`.
 
-## Caller identity (experimental)
+## Agent identity
 
-Without an interceptor, a tool Lambda learns nothing about the caller: `client_context.custom` carries the gateway, target, tool name and request IDs only. With `caller_interceptor_enabled = true`, Terraform attaches a gateway REQUEST interceptor (`mcp/interceptor/`) with `passRequestHeaders`. The gateway runs it after validating the inbound JWT. For `tools/call` it sets the reserved argument `_kube_handrail_caller` to the token's `client_id` (`unknown` if the token cannot be read), overwriting whatever the client sent under that name. It never logs or forwards the token.
+An agent is an OAuth client (a Cognito app client): Terraform's `agents` map names each agent and creates its client, or names an existing `client_id` of the user pool. Two agents that share a client are one agent; nothing enforces one client per agent, so give each agent its own. See [ADR 0003](../docs/adr/0003-agent-identity.md).
 
-Before any handler runs, dispatch removes `_kube_handrail_caller` from the arguments. It trusts the value only when the Lambda's `CALLER_INTERCEPTOR` is `true` (without the interceptor, a client could have sent it) and logs it as `caller` in the [tool record](#observability) (`null` when not trusted). It is not yet used for any decision: plans still record `requested_by = "mcp-gateway"`. Per-agent attribution and budgets are Milestone 2.
+Without an interceptor, a tool Lambda learns nothing about the caller: `client_context.custom` carries the gateway, target, tool name and request IDs only. With `caller_interceptor_enabled = true` (the default), Terraform attaches a gateway REQUEST interceptor (`mcp/interceptor/`) with `passRequestHeaders`. The gateway runs it after validating the inbound JWT. For `tools/call` it sets the reserved argument `_kube_handrail_caller` to the token's `client_id` (`unknown` if the token cannot be read), overwriting whatever the client sent under that name. It keeps no state, so the gateway's retries are safe, and it never logs or forwards the token. The reserved name is not in any tool's `inputSchema`; the gateway passes it through to the interceptor and on to the target without rejecting it.
 
-The reserved name is not in any tool's `inputSchema`. The gateway passed it through to the interceptor and on to the target without rejecting it.
+Before any handler runs, dispatch removes `_kube_handrail_caller` from the arguments. It trusts the value only when the Lambda's `CALLER_INTERCEPTOR` is `true` (without the interceptor, a client could have sent it), logs it as `caller` in the [tool record](#observability) (`null` when not trusted), and gives it to the handler as the verified caller.
+
+**Identity mode** (`CALLER_INTERCEPTOR=true`). `AGENTS` maps each `client_id` to its agent. The caller's agent is `AGENTS[caller]`; a caller that is missing, `unknown` or not listed is refused with `forbidden`, `details: {"reason": "agent_unknown"}` (the `client_id` is in the tool record, not in the response), on every `plan_*` tool, on `request_approval` and on every `apply_*` through the gateway. Read tools are allowed for any caller the gateway let in, and the caller is logged. A plan records `requested_by = "agent:<name>"`, `agent` and `requested_client_id` ([Plan record](#plan-record-dynamodb)), and its response `data` has `requested_by`. The agent is not part of `args_hash`: the consume condition binds it instead, so argument hashes are the same in both modes.
+
+- `request_approval` only for a plan whose `requested_by` is the caller's: otherwise `forbidden`, `details: {"reason": "not_requester"}`, nobody is notified and nothing changes.
+- A gateway apply consumes the plan only if `requested_by` is the caller's, in the same conditional write that checks everything else ([Apply condition](#apply-condition)): another agent gets `forbidden` with `not_requester` and the plan stays usable. A plan made in legacy mode (`requested_by = "mcp-gateway"`) is therefore refused to every agent and must be planned again.
+- An apply on the approval channel (below) carries no caller and needs none. It is attributed to the plan's agent; a plan without one is refused after the consume with `forbidden`, `agent_unknown`.
+- Every apply of a plan that names its agent also sets the Deployment annotation `kube-handrail.io/requested-by` to `requested_by`, in the same patch as the other annotations, so humans and admission policy can see which agent asked.
+
+**Legacy mode** (`caller_interceptor_enabled = false`, for gateways where interceptors are not available). No caller is verified and `AGENTS` is ignored. Every plan records `requested_by = "mcp-gateway"`, the class of the gateway's machine identities, without `agent`; there are no per-agent checks. Terraform warns (a `check` block) when this mode is chosen.
+
+**Channels.** The approver adds `"kubeHandrailChannel": "approval-api"` to the `ClientContext` of the apply it runs ([Approval API](#approval-api)), next to `kubeHandrailCorrelationId`. Dispatch reads it as the invocation's channel: exactly `approval-api`, or `gateway` for anything else, including no value. Gateway clients cannot set `client_context.custom`; anyone who can invoke the write Lambda directly can set it, and can already forge every argument, which is administrator-level access. The approval channel grants nothing that server mode does not: the consume condition still requires the human approval. The apply records its channel in the plan record (`channel`), in the same conditional write that consumes the plan.
+
+Known limits:
+
+- The identity is the OAuth client, not the agent session: two agents sharing a client cannot be told apart.
+- If the interceptor is missing or broken, gateway calls arrive without a caller and every write path is refused (fail closed); the [drift sentinel](#drift-sentinel) reports the gateway configuration.
 
 ## Observability
 
@@ -68,15 +84,16 @@ Every tool invocation, including `unknown_tool`, prints exactly one JSON line wh
       "Metrics": [ { "Name": "GuardRejections", "Unit": "Count" } ] } ] },
   "Tool": "apply_scale_deployment", "Code": "conflict",
   "ToolCalls": 1, "ToolErrors": 0, "GuardRejections": 1,
-  "tool": "apply_scale_deployment", "correlation_id": "...", "caller": null,
-  "plan_id": "...", "outcome": "conflict", "duration_ms": 412
+  "tool": "apply_scale_deployment", "correlation_id": "...", "caller": "<client_id>",
+  "plan_id": "...", "outcome": "conflict", "reason": null, "scope": null, "duration_ms": 412
 }
 ```
 
 - `tool`: the tool name, `null` for an unknown tool (whose `Tool` dimension is `unknown`).
-- `caller`: the verified caller ([Caller identity](#caller-identity-experimental)), otherwise `null`.
+- `caller`: the verified caller's `client_id` ([Agent identity](#agent-identity)), otherwise `null`.
 - `plan_id`: the `plan_id` of a successful response's `data`, otherwise the `plan_id` argument, and only if it is a UUID; otherwise `null`.
 - `outcome`: `ok` or the error code.
+- `reason` and `scope`: a rejection's `details.reason` (`forbidden`) and `details.scope` (`remediation_disabled`), otherwise `null`. They are fixed words set by the server, so the metrics keep `Code` as their only rejection dimension.
 - `ToolCalls` is 1. `ToolErrors` is 1 for `internal` and `kubernetes_error` (the tool could not do its job, for example the Kubernetes API refused its credentials or returned a server error). Any other error code is a guard rejection: the record then has `Code` and `GuardRejections = 1` and the second metric entry; an `ok`, `internal` or `kubernetes_error` record has neither. The empty dimension set gives `ToolCalls` and `ToolErrors` across all tools.
 
 The record has only these fields. Argument values, tokens and error messages are never in it. An internal error additionally logs its stack trace through the Lambda logger, in a line that names the correlation ID.
@@ -251,7 +268,9 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `expires_at` | N | epoch seconds, end of plan validity: `created_at + PLAN_TTL_SECONDS` (default 300 s); `created_at + APPROVAL_WAIT_TTL_SECONDS` once an approval is requested; `approved_at + APPLY_AFTER_APPROVAL_TTL_SECONDS` once approved; `rejected_at` once rejected |
 | `retain_until` | N | epoch seconds, the table TTL attribute: `created_at + max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60`, the longest window plus the longest a plan can stay valid, so a record stays readable as history after the plan expired. A record without it is kept until deleted |
 | `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a AND attribute_not_exists(rejected_by)`, extended in `server` and `both` mode (see [Server-side approval](#server-side-approval)) |
-| `requested_by` | S | the requesting principal. Until per-agent identity reaches the server it is the constant `mcp-gateway`, the class of the gateway's machine identities |
+| `requested_by` | S | the requesting principal: `agent:<name>` in identity mode, the constant `mcp-gateway` (the class of the gateway's machine identities) in legacy mode and on records made before identity mode ([Agent identity](#agent-identity)) |
+| `agent`, `requested_client_id` | S, S | identity mode only: the requesting agent's name and the verified OAuth `client_id` it planned with, kept as evidence because the name-to-client mapping can change |
+| `channel` | S | the channel the apply ran under, `gateway` or `approval-api`, written by the conditional update that consumes the plan; absent until then |
 | `status` | S | `planned`, `awaiting_approval`, `approved` or `rejected`. `applied` (`used = true`) and `expired` (`expires_at <= now`) are derived, never stored. Records made before server approval have no `status` and `requested_by`; they can be applied in `client` mode until they expire but never requested or approved |
 | `override_manual_change` | BOOL | the value pinned in `args_hash` |
 | `impact` | M | the impact preview returned with the plan, so the approval channel renders the server's own record |
@@ -280,6 +299,8 @@ Plan (`k8s_read`):
 8. Global budget: the current hour's counter, read consistently, must be below `GLOBAL_HOURLY_APPLY_BUDGET`. Planning only reads it.
 9. Impact preview: list the PodDisruptionBudgets, Services and EndpointSlices in the namespace (below). Any error fails the plan with `kubernetes_error`, so the approver never sees a preview with gaps. Only then is the plan record written.
 
+In identity mode the caller is resolved to its agent right after checks 1-3, before the Deployment is read (`forbidden`, `agent_unknown`; [Agent identity](#agent-identity)).
+
 The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact`, `expires_at` and `correlation_id`. `preflight` lists the checks that passed, in this order: `arguments`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`.
 
 `blast_radius_exceeded` `details`:
@@ -298,6 +319,8 @@ Apply (`k8s_write`), all re-checked independently of the plan step:
 5. Server-side dry run (`dryRun=All`) before each real patch. A plan is consumed before the dry run, so any failure after step 3 requires a new plan.
 6. The patch also sets the annotations `kube-handrail.io/last-plan-id` to the applied `plan_id` and `kube-handrail.io/correlation-id` to the apply's [correlation ID](#observability).
 7. History checks, after step 3 and after the first read in step 4 has passed: manual change, cooldown, flapping and object budget (not the plan rate limit), then the global budget: one conditional update adds 1 to the current hour's counter only if it is below `GLOBAL_HOURLY_APPLY_BUDGET`, so concurrent applies cannot overshoot it. The unit is taken before the patch and not returned if the patch then fails. They use the planned `replicas_from` and `replicas_to`; the check in step 4 has confirmed that `replicas_from` is the current count. A 409 retry re-runs step 4 but not the history checks. A rejection here leaves the plan consumed, with the error code as its `result`.
+
+In identity mode, a gateway apply resolves its caller to an agent between steps 1 and 2 (`forbidden`, `agent_unknown`), and step 3's conditional update also requires the plan's `requested_by` to be that agent's ([Apply condition](#apply-condition)). Step 3 records the apply's `channel` in the same update. Right after it, a plan without `agent` is refused in identity mode (`forbidden`, `agent_unknown`; only the approval channel can get that far with one), leaving it consumed with that `result`.
 
 The kill switch is read on every apply (no caching), so turning it off takes effect immediately.
 
@@ -569,7 +592,7 @@ A plan can be approved without a request (for example right after planning). Eve
 
 ### Apply condition
 
-In every mode the consume condition refuses a rejected plan (`attribute_not_exists(rejected_by)`), even if the rejecting and the applying clock disagree about `expires_at`. In `server` and `both` mode it becomes
+In every mode the consume condition refuses a rejected plan (`attribute_not_exists(rejected_by)`), even if the rejecting and the applying clock disagree about `expires_at`. In identity mode a gateway apply adds `AND requested_by = :rb`, the caller's `agent:<name>` ([Agent identity](#agent-identity)). In `server` and `both` mode it becomes
 
 ```
 used = false AND expires_at > :now AND args_hash = :h AND action = :a
@@ -586,8 +609,9 @@ Approval, argument match, separation of duties, expiry and single use are one at
 3. approved but `approval_expires_at <= now` (server and both): `approval_required`, `details: {"status": "approval_expired"}`;
 4. `expires_at <= now`: `plan_expired`;
 5. arguments differ: `plan_mismatch` (the approval is pinned to `args_hash`, including `override_manual_change`);
-6. not approved (server and both): `approval_required`, `details: {"status": "planned" | "awaiting_approval"}`;
-7. approved by the requester, or an approval of other arguments (only possible by writing the table directly): `approval_required`, `details: {"status": "approval_invalid"}`.
+6. identity mode, gateway apply, `requested_by` is not the caller's: `forbidden`, `details: {"reason": "not_requester"}`;
+7. not approved (server and both): `approval_required`, `details: {"status": "planned" | "awaiting_approval"}`;
+8. approved by the requester, or an approval of other arguments (only possible by writing the table directly): `approval_required`, `details: {"status": "approval_invalid"}`.
 
 After the consume, the record's `args` must equal the request's arguments without `plan_id` (an absent or `false` override counts as not given), and its `namespace`, `name`, `replicas_to` and `override_manual_change` must match them (for a restart: `namespace` and `name`, plus the record checks in [Restart](#restart); for a rollback: those in [Rollback](#rollback)) (`plan_mismatch` otherwise; a record without `args` is `plan_expired`, as at the approver), so a record altered in the table cannot redirect an apply even with a matching `args_hash`. A successful scale apply's `data` is `plan_id`, `namespace`, `name`, `replicas_from`, `replicas_to`, `resource_version`, `approved: true | false` and `correlation_id` (a restart's is in [Restart](#restart), a rollback's in [Rollback](#rollback)); the approver's identity stays in the plan record and the logs. Everything after the consume (blast radius, live object checks, history checks, global budget, dry run) is unchanged: an approval never lifts a guard.
 
@@ -596,11 +620,12 @@ After the consume, the record's `args` must equal the request's arguments withou
 `READ_ONLY` tool on `k8sr`. It approves nothing and only `plan_id` is read from the arguments, so no agent text reaches the approvers.
 
 1. `plan_id` must be a UUID, and the mode must be `server` or `both` (`invalid_argument` otherwise, so a plan's life is never extended in `client` mode). Without a configured `APPROVAL_TOPIC_ARN` the call fails with `internal` before the plan changes.
-2. The record is read consistently: `plan_not_found`, `plan_used`, `plan_decided` (approved or rejected), `plan_expired`.
-3. If it already notified less than `APPROVAL_REQUEST_COOLDOWN_SECONDS` ago, nothing changes and nobody is notified: `ok` with `notified: false` and `retry_after`.
-4. One conditional update adds 1 to the current window's approval request counter only while it is below `APPROVAL_REQUEST_LIMIT` (`approval_rate_limited`, `details: {"limit", "window_seconds": 600, "window_start", "retry_after"}`). Clock windows, so up to twice the limit can pass across a window boundary.
-5. One conditional update sets `status = awaiting_approval`, `approval_requested_at = now`, `approval_request_correlation_id` and `expires_at = created_at + APPROVAL_WAIT_TTL_SECONDS` (from creation, so asking again never extends a plan). If the record changed between the read and this update and the cooldown does not explain it, the call fails with `conflict` ("plan changed concurrently; try again"); calling it again is safe.
-6. The notification is published to the server's SNS topic, rendered from the record: Deployment, the change (the replica change for a scale; for a restart, that every pod is replaced with the replica count unchanged and the annotation the pods get; for a rollback, the revision and ReplicaSet, each image that changes, as stored, and the other changed field names), override flag, requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
+2. Identity mode: the caller must be a configured agent (`forbidden`, `agent_unknown`).
+3. The record is read consistently: `plan_not_found`; in identity mode `forbidden`, `not_requester` unless its `requested_by` is the caller's, checked before anything else about the plan; then `plan_used`, `plan_decided` (approved or rejected), `plan_expired`.
+4. If it already notified less than `APPROVAL_REQUEST_COOLDOWN_SECONDS` ago, nothing changes and nobody is notified: `ok` with `notified: false` and `retry_after`.
+5. One conditional update adds 1 to the current window's approval request counter only while it is below `APPROVAL_REQUEST_LIMIT` (`approval_rate_limited`, `details: {"limit", "window_seconds": 600, "window_start", "retry_after"}`). Clock windows, so up to twice the limit can pass across a window boundary.
+6. One conditional update sets `status = awaiting_approval`, `approval_requested_at = now`, `approval_request_correlation_id` and `expires_at = created_at + APPROVAL_WAIT_TTL_SECONDS` (from creation, so asking again never extends a plan). If the record changed between the read and this update and the cooldown does not explain it, the call fails with `conflict` ("plan changed concurrently; try again"); calling it again is safe.
+7. The notification is published to the server's SNS topic, rendered from the record: Deployment, the change (the replica change for a scale; for a restart, that every pod is replaced with the replica count unchanged and the annotation the pods get; for a rollback, the revision and ReplicaSet, each image that changes, as stored, and the other changed field names), override flag, requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
 
 Response `data`: `plan_id`, `status` (`awaiting_approval`), `expires_at`, `notified`, `approval_mode`, `correlation_id`, and `retry_after` when `notified` is false.
 
@@ -616,12 +641,12 @@ Authorization, before anything else:
 
 Requests (responses are the JSON envelope in the body):
 
-- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `change` (what the plan changes, in the shape of the plan response's `diff`: `{"replicas": {from, to}}` for a scale, `{"restart": {"pods_replaced"}, "template": {from, to}}` for a restart, `{"revision": {from, to}, "template": {from, to}, "replica_set", "images", "fields_changed", "truncated"}` for a rollback, where `truncated` is the record's `diff_truncated`), `override_manual_change`, `impact`, `requested_by`, `created_at`, `expires_at`, and when present `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
+- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `change` (what the plan changes, in the shape of the plan response's `diff`: `{"replicas": {from, to}}` for a scale, `{"restart": {"pods_replaced"}, "template": {from, to}}` for a restart, `{"revision": {from, to}, "template": {from, to}, "replica_set", "images", "fields_changed", "truncated"}` for a rollback, where `truncated` is the record's `diff_truncated`), `override_manual_change`, `impact`, `requested_by`, `agent` (`null` in legacy mode), `created_at`, `expires_at`, and when present `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
 - `POST /` with a JSON object of at most 4096 bytes and only these fields: `plan_id` (UUID), `decision` (`approve` or `reject`), optional `reason` (string, at most 500 characters, control characters removed), optional `apply` (boolean, default `true`). Any other field is `invalid_argument`.
   - `approve`: first the record is read; if its `action` has no apply tool the request fails with `internal`, and if it has no `args` with `plan_expired` ("plan again"), before any decision is recorded, so an approval never names a plan that nothing can apply. Then one conditional update, `status IN (planned, awaiting_approval) AND used = false AND expires_at > now AND requested_by <> caller`, sets `status = approved`, `approved_by`, `approved_at`, `approved_args_hash = args_hash` (copied from the record in the same update), `approval_channel = api`, `approval_expires_at = expires_at = now + APPLY_AFTER_APPROVAL_TTL_SECONDS` and `decision_correlation_id` (the approver's request ID).
   - `reject`: the same condition; sets `status = rejected`, `rejected_by`, `rejected_at`, `reject_reason`, `decision_correlation_id`, `expires_at = now`.
   - Refusals: `plan_not_found`, `plan_used`, `plan_decided`, `plan_expired`, `forbidden` (the requester), `conflict` (changed concurrently).
-  - In `server` mode only, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id` and the record's `args`, unchanged) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "<apply tool>", "kubeHandrailCorrelationId": "<approver request ID>"}}`, where the apply tool is the one for the plan's `action` (`scale_deployment`: `k8sw___apply_scale_deployment`, `restart_deployment`: `k8sw___apply_restart_deployment`, `rollback_deployment`: `k8sw___apply_rollback_deployment`), as the gateway calls it except that the correlation ID is the approver's ([Observability](#observability)). The write guard is unchanged and authoritative.
+  - In `server` mode only, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id` and the record's `args`, unchanged) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "<apply tool>", "kubeHandrailChannel": "approval-api", "kubeHandrailCorrelationId": "<approver request ID>"}}`, where the apply tool is the one for the plan's `action` (`scale_deployment`: `k8sw___apply_scale_deployment`, `restart_deployment`: `k8sw___apply_restart_deployment`, `rollback_deployment`: `k8sw___apply_rollback_deployment`), as the gateway calls it except that the correlation ID is the approver's ([Observability](#observability)). The write guard is unchanged and authoritative.
   - Response `data`: `plan` (the view above, read again after the apply), `apply` (the write Lambda's envelope, or `null` when no apply ran, as always in `client` and `both` mode) and `approval_mode`. If the write Lambda cannot be invoked at all, `apply` is `internal` with the message `approval recorded; apply could not be started: <error code>`. A failed apply does not undo the approval: an approval whose apply was refused before the consume (for example `remediation_disabled`) can still be applied through the gateway until it expires.
 - Any other method: `invalid_argument`.
 
@@ -640,7 +665,7 @@ Either way the allowlist in the approver's code is the gate that counts. Any sam
 
 Known limits:
 
-- Separation of duties is between principal classes: every plan is requested by `mcp-gateway` and only listed human principals approve. Per-agent `requested_by` needs caller identity on the server (Milestone 1, item 6).
+- Separation of duties is between principals: a plan is requested by an agent (`agent:<name>`, or `mcp-gateway` in legacy mode) and only listed human IAM principals approve, so `approved_by <> requested_by` always holds for a human approval.
 - The apply triggered by the approval channel does not pass through the gateway, so gateway policy (Cedar, once added) does not see it; the write guard and RBAC do.
 - Slack is not an approval channel yet; the implemented channel is this IAM-authenticated API and its CLI.
 
@@ -693,6 +718,15 @@ The EKS token is a presigned `sts:GetCallerIdentity` URL built locally; the Lamb
 ## Configuration (environment variables)
 
 `CLUSTER_NAME`, `PLANS_TABLE`, `ALLOWED_NAMESPACES` (comma-separated), `MIN_REPLICAS`, `MAX_REPLICAS`, `PLAN_TTL_SECONDS`, `REMEDIATION_ENABLED_PARAM` (write only), `METRIC_NAMESPACE` (the [tool record](#observability)'s metric namespace; Terraform sets `<name_prefix>/tools`, default `kube-handrail/tools`). `AWS_REGION` is provided by Lambda.
+
+Agent identity, set on both tool Lambdas ([Agent identity](#agent-identity)):
+
+| Variable | Notes | Terraform variable |
+|---|---|---|
+| `CALLER_INTERCEPTOR` | `true` turns on identity mode; anything else is legacy mode | `caller_interceptor_enabled` (default `true`) |
+| `AGENTS` | JSON `{"<client_id>": {"name": "<agent>"}}`. Required in identity mode, with at least one agent; names match `^[a-z][a-z0-9_]{0,31}$` and are unique. Ignored in legacy mode | `agents`: a map from agent name to `{client_id = optional(string)}`, default `{devops_agent = {}, smoke_test = {}}`; an entry without `client_id` gets a Cognito app client |
+
+Outputs: `agent_client_ids` (every agent's `client_id` by name) and `cognito_client_ids` (the clients created here).
 
 Server-side approval, set on both tool Lambdas (the approver reads `APPROVAL_MODE` and `APPLY_AFTER_APPROVAL_TTL_SECONDS` as well):
 

@@ -75,7 +75,7 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 | `approval_rate_limited` | Too many approval requests. | Wait until `details.retry_after`. |
 | `plan_decided` | Plan already approved or rejected (`details.status`). | Do not request again. `rejected`: stop. `approved`: check `get_workload_status`; apply only in `both` mode or when the human says the approval did not apply it. |
 | `revision_not_found` | The revision has no ReplicaSet of the Deployment any more (`details.available` lists those that exist). | Call `get_rollout_history`. The revision may have been pruned by `revisionHistoryLimit` or renumbered by a rollback. Ask the human which revision to use. |
-| `forbidden` | Caller not allowed (approval API only). | Stop. |
+| `forbidden` | Caller not allowed; `details.reason` says why. `not_requester`: the plan was made by another agent (on apply or `request_approval`). `agent_unknown`: the server does not know your OAuth client. Without a reason: the approval API refused the caller. | `not_requester`: plan the change yourself and use your own plan. Otherwise stop and tell the human. |
 | `kubernetes_error`, `internal` | Cluster or server error. | Retry a read or re-plan once, then stop. |
 
 The guards behind these codes are in "Guard checks", "History checks (oscillation breaker)" and "Server-side approval".

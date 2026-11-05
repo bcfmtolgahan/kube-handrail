@@ -181,9 +181,30 @@ variable "alert_email" {
 }
 
 variable "caller_interceptor_enabled" {
-  description = "Experimental: attach a gateway request interceptor that passes the verified OAuth client_id to the tool Lambdas (mcp/CONTRACT.md, Caller identity)."
+  description = "Attach the gateway request interceptor that passes the verified OAuth client_id to the tool Lambdas, which then identify each agent by it and refuse writes from unknown callers (mcp/CONTRACT.md, Agent identity). false is the legacy mode: no per-agent attribution or limits."
   type        = bool
-  default     = false
+  default     = true
+}
+
+variable "agents" {
+  description = "Agents by name, one OAuth client each. An entry without client_id gets a Cognito app client created here; with client_id, that existing client of the user pool is allowed instead. The default keys are the app clients earlier versions created, so they are kept on upgrade."
+  type = map(object({
+    client_id = optional(string)
+  }))
+  default = {
+    devops_agent = {}
+    smoke_test   = {}
+  }
+
+  validation {
+    condition     = length(var.agents) > 0 && alltrue([for name in keys(var.agents) : can(regex("^[a-z][a-z0-9_]{0,31}$", name))])
+    error_message = "agents must name at least one agent, each matching ^[a-z][a-z0-9_]{0,31}$."
+  }
+
+  validation {
+    condition     = alltrue([for a in values(var.agents) : a.client_id == null || try(length(a.client_id) > 0, false)])
+    error_message = "An agent's client_id must not be empty; leave it out to create a client."
+  }
 }
 
 variable "approval_mode" {

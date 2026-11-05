@@ -1,6 +1,6 @@
-# Experimental gateway request interceptor (Milestone 1, item 6; mcp/CONTRACT.md, Caller identity).
-# Off by default. When on, it copies the verified token's client_id into a reserved tool
-# argument, and the tool Lambdas log it.
+# Gateway request interceptor (mcp/CONTRACT.md, Agent identity). On by default: it copies the
+# verified token's client_id into a reserved tool argument, by which the tool Lambdas identify
+# the agent. Without it (legacy mode) plans name no agent and per-agent limits do not apply.
 
 locals {
   interceptor_count = var.caller_interceptor_enabled ? 1 : 0
@@ -36,6 +36,13 @@ resource "aws_iam_role_policy" "interceptor" {
   name   = "runtime"
   role   = aws_iam_role.interceptor[0].id
   policy = data.aws_iam_policy_document.interceptor[0].json
+}
+
+check "agent_identity" {
+  assert {
+    condition     = var.caller_interceptor_enabled
+    error_message = "caller_interceptor_enabled is false (legacy mode): plans name no agent, and per-agent attribution, budgets and kill switches do not apply."
+  }
 }
 
 resource "aws_lambda_function" "interceptor" {

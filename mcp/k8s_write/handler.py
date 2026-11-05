@@ -11,6 +11,7 @@ import boto3
 from kubernetes import client as k8s
 from kubernetes.client.exceptions import ApiException
 
+from handrail_common.agents import check_plan_agent, guard_apply
 from handrail_common.breaker import (
     LAST_PLAN_ANNOTATION,
     check_history,
@@ -37,7 +38,11 @@ from handrail_common.envelope import (
 )
 from handrail_common.gitops import is_gitops_managed
 from handrail_common.killswitch import KillSwitch
-from handrail_common.observability import CORRELATION_ANNOTATION, current_correlation_id
+from handrail_common.observability import (
+    CORRELATION_ANNOTATION,
+    current_channel,
+    current_correlation_id,
+)
 from handrail_common.plans import (
     RESTART_ANNOTATION,
     RESTART_DEPLOYMENT,
@@ -69,6 +74,8 @@ DEFAULT_REPLICAS = 1
 # Status updates (for example during a rollout) change resourceVersion but not the spec.
 # A 409 caused by one is retried after re-checking the object; a spec change never is.
 PATCH_ATTEMPTS = 3
+# Set by every apply of a plan that names its agent, so humans and admission see who asked.
+REQUESTED_BY_ANNOTATION = "kube-handrail.io/requested-by"
 
 
 @dataclass
@@ -130,33 +137,56 @@ class Action:
     extra_checks: Callable[[k8s.AppsV1Api, Plan, Any], Any] = _no_checks
 
 
-def _patch_metadata(
-    resource_version: str, plan_id: str, correlation_id: str | None
-) -> dict[str, Any]:
-    # resourceVersion in the patch body makes the API server reject it with 409 if the
-    # object changed between the spec check and the patch.
+def _annotations(
+    plan_id: str, correlation_id: str | None, requested_by: str | None
+) -> dict[str, str]:
     annotations = {LAST_PLAN_ANNOTATION: plan_id}
     if correlation_id is not None:
         annotations[CORRELATION_ANNOTATION] = correlation_id
-    return {"resourceVersion": resource_version, "annotations": annotations}
+    if requested_by is not None:
+        annotations[REQUESTED_BY_ANNOTATION] = requested_by
+    return annotations
+
+
+def _patch_metadata(
+    resource_version: str, plan_id: str, correlation_id: str | None, requested_by: str | None
+) -> dict[str, Any]:
+    # resourceVersion in the patch body makes the API server reject it with 409 if the
+    # object changed between the spec check and the patch.
+    return {
+        "resourceVersion": resource_version,
+        "annotations": _annotations(plan_id, correlation_id, requested_by),
+    }
+
+
+def agent_requester(plan: Plan) -> str | None:
+    """The requested-by annotation's value: only for a plan that names its agent."""
+    return plan.requested_by if plan.agent is not None else None
 
 
 def scale_patch(
-    replicas: int, resource_version: str, plan_id: str, correlation_id: str | None = None
+    replicas: int,
+    resource_version: str,
+    plan_id: str,
+    correlation_id: str | None = None,
+    requested_by: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "metadata": _patch_metadata(resource_version, plan_id, correlation_id),
+        "metadata": _patch_metadata(resource_version, plan_id, correlation_id, requested_by),
         "spec": {"replicas": replicas},
     }
 
 
 def restart_patch(
-    resource_version: str, plan_id: str, correlation_id: str | None = None
+    resource_version: str,
+    plan_id: str,
+    correlation_id: str | None = None,
+    requested_by: str | None = None,
 ) -> dict[str, Any]:
     """Only the restart annotation changes in the pod template, so the template written is
     the one the plan pinned (template_to)."""
     return {
-        "metadata": _patch_metadata(resource_version, plan_id, correlation_id),
+        "metadata": _patch_metadata(resource_version, plan_id, correlation_id, requested_by),
         "spec": {"template": {"metadata": {"annotations": {RESTART_ANNOTATION: plan_id}}}},
     }
 
@@ -172,13 +202,12 @@ def rollback_patch(
     plan_id: str,
     correlation_id: str | None = None,
     has_annotations: bool = True,
+    requested_by: str | None = None,
 ) -> list[dict[str, Any]]:
     """A JSON Patch (the client sends a list body as application/json-patch+json) that
     writes exactly `template` as the pod template. The resourceVersion op comes first: a
     stale value makes the API server reject the patch with 409, as in the merge patches."""
-    annotations = {LAST_PLAN_ANNOTATION: plan_id}
-    if correlation_id is not None:
-        annotations[CORRELATION_ANNOTATION] = correlation_id
+    annotations = _annotations(plan_id, correlation_id, requested_by)
     ops: list[dict[str, Any]] = [
         {"op": "replace", "path": "/metadata/resourceVersion", "value": resource_version},
         {"op": "replace", "path": "/spec/template", "value": template},
@@ -323,6 +352,8 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
         raise GuardError(REMEDIATION_DISABLED, "remediation is disabled")
 
     s = rt.settings
+    # Who is applying: in identity mode a gateway apply must come from the plan's agent.
+    expected_requester = guard_apply(s)
     namespace, name, request = action.validate(args, s)
     override = request.get("override_manual_change", False) is True
     plan_id = require_plan_id(args.get("plan_id"))
@@ -335,9 +366,12 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
         action.name,
         now,
         require_approval=s.approval_required,
+        requester=expected_requester,
+        channel=current_channel(),
     )
 
     try:
+        check_plan_agent(s, plan)
         check_record_matches(plan, action, namespace, name, request)
         action.check_plan(rt, plan)
         updated = _patch(
@@ -414,7 +448,11 @@ SCALE = Action(
     check_plan=_check_scale_plan,
     breaker=_scale_breaker,
     body=lambda plan, args, deployment, extra, correlation_id: scale_patch(
-        args["replicas"], deployment.metadata.resource_version, plan.plan_id, correlation_id
+        args["replicas"],
+        deployment.metadata.resource_version,
+        plan.plan_id,
+        correlation_id,
+        agent_requester(plan),
     ),
     result=lambda plan, args: {
         "replicas_from": plan.replicas_from,
@@ -464,7 +502,7 @@ RESTART = Action(
     check_plan=_no_checks,
     breaker=_restart_breaker,
     body=lambda plan, args, deployment, extra, correlation_id: restart_patch(
-        deployment.metadata.resource_version, plan.plan_id, correlation_id
+        deployment.metadata.resource_version, plan.plan_id, correlation_id, agent_requester(plan)
     ),
     result=lambda plan, args: {"pods_replaced": plan.replicas_to, "template": plan.template_to},
     extra_checks=lambda apps, plan, deployment: check_not_paused(deployment),
@@ -559,6 +597,7 @@ ROLLBACK = Action(
         plan.plan_id,
         correlation_id,
         has_annotations=bool(deployment.metadata.annotations),
+        requested_by=agent_requester(plan),
     ),
     result=lambda plan, args: {
         "revision_requested": args["revision"],

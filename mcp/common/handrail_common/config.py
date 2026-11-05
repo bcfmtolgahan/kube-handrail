@@ -1,8 +1,10 @@
 """Typed settings from the environment variables listed in mcp/CONTRACT.md."""
 
+import json
 import os
+import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class ConfigError(Exception):
@@ -13,6 +15,16 @@ CLIENT = "client"
 SERVER = "server"
 BOTH = "both"
 APPROVAL_MODES = (CLIENT, SERVER, BOTH)
+# The keys of the Terraform agents map; also part of SSM parameter names and counter keys.
+AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+
+@dataclass(frozen=True)
+class Agent:
+    """One agent: an OAuth client listed in AGENTS (mcp/CONTRACT.md, Agent identity)."""
+
+    name: str
+    client_id: str
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,11 @@ class Settings:
     # Read Lambda only: where request_approval notifies, and the URL shown in the message.
     approval_topic_arn: str | None = None
     approval_url: str | None = None
+    # CALLER_INTERCEPTOR is "true": callers are verified OAuth clients, and planning,
+    # request_approval and gateway applies need one listed in `agents`.
+    identity_required: bool = False
+    # client_id => Agent, from AGENTS; empty unless identity_required.
+    agents: Mapping[str, Agent] = field(default_factory=dict)
 
     @property
     def approval_required(self) -> bool:
@@ -77,6 +94,26 @@ def approval_mode(env: Mapping[str, str]) -> str:
     if mode not in APPROVAL_MODES:
         raise ConfigError(f"APPROVAL_MODE must be one of {', '.join(APPROVAL_MODES)}")
     return mode
+
+
+def parse_agents(raw: str) -> dict[str, Agent]:
+    """AGENTS: a JSON object {"<client_id>": {"name": "<agent>"}}, at least one entry, with
+    unique names."""
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        raise ConfigError("AGENTS must be a JSON object") from None
+    if not isinstance(value, dict) or not value:
+        raise ConfigError("AGENTS must list at least one agent")
+    agents: dict[str, Agent] = {}
+    for client_id, entry in value.items():
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if not client_id or not isinstance(name, str) or not AGENT_NAME.match(name):
+            raise ConfigError(f"AGENTS: each agent needs a name matching {AGENT_NAME.pattern}")
+        agents[client_id] = Agent(name=name, client_id=client_id)
+    if len({a.name for a in agents.values()}) != len(agents):
+        raise ConfigError("AGENTS: agent names must be unique")
+    return agents
 
 
 def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) -> Settings:
@@ -126,6 +163,10 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
     if write and param is None:
         raise ConfigError("REMEDIATION_ENABLED_PARAM is required")
 
+    # Without the interceptor nobody is verified, so AGENTS would name nobody (legacy mode).
+    identity = env.get("CALLER_INTERCEPTOR") == "true"
+    agents = parse_agents(required_env(env, "AGENTS")) if identity else {}
+
     return Settings(
         cluster_name=required_env(env, "CLUSTER_NAME"),
         plans_table=required_env(env, "PLANS_TABLE"),
@@ -149,4 +190,6 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         approval_request_limit=limits["APPROVAL_REQUEST_LIMIT"],
         approval_topic_arn=env.get("APPROVAL_TOPIC_ARN", "").strip() or None,
         approval_url=env.get("APPROVAL_URL", "").strip() or None,
+        identity_required=identity,
+        agents=agents,
     )

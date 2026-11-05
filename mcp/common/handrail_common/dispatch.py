@@ -10,11 +10,14 @@ from handrail_common.envelope import INTERNAL, UNKNOWN_TOOL, Envelope, err
 from handrail_common.observability import (
     DEFAULT_METRIC_NAMESPACE,
     OK,
+    bind_caller,
     bind_correlation_id,
+    channel,
     correlation_id,
     current_correlation_id,
     emit,
     tool_record,
+    unbind_caller,
     unbind_correlation_id,
 )
 from handrail_common.validation import GuardError, require_plan_id
@@ -24,7 +27,7 @@ logger = logging.getLogger(__name__)
 TOOL_NAME_KEY = "bedrockAgentCoreToolName"
 TARGET_DELIMITER = "___"
 # Reserved argument the gateway request interceptor sets to the verified caller (CONTRACT.md,
-# Caller identity). It is trusted only when CALLER_INTERCEPTOR is "true"; otherwise a client
+# Agent identity). It is trusted only when CALLER_INTERCEPTOR is "true"; otherwise a client
 # could have sent it.
 CALLER_ARGUMENT = "_kube_handrail_caller"
 
@@ -51,6 +54,12 @@ def pop_caller(args: dict[str, Any], env: Mapping[str, str] | None = None) -> st
     if env.get("CALLER_INTERCEPTOR") != "true":
         return None
     return value if isinstance(value, str) and value else None
+
+
+def _detail(envelope: Envelope, key: str) -> str | None:
+    details = (envelope.get("error") or {}).get("details")
+    value = details.get(key) if isinstance(details, Mapping) else None
+    return value if isinstance(value, str) else None
 
 
 def logged_plan_id(envelope: Envelope, args: Mapping[str, Any]) -> str | None:
@@ -92,9 +101,12 @@ def dispatch(
     caller = pop_caller(args, env)
     correlation = correlation_id(context)
     token = bind_correlation_id(correlation)
+    # Handlers read the caller and channel through observability, as the correlation id.
+    tokens = bind_caller(caller, channel(context))
     try:
         envelope = _run(handler, name, args)
     finally:
+        unbind_caller(tokens)
         unbind_correlation_id(token)
     outcome = OK if envelope.get("ok") else str((envelope.get("error") or {}).get("code"))
     emit(
@@ -106,6 +118,8 @@ def dispatch(
             outcome=outcome,
             duration_ms=int((time.monotonic() - started) * 1000),
             namespace=env.get("METRIC_NAMESPACE", "").strip() or DEFAULT_METRIC_NAMESPACE,
+            reason=_detail(envelope, "reason"),
+            scope=_detail(envelope, "scope"),
         )
     )
     return envelope

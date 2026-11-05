@@ -1,9 +1,11 @@
 """Gateway request interceptor: passes the verified caller to the tool Lambdas.
 
-Experimental (Milestone 1, item 6). The gateway runs it after it has validated the inbound
-JWT, so the token's claims are trusted here without verifying the signature again. For
-tools/call it overwrites the reserved argument CALLER_ARGUMENT with the token's client_id,
-whatever the client sent under that name. The token itself is never logged or forwarded.
+On by default (mcp/CONTRACT.md, Agent identity): the tool Lambdas identify the agent by
+this client_id. The gateway runs it after it has validated the inbound JWT, so the token's
+claims are trusted here without verifying the signature again. For tools/call it overwrites
+the reserved argument CALLER_ARGUMENT with the token's client_id, whatever the client sent
+under that name. It keeps no state, so the gateway may retry it. The token itself is never
+logged or forwarded.
 """
 
 import base64

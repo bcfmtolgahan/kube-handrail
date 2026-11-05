@@ -72,7 +72,7 @@ See [Server-side approval](../mcp/CONTRACT.md#server-side-approval). Implemented
 
 ### 6. Caller identity spike (done)
 
-Verified on a test deployment with the experimental interceptor in `mcp/interceptor/` (off by default; see [Caller identity](../mcp/CONTRACT.md#caller-identity-experimental)):
+Verified on a test deployment with the then experimental interceptor in `mcp/interceptor/` (off by default at the time; it is now the basis of [Agent identity](../mcp/CONTRACT.md#agent-identity)):
 
 - A request interceptor with `passRequestHeaders` receives the validated bearer token and can rewrite `tools/call` arguments. The tool Lambda received the token's `client_id`.
 - A client that sent the reserved argument itself (`attacker`) still arrived as its real `client_id`, because the interceptor overwrites the argument unconditionally.

@@ -14,8 +14,13 @@ output "cognito_scopes" {
 }
 
 output "cognito_client_ids" {
-  description = "App client IDs by client name. Secrets are not output; read them from Cognito."
+  description = "IDs of the app clients created here, by agent name. Secrets are not output; read them from Cognito."
   value       = { for k, c in aws_cognito_user_pool_client.this : k => c.id }
+}
+
+output "agent_client_ids" {
+  description = "OAuth client ID of every agent, created or external, by agent name."
+  value       = local.agent_client_ids
 }
 
 output "plans_table_name" {

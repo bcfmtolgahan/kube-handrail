@@ -14,7 +14,12 @@ from handrail_common.envelope import (
     err,
     ok,
 )
-from handrail_common.observability import correlation_id, current_correlation_id
+from handrail_common.observability import (
+    correlation_id,
+    current_caller,
+    current_channel,
+    current_correlation_id,
+)
 from handrail_common.validation import GuardError
 
 
@@ -177,6 +182,8 @@ def test_one_record_per_successful_call(capsys):
         "caller": "client-1",
         "plan_id": PLAN_ID,
         "outcome": "ok",
+        "reason": None,
+        "scope": None,
     }
 
 
@@ -243,3 +250,42 @@ def test_unverified_caller_is_null(capsys):
     (record,) = records(capsys)
     assert record["caller"] is None
     assert "forged" not in json.dumps(record)
+
+
+def test_caller_and_channel_are_bound_only_during_the_call(capsys):
+    seen = []
+    handlers = {"x": lambda args: seen.append((current_caller(), current_channel())) or ok({})}
+    env = {"CALLER_INTERCEPTOR": "true"}
+    dispatch(handlers, {"_kube_handrail_caller": "client-1"}, full_ctx(), env)
+    custom = {"kubeHandrailChannel": "approval-api"}
+    dispatch(handlers, {}, full_ctx(custom), env)
+    assert seen == [("client-1", "gateway"), (None, "approval-api")]
+    assert (current_caller(), current_channel()) == (None, "gateway")
+
+
+def test_a_forged_caller_is_ignored_in_legacy_mode(capsys):
+    seen = []
+    handlers = {"x": lambda args: seen.append((current_caller(), args)) or ok({})}
+    dispatch(handlers, {"_kube_handrail_caller": "forged", "a": 1}, full_ctx(), {})
+    assert seen == [(None, {"a": 1})]
+
+
+@pytest.mark.parametrize("value", ["verifier", "APPROVAL-API", "", 1, None])
+def test_any_other_channel_value_is_the_gateway(capsys, value):
+    seen = []
+    handlers = {"x": lambda args: seen.append(current_channel()) or ok({})}
+    dispatch(handlers, {}, full_ctx({"kubeHandrailChannel": value}), {})
+    assert seen == ["gateway"]
+
+
+def test_rejection_reason_and_scope_are_recorded(capsys):
+    def handler(args):
+        raise GuardError("forbidden", "no", {"reason": "not_requester"})
+
+    dispatch({"x": handler}, {}, full_ctx(), {})
+    (record,) = records(capsys)
+    assert (record["Code"], record["reason"], record["scope"]) == (
+        "forbidden",
+        "not_requester",
+        None,
+    )

@@ -14,7 +14,8 @@ from kubernetes.client.rest import ApiException
 from moto import mock_aws
 
 from handrail_common.breaker import LAST_PLAN_ANNOTATION, retention_seconds
-from handrail_common.config import Settings
+from handrail_common.config import Agent, Settings
+from handrail_common.observability import bind_caller, unbind_caller
 from handrail_common.plans import (
     PlanStore,
     object_key,
@@ -1827,3 +1828,94 @@ def test_lambda_handler_plans_a_rollback_through_dispatch(wired):
         {"namespace": "sandbox", "name": "web", "revision": 5}, context("plan_rollback_deployment")
     )
     assert result["ok"] is True and result["data"]["diff"]["replica_set"] == "web-5"
+
+
+# --- Agent identity -----------------------------------------------------------
+
+SMOKE = Agent(name="smoke_test", client_id="client-a")
+DEVOPS = Agent(name="devops_agent", client_id="client-b")
+IDENTITY_SETTINGS = dataclasses.replace(
+    APPROVAL_SETTINGS,
+    identity_required=True,
+    agents={"client-a": SMOKE, "client-b": DEVOPS},
+)
+
+
+@pytest.fixture
+def caller():
+    """Bind the verified caller as dispatch does (the gateway channel)."""
+    bound = []
+
+    def bind(value: str | None) -> None:
+        bound.append(bind_caller(value, "gateway"))
+
+    yield bind
+    for tokens in reversed(bound):
+        unbind_caller(tokens)
+
+
+def test_identity_plan_records_the_agent_and_its_client(clients, table, caller):
+    caller("client-a")
+    data = handler.plan_scale_deployment(
+        {"namespace": "sandbox", "name": "web", "replicas": 3}, IDENTITY_SETTINGS, clients, NOW
+    )["data"]
+    assert data["requested_by"] == "agent:smoke_test"
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["requested_by"] == "agent:smoke_test"
+    assert (item["agent"], item["requested_client_id"]) == ("smoke_test", "client-a")
+    # The agent is bound by the consume condition, not by the approved arguments.
+    assert item["args_hash"] == scale_args_hash("sandbox", "web", 3)
+
+
+def test_legacy_plan_names_the_gateway_and_no_agent(clients, table, caller):
+    caller("client-a")
+    data = plan(clients)["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert data["requested_by"] == item["requested_by"] == "mcp-gateway"
+    assert "agent" not in item and "requested_client_id" not in item
+
+
+@pytest.mark.parametrize("value", [None, "unknown", "client-z"])
+def test_identity_plan_refuses_an_unknown_caller_before_any_cluster_read(
+    clients, table, caller, value
+):
+    caller(value)
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(
+            {"namespace": "sandbox", "name": "web", "replicas": 3}, IDENTITY_SETTINGS, clients, NOW
+        )
+    assert (exc.value.code, exc.value.details) == ("forbidden", {"reason": "agent_unknown"})
+    clients.apps.read_namespaced_deployment.assert_not_called()
+    assert table.scan()["Items"] == []
+
+
+def test_identity_request_approval_only_by_the_planning_agent(approvals, table, caller):
+    caller("client-a")
+    plan_id = handler.plan_scale_deployment(
+        {"namespace": "sandbox", "name": "web", "replicas": 3}, IDENTITY_SETTINGS, approvals, NOW
+    )["data"]["plan_id"]
+    caller("client-b")
+    with pytest.raises(GuardError) as exc:
+        request(approvals, plan_id, settings=IDENTITY_SETTINGS)
+    assert (exc.value.code, exc.value.details) == ("forbidden", {"reason": "not_requester"})
+    assert approvals.sns.messages == []
+    caller("client-z")
+    with pytest.raises(GuardError) as exc:
+        request(approvals, plan_id, settings=IDENTITY_SETTINGS)
+    assert exc.value.details == {"reason": "agent_unknown"}
+    caller("client-a")
+    assert request(approvals, plan_id, settings=IDENTITY_SETTINGS)["data"]["notified"] is True
+    (message,) = approvals.sns.messages
+    assert "Requested by: agent:smoke_test" in message["Message"]
+
+
+@pytest.mark.parametrize("tool", sorted(t for t in handler.HANDLERS if t.startswith("plan_")))
+def test_every_plan_tool_runs_the_agent_guard(wired, monkeypatch, tool):
+    def refuse(settings):
+        raise GuardError("forbidden", "guard ran", {"reason": "agent_unknown"})
+
+    monkeypatch.setattr(handler, "guard_plan", refuse)
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3, "revision": 5}
+    result = handler.lambda_handler(args, context(tool))
+    assert result["error"]["message"] == "guard ran"
+    wired.apps.read_namespaced_deployment.assert_not_called()

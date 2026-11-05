@@ -64,6 +64,8 @@ locals {
     APPROVAL_REQUEST_COOLDOWN_SECONDS = tostring(var.approval_request_cooldown_seconds)
     APPROVAL_REQUEST_LIMIT            = tostring(var.approval_request_limit)
 
+    AGENTS = local.agents_env
+
     METRIC_NAMESPACE = local.tools_metric_namespace
   }
 
@@ -86,6 +88,19 @@ locals {
   }
 
   scopes = ["read", "remediate"]
+
+  # Agent name => OAuth client_id: the clients created below and the external ones named in
+  # var.agents. The gateway allows exactly these, and the tool Lambdas know them as AGENTS.
+  agent_client_ids = merge(
+    { for name, client in aws_cognito_user_pool_client.this : name => client.id },
+    { for name, agent in var.agents : name => agent.client_id if agent.client_id != null },
+  )
+  # Sorted by agent name; with the default agents this is the list earlier versions allowed.
+  allowed_clients = [for name in sort(keys(local.agent_client_ids)) : local.agent_client_ids[name]]
+  # client_id => {name}, as mcp/CONTRACT.md (Agent identity) defines AGENTS.
+  agents_env = jsonencode({
+    for name, client_id in local.agent_client_ids : client_id => { name = name }
+  })
 
   cognito_domain        = "${var.name_prefix}-${local.account_id}"
   cognito_discovery_url = "https://cognito-idp.${local.region}.amazonaws.com/${aws_cognito_user_pool.this.id}/.well-known/openid-configuration"
@@ -449,8 +464,10 @@ resource "aws_cognito_resource_server" "this" {
   }
 }
 
+# One client per agent without an external client_id. The keys are agent names, as the
+# fixed set (devops_agent, smoke_test) was before, so those clients keep their addresses.
 resource "aws_cognito_user_pool_client" "this" {
-  for_each = toset(["devops_agent", "smoke_test"])
+  for_each = { for name, agent in var.agents : name => agent if agent.client_id == null }
 
   name                                 = "${var.name_prefix}-${replace(each.key, "_", "-")}"
   user_pool_id                         = aws_cognito_user_pool.this.id
@@ -505,7 +522,7 @@ resource "aws_bedrockagentcore_gateway" "this" {
   authorizer_configuration {
     custom_jwt_authorizer {
       discovery_url   = local.cognito_discovery_url
-      allowed_clients = [for c in aws_cognito_user_pool_client.this : c.id]
+      allowed_clients = local.allowed_clients
     }
   }
 

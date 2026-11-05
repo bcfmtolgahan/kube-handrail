@@ -29,6 +29,49 @@ def test_settings_parse():
     assert s.approval_topic_arn is None and s.approval_url is None
 
 
+IDENTITY = {"CALLER_INTERCEPTOR": "true"}
+AGENTS = '{"client-a": {"name": "smoke_test"}, "client-b": {"name": "devops_agent"}}'
+
+
+def test_legacy_mode_ignores_agents():
+    s = load_settings(BASE | {"AGENTS": "not json"})
+    assert s.identity_required is False and s.agents == {}
+
+
+def test_identity_mode_parses_agents_by_client_id():
+    s = load_settings(BASE | IDENTITY | {"AGENTS": AGENTS})
+    assert s.identity_required is True
+    assert {cid: a.name for cid, a in s.agents.items()} == {
+        "client-a": "smoke_test",
+        "client-b": "devops_agent",
+    }
+    assert s.agents["client-a"].client_id == "client-a"
+
+
+@pytest.mark.parametrize(
+    "agents",
+    [
+        None,
+        "",
+        "not json",
+        "[]",
+        "{}",
+        '{"client-a": "smoke_test"}',
+        '{"client-a": {}}',
+        '{"client-a": {"name": "Smoke"}}',
+        '{"client-a": {"name": "1agent"}}',
+        '{"client-a": {"name": "a-b"}}',
+        '{"client-a": {"name": "' + "a" * 33 + '"}}',
+        '{"": {"name": "smoke_test"}}',
+        '{"client-a": {"name": "x"}, "client-b": {"name": "x"}}',
+    ],
+)
+def test_identity_mode_refuses_bad_agents(agents):
+    env = BASE | IDENTITY | ({} if agents is None else {"AGENTS": agents})
+    with pytest.raises(ConfigError):
+        load_settings(env)
+
+
 def test_bounds_are_read_per_namespace():
     s = load_settings(BASE)
     assert s.bounds_for("sandbox") == s.bounds_for("demo") == (0, 5)
