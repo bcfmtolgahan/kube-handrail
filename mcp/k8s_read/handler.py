@@ -70,6 +70,8 @@ from handrail_common.validation import (
 )
 
 REVISION_ANNOTATION = "deployment.kubernetes.io/revision"
+# A revision is an int64 in the Deployment controller.
+MAX_REVISION_DIGITS = 18
 APPROVAL_SUBJECT = "kube-handrail: approval requested"
 # The API server defaults spec.replicas to 1 when it is omitted.
 DEFAULT_REPLICAS = 1
@@ -186,9 +188,15 @@ def _impact(
 
 
 def _revision(deployment: Any) -> int | None:
-    """The Deployment's revision annotation as an integer, or None when it is not one."""
+    """The Deployment's revision annotation as an integer, or None when it is not one.
+
+    The annotation is untrusted text: isdigit() alone accepts digits int() rejects, such as
+    "²", and the length cap keeps the number within what the record can store.
+    """
     value = (deployment.metadata.annotations or {}).get(REVISION_ANNOTATION)
-    return int(value) if isinstance(value, str) and value.isdigit() else None
+    if not (isinstance(value, str) and value.isascii() and value.isdigit()):
+        return None
+    return int(value) if len(value) <= MAX_REVISION_DIGITS else None
 
 
 def _desired_replicas(deployment: Any) -> int:

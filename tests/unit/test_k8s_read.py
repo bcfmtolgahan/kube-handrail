@@ -1294,6 +1294,15 @@ def test_restart_plan_returns_the_rollout_impact(clients):
     assert impact["rollout"] == {"strategy": "RollingUpdate", "max_unavailable": 0, "max_surge": 1}
 
 
+@pytest.mark.parametrize("revision", ["\u00b2", "7a", "", "1" * 19])
+def test_restart_plan_records_no_revision_that_is_not_an_integer(clients, table, revision):
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={"deployment.kubernetes.io/revision": revision}
+    )
+    data = restart(clients)["data"]
+    assert "revision_from" not in table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+
+
 def test_scale_plan_records_no_revision(clients, table):
     data = plan(clients)["data"]
     assert "revision_from" not in table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
