@@ -1,16 +1,27 @@
-"""Measured impact preview of a scale plan (mcp/CONTRACT.md, Impact preview).
+"""Measured impact preview of a plan (mcp/CONTRACT.md, Impact preview).
 
 Pure functions over objects the read handler has already read, as the API server returns
 them (JSON objects with camelCase keys); nothing here calls the API. Values that depend on
 what happens after the change are named `projected_*`.
 """
 
+import math
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 PDB_HEADROOM = "pdb_headroom"
 SERVICE_WITHOUT_ENDPOINTS = "service_without_endpoints"
 SCALE_TO_ZERO = "scale_to_zero"
+RECREATE_STRATEGY = "recreate_strategy"
+ROLLOUT_IN_PROGRESS = "rollout_in_progress"
+NO_PODS = "no_pods"
+RECREATE = "Recreate"
+ROLLING_UPDATE = "RollingUpdate"
+# The API server's defaults for a RollingUpdate Deployment.
+DEFAULT_MAX_UNAVAILABLE = "25%"
+DEFAULT_MAX_SURGE = "25%"
+_PERCENT = re.compile(r"^(\d+)%$")
 SERVICE_NAME_LABEL = "kubernetes.io/service-name"
 # Items returned per list, so a namespace with many matches cannot blow up the response.
 # Warnings are computed over every match before the lists are cut.
@@ -164,6 +175,143 @@ def scale_impact(
             "added": max(0, replicas_to - replicas_from),
             "removed": removed,
         },
+        "pod_disruption_budgets": matching_pdbs[:LIST_LIMIT],
+        "services": matching_services[:LIST_LIMIT],
+        "warnings": warnings[:LIST_LIMIT],
+        "truncated": truncated,
+    }
+
+
+def scaled_value(value: Any, total: int, round_up: bool) -> int:
+    """An int-or-percent field as a count of `total`, the way the Deployment controller
+    resolves it (k8s.io/apimachinery intstr.GetScaledValueFromIntOrPercent)."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    match = _PERCENT.match(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError(f"invalid int or percent value: {value!r}")
+    scaled = int(match.group(1)) * total / 100
+    return math.ceil(scaled) if round_up else math.floor(scaled)
+
+
+def rollout_strategy(deployment: Obj, replicas: int) -> dict[str, Any]:
+    """The Deployment's strategy with maxUnavailable and maxSurge resolved to pod counts, as
+    the controller resolves them (deployment util ResolveFenceposts): maxUnavailable rounds
+    down, maxSurge rounds up, and if both are 0 maxUnavailable becomes 1. Recreate has
+    neither."""
+    strategy = _get(deployment, "spec", "strategy") or {}
+    if strategy.get("type") == RECREATE:
+        return {"strategy": RECREATE, "max_unavailable": None, "max_surge": None}
+    rolling = strategy.get("rollingUpdate") or {}
+    surge = scaled_value(rolling.get("maxSurge", DEFAULT_MAX_SURGE), replicas, round_up=True)
+    unavailable = scaled_value(
+        rolling.get("maxUnavailable", DEFAULT_MAX_UNAVAILABLE), replicas, round_up=False
+    )
+    if surge == 0 and unavailable == 0:
+        unavailable = 1
+    return {"strategy": ROLLING_UPDATE, "max_unavailable": unavailable, "max_surge": surge}
+
+
+def rollout_in_progress(deployment: Obj, replicas: int) -> bool:
+    generation = _get(deployment, "metadata", "generation") or 0
+    observed = _get(deployment, "status", "observedGeneration") or 0
+    updated = _get(deployment, "status", "updatedReplicas") or 0
+    return observed < generation or updated < replicas
+
+
+def rollout_impact(
+    deployment: Obj,
+    labels: Mapping[str, str],
+    ready_now: int,
+    replicas: int,
+    pdbs: Sequence[Obj],
+    services: Sequence[Obj],
+    slices: Sequence[Obj],
+) -> dict[str, Any]:
+    """Pods, PodDisruptionBudgets and Services affected by rolling out a new pod template to
+    a Deployment with `replicas` desired pods, and warnings for the approver. Every pod is
+    replaced at the pace of the Deployment's own strategy. Warnings never block the plan."""
+    rollout = rollout_strategy(deployment, replicas)
+    recreate = rollout["strategy"] == RECREATE
+    # Pods below the desired count at the lowest point of the rollout.
+    down = replicas if recreate else min(rollout["max_unavailable"], replicas)
+    warnings: list[dict[str, str]] = []
+    if recreate:
+        warnings.append(
+            {
+                "code": RECREATE_STRATEGY,
+                "message": "the Deployment uses the Recreate strategy: every pod is stopped "
+                "before new ones start",
+            }
+        )
+
+    matching_pdbs = sorted(
+        (_pdb_summary(p) for p in pdbs if selector_matches(_get(p, "spec", "selector"), labels)),
+        key=lambda p: p["name"] or "",
+    )
+    for pdb in matching_pdbs:
+        allowed = pdb["disruptions_allowed"] or 0
+        if down > allowed:
+            warnings.append(
+                {
+                    "code": PDB_HEADROOM,
+                    "message": f"the rollout can take {down} pod(s) down at once, more than "
+                    f"PodDisruptionBudget {pdb['name']} allows now ({allowed}); a rollout is "
+                    "not an eviction, so the PodDisruptionBudget will not stop it",
+                }
+            )
+
+    endpoints = slices_by_service(slices)
+    matching_services = []
+    for service in sorted(services, key=lambda s: _get(s, "metadata", "name") or ""):
+        if not service_selects(service, labels):
+            continue
+        name = _get(service, "metadata", "name")
+        now = ready_endpoints(endpoints.get(name, []))
+        # The lowest point of the rollout, assuming new pods become ready and the Service's
+        # other backends stay as they are. It includes the start, so this Deployment's ready
+        # pods count no more than are ready now.
+        projected = max(0, now - ready_now) + min(ready_now, replicas - down)
+        matching_services.append(
+            {"name": name, "ready_endpoints_now": now, "projected_min_ready_endpoints": projected}
+        )
+        if projected == 0:
+            warnings.append(
+                {
+                    "code": SERVICE_WITHOUT_ENDPOINTS,
+                    "message": f"Service {name} is projected to have no ready endpoints "
+                    "during the rollout",
+                }
+            )
+
+    if rollout_in_progress(deployment, replicas):
+        warnings.append(
+            {
+                "code": ROLLOUT_IN_PROGRESS,
+                "message": "a rollout of the Deployment has not finished yet",
+            }
+        )
+    if replicas == 0:
+        warnings.append(
+            {
+                "code": NO_PODS,
+                "message": "the Deployment has no pods; the template changes but no pod restarts",
+            }
+        )
+
+    truncated = any(
+        len(items) > LIST_LIMIT for items in (matching_pdbs, matching_services, warnings)
+    )
+    return {
+        "pods": {
+            "ready_now": ready_now,
+            "from": replicas,
+            "to": replicas,
+            "added": 0,
+            "removed": 0,
+            "replaced": replicas,
+        },
+        "rollout": rollout,
         "pod_disruption_budgets": matching_pdbs[:LIST_LIMIT],
         "services": matching_services[:LIST_LIMIT],
         "warnings": warnings[:LIST_LIMIT],

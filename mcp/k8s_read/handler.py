@@ -1,10 +1,10 @@
-"""k8s_read Lambda: Deployment status and events, and scale planning. Never mutates the cluster."""
+"""k8s_read Lambda: Deployment status and events, and change planning. Never mutates the cluster."""
 
 import json
 import re
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cache, partial
@@ -19,6 +19,7 @@ from handrail_common.breaker import (
     check_history,
     check_manual_change,
     last_applied_plan,
+    replica_baseline,
     retention_seconds,
 )
 from handrail_common.config import Settings, load_settings
@@ -35,11 +36,12 @@ from handrail_common.envelope import (
     ok,
 )
 from handrail_common.gitops import is_gitops_managed
-from handrail_common.impact import scale_impact
+from handrail_common.impact import rollout_impact, scale_impact
 from handrail_common.observability import current_correlation_id
 from handrail_common.plans import (
     GLOBAL_BUDGET_WINDOW_SECONDS,
     REQUESTER_GATEWAY,
+    RESTART_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     STATUS_AWAITING,
     STATUS_PLANNED,
@@ -48,6 +50,8 @@ from handrail_common.plans import (
     global_budget_error,
     object_key,
     plan_args_hash,
+    restart_args,
+    restart_template,
     scale_args,
     template_hash,
 )
@@ -55,6 +59,7 @@ from handrail_common.untrusted import fit_list, untrusted_text
 from handrail_common.validation import (
     GuardError,
     check_namespace_allowed,
+    check_not_paused,
     check_replica_step,
     require_int,
     require_name,
@@ -62,9 +67,12 @@ from handrail_common.validation import (
     require_override_flag,
     require_plan_id,
     validate_scale_args,
+    validate_target_args,
 )
 
 REVISION_ANNOTATION = "deployment.kubernetes.io/revision"
+# A revision is an int64 in the Deployment controller.
+MAX_REVISION_DIGITS = 18
 APPROVAL_SUBJECT = "kube-handrail: approval requested"
 # The API server defaults spec.replicas to 1 when it is omitted.
 DEFAULT_REPLICAS = 1
@@ -151,8 +159,15 @@ def _pod_template_labels(deployment: Any) -> dict[str, str]:
     return dict((metadata.labels if metadata else None) or {})
 
 
+# Builds the impact preview from the pod template labels, the ready pods and the
+# PodDisruptionBudgets, Services and EndpointSlices of the namespace.
+Preview = Callable[
+    [Mapping[str, str], int, Sequence[Any], Sequence[Any], Sequence[Any]], dict[str, Any]
+]
+
+
 def _impact(
-    clients: "Clients", namespace: str, deployment: Any, replicas_from: int, replicas_to: int
+    clients: "Clients", namespace: str, deployment: Any, preview: Preview
 ) -> dict[str, Any]:
     """Read what the change affects. Any read failure fails the plan: the approver must see
     facts, not gaps."""
@@ -167,18 +182,22 @@ def _impact(
     )
     ready_now = (deployment.status.ready_replicas if deployment.status else None) or 0
     try:
-        return scale_impact(
-            _pod_template_labels(deployment),
-            ready_now,
-            replicas_from,
-            replicas_to,
-            pdbs,
-            services,
-            slices,
-        )
+        return preview(_pod_template_labels(deployment), ready_now, pdbs, services, slices)
     except ValueError as exc:
         # An object the preview cannot interpret, such as an unknown selector operator.
         raise GuardError(KUBERNETES_ERROR, f"cannot build the impact preview: {exc}") from None
+
+
+def _revision(deployment: Any) -> int | None:
+    """The Deployment's revision annotation as an integer, or None when it is not one.
+
+    The annotation is untrusted text: isdigit() alone accepts digits int() rejects, such as
+    "²", and the length cap keeps the number within what the record can store.
+    """
+    value = (deployment.metadata.annotations or {}).get(REVISION_ANNOTATION)
+    if not (isinstance(value, str) and value.isascii() and value.isdigit()):
+        return None
+    return int(value) if len(value) <= MAX_REVISION_DIGITS else None
 
 
 def _desired_replicas(deployment: Any) -> int:
@@ -444,8 +463,8 @@ class PlanAction:
     # plan stores and args_hash covers: the apply arguments without plan_id, optional ones
     # only when given.
     validate: Callable[[Mapping[str, Any], Settings], tuple[str, str, dict[str, Any]]]
-    # The resulting replica count.
-    replicas_to: Callable[[Mapping[str, Any]], int]
+    # The resulting replica count, from the current one and the arguments.
+    replicas_to: Callable[[int, Mapping[str, Any]], int]
     # Checks on the live Deployment after the GitOps check (scale: HPA and blast radius).
     checks: Callable[[Clients, Settings, Any, int, Mapping[str, Any]], None]
     # History checks; returns whether the manual-change override was used.
@@ -453,6 +472,10 @@ class PlanAction:
     # Names of the checks reported in preflight, in order.
     preflight: tuple[str, ...]
     diff: Callable[[Plan], dict[str, Any]]
+    # The pod template the change leaves, from the plan id and the current raw template.
+    template_to: Callable[[str, Mapping[str, Any]], dict[str, Any]]
+    # The impact preview, given the raw Deployment, the current and the resulting replicas.
+    impact: Callable[[Mapping[str, Any], int, int], Preview]
 
 
 def _plan(
@@ -472,15 +495,17 @@ def _plan(
         raise global_budget_error(
             now - now % GLOBAL_BUDGET_WINDOW_SECONDS, settings.global_hourly_apply_budget
         )
-    replicas_to = action.replicas_to(request)
+    replicas_to = action.replicas_to(current, request)
     # Last, after every check has passed, and before the plan is stored.
-    impact = _impact(clients, namespace, deployment, current, replicas_to)
+    impact = _impact(clients, namespace, deployment, action.impact(raw, current, replicas_to))
     correlation_id = current_correlation_id()
-    # No action changes the pod template yet, so the template it leaves is the current one.
-    template = template_hash((raw.get("spec") or {}).get("template") or {})
+    plan_id = str(uuid.uuid4())
+    template = (raw.get("spec") or {}).get("template") or {}
+    template_from = template_hash(template)
+    template_to = template_hash(action.template_to(plan_id, template))
 
     plan = Plan(
-        plan_id=str(uuid.uuid4()),
+        plan_id=plan_id,
         action=action.name,
         namespace=namespace,
         name=name,
@@ -499,8 +524,9 @@ def _plan(
         impact=impact,
         plan_correlation_id=correlation_id,
         args=request,
-        template_from=template,
-        template_to=template,
+        template_from=template_from,
+        template_to=template_to,
+        revision_from=_revision(deployment) if template_to != template_from else None,
     )
     clients.store.create(plan)
     preflight: list[dict[str, Any]] = [
@@ -554,7 +580,9 @@ def _scale_breaker(
 ) -> bool:
     last_applied = last_applied_plan(clients.store, deployment)
     overridden = check_manual_change(
-        last_applied, current, args.get("override_manual_change", False) is True
+        replica_baseline(clients.store, settings, last_applied, now),
+        current,
+        args.get("override_manual_change", False) is True,
     )
     check_history(
         clients.store,
@@ -572,7 +600,7 @@ def _scale_breaker(
 SCALE = PlanAction(
     name=SCALE_DEPLOYMENT,
     validate=_validate_scale,
-    replicas_to=lambda args: args["replicas"],
+    replicas_to=lambda current, args: args["replicas"],
     checks=_check_scale,
     breaker=_scale_breaker,
     preflight=(
@@ -590,6 +618,13 @@ SCALE = PlanAction(
         "global_budget",
     ),
     diff=lambda plan: {"replicas": {"from": plan.replicas_from, "to": plan.replicas_to}},
+    # A scale leaves the pod template as it is.
+    template_to=lambda plan_id, template: dict(template),
+    impact=lambda raw, current, replicas_to: (
+        lambda labels, ready, pdbs, services, slices: scale_impact(
+            labels, ready, current, replicas_to, pdbs, services, slices
+        )
+    ),
 )
 
 
@@ -597,6 +632,82 @@ def plan_scale_deployment(
     args: dict[str, Any], settings: Settings, clients: Clients, now: int
 ) -> Envelope:
     return _plan(SCALE, args, settings, clients, now)
+
+
+# --- restart_deployment -------------------------------------------------------
+
+
+def _validate_restart(
+    args: Mapping[str, Any], settings: Settings
+) -> tuple[str, str, dict[str, Any]]:
+    namespace, name = validate_target_args(args, settings.allowed_namespaces)
+    return namespace, name, restart_args(namespace, name)
+
+
+def _check_restart(
+    clients: Clients, settings: Settings, deployment: Any, current: int, args: Mapping[str, Any]
+) -> None:
+    # No HPA check: a restart leaves spec.replicas, which an HPA owns, as it is.
+    check_not_paused(deployment)
+
+
+def _restart_breaker(
+    clients: Clients,
+    settings: Settings,
+    deployment: Any,
+    current: int,
+    args: Mapping[str, Any],
+    now: int,
+) -> bool:
+    # No manual-change check: a restart undoes no change, and a later scale still compares
+    # against the count kube-handrail set before it (replica_baseline). Replicas stay as
+    # they are, so the change has no direction and is never flapping.
+    check_history(
+        clients.store,
+        object_key(args["namespace"], args["name"], str(deployment.metadata.uid)),
+        now,
+        settings,
+        current,
+        current,
+        plan_rate=True,
+        last_applied=last_applied_plan(clients.store, deployment),
+    )
+    return False
+
+
+RESTART = PlanAction(
+    name=RESTART_DEPLOYMENT,
+    validate=_validate_restart,
+    replicas_to=lambda current, args: current,
+    checks=_check_restart,
+    breaker=_restart_breaker,
+    preflight=(
+        "arguments",
+        "namespace_allowed",
+        "not_gitops_managed",
+        "not_paused",
+        "cooldown",
+        "object_budget",
+        "plan_rate",
+        "global_budget",
+    ),
+    diff=lambda plan: {
+        "restart": {"pods_replaced": plan.replicas_from},
+        "template": {"from": plan.template_from, "to": plan.template_to},
+    },
+    template_to=lambda plan_id, template: restart_template(template, plan_id),
+    impact=lambda raw, current, replicas_to: (
+        lambda labels, ready, pdbs, services, slices: rollout_impact(
+            raw, labels, ready, current, pdbs, services, slices
+        )
+    ),
+)
+
+
+def plan_restart_deployment(
+    args: dict[str, Any], settings: Settings, clients: Clients, now: int
+) -> Envelope:
+    return _plan(RESTART, args, settings, clients, now)
 
 
 def request_approval(
@@ -652,6 +763,9 @@ HANDLERS = {
         args, _settings(), Clients(_settings())
     ),
     "plan_scale_deployment": lambda args: plan_scale_deployment(
+        args, _settings(), Clients(_settings()), int(time.time())
+    ),
+    "plan_restart_deployment": lambda args: plan_restart_deployment(
         args, _settings(), Clients(_settings()), int(time.time())
     ),
     "request_approval": lambda args: request_approval(

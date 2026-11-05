@@ -26,6 +26,16 @@ AGENTS_MD_TEXT = (REPO / "AGENTS.md").read_text()
 SKILL = register.parse_skill(REPO / "agent/skills/kube-handrail-scale/SKILL.md")
 
 
+@pytest.fixture(autouse=True)
+def one_skill(tmp_path_factory, monkeypatch):
+    """The stubbed install, status and remove flows below expect the requests for one skill;
+    the repository's own skills are checked in test_repository_guidance_is_valid."""
+    skills = tmp_path_factory.mktemp("skills")
+    (skills / SKILL.name).mkdir()
+    (skills / SKILL.name / "SKILL.md").write_text(SKILL.text)
+    monkeypatch.setattr(register, "SKILLS_DIR", skills)
+
+
 def asset(asset_id: str, asset_type: str, metadata: dict, version: int = 1) -> dict:
     return {
         "assetId": asset_id,
@@ -102,10 +112,13 @@ def skill_content() -> dict:
 
 def test_repository_guidance_is_valid():
     assert register.load_agents_md(REPO / "AGENTS.md") == AGENTS_MD_TEXT
-    assert [s.name for s in register.load_skills(REPO / "agent/skills")] == ["kube-handrail-scale"]
+    skills = register.load_skills(REPO / "agent/skills")
+    assert [s.name for s in skills] == ["kube-handrail-rollout", "kube-handrail-scale"]
     assert SKILL.text.startswith("---\nname: kube-handrail-scale\n")
-    assert register.skill_marked(SKILL.text)
-    assert 100 <= len(SKILL.description) <= register.SKILL_DESCRIPTION_MAX
+    for skill in skills:
+        assert skill.text.startswith(f"---\nname: {skill.name}\n")
+        assert register.skill_marked(skill.text)
+        assert 100 <= len(skill.description) <= register.SKILL_DESCRIPTION_MAX
 
 
 def test_install_creates_when_absent(stubbed, capsys):

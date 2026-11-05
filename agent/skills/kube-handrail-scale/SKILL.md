@@ -6,7 +6,7 @@ description: Procedure for changing the replica count of a Kubernetes Deployment
 
 # Scale a Deployment with kube-handrail
 
-kube-handrail changes a Deployment only through a single-use plan that a human approves and the server re-checks on apply. This skill is the step-by-step procedure; the standing rules and the meaning of every error code are in the kube-handrail AGENTS.md, and the binding definition is `mcp/CONTRACT.md` in the kube-handrail repository.
+kube-handrail changes a Deployment only through a single-use plan that a human approves and the server re-checks on apply. This skill is the step-by-step procedure; the standing rules and the meaning of every error code are in the kube-handrail AGENTS.md, and the binding definition is `mcp/CONTRACT.md` in the kube-handrail repository. To replace a Deployment's pods without changing the count, use the kube-handrail-rollout skill.
 
 ## Step 1: Read the current state
 

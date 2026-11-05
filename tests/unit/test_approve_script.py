@@ -72,3 +72,40 @@ def test_show_puts_the_plan_id_in_the_query(monkeypatch):
     )
     approve.show(URL, "eu-central-1", PLAN_ID)
     assert sent[0].full_url == f"{URL}?plan_id={PLAN_ID}" and sent[0].get_method() == "GET"
+
+
+@pytest.mark.parametrize(
+    ("view", "line"),
+    [
+        (
+            {
+                "action": "scale_deployment",
+                "namespace": "sandbox",
+                "name": "web",
+                "change": {"replicas": {"from": 1, "to": 2}},
+            },
+            "scale_deployment sandbox/web: replicas 1 -> 2",
+        ),
+        (
+            {
+                "action": "restart_deployment",
+                "namespace": "sandbox",
+                "name": "web",
+                "change": {"restart": {"pods_replaced": 3}, "template": {}},
+            },
+            "restart_deployment sandbox/web: replace 3 pod(s), replicas unchanged",
+        ),
+        # A view from an approver without the change block.
+        (
+            {
+                "action": "scale_deployment",
+                "namespace": "sandbox",
+                "name": "web",
+                "replicas": {"from": 2, "to": 1},
+            },
+            "scale_deployment sandbox/web: replicas 2 -> 1",
+        ),
+    ],
+)
+def test_summary_names_the_change(view, line):
+    assert approve.summary(view) == line

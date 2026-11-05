@@ -2,7 +2,7 @@
 
 Guarded remediation layer for AI agents on Kubernetes: **plan → policy → approve → apply → audit**. MCP tools for Amazon EKS, intended to work with AWS DevOps Agent and other MCP clients.
 
-> **Status: Milestones 0 and 1 are implemented and tested on test clusters.** That covers a workload status tool and one guarded plan/apply pair for scaling, server-verified approval, the oscillation breaker, the impact preview and the drift sentinel. Correlation IDs, tool output hygiene with a workload events tool, agent guidance, and deployment to private-endpoint clusters are tested as well. Restart, rollback, the Cedar and admission policy layers and the later milestones are planned, not built. See [Status](#status).
+> **Status: Milestones 0 and 1 are implemented and tested on test clusters.** That covers a workload status tool and one guarded plan/apply pair for scaling, server-verified approval, the oscillation breaker, the impact preview and the drift sentinel. Correlation IDs, tool output hygiene with a workload events tool, agent guidance, and deployment to private-endpoint clusters are tested as well. Restart (Milestone 2, item 1) is implemented and tested on a test cluster. Rollback, the Cedar and admission policy layers and the later milestones are planned, not built. See [Status](#status).
 
 ## Why
 
@@ -81,7 +81,7 @@ A remediation follows this sequence:
   - Server-verified approval, pinned to the plan's arguments (`server` and `both` mode)
   - Client-side approval (DevOps Agent directed actions)
 - **GitOps-aware.** Resources managed by Argo CD (and Flux, once its ownership markers are validated) are not modified; the plan returns the error `gitops_managed`. ([Argo CD resource tracking](https://argo-cd.readthedocs.io/en/stable/user-guide/resource_tracking/))
-- **No delete-class tools.** No delete, no generic `apply_yaml`. The first action is scale; restart and rollback of Deployments are planned.
+- **No delete-class tools.** No delete, no generic `apply_yaml`. The actions are scale and restart of Deployments; rollback by exact revision is planned.
 - **Tool output is untrusted.** In the tool Lambdas (the gateway interceptor in the diagram is not used for this), text from the cluster that anyone with write access can set (condition and event reasons and messages today; logs and alert annotations once there are tools for them) is stripped of control and format characters, redacted for common secret patterns, cut to a field limit with an explicit marker, and wrapped in `<untrusted>...</untrusted>`; list responses have a size limit. The delimiters are a hint to the model, not a security boundary: the boundary is that read tools change nothing and every change needs a human approval pinned to its arguments. See [Untrusted output](mcp/CONTRACT.md#untrusted-output). ([OWASP LLM01](https://genai.owasp.org/llmrisk/llm01-prompt-injection/))
 - **Bounded blast radius.** A kill switch in SSM Parameter Store, a maximum step per change (`MAX_REPLICA_STEP_PERCENT` of the current replica count, enforced whatever the approval says), a per-object cooldown, and per-object and global hourly apply budgets.
 - **One classification source.** Every tool's `READ_ONLY` / `MUTATIVE` classification is in `mcp/classification.json`; registration, the drift sentinel and a CI check all read it, and CI fails if a write tool is not `MUTATIVE`.
@@ -98,6 +98,8 @@ A remediation follows this sequence:
 Milestone 0 is implemented and tested on a test cluster: `get_workload_status` and a guarded `plan_scale_deployment` / `apply_scale_deployment` pair behind an AgentCore Gateway, with Terraform, namespace-scoped RBAC, end-to-end guard tests and AWS DevOps Agent registration. Setup, tests and observed behavior are in [Milestone 0](docs/milestone-0.md). There is no release.
 
 Milestone 1 (server-verified write path): items 1-5 are implemented and tested on a test cluster, and the caller identity spike (item 6) is done, with an experimental interceptor that is off by default. Tool output hygiene, with the `get_workload_events` tool, and agent guidance ([`AGENTS.md`](AGENTS.md) and a DevOps Agent skill, installed by `scripts/devops_agent_register.py install-guidance`) are implemented and tested on a test cluster, as are correlation IDs and tool metrics. Deployment to a new account, including clusters with a private endpoint ([Deploying to a new account](docs/deploy.md)), is implemented and tested, including a fresh deployment against a cluster with only a private endpoint, reaching AWS through VPC endpoints. With that, Milestone 1 is complete; the next milestones are in the [roadmap](docs/roadmap.md). Integration details that are still unverified are listed there under "Open questions".
+
+Milestone 2, item 1 (action framework and restart): `plan_restart_deployment` / `apply_restart_deployment` and the generic plan/apply path are implemented and tested on a test cluster, in `client` and `server` mode and through a DevOps Agent chat. See [Restart](mcp/CONTRACT.md#restart).
 
 ## Planned layout
 

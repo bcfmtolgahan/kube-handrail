@@ -216,12 +216,38 @@ def last_applied_plan(store: PlanStore, deployment: Any) -> Plan | None:
     return plan
 
 
-def check_manual_change(last_applied: Plan | None, current: int, override: bool) -> bool:
+def replica_baseline(
+    store: PlanStore, settings: Settings, last_applied: Plan | None, now: int
+) -> int | None:
+    """The replica count kube-handrail last set on this object, or None when unknown.
+
+    An apply that left the count as it was (a restart) took whatever count it found, so it
+    does not hide a change made outside kube-handrail before it: the last apply before it
+    in the history that changed the count is the baseline. Without one in the history, the
+    restart's own count is used.
+    """
+    if last_applied is None or last_applied.replicas_from != last_applied.replicas_to:
+        return None if last_applied is None else last_applied.replicas_to
+    retention = retention_seconds(settings)
+    entries = with_last_applied(
+        store.history(last_applied.object_key, now - retention), last_applied, now
+    )
+    restart = entries[-1]  # with_last_applied puts the annotated plan last
+    for entry in reversed(applied_within(entries[:-1], now, retention)):
+        if (entry.applied_at or 0) <= (restart.applied_at or 0) and (
+            entry.replicas_from != entry.replicas_to
+        ):
+            return entry.replicas_to
+    return last_applied.replicas_to
+
+
+def check_manual_change(baseline: int | None, current: int, override: bool) -> bool:
     """Reject undoing a change made outside kube-handrail since its last apply.
 
-    Returns True when a manual change was found and `override` allowed it.
+    `baseline` is the count kube-handrail last set (replica_baseline). Returns True when a
+    manual change was found and `override` allowed it.
     """
-    if last_applied is None or last_applied.replicas_to == current:
+    if baseline is None or baseline == current:
         return False
     if override:
         return True
@@ -229,5 +255,5 @@ def check_manual_change(last_applied: Plan | None, current: int, override: bool)
         MANUAL_CHANGE,
         "replicas were changed outside kube-handrail since its last apply; "
         "plan with override_manual_change=true to change them anyway",
-        {"last_applied_to": last_applied.replicas_to, "current": current},
+        {"last_applied_to": baseline, "current": current},
     )

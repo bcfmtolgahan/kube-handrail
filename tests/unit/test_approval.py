@@ -16,12 +16,15 @@ from handrail_common.approval import (
 from handrail_common.plans import (
     APPROVAL_REQUEST_WINDOW_SECONDS,
     REQUESTER_GATEWAY,
+    RESTART_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     STATUS_AWAITING,
     STATUS_PLANNED,
     Plan,
     PlanStore,
     approval_request_key,
+    plan_args_hash,
+    restart_args,
     scale_args_hash,
 )
 from handrail_common.validation import GuardError, require_plan_id
@@ -402,6 +405,7 @@ def test_plan_view_and_derived_status(store):
     assert view["replicas"] == {"from": 1, "to": 3}
     assert view["override_manual_change"] is True
     assert view["impact"] == IMPACT
+    assert view["change"] == {"replicas": {"from": 1, "to": 3}}
     assert isinstance(view["expires_at"], int)
     assert "approval" not in view and "rejection" not in view
     assert derived_status(item(store, plan.plan_id), NOW + 300) == "expired"
@@ -428,6 +432,69 @@ def test_notification_is_rendered_from_the_record(store):
         f"APPROVAL_URL=https://approve.example scripts/approve.py approve {plan.plan_id}" in message
     )
     assert f"scripts/approve.py reject {plan.plan_id}" in message
+
+
+ROLLOUT_IMPACT = {
+    "pods": {"ready_now": 2, "from": 2, "to": 2, "added": 0, "removed": 0, "replaced": 2},
+    "rollout": {"strategy": "RollingUpdate", "max_unavailable": 0, "max_surge": 1},
+    "pod_disruption_budgets": [],
+    "services": [{"name": "web", "ready_endpoints_now": 2, "projected_min_ready_endpoints": 2}],
+    "warnings": [],
+    "truncated": False,
+}
+
+
+def make_restart_plan(store: PlanStore, impact: dict = ROLLOUT_IMPACT) -> Plan:
+    plan = Plan(
+        plan_id=str(uuid.uuid4()),
+        action=RESTART_DEPLOYMENT,
+        namespace="sandbox",
+        name="web",
+        replicas_from=2,
+        replicas_to=2,
+        args_hash=plan_args_hash(RESTART_DEPLOYMENT, restart_args("sandbox", "web")),
+        args=restart_args("sandbox", "web"),
+        resource_version="1",
+        generation=4,
+        uid=UID,
+        created_at=NOW,
+        expires_at=NOW + 300,
+        impact=impact,
+        template_from="sha256:a",
+        template_to="sha256:b",
+    )
+    store.create(plan)
+    return plan
+
+
+def test_restart_view_shows_the_pods_replaced_and_the_templates(store):
+    plan = make_restart_plan(store)
+    view = plan_view(item(store, plan.plan_id), NOW)
+    assert view["action"] == "restart_deployment"
+    assert view["change"] == {
+        "restart": {"pods_replaced": 2},
+        "template": {"from": "sha256:a", "to": "sha256:b"},
+    }
+
+
+def test_restart_notification_describes_the_rollout(store):
+    plan = make_restart_plan(store)
+    message = notification(plan_view(item(store, plan.plan_id), NOW), None)
+    assert (
+        "Restart: every pod replaced, replicas stay at 2; pods get the annotation "
+        f"kube-handrail.io/restart-plan-id={plan.plan_id}"
+    ) in message
+    assert "Replicas:" not in message
+    assert "Pods: 2 ready now, 2 replaced" in message
+    assert "Rollout: RollingUpdate, up to 0 unavailable, 1 surge" in message
+    assert "Service web: 2 ready endpoints now, 2 projected at the lowest" in message
+
+
+def test_recreate_notification_says_every_pod_stops_first(store):
+    impact = {**ROLLOUT_IMPACT, "rollout": {"strategy": "Recreate", "max_unavailable": None}}
+    plan = make_restart_plan(store, impact)
+    message = notification(plan_view(item(store, plan.plan_id), NOW), None)
+    assert "Rollout: Recreate, every pod stops first" in message
 
 
 def test_sanitize_reason():

@@ -3,10 +3,15 @@ from typing import Any
 import pytest
 
 from handrail_common.impact import (
+    NO_PODS,
     PDB_HEADROOM,
+    RECREATE_STRATEGY,
+    ROLLOUT_IN_PROGRESS,
     SCALE_TO_ZERO,
     SERVICE_WITHOUT_ENDPOINTS,
     ready_endpoints,
+    rollout_impact,
+    rollout_strategy,
     scale_impact,
     selector_matches,
     service_selects,
@@ -354,3 +359,160 @@ def test_long_lists_are_cut_after_the_warnings_are_computed():
     # scale_to_zero plus one service_without_endpoints per Service, cut to 20.
     assert len(result["warnings"]) == 20
     assert result["truncated"] is True
+
+
+# --- Rollout (restart) -------------------------------------------------------
+
+
+def deployment(
+    replicas: int = 2,
+    strategy: dict | None = None,
+    generation: int = 3,
+    observed: int = 3,
+    updated: int | None = None,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {"replicas": replicas}
+    if strategy is not None:
+        spec["strategy"] = strategy
+    return {
+        "metadata": {"generation": generation},
+        "spec": spec,
+        "status": {
+            "observedGeneration": observed,
+            "updatedReplicas": replicas if updated is None else updated,
+        },
+    }
+
+
+def rolling(max_unavailable: Any = UNSET, max_surge: Any = UNSET) -> dict[str, Any]:
+    params = {}
+    if max_unavailable is not UNSET:
+        params["maxUnavailable"] = max_unavailable
+    if max_surge is not UNSET:
+        params["maxSurge"] = max_surge
+    return {"type": "RollingUpdate", "rollingUpdate": params}
+
+
+def rollout(
+    dep: dict[str, Any],
+    pdbs: list[dict] = (),
+    services: list[dict] = (),
+    slices: list[dict] = (),
+    ready_now: int = 2,
+) -> dict[str, Any]:
+    replicas = dep["spec"]["replicas"]
+    return rollout_impact(dep, LABELS, ready_now, replicas, pdbs, services, slices)
+
+
+@pytest.mark.parametrize(
+    ("replicas", "strategy", "unavailable", "surge"),
+    [
+        # The API server's defaults, 25 % each: unavailable rounds down, surge rounds up.
+        (4, None, 1, 1),
+        (3, None, 0, 1),
+        (1, None, 0, 1),
+        (10, rolling("33%", "33%"), 3, 4),
+        (5, rolling(2, 0), 2, 0),
+        # Both 0 would never progress, so the controller lets one pod be unavailable.
+        (3, rolling(0, 0), 1, 0),
+        (3, rolling("0%", "0%"), 1, 0),
+        (0, None, 1, 0),
+    ],
+)
+def test_rollout_strategy_resolves_counts_like_the_controller(
+    replicas, strategy, unavailable, surge
+):
+    assert rollout_strategy(deployment(replicas, strategy), replicas) == {
+        "strategy": "RollingUpdate",
+        "max_unavailable": unavailable,
+        "max_surge": surge,
+    }
+
+
+def test_rollout_strategy_recreate_has_no_counts():
+    assert rollout_strategy(deployment(strategy={"type": "Recreate"}), 2) == {
+        "strategy": "Recreate",
+        "max_unavailable": None,
+        "max_surge": None,
+    }
+
+
+@pytest.mark.parametrize("value", ["25", "a%", True, None, 1.5])
+def test_rollout_strategy_refuses_values_it_cannot_resolve(value):
+    with pytest.raises(ValueError):
+        rollout_strategy(deployment(strategy=rolling(max_unavailable=value)), 2)
+
+
+def test_rollout_replaces_every_pod_and_keeps_the_count():
+    result = rollout(deployment(2, rolling(0, 1)))
+    assert result["pods"] == {
+        "ready_now": 2,
+        "from": 2,
+        "to": 2,
+        "added": 0,
+        "removed": 0,
+        "replaced": 2,
+    }
+    assert result["rollout"] == {"strategy": "RollingUpdate", "max_unavailable": 0, "max_surge": 1}
+    assert result["warnings"] == [] and result["truncated"] is False
+
+
+def test_rollout_projects_the_lowest_ready_endpoints():
+    slices = [endpoint_slice("web", [endpoint(address=f"10.0.0.{i}") for i in range(4)])]
+    # Three pods of this Deployment are ready, one other backend; one pod can be down.
+    result = rollout(deployment(3, rolling(1, 0)), services=[service()], slices=slices, ready_now=3)
+    assert result["services"] == [
+        {"name": "web", "ready_endpoints_now": 4, "projected_min_ready_endpoints": 3}
+    ]
+
+
+def test_rollout_of_a_degraded_deployment_projects_no_more_than_are_ready_now():
+    # One replica, not ready: the Service has no ready endpoint before the rollout starts.
+    result = rollout(deployment(1), services=[service()], slices=[], ready_now=0)
+    assert result["services"] == [
+        {"name": "web", "ready_endpoints_now": 0, "projected_min_ready_endpoints": 0}
+    ]
+    assert codes(result) == [SERVICE_WITHOUT_ENDPOINTS]
+    # Four replicas, two ready, one other backend; one pod can be down.
+    slices = [endpoint_slice("web", [endpoint(address=f"10.0.0.{i}") for i in range(3)])]
+    result = rollout(deployment(4, rolling(1, 0)), services=[service()], slices=slices)
+    assert result["services"][0]["projected_min_ready_endpoints"] == 3
+
+
+def test_rollout_pdb_headroom_counts_the_pods_down_at_once():
+    assert codes(rollout(deployment(4, rolling(1, 1)), pdbs=[pdb(allowed=1)])) == []
+    result = rollout(deployment(4, rolling(2, 0)), pdbs=[pdb(allowed=1)])
+    assert codes(result) == [PDB_HEADROOM]
+    assert "2 pod(s) down at once" in result["warnings"][0]["message"]
+    # Never more than the pods there are.
+    assert codes(rollout(deployment(1, rolling(5, 0)), pdbs=[pdb(allowed=1)])) == []
+
+
+def test_rollout_recreate_warns_and_empties_the_service():
+    slices = [endpoint_slice("web", [endpoint(address=f"10.0.0.{i}") for i in range(2)])]
+    result = rollout(
+        deployment(2, {"type": "Recreate"}),
+        pdbs=[pdb(allowed=1)],
+        services=[service()],
+        slices=slices,
+    )
+    assert codes(result) == [RECREATE_STRATEGY, PDB_HEADROOM, SERVICE_WITHOUT_ENDPOINTS]
+    assert result["services"][0]["projected_min_ready_endpoints"] == 0
+
+
+@pytest.mark.parametrize(
+    ("dep", "in_progress"),
+    [
+        (deployment(2), False),
+        (deployment(2, generation=4, observed=3), True),
+        (deployment(2, updated=1), True),
+    ],
+)
+def test_rollout_in_progress_is_reported(dep, in_progress):
+    assert (ROLLOUT_IN_PROGRESS in codes(rollout(dep))) is in_progress
+
+
+def test_rollout_of_no_pods_warns():
+    result = rollout(deployment(0), ready_now=0)
+    assert codes(result) == [NO_PODS]
+    assert result["pods"]["replaced"] == 0

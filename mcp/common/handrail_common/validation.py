@@ -7,6 +7,7 @@ from typing import Any
 
 from handrail_common.envelope import (
     BLAST_RADIUS_EXCEEDED,
+    CONFLICT,
     FORBIDDEN_NAMESPACE,
     INVALID_ARGUMENT,
     OUT_OF_BOUNDS,
@@ -82,6 +83,25 @@ def check_replica_step(replicas_from: int, replicas_to: int, percent: int) -> No
                 "max_step": step,
                 "max_step_percent": percent,
             },
+        )
+
+
+def validate_target_args(args: Mapping[str, Any], allowed: Collection[str]) -> tuple[str, str]:
+    """Guard checks 1-2 for a request that names only a Deployment; returns (namespace, name)."""
+    if not isinstance(args, Mapping):
+        raise GuardError(INVALID_ARGUMENT, "arguments must be an object")
+    namespace = require_namespace(args.get("namespace"))
+    name = require_name(args.get("name"))
+    check_namespace_allowed(namespace, allowed)
+    return namespace, name
+
+
+def check_not_paused(deployment: Any) -> None:
+    """A paused Deployment does not roll out a pod template change, so a plan for one would
+    replace no pod. `deployment` is a client model."""
+    if getattr(getattr(deployment, "spec", None), "paused", None) is True:
+        raise GuardError(
+            CONFLICT, "the Deployment's rollout is paused; resume it first", {"paused": True}
         )
 
 

@@ -2,9 +2,10 @@
 """Check that tool schemas, mcp/classification.json and Terraform agree.
 
 Fails if a tool has no classification, the classification names a tool that does
-not exist, a write tool is not MUTATIVE, a full tool name is invalid,
-terraform/main.tf does not load each target's tools.json under that target name,
-or AGENTS.md does not name every error code listed in mcp/CONTRACT.md.
+not exist, a write tool is not MUTATIVE, a full tool name is invalid, a plan_<x>
+tool has no apply_<x> tool or the reverse, terraform/main.tf does not load each
+target's tools.json under that target name, or AGENTS.md does not name every
+error code listed in mcp/CONTRACT.md.
 Standard library only, so it runs before any dependency is installed.
 """
 
@@ -18,6 +19,8 @@ DELIMITER = "___"
 WRITE_TARGET = "k8sw"
 # An apply_* tool is a write tool wherever it is placed.
 WRITE_TOOL_PREFIX = "apply_"
+# Every action is planned by plan_<action> and applied by apply_<action>.
+PLAN_TOOL_PREFIX = "plan_"
 WRITE_DIR = "k8s_write"
 CLASSIFICATIONS = {"READ_ONLY", "MUTATIVE"}
 NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
@@ -82,6 +85,15 @@ def check_agents_md(root: Path) -> list[str]:
     return [f"AGENTS.md does not mention {code}" for code in codes if code not in named]
 
 
+def check_pairs(names: set[str]) -> list[str]:
+    """A plan nothing can apply, or an apply nothing can plan, is a contract error."""
+    plans = {n.removeprefix(PLAN_TOOL_PREFIX) for n in names if n.startswith(PLAN_TOOL_PREFIX)}
+    applies = {n.removeprefix(WRITE_TOOL_PREFIX) for n in names if n.startswith(WRITE_TOOL_PREFIX)}
+    return [
+        f"{PLAN_TOOL_PREFIX}{a}: no {WRITE_TOOL_PREFIX}{a} tool" for a in sorted(plans - applies)
+    ] + [f"{WRITE_TOOL_PREFIX}{a}: no {PLAN_TOOL_PREFIX}{a} tool" for a in sorted(applies - plans)]
+
+
 def check(root: Path) -> list[str]:
     errors: list[str] = []
     classification = json.loads((root / "mcp/classification.json").read_text())
@@ -97,10 +109,12 @@ def check(root: Path) -> list[str]:
         )
 
     tools: set[str] = set()
+    names: set[str] = set()
     for target, directory in sorted(targets.items()):
         for name in schema_tools(root, directory):
             full = f"{target}{DELIMITER}{name}"
             tools.add(full)
+            names.add(name)
             if len(full) > MAX_NAME_LENGTH or not NAME_PATTERN.match(full):
                 errors.append(f"{full}: must be at most {MAX_NAME_LENGTH} characters of [a-z0-9_]")
             if full not in classification:
@@ -118,7 +132,7 @@ def check(root: Path) -> list[str]:
             errors.append(f"{full}: target {target} is not loaded by terraform/main.tf")
         elif full not in tools:
             errors.append(f"{full}: classified but not in mcp/{targets[target]}/tools.json")
-    return errors + check_agents_md(root)
+    return errors + check_pairs(names) + check_agents_md(root)
 
 
 def main() -> None:

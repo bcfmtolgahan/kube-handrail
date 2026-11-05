@@ -17,11 +17,12 @@ from handrail_common.breaker import (
     last_applied_plan,
     last_plan_id,
     max_plan_lifetime,
+    replica_baseline,
     retention_seconds,
     with_last_applied,
 )
 from handrail_common.config import load_settings
-from handrail_common.plans import SCALE_DEPLOYMENT, HistoryEntry, Plan
+from handrail_common.plans import RESTART_DEPLOYMENT, SCALE_DEPLOYMENT, HistoryEntry, Plan
 from handrail_common.validation import GuardError
 
 NOW = 1_700_000_000
@@ -234,24 +235,24 @@ def last_plan(replicas_to: int = 2, uid: str = UID) -> Plan:
 
 def test_manual_change_is_rejected():
     with pytest.raises(GuardError) as exc:
-        check_manual_change(last_plan(replicas_to=2), 3, False)
+        check_manual_change(2, 3, False)
     assert exc.value.code == "manual_change"
     assert exc.value.details == {"last_applied_to": 2, "current": 3}
 
 
 def test_manual_change_with_override_is_allowed():
-    assert check_manual_change(last_plan(replicas_to=2), 3, True) is True
+    assert check_manual_change(2, 3, True) is True
 
 
 @pytest.mark.parametrize(
-    ("plan", "current"),
+    ("baseline", "current"),
     [
         (None, 3),  # annotation absent, or plan no longer in the table, or never consumed
-        (last_plan(replicas_to=3), 3),  # nothing changed since the last apply
+        (3, 3),  # nothing changed since the last apply
     ],
 )
-def test_no_manual_change(plan, current):
-    assert check_manual_change(plan, current, False) is False
+def test_no_manual_change(baseline, current):
+    assert check_manual_change(baseline, current, False) is False
 
 
 class FakePlanLookup:
@@ -494,3 +495,50 @@ def test_check_history_runs_the_cooldown_first():
 def test_retention_covers_a_long_cooldown():
     settings = replace(SETTINGS, apply_cooldown_seconds=7200)
     assert retention_seconds(settings) == 7200 + 1020 + APPLY_GRACE_SECONDS
+
+
+# --- Replica baseline -------------------------------------------------------
+#
+# A restart keeps the count it finds, so it must not hide a change made outside
+# kube-handrail before it from the manual-change check of a later scale.
+
+
+def restart_applied(replicas: int, applied_at: int) -> Plan:
+    return replace(
+        last_applied(replicas, replicas, applied_at, "applied"), action=RESTART_DEPLOYMENT
+    )
+
+
+def test_baseline_is_none_without_a_last_apply():
+    store = FakeStore()
+    assert replica_baseline(store, SETTINGS, None, NOW) is None
+    assert store.calls == []
+
+
+def test_baseline_of_a_scale_is_its_count_without_reading_the_history():
+    store = FakeStore()
+    assert replica_baseline(store, SETTINGS, last_applied(1, 3, NOW - 60, "applied"), NOW) == 3
+    assert store.calls == []
+
+
+def test_baseline_skips_a_restart_made_over_a_manual_change():
+    # Scaled 2 -> 3, set back to 2 by hand, then restarted at 2: the baseline stays 3.
+    store = FakeStore([applied(2, 3, NOW - 600), applied(4, 4, NOW - 400)])
+    assert replica_baseline(store, SETTINGS, restart_applied(2, NOW - 60), NOW) == 3
+    assert store.calls == [(KEY, NOW - retention_seconds(SETTINGS))]
+
+
+def test_baseline_of_a_restart_without_an_earlier_scale_is_its_count():
+    store = FakeStore([applied(5, 5, NOW - 400)])
+    assert replica_baseline(store, SETTINGS, restart_applied(2, NOW - 60), NOW) == 2
+
+
+def test_baseline_ignores_a_later_entry_than_the_restart():
+    store = FakeStore([applied(2, 3, NOW - 600), applied(3, 4, NOW - 10)])
+    assert replica_baseline(store, SETTINGS, restart_applied(2, NOW - 60), NOW) == 3
+
+
+def test_baseline_fails_closed_on_a_history_error():
+    store = FakeStore(error=RuntimeError("throttled"))
+    with pytest.raises(RuntimeError):
+        replica_baseline(store, SETTINGS, restart_applied(2, NOW - 60), NOW)

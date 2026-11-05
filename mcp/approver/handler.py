@@ -34,14 +34,17 @@ from handrail_common.envelope import (
     ok,
 )
 from handrail_common.observability import APPROVER_CORRELATION_KEY, emit
-from handrail_common.plans import SCALE_DEPLOYMENT, PlanStore
+from handrail_common.plans import RESTART_DEPLOYMENT, SCALE_DEPLOYMENT, PlanStore
 from handrail_common.validation import GuardError, require_plan_id
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # The write tool that applies each plan action, as the gateway names it.
-APPLY_TOOLS = {SCALE_DEPLOYMENT: "k8sw___apply_scale_deployment"}
+APPLY_TOOLS = {
+    SCALE_DEPLOYMENT: "k8sw___apply_scale_deployment",
+    RESTART_DEPLOYMENT: "k8sw___apply_restart_deployment",
+}
 APPROVE = "approve"
 REJECT = "reject"
 BODY_FIELDS = frozenset({"plan_id", "decision", "reason", "apply"})

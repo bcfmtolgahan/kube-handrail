@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import pathlib
 import sys
 import time
 from typing import Any
@@ -33,12 +34,13 @@ from mcp.client.streamable_http import create_mcp_http_client, streamable_http_c
 
 from mcp import ClientSession
 
+TARGET_PREFIXES = {"k8s_read": "k8sr", "k8s_write": "k8sw"}
+MCP_DIR = pathlib.Path(__file__).resolve().parent.parent / "mcp"
+# The gateway prefixes each target's tool names with the target name and "___".
 EXPECTED_TOOLS = {
-    "k8sr___get_workload_status",
-    "k8sr___get_workload_events",
-    "k8sr___plan_scale_deployment",
-    "k8sr___request_approval",
-    "k8sw___apply_scale_deployment",
+    f"{prefix}___{tool['name']}"
+    for target, prefix in TARGET_PREFIXES.items()
+    for tool in json.loads((MCP_DIR / target / "tools.json").read_text())
 }
 READY_TIMEOUT_SECONDS = 180
 CONFLICT_RETRIES = 3

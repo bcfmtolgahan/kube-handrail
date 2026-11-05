@@ -13,9 +13,13 @@ from moto import mock_aws
 from handrail_common.config import load_settings
 from handrail_common.killswitch import KillSwitch
 from handrail_common.plans import (
+    RESTART_ANNOTATION,
+    RESTART_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
+    plan_args_hash,
+    restart_args,
     scale_args,
     scale_args_hash,
 )
@@ -636,6 +640,31 @@ def test_apply_rejects_manual_change(rt):
     assert item(plan.plan_id)["result"] == "manual_change"
 
 
+def test_apply_rejects_a_manual_change_made_before_a_restart(rt):
+    runtime_, apps = rt
+    seed(1, 2, NOW - 600)
+    last = seed(1, 1, NOW - 300)  # set back to 1 by hand, then restarted at 1
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "manual_change"
+    assert response["error"]["details"] == {"last_applied_to": 2, "current": 1}
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_apply_after_a_restart_compares_against_the_restart(rt):
+    runtime_, apps = rt
+    last = seed(2, 2, NOW - 300)  # no earlier scale; the Deployment now has 1
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    assert error_code(apply(create_plan(runtime_.store).plan_id)) == "manual_change"
+
+
 def test_apply_rejects_manual_change_when_the_apply_result_was_not_recorded(rt):
     runtime_, apps = rt
     last = seed(3, 2, NOW - 100, result=None)  # patched to 2, then record_result failed
@@ -960,3 +989,173 @@ def test_a_record_with_altered_args_cannot_be_applied(rt):
     assert error_code(apply(plan.plan_id)) == "plan_mismatch"
     apps.read_namespaced_deployment.assert_not_called()
     assert item(plan.plan_id)["result"] == "plan_mismatch"
+
+
+# --- apply_restart_deployment ---------------------------------------------------
+
+RESTART_CONTEXT = SimpleNamespace(
+    client_context=SimpleNamespace(
+        custom={
+            "bedrockAgentCoreToolName": "k8sw___apply_restart_deployment",
+            "bedrockAgentCoreAwsRequestId": GATEWAY_REQUEST_ID,
+        }
+    ),
+    aws_request_id="lambda-request-id",
+)
+
+
+def create_restart_plan(store: PlanStore, **overrides) -> Plan:
+    plan = Plan(
+        plan_id=str(uuid.uuid4()),
+        action=RESTART_DEPLOYMENT,
+        namespace="sandbox",
+        name="web",
+        replicas_from=1,
+        replicas_to=1,
+        args_hash=plan_args_hash(RESTART_DEPLOYMENT, restart_args("sandbox", "web")),
+        args=restart_args("sandbox", "web"),
+        resource_version="12345",
+        generation=4,
+        uid=UID,
+        created_at=NOW,
+        expires_at=NOW + 300,
+        template_from="sha256:from",
+        template_to="sha256:to",
+    )
+    plan = dataclasses.replace(plan, **overrides)
+    store.create(plan)
+    return plan
+
+
+def apply_restart(plan_id: str, **overrides) -> dict:
+    event = {"plan_id": plan_id, "namespace": "sandbox", "name": "web"}
+    return handler.lambda_handler({**event, **overrides}, RESTART_CONTEXT)
+
+
+def test_restart_sets_only_the_plan_annotations(rt):
+    runtime_, apps = rt
+    plan = create_restart_plan(runtime_.store)
+
+    response = apply_restart(plan.plan_id)
+
+    assert response["ok"] is True
+    assert response["data"] == {
+        "plan_id": plan.plan_id,
+        "namespace": "sandbox",
+        "name": "web",
+        "pods_replaced": 1,
+        "template": "sha256:to",
+        "resource_version": "12346",
+        "approved": False,
+        "correlation_id": GATEWAY_REQUEST_ID,
+    }
+    dry, real = apps.patch_namespaced_deployment.call_args_list
+    assert dry.kwargs == {"dry_run": "All"} and real.kwargs == {}
+    # A dict body: the client sends it as a merge patch. No spec.replicas.
+    assert real.args == (
+        "web",
+        "sandbox",
+        {
+            "metadata": {
+                "resourceVersion": "12345",
+                "annotations": {
+                    handler.LAST_PLAN_ANNOTATION: plan.plan_id,
+                    "kube-handrail.io/correlation-id": GATEWAY_REQUEST_ID,
+                },
+            },
+            "spec": {"template": {"metadata": {"annotations": {RESTART_ANNOTATION: plan.plan_id}}}},
+        },
+    )
+    assert item(plan.plan_id)["result"] == "applied"
+
+
+def test_restart_kill_switch_off(aws, monkeypatch):
+    runtime_, apps = runtime(enabled="false")
+    monkeypatch.setattr(handler, "get_runtime", lambda: runtime_)
+    plan = create_restart_plan(runtime_.store)
+    assert error_code(apply_restart(plan.plan_id)) == "remediation_disabled"
+    apps.read_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["used"] is False
+
+
+def test_restart_of_a_paused_rollout_is_conflict(rt):
+    runtime_, apps = rt
+    paused = deployment()
+    paused.spec.paused = True
+    apps.read_namespaced_deployment.return_value = paused
+    plan = create_restart_plan(runtime_.store)
+    response = apply_restart(plan.plan_id)
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"] == {"paused": True}
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["result"] == "conflict"
+
+
+def test_restart_after_a_spec_change_is_conflict(rt):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.return_value = deployment(generation=5)
+    plan = create_restart_plan(runtime_.store)
+    assert error_code(apply_restart(plan.plan_id)) == "conflict"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_restart_within_the_cooldown_is_refused(rt):
+    runtime_, apps = rt
+    seed(1, 1, NOW - 30)
+    assert error_code(apply_restart(create_restart_plan(runtime_.store).plan_id)) == "cooldown"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_restart_skips_the_manual_change_check(rt):
+    runtime_, apps = rt
+    # The last apply left 3 replicas and the Deployment has 1.
+    last = seed(1, 3, NOW - 500)
+    apps.read_namespaced_deployment.return_value = deployment(
+        annotations={handler.LAST_PLAN_ANNOTATION: last}
+    )
+    assert apply_restart(create_restart_plan(runtime_.store).plan_id)["ok"] is True
+
+
+def test_restart_takes_one_unit_of_the_global_budget(rt):
+    runtime_, _ = rt
+    apply_restart(create_restart_plan(runtime_.store).plan_id)
+    assert runtime_.store.global_applies(NOW) == 1
+
+
+def test_restart_ignores_the_blast_radius_setting(rt):
+    runtime_, _ = rt
+    runtime_.settings = dataclasses.replace(runtime_.settings, max_replica_step_percent=1)
+    assert apply_restart(create_restart_plan(runtime_.store).plan_id)["ok"] is True
+
+
+def test_restart_plan_cannot_be_applied_as_a_scale(rt):
+    runtime_, apps = rt
+    plan = create_restart_plan(runtime_.store)
+    assert error_code(apply(plan.plan_id, replicas=1)) == "plan_mismatch"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"replicas_to": 2},
+        {"template_to": None},
+        {"override_manual_change": True},
+        {"name": "other"},
+    ],
+)
+def test_an_altered_restart_record_cannot_be_applied(rt, change):
+    runtime_, apps = rt
+    plan = create_restart_plan(runtime_.store, **change)
+    assert error_code(apply_restart(plan.plan_id)) == "plan_mismatch"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_server_mode_restart_after_approval(server_rt):
+    runtime_, apps = server_rt
+    plan = create_restart_plan(runtime_.store)
+    assert error_code(apply_restart(plan.plan_id)) == "approval_required"
+    plan = create_restart_plan(runtime_.store)
+    runtime_.store.approve(plan.plan_id, HUMAN, NOW, 120)
+    response = apply_restart(plan.plan_id)
+    assert response["ok"] is True and response["data"]["approved"] is True

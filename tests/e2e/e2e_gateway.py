@@ -32,6 +32,13 @@ credentials (SigV4, service lambda) applies the plan and the record names the
 approver, and a rejected plan cannot be applied. They need APPROVAL_URL (the
 approval_url output) and an operator identity listed in approver_principals.
 
+With --with-rollout, the restart cases also run, against a 2-replica fixture
+Deployment e2e-restart created for this run: a restart replaces every pod, keeps
+the replica count and puts the plan id on the pod template and every new pod;
+a second restart right after it is refused with cooldown; and with the kill
+switch off its apply is remediation_disabled. With --approval-mode server the
+restart is applied by an approval through the approval URL, as above.
+
 The per-object and global hourly budgets and the plan rate limit are covered by
 unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
 scale_to_zero and service_without_endpoints warnings: they need a plan to 0
@@ -63,14 +70,17 @@ WEB = {"namespace": NAMESPACE, "name": "web"}
 TARGET = {"namespace": NAMESPACE, "name": "e2e-target"}
 FLAP = {"namespace": NAMESPACE, "name": "e2e-flap"}
 MANUAL = {"namespace": NAMESPACE, "name": "e2e-manual"}
+RESTART = {"namespace": NAMESPACE, "name": "e2e-restart"}
 FIXTURES = (TARGET["name"], FLAP["name"], MANUAL["name"])
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
+RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
 CORRELATION_ANNOTATION = "kube-handrail.io/correlation-id"
 # The plan history index is eventually consistent; give a just-recorded apply time to show up.
 HISTORY_SETTLE_SECONDS = 3
 # Must match the deployed APPLY_COOLDOWN_SECONDS; a lower value here makes cases fail.
 COOLDOWN_SECONDS = int(os.environ.get("APPLY_COOLDOWN_SECONDS", "60"))
 PLAN, APPLY = "k8sr___plan_scale_deployment", "k8sw___apply_scale_deployment"
+PLAN_RESTART, APPLY_RESTART = "k8sr___plan_restart_deployment", "k8sw___apply_restart_deployment"
 REQUEST_APPROVAL = "k8sr___request_approval"
 EVENTS = "k8sr___get_workload_events"
 # AWS's documented example key ID, split so the source holds no key-shaped literal.
@@ -103,15 +113,15 @@ def kubectl(*args: str, stdin: str | None = None) -> str:
     ).stdout
 
 
-def fixture(name: str) -> dict[str, Any]:
-    """A 1-replica unprivileged nginx that passes Pod Security `restricted` and has no GitOps markers."""
+def fixture(name: str, replicas: int = 1) -> dict[str, Any]:
+    """An unprivileged nginx that passes Pod Security `restricted` and has no GitOps markers."""
     labels = {"app.kubernetes.io/name": name, "app.kubernetes.io/part-of": NAMESPACE}
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {"name": name, "namespace": NAMESPACE, "labels": labels},
         "spec": {
-            "replicas": 1,
+            "replicas": replicas,
             "revisionHistoryLimit": 1,
             "selector": {"matchLabels": labels},
             "template": {
@@ -183,17 +193,21 @@ def target_pdb(min_available: int) -> dict[str, Any]:
 def delete_fixtures() -> None:
     kubectl("delete", "service", TARGET["name"], "--ignore-not-found")
     kubectl("delete", "pdb", TARGET["name"], "--ignore-not-found")
-    kubectl("delete", "deployment", *FIXTURES, "--ignore-not-found", "--wait=true")
+    kubectl("delete", "deployment", *FIXTURES, RESTART["name"], "--ignore-not-found", "--wait=true")
 
 
-def create_fixtures() -> None:
+def create_fixtures(with_rollout: bool) -> None:
     # Delete leftovers from an aborted run first: a new object (new uid) has no history.
     delete_fixtures()
+    names = [*FIXTURES]
     for name in FIXTURES:
         kubectl("create", "-f", "-", stdin=json.dumps(fixture(name)))
+    if with_rollout:
+        kubectl("create", "-f", "-", stdin=json.dumps(fixture(RESTART["name"], replicas=2)))
+        names.append(RESTART["name"])
     kubectl("create", "-f", "-", stdin=json.dumps(target_service()))
     kubectl("create", "-f", "-", stdin=json.dumps(target_pdb(1)))
-    for name in FIXTURES:
+    for name in names:
         kubectl("rollout", "status", f"deploy/{name}", "--timeout=120s")
 
 
@@ -879,7 +893,107 @@ async def approval_tests(gw: Gateway, token: str) -> None:
     )
 
 
-async def run(with_expiry: bool, approval_mode: str) -> None:
+def restart_pods() -> dict[str, str]:
+    """Pod name => restart-plan-id annotation of the e2e-restart pods not being deleted."""
+    out = kubectl("get", "pods", "-l", f"app.kubernetes.io/name={RESTART['name']}", "-o", "json")
+    return {
+        pod["metadata"]["name"]: (pod["metadata"].get("annotations") or {}).get(
+            RESTART_ANNOTATION, ""
+        )
+        for pod in json.loads(out)["items"]
+        if not pod["metadata"].get("deletionTimestamp")
+    }
+
+
+async def restart_and_check(gw: Gateway, approval_mode: str) -> bool:
+    """Plan and apply a restart (through the approval URL in server mode), check that a
+    second restart is refused with cooldown, then that every pod was replaced, the count
+    kept and the plan id put on the template and pods. Returns whether it was applied."""
+    before = restart_pods()
+    planned = await gw.call(PLAN_RESTART, RESTART)
+    data = planned.get("data") or {}
+    impact = data.get("impact") or {}
+    report(
+        "restart: plan shows the pods replaced and the rollout",
+        planned.get("ok") is True
+        and (data.get("diff") or {}).get("restart") == {"pods_replaced": 2}
+        and (impact.get("rollout") or {}).get("strategy") == "RollingUpdate"
+        and (impact.get("pods") or {}).get("replaced") == 2,
+        code(planned) or impact.get("rollout"),
+    )
+    if not planned.get("ok"):
+        return False
+    plan_id = data["plan_id"]
+    if approval_mode == "server":
+        approve = approve_script()
+        url = os.environ["APPROVAL_URL"]
+        region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
+        await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+        status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
+        applied = (envelope.get("data") or {}).get("apply") or {}
+        report(
+            "restart: an approval applies the restart",
+            status == 200 and applied.get("ok") is True,
+            (applied.get("error") or {}).get("code") or status,
+        )
+    else:
+        applied = await gw.call(APPLY_RESTART, {"plan_id": plan_id, **RESTART})
+        report("restart: apply succeeds", applied.get("ok") is True, code(applied) or "ok")
+    if not applied.get("ok"):
+        return False
+    # Right after the apply, so the rollout's duration cannot outlast the cooldown. The
+    # Deployment's last-plan annotation names the restart, so no index settle is needed.
+    envelope = await gw.call(PLAN_RESTART, RESTART)
+    report(
+        "restart: a second restart right after the first is refused with cooldown",
+        code(envelope) == "cooldown",
+        code(envelope) or "ok",
+    )
+    await asyncio.sleep(HISTORY_SETTLE_SECONDS)
+    kubectl("rollout", "status", f"deploy/{RESTART['name']}", "--timeout=180s")
+    wait_for(
+        "the old e2e-restart pods to go",
+        lambda: len(restart_pods()) == 2 and not set(restart_pods()) & set(before),
+        timeout=180,
+    )
+    after = restart_pods()
+    spec = json.loads(kubectl("get", f"deploy/{RESTART['name']}", "-o", "json"))["spec"]
+    replicas = spec.get("replicas")
+    template = (spec["template"]["metadata"].get("annotations") or {}).get(RESTART_ANNOTATION)
+    report(
+        "restart: every pod is replaced, replicas are kept, and the template and pods carry the plan id",
+        not set(after) & set(before)
+        and replicas == 2
+        and template == plan_id
+        and set(after.values()) == {plan_id},
+        f"{sorted(before)} -> {after}, replicas {replicas}",
+    )
+    return True
+
+
+async def rollout_tests(gw: Gateway, approval_mode: str) -> None:
+    if not await restart_and_check(gw, approval_mode):
+        # The kill switch case needs an applied restart; its failure is already reported.
+        return
+    await cool_down()
+    envelope = await gw.call(PLAN_RESTART, RESTART)
+    if not envelope.get("ok"):
+        report("restart: plan after the cooldown", False, code(envelope))
+        return
+    set_kill_switch("false")
+    try:
+        await expect(
+            gw,
+            "restart: kill switch off refuses the apply",
+            APPLY_RESTART,
+            {"plan_id": envelope["data"]["plan_id"], **RESTART},
+            "remediation_disabled",
+        )
+    finally:
+        set_kill_switch("true")
+
+
+async def run(with_expiry: bool, approval_mode: str, with_rollout: bool) -> None:
     token = fetch_token()
     auth_tests(token)
     async with streamablehttp_client(
@@ -898,10 +1012,12 @@ async def run(with_expiry: bool, approval_mode: str) -> None:
                 )
                 await impact_tests(gw)
                 await approval_tests(gw, token)
-                return
-            await plan_tests(gw, with_expiry)
-            await impact_tests(gw)
-            await breaker_tests(gw)
+            else:
+                await plan_tests(gw, with_expiry)
+                await impact_tests(gw)
+                await breaker_tests(gw)
+            if with_rollout:
+                await rollout_tests(gw, approval_mode)
 
 
 def describe(exc: BaseException) -> str:
@@ -915,6 +1031,7 @@ def describe(exc: BaseException) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--with-expiry", action="store_true", help="also wait out a plan TTL")
+    parser.add_argument("--with-rollout", action="store_true", help="also run the restart cases")
     parser.add_argument(
         "--approval-mode",
         choices=["client", "server"],
@@ -925,8 +1042,8 @@ def main() -> None:
     started = time.time()
     web_before = web_spec()
     try:
-        create_fixtures()
-        asyncio.run(run(args.with_expiry, args.approval_mode))
+        create_fixtures(args.with_rollout)
+        asyncio.run(run(args.with_expiry, args.approval_mode, args.with_rollout))
     except Exception as exc:
         # A case that raised (for example a plan that failed unexpectedly) still gets the
         # fixtures deleted and the summary printed.

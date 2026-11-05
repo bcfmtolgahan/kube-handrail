@@ -4,7 +4,8 @@
 Requests are signed with your own AWS credentials (SigV4, service `lambda`), selected the
 usual way (AWS_PROFILE, AWS_REGION, ...). Only principals listed in the deployment's
 approver_principals can decide; the tool Lambdas' roles never can. The plan is shown as
-the server recorded it, and approve and reject ask for confirmation unless --yes is given.
+the server recorded it, followed by a one-line summary of the change, and approve and
+reject ask for confirmation unless --yes is given.
 
   approve.py show <plan_id>
   approve.py approve <plan_id> [--no-apply] [--yes]
@@ -91,6 +92,18 @@ def emit(envelope: dict[str, Any]) -> None:
     print(json.dumps(envelope, indent=2, sort_keys=True))
 
 
+def summary(view: dict[str, Any]) -> str:
+    """One line naming the action, the Deployment and what changes, from the server's view."""
+    change = view.get("change") or {}
+    target = f"{view.get('action')} {view.get('namespace')}/{view.get('name')}"
+    if "restart" in change:
+        return (
+            f"{target}: replace {change['restart'].get('pods_replaced')} pod(s), replicas unchanged"
+        )
+    replicas = change.get("replicas") or view.get("replicas") or {}
+    return f"{target}: replicas {replicas.get('from')} -> {replicas.get('to')}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--url", default=os.environ.get("APPROVAL_URL"))
@@ -116,6 +129,8 @@ def main() -> None:
 
     status, envelope = show(args.url, region, args.plan_id)
     emit(envelope)
+    if envelope.get("ok"):
+        print(summary(envelope.get("data") or {}), file=sys.stderr)
     if args.command == "show" or not envelope.get("ok"):
         sys.exit(0 if envelope.get("ok") else 1)
 
