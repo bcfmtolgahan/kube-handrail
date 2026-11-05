@@ -95,6 +95,20 @@ def test_show_puts_the_plan_id_in_the_query(monkeypatch):
             },
             "restart_deployment sandbox/web: replace 3 pod(s), replicas unchanged",
         ),
+        (
+            {
+                "action": "rollback_deployment",
+                "namespace": "sandbox",
+                "name": "web",
+                "change": {
+                    "revision": {"from": 5, "to": 3},
+                    "replica_set": "web-7d5b9c6f8",
+                    "images": [{"changed": True}, {"changed": False}],
+                },
+            },
+            "rollback_deployment sandbox/web: revision 5 -> 3 (ReplicaSet web-7d5b9c6f8), "
+            "1 image(s) changed, replicas unchanged",
+        ),
         # A view from an approver without the change block.
         (
             {

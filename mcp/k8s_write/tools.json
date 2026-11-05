@@ -26,5 +26,20 @@
       },
       "required": ["plan_id", "namespace", "name"]
     }
+  },
+  {
+    "name": "apply_rollback_deployment",
+    "description": "Apply a rollback previously returned by plan_rollback_deployment: the Deployment's pod template is set to exactly the template of the ReplicaSet the plan pinned, replicas stay as they are. Arguments must match the plan exactly. The plan is single-use, expires after a few minutes, and is rejected if the Deployment changed since planning, or the pinned ReplicaSet was removed (revision_not_found), replaced or edited.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "plan_id": { "type": "string", "description": "plan_id returned by plan_rollback_deployment." },
+        "namespace": { "type": "string", "description": "Kubernetes namespace." },
+        "name": { "type": "string", "description": "Deployment name." },
+        "revision": { "type": "integer", "description": "Revision; must equal the planned value." },
+        "override_manual_change": { "type": "boolean", "description": "Must equal the value given to plan_rollback_deployment (default false)." }
+      },
+      "required": ["plan_id", "namespace", "name", "revision"]
+    }
   }
 ]

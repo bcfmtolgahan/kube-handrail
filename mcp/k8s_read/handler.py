@@ -5,7 +5,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import cache, partial
 from typing import Any
@@ -18,6 +18,7 @@ from handrail_common.approval import notification, plain, plan_view
 from handrail_common.breaker import (
     check_history,
     check_manual_change,
+    check_template_manual_change,
     last_applied_plan,
     replica_baseline,
     retention_seconds,
@@ -42,6 +43,7 @@ from handrail_common.plans import (
     GLOBAL_BUDGET_WINDOW_SECONDS,
     REQUESTER_GATEWAY,
     RESTART_DEPLOYMENT,
+    ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     STATUS_AWAITING,
     STATUS_PLANNED,
@@ -52,6 +54,7 @@ from handrail_common.plans import (
     plan_args_hash,
     restart_args,
     restart_template,
+    rollback_args,
     scale_args,
     template_hash,
 )
@@ -59,8 +62,13 @@ from handrail_common.rollout import (
     CHANGE_CAUSE_ANNOTATION,
     REVISION_ANNOTATION,
     container_images,
+    fields_changed,
+    image_diff,
     owned_revisions,
     parse_revision,
+    require_revision,
+    resolve_revision,
+    rollback_warnings,
     template_of,
 )
 from handrail_common.untrusted import fit_list, untrusted_text
@@ -496,6 +504,22 @@ def get_rollout_history(args: dict[str, Any], settings: Settings, clients: Clien
 
 
 @dataclass(frozen=True)
+class Resolved:
+    """What an action's checks found besides the Deployment (rollback: the target ReplicaSet)."""
+
+    # The pod template the change leaves, when it comes from elsewhere; None means
+    # PlanAction.template_to derives it from the current template.
+    template: dict[str, Any] | None = None
+    # Extra Plan fields that describe the change.
+    record: Mapping[str, Any] = field(default_factory=dict)
+    # Whether a field in `record` was cut (untrusted text at its limit).
+    truncated: bool = False
+
+
+NOTHING = Resolved()
+
+
+@dataclass(frozen=True)
 class PlanAction:
     """What one action adds to the generic plan path (_plan)."""
 
@@ -507,17 +531,23 @@ class PlanAction:
     validate: Callable[[Mapping[str, Any], Settings], tuple[str, str, dict[str, Any]]]
     # The resulting replica count, from the current one and the arguments.
     replicas_to: Callable[[int, Mapping[str, Any]], int]
-    # Checks on the live Deployment after the GitOps check (scale: HPA and blast radius).
-    checks: Callable[[Clients, Settings, Any, int, Mapping[str, Any]], None]
-    # History checks; returns whether the manual-change override was used.
-    breaker: Callable[[Clients, Settings, Any, int, Mapping[str, Any], int], bool]
+    # Checks on the live Deployment after the GitOps check (scale: HPA and blast radius),
+    # given its current raw pod template; returns what they resolved.
+    checks: Callable[[Clients, Settings, Any, Mapping[str, Any], int, Mapping[str, Any]], Resolved]
+    # History checks, given the current raw pod template; returns whether the
+    # manual-change override was used.
+    breaker: Callable[
+        [Clients, Settings, Any, Mapping[str, Any], int, Mapping[str, Any], int], bool
+    ]
     # Names of the checks reported in preflight, in order.
     preflight: tuple[str, ...]
     diff: Callable[[Plan], dict[str, Any]]
-    # The pod template the change leaves, from the plan id and the current raw template.
-    template_to: Callable[[str, Mapping[str, Any]], dict[str, Any]]
-    # The impact preview, given the raw Deployment, the current and the resulting replicas.
-    impact: Callable[[Mapping[str, Any], int, int], Preview]
+    # The pod template the change leaves, from the plan id, the current raw template and
+    # what the checks resolved.
+    template_to: Callable[[str, Mapping[str, Any], Resolved], dict[str, Any]]
+    # The impact preview, given the raw Deployment, the current and the resulting replicas
+    # and what the checks resolved.
+    impact: Callable[[Mapping[str, Any], int, int, Resolved], Preview]
 
 
 def _plan(
@@ -529,9 +559,10 @@ def _plan(
     if is_gitops_managed(deployment):
         raise GuardError(GITOPS_MANAGED, "deployment is managed by GitOps; change it in Git")
     current = _desired_replicas(deployment)
-    action.checks(clients, settings, deployment, current, request)
+    template = (raw.get("spec") or {}).get("template") or {}
+    resolved = action.checks(clients, settings, deployment, template, current, request)
     # History checks give early feedback; apply runs all but the plan rate limit again.
-    overridden = action.breaker(clients, settings, deployment, current, request, now)
+    overridden = action.breaker(clients, settings, deployment, template, current, request, now)
     # Read only here; apply takes a unit of the budget atomically.
     if clients.store.global_applies(now) >= settings.global_hourly_apply_budget:
         raise global_budget_error(
@@ -539,12 +570,13 @@ def _plan(
         )
     replicas_to = action.replicas_to(current, request)
     # Last, after every check has passed, and before the plan is stored.
-    impact = _impact(clients, namespace, deployment, action.impact(raw, current, replicas_to))
+    impact = _impact(
+        clients, namespace, deployment, action.impact(raw, current, replicas_to, resolved)
+    )
     correlation_id = current_correlation_id()
     plan_id = str(uuid.uuid4())
-    template = (raw.get("spec") or {}).get("template") or {}
     template_from = template_hash(template)
-    template_to = template_hash(action.template_to(plan_id, template))
+    template_to = template_hash(action.template_to(plan_id, template, resolved))
 
     plan = Plan(
         plan_id=plan_id,
@@ -569,6 +601,7 @@ def _plan(
         template_from=template_from,
         template_to=template_to,
         revision_from=_revision(deployment) if template_to != template_from else None,
+        **resolved.record,
     )
     clients.store.create(plan)
     preflight: list[dict[str, Any]] = [
@@ -586,7 +619,7 @@ def _plan(
             "expires_at": plan.expires_at,
             "correlation_id": correlation_id,
         },
-        truncated=impact["truncated"],
+        truncated=impact["truncated"] or resolved.truncated,
     )
 
 
@@ -602,20 +635,27 @@ def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, s
 
 
 def _check_scale(
-    clients: Clients, settings: Settings, deployment: Any, current: int, args: Mapping[str, Any]
-) -> None:
+    clients: Clients,
+    settings: Settings,
+    deployment: Any,
+    template: Mapping[str, Any],
+    current: int,
+    args: Mapping[str, Any],
+) -> Resolved:
     hpas = _targeting_hpas(clients.autoscaling, args["namespace"], args["name"])
     if hpas:
         raise GuardError(
             CONFLICT, f"HorizontalPodAutoscaler {', '.join(sorted(hpas))} targets this deployment"
         )
     check_replica_step(current, args["replicas"], settings.max_replica_step_percent)
+    return NOTHING
 
 
 def _scale_breaker(
     clients: Clients,
     settings: Settings,
     deployment: Any,
+    template: Mapping[str, Any],
     current: int,
     args: Mapping[str, Any],
     now: int,
@@ -661,8 +701,8 @@ SCALE = PlanAction(
     ),
     diff=lambda plan: {"replicas": {"from": plan.replicas_from, "to": plan.replicas_to}},
     # A scale leaves the pod template as it is.
-    template_to=lambda plan_id, template: dict(template),
-    impact=lambda raw, current, replicas_to: (
+    template_to=lambda plan_id, template, resolved: dict(template),
+    impact=lambda raw, current, replicas_to, resolved: (
         lambda labels, ready, pdbs, services, slices: scale_impact(
             labels, ready, current, replicas_to, pdbs, services, slices
         )
@@ -687,16 +727,23 @@ def _validate_restart(
 
 
 def _check_restart(
-    clients: Clients, settings: Settings, deployment: Any, current: int, args: Mapping[str, Any]
-) -> None:
+    clients: Clients,
+    settings: Settings,
+    deployment: Any,
+    template: Mapping[str, Any],
+    current: int,
+    args: Mapping[str, Any],
+) -> Resolved:
     # No HPA check: a restart leaves spec.replicas, which an HPA owns, as it is.
     check_not_paused(deployment)
+    return NOTHING
 
 
 def _restart_breaker(
     clients: Clients,
     settings: Settings,
     deployment: Any,
+    template: Mapping[str, Any],
     current: int,
     args: Mapping[str, Any],
     now: int,
@@ -737,8 +784,8 @@ RESTART = PlanAction(
         "restart": {"pods_replaced": plan.replicas_from},
         "template": {"from": plan.template_from, "to": plan.template_to},
     },
-    template_to=lambda plan_id, template: restart_template(template, plan_id),
-    impact=lambda raw, current, replicas_to: (
+    template_to=lambda plan_id, template, resolved: restart_template(template, plan_id),
+    impact=lambda raw, current, replicas_to, resolved: (
         lambda labels, ready, pdbs, services, slices: rollout_impact(
             raw, labels, ready, current, pdbs, services, slices
         )
@@ -750,6 +797,129 @@ def plan_restart_deployment(
     args: dict[str, Any], settings: Settings, clients: Clients, now: int
 ) -> Envelope:
     return _plan(RESTART, args, settings, clients, now)
+
+
+# --- rollback_deployment ------------------------------------------------------
+
+
+def _validate_rollback(
+    args: Mapping[str, Any], settings: Settings
+) -> tuple[str, str, dict[str, Any]]:
+    namespace, name = validate_target_args(args, settings.allowed_namespaces)
+    revision = require_revision(args.get("revision"))
+    override = require_override_flag(args)
+    return namespace, name, rollback_args(namespace, name, revision, override)
+
+
+def _check_rollback(
+    clients: Clients,
+    settings: Settings,
+    deployment: Any,
+    template: Mapping[str, Any],
+    current: int,
+    args: Mapping[str, Any],
+) -> Resolved:
+    """Resolve the revision to the one ReplicaSet the Deployment controls with it, and
+    describe what rolling back to its template changes: images and field names only."""
+    # No HPA check: a rollback leaves spec.replicas, which an HPA owns, as it is.
+    check_not_paused(deployment)
+    revision = args["revision"]
+    rs = resolve_revision(
+        _replica_sets(clients, args["namespace"]), str(deployment.metadata.uid), revision
+    )
+    target = template_of(rs)
+    if template_hash(target) == template_hash(template):
+        raise GuardError(INVALID_ARGUMENT, f"revision {revision} is the current template")
+    images, images_cut = image_diff(template, target)
+    fields, fields_cut = fields_changed(template, target)
+    meta = rs.get("metadata") or {}
+    return Resolved(
+        template=target,
+        record={
+            "revision_to": revision,
+            "target_rs_name": str(meta.get("name")),
+            "target_rs_uid": str(meta.get("uid")),
+            "images": images,
+            "fields_changed": fields,
+        },
+        truncated=images_cut or fields_cut,
+    )
+
+
+def _rollback_breaker(
+    clients: Clients,
+    settings: Settings,
+    deployment: Any,
+    template: Mapping[str, Any],
+    current: int,
+    args: Mapping[str, Any],
+    now: int,
+) -> bool:
+    # Replicas stay as they are, so the replica rules (manual change, flapping) do not apply;
+    # the template manual-change rule does.
+    last_applied = last_applied_plan(clients.store, deployment)
+    overridden = check_template_manual_change(
+        last_applied, template_hash(template), args.get("override_manual_change", False) is True
+    )
+    check_history(
+        clients.store,
+        object_key(args["namespace"], args["name"], str(deployment.metadata.uid)),
+        now,
+        settings,
+        current,
+        current,
+        plan_rate=True,
+        last_applied=last_applied,
+    )
+    return overridden
+
+
+ROLLBACK = PlanAction(
+    name=ROLLBACK_DEPLOYMENT,
+    validate=_validate_rollback,
+    replicas_to=lambda current, args: current,
+    checks=_check_rollback,
+    breaker=_rollback_breaker,
+    preflight=(
+        "arguments",
+        "namespace_allowed",
+        "not_gitops_managed",
+        "not_paused",
+        "revision_found",
+        "template_differs",
+        "no_manual_change",
+        "cooldown",
+        "object_budget",
+        "plan_rate",
+        "global_budget",
+    ),
+    diff=lambda plan: {
+        "revision": {"from": plan.revision_from, "to": plan.revision_to},
+        "template": {"from": plan.template_from, "to": plan.template_to},
+        "replica_set": plan.target_rs_name,
+        "images": plan.images,
+        "fields_changed": plan.fields_changed,
+    },
+    template_to=lambda plan_id, template, resolved: resolved.template or {},
+    impact=lambda raw, current, replicas_to, resolved: (
+        lambda labels, ready, pdbs, services, slices: rollout_impact(
+            raw,
+            labels,
+            ready,
+            current,
+            pdbs,
+            services,
+            slices,
+            rollback_warnings((raw.get("spec") or {}).get("template") or {}, resolved.template),
+        )
+    ),
+)
+
+
+def plan_rollback_deployment(
+    args: dict[str, Any], settings: Settings, clients: Clients, now: int
+) -> Envelope:
+    return _plan(ROLLBACK, args, settings, clients, now)
 
 
 def request_approval(
@@ -812,6 +982,9 @@ HANDLERS = {
     ),
     "get_rollout_history": lambda args: get_rollout_history(
         args, _settings(), Clients(_settings())
+    ),
+    "plan_rollback_deployment": lambda args: plan_rollback_deployment(
+        args, _settings(), Clients(_settings()), int(time.time())
     ),
     "request_approval": lambda args: request_approval(
         args, _settings(), Clients(_settings()), int(time.time())

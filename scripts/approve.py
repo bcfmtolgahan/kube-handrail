@@ -100,6 +100,14 @@ def summary(view: dict[str, Any]) -> str:
         return (
             f"{target}: replace {change['restart'].get('pods_replaced')} pod(s), replicas unchanged"
         )
+    if "revision" in change:
+        revision = change["revision"]
+        images = sum(1 for image in change.get("images") or [] if image.get("changed"))
+        return (
+            f"{target}: revision {revision.get('from')} -> {revision.get('to')} "
+            f"(ReplicaSet {change.get('replica_set')}), {images} image(s) changed, "
+            "replicas unchanged"
+        )
     replicas = change.get("replicas") or view.get("replicas") or {}
     return f"{target}: replicas {replicas.get('from')} -> {replicas.get('to')}"
 

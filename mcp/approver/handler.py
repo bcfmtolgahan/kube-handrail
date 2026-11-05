@@ -34,7 +34,12 @@ from handrail_common.envelope import (
     ok,
 )
 from handrail_common.observability import APPROVER_CORRELATION_KEY, emit
-from handrail_common.plans import RESTART_DEPLOYMENT, SCALE_DEPLOYMENT, PlanStore
+from handrail_common.plans import (
+    RESTART_DEPLOYMENT,
+    ROLLBACK_DEPLOYMENT,
+    SCALE_DEPLOYMENT,
+    PlanStore,
+)
 from handrail_common.validation import GuardError, require_plan_id
 
 logger = logging.getLogger(__name__)
@@ -44,6 +49,7 @@ logger.setLevel(logging.INFO)
 APPLY_TOOLS = {
     SCALE_DEPLOYMENT: "k8sw___apply_scale_deployment",
     RESTART_DEPLOYMENT: "k8sw___apply_restart_deployment",
+    ROLLBACK_DEPLOYMENT: "k8sw___apply_rollback_deployment",
 }
 APPROVE = "approve"
 REJECT = "reject"

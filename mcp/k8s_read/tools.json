@@ -63,8 +63,22 @@
     }
   },
   {
+    "name": "plan_rollback_deployment",
+    "description": "Plan a rollback of a Deployment to one revision from get_rollout_history without changing anything. The revision is resolved to the one ReplicaSet the Deployment controls with that number; the plan pins that ReplicaSet and a hash of its pod template, and the apply writes exactly that template or is refused. Replicas stay as they are; every pod is replaced at the pace of the Deployment's own rollout strategy. Runs preflight checks and returns a single-use plan_id, the diff (revision before and after, template hash before and after, the ReplicaSet, the image of each container before and after as untrusted text, and the names, never the values, of the other template fields that change), a measured impact preview (as for a restart, plus warnings when a target image is not pinned by digest or the target template reads ConfigMaps or Secrets, whose content a rollback does not restore) and an expiry. The change is only made by apply_rollback_deployment with the same arguments and plan_id. Refused when the revision no longer exists (revision_not_found), is the current template, the rollout is paused, the Deployment was changed too recently or too often, or the last kube-handrail template change was undone by someone else without override_manual_change.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "namespace": { "type": "string", "description": "Kubernetes namespace." },
+        "name": { "type": "string", "description": "Deployment name." },
+        "revision": { "type": "integer", "description": "Revision to roll back to, as listed by get_rollout_history (at least 1)." },
+        "override_manual_change": { "type": "boolean", "description": "Default false. Set to true only to roll back over a pod template change made outside kube-handrail since its last template change; the approver sees it and apply must pass the same value." }
+      },
+      "required": ["namespace", "name", "revision"]
+    }
+  },
+  {
     "name": "request_approval",
-    "description": "Ask the human approvers configured on the server to approve or reject a plan returned by a plan_* tool (plan_scale_deployment, plan_restart_deployment). Only when the server requires approval (server or both mode; in client mode it is refused because the client approves). Approves nothing and changes nothing in the cluster: it marks the plan as awaiting approval, keeps it valid for the approval wait counted from its creation, and notifies the approvers with the plan as recorded by the server. Approvers decide outside MCP; in server mode their approval also triggers the apply, in both mode the client applies after its own approval. Repeated calls within a short cooldown notify nobody again, and requests are rate limited.",
+    "description": "Ask the human approvers configured on the server to approve or reject a plan returned by a plan_* tool (plan_scale_deployment, plan_restart_deployment, plan_rollback_deployment). Only when the server requires approval (server or both mode; in client mode it is refused because the client approves). Approves nothing and changes nothing in the cluster: it marks the plan as awaiting approval, keeps it valid for the approval wait counted from its creation, and notifies the approvers with the plan as recorded by the server. Approvers decide outside MCP; in server mode their approval also triggers the apply, in both mode the client applies after its own approval. Repeated calls within a short cooldown notify nobody again, and requests are rate limited.",
     "inputSchema": {
       "type": "object",
       "properties": {

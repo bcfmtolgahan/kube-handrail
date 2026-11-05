@@ -14,6 +14,7 @@ from handrail_common.breaker import (
     check_manual_change,
     check_object_budget,
     check_plan_rate,
+    check_template_manual_change,
     last_applied_plan,
     last_plan_id,
     max_plan_lifetime,
@@ -22,7 +23,13 @@ from handrail_common.breaker import (
     with_last_applied,
 )
 from handrail_common.config import load_settings
-from handrail_common.plans import RESTART_DEPLOYMENT, SCALE_DEPLOYMENT, HistoryEntry, Plan
+from handrail_common.plans import (
+    RESTART_DEPLOYMENT,
+    ROLLBACK_DEPLOYMENT,
+    SCALE_DEPLOYMENT,
+    HistoryEntry,
+    Plan,
+)
 from handrail_common.validation import GuardError
 
 NOW = 1_700_000_000
@@ -542,3 +549,46 @@ def test_baseline_fails_closed_on_a_history_error():
     store = FakeStore(error=RuntimeError("throttled"))
     with pytest.raises(RuntimeError):
         replica_baseline(store, SETTINGS, restart_applied(2, NOW - 60), NOW)
+
+
+# --- Template manual change (rollback) ------------------------------------------
+
+
+def template_change(template_from: str | None, template_to: str | None) -> Plan:
+    return replace(
+        last_applied(2, 2, NOW - 60, "applied"),
+        action=ROLLBACK_DEPLOYMENT,
+        template_from=template_from,
+        template_to=template_to,
+    )
+
+
+def test_template_rule_refuses_undoing_a_template_change_made_by_hand():
+    with pytest.raises(GuardError) as exc:
+        check_template_manual_change(template_change("sha256:a", "sha256:b"), "sha256:c", False)
+    assert exc.value.code == "manual_change"
+    assert exc.value.details == {
+        "last_applied_template": "sha256:b",
+        "current_template": "sha256:c",
+    }
+
+
+def test_template_rule_with_the_override_reports_it():
+    assert check_template_manual_change(template_change("sha256:a", "sha256:b"), "sha256:c", True)
+
+
+@pytest.mark.parametrize(
+    "last",
+    [
+        None,
+        # The template is still the one the last apply left.
+        template_change("sha256:a", "sha256:b"),
+        # The last apply was a scale: it left the template as it was.
+        replace(template_change("sha256:x", "sha256:x"), action=SCALE_DEPLOYMENT),
+        # Records made before template hashes.
+        template_change(None, None),
+        template_change("sha256:a", None),
+    ],
+)
+def test_template_rule_is_skipped(last):
+    assert check_template_manual_change(last, "sha256:b", False) is False

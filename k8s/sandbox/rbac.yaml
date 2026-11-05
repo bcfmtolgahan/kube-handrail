@@ -24,8 +24,8 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list"]
-  # get_workload_events and get_rollout_history. Events name Pods; the reader still
-  # cannot read them.
+  # get_workload_events, get_rollout_history and plan_rollback_deployment. Events name
+  # Pods; the reader still cannot read them.
   - apiGroups: ["apps"]
     resources: ["replicasets"]
     verbs: ["list"]
@@ -60,6 +60,10 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "patch"]
+  # apply_rollback_deployment re-reads the ReplicaSet the plan pinned.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

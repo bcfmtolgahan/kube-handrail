@@ -39,6 +39,19 @@ a second restart right after it is refused with cooldown; and with the kill
 switch off its apply is remediation_disabled. With --approval-mode server the
 restart is applied by an approval through the approval URL, as above.
 
+The rollback cases run with --with-rollout too, against a fixture Deployment
+e2e-rollback with revisionHistoryLimit 3, rolled forward to revision 5 at the
+start so that revision 1 is pruned (two image tags and an env var tell the
+revisions apart). get_rollout_history lists 5, 4, 3, 2; a paused rollout, the
+pruned revision 1, the current revision and the GitOps fixture are refused; a
+plan to revision 3 applied with revision 4 is plan_mismatch, and applied as
+planned (through the approval URL in server mode) leaves spec.template equal to
+the target ReplicaSet's template without its pod-template-hash label, compared
+as JSON. A template change by hand afterwards makes the next rollback plan
+manual_change, and the override plans it. In client mode, a ReplicaSet edited
+with kubectl patch between plan and apply is a conflict, and the override plan
+is applied.
+
 The per-object and global hourly budgets and the plan rate limit are covered by
 unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
 scale_to_zero and service_without_endpoints warnings: they need a plan to 0
@@ -71,6 +84,7 @@ TARGET = {"namespace": NAMESPACE, "name": "e2e-target"}
 FLAP = {"namespace": NAMESPACE, "name": "e2e-flap"}
 MANUAL = {"namespace": NAMESPACE, "name": "e2e-manual"}
 RESTART = {"namespace": NAMESPACE, "name": "e2e-restart"}
+ROLLBACK = {"namespace": NAMESPACE, "name": "e2e-rollback"}
 FIXTURES = (TARGET["name"], FLAP["name"], MANUAL["name"])
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
 RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
@@ -81,6 +95,11 @@ HISTORY_SETTLE_SECONDS = 3
 COOLDOWN_SECONDS = int(os.environ.get("APPLY_COOLDOWN_SECONDS", "60"))
 PLAN, APPLY = "k8sr___plan_scale_deployment", "k8sw___apply_scale_deployment"
 PLAN_RESTART, APPLY_RESTART = "k8sr___plan_restart_deployment", "k8sw___apply_restart_deployment"
+PLAN_ROLLBACK, APPLY_ROLLBACK = (
+    "k8sr___plan_rollback_deployment",
+    "k8sw___apply_rollback_deployment",
+)
+HISTORY = "k8sr___get_rollout_history"
 REQUEST_APPROVAL = "k8sr___request_approval"
 EVENTS = "k8sr___get_workload_events"
 # AWS's documented example key ID, split so the source holds no key-shaped literal.
@@ -89,6 +108,11 @@ FAKE_ACCESS_KEY_ID = "AKIA" + "IOSFODNN7EXAMPLE"
 FIELD_MAX_CHARS = 1024
 OPEN, CLOSE = "<untrusted>", "</untrusted>"
 FIXTURE = Path(__file__).parent / "fixtures" / "argo-managed.yaml"
+IMAGE = "nginxinc/nginx-unprivileged:1.27.5-alpine"
+OLD_IMAGE = "nginxinc/nginx-unprivileged:1.27.4-alpine"
+# (image, E2E_REVISION) of e2e-rollback's revisions 2-5; revision 1 is the fixture itself.
+ROLLBACK_REVISIONS = ((OLD_IMAGE, "2"), (OLD_IMAGE, "3"), (OLD_IMAGE, "4"), (IMAGE, "5"))
+POD_TEMPLATE_HASH = "pod-template-hash"
 UNKNOWN_PLAN = "00000000-0000-4000-8000-000000000000"
 
 results: list[bool] = []
@@ -137,7 +161,7 @@ def fixture(name: str, replicas: int = 1) -> dict[str, Any]:
                     "containers": [
                         {
                             "name": "nginx",
-                            "image": "nginxinc/nginx-unprivileged:1.27.5-alpine",
+                            "image": IMAGE,
                             "resources": {
                                 "requests": {"cpu": "5m", "memory": "16Mi"},
                                 "limits": {"cpu": "50m", "memory": "64Mi"},
@@ -193,7 +217,15 @@ def target_pdb(min_available: int) -> dict[str, Any]:
 def delete_fixtures() -> None:
     kubectl("delete", "service", TARGET["name"], "--ignore-not-found")
     kubectl("delete", "pdb", TARGET["name"], "--ignore-not-found")
-    kubectl("delete", "deployment", *FIXTURES, RESTART["name"], "--ignore-not-found", "--wait=true")
+    kubectl(
+        "delete",
+        "deployment",
+        *FIXTURES,
+        RESTART["name"],
+        ROLLBACK["name"],
+        "--ignore-not-found",
+        "--wait=true",
+    )
 
 
 def create_fixtures(with_rollout: bool) -> None:
@@ -205,10 +237,40 @@ def create_fixtures(with_rollout: bool) -> None:
     if with_rollout:
         kubectl("create", "-f", "-", stdin=json.dumps(fixture(RESTART["name"], replicas=2)))
         names.append(RESTART["name"])
+        rollback = fixture(ROLLBACK["name"])
+        rollback["spec"]["revisionHistoryLimit"] = 3
+        kubectl("create", "-f", "-", stdin=json.dumps(rollback))
     kubectl("create", "-f", "-", stdin=json.dumps(target_service()))
     kubectl("create", "-f", "-", stdin=json.dumps(target_pdb(1)))
     for name in names:
         kubectl("rollout", "status", f"deploy/{name}", "--timeout=120s")
+    if with_rollout:
+        kubectl("rollout", "status", f"deploy/{ROLLBACK['name']}", "--timeout=120s")
+        for image, value in ROLLBACK_REVISIONS:
+            roll_forward(image, value)
+        wait_for(
+            "revision 1 of e2e-rollback to be pruned",
+            lambda: sorted(rollback_replica_sets()) == [2, 3, 4, 5],
+        )
+
+
+def roll_forward(image: str, value: str | None = None) -> None:
+    """A new revision of e2e-rollback, made by hand as a deploy would make it."""
+    container: dict[str, Any] = {"name": "nginx", "image": image}
+    if value is not None:
+        container["env"] = [{"name": "E2E_REVISION", "value": value}]
+    patch = {"spec": {"template": {"spec": {"containers": [container]}}}}
+    kubectl("patch", f"deploy/{ROLLBACK['name']}", "-p", json.dumps(patch))
+    kubectl("rollout", "status", f"deploy/{ROLLBACK['name']}", "--timeout=120s")
+
+
+def rollback_replica_sets() -> dict[int, dict[str, Any]]:
+    """Revision => ReplicaSet of e2e-rollback."""
+    out = kubectl("get", "rs", "-l", f"app.kubernetes.io/name={ROLLBACK['name']}", "-o", "json")
+    return {
+        int(rs["metadata"]["annotations"]["deployment.kubernetes.io/revision"]): rs
+        for rs in json.loads(out)["items"]
+    }
 
 
 def web_spec() -> str:
@@ -993,6 +1055,205 @@ async def rollout_tests(gw: Gateway, approval_mode: str) -> None:
         set_kill_switch("true")
 
 
+def template_without_hash(rs_name: str) -> dict[str, Any]:
+    """The ReplicaSet's pod template without the label the controller adds to it."""
+    template = json.loads(kubectl("get", "rs", rs_name, "-o", "json"))["spec"]["template"]
+    labels = template.get("metadata", {}).get("labels", {})
+    labels.pop(POD_TEMPLATE_HASH, None)
+    if not labels:
+        template.get("metadata", {}).pop("labels", None)
+    return template
+
+
+def deployment_template(name: str) -> dict[str, Any]:
+    return json.loads(kubectl("get", f"deploy/{name}", "-o", "json"))["spec"]["template"]
+
+
+async def plan_rollback(gw: Gateway, revision: int, **extra: Any) -> dict[str, Any]:
+    return await gw.call(PLAN_ROLLBACK, {**ROLLBACK, "revision": revision, **extra})
+
+
+async def apply_rollback_through_approval(gw: Gateway, plan_id: str) -> dict[str, Any]:
+    """Request approval, check that show renders the image change, approve; returns the
+    apply envelope the approval ran."""
+    approve = approve_script()
+    url = os.environ["APPROVAL_URL"]
+    region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
+    await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+    status, envelope = approve.show(url, region, plan_id)
+    change = (envelope.get("data") or {}).get("change") or {}
+    images = change.get("images") or []
+    report(
+        "rollback: show renders the revision and the image change",
+        status == 200
+        and (change.get("revision") or {}).get("to") == 3
+        and [(i.get("from"), i.get("to")) for i in images]
+        == [(f"{OPEN}{IMAGE}{CLOSE}", f"{OPEN}{OLD_IMAGE}{CLOSE}")],
+        status,
+    )
+    status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
+    applied = (envelope.get("data") or {}).get("apply") or {}
+    report(
+        "rollback: an approval applies the rollback",
+        status == 200 and applied.get("ok") is True,
+        (applied.get("error") or {}).get("code") or status,
+    )
+    return applied
+
+
+async def rollback_refusal_tests(gw: Gateway) -> None:
+    """Plans only, none stored, so nothing here counts toward the breaker."""
+    envelope = await gw.call(HISTORY, ROLLBACK)
+    revisions = (envelope.get("data") or {}).get("revisions") or []
+    report(
+        "rollback: history lists the revisions newest first, the current one marked",
+        [(r.get("revision"), r.get("current")) for r in revisions]
+        == [(5, True), (4, False), (3, False), (2, False)]
+        and [i.get("image") for i in revisions[2].get("images") or []]
+        == [f"{OPEN}{OLD_IMAGE}{CLOSE}"],
+        code(envelope) or [r.get("revision") for r in revisions],
+    )
+
+    kubectl("rollout", "pause", f"deploy/{ROLLBACK['name']}")
+    try:
+        envelope = await plan_rollback(gw, 3)
+        details = (envelope.get("error") or {}).get("details")
+        report(
+            "rollback: plan of a paused rollout is conflict",
+            code(envelope) == "conflict" and details == {"paused": True},
+            code(envelope) or "ok",
+        )
+    finally:
+        kubectl("rollout", "resume", f"deploy/{ROLLBACK['name']}")
+
+    envelope = await plan_rollback(gw, 1)
+    details = (envelope.get("error") or {}).get("details") or {}
+    report(
+        "rollback: a pruned revision is revision_not_found",
+        code(envelope) == "revision_not_found"
+        and details == {"revision": 1, "available": [5, 4, 3, 2]},
+        code(envelope) or "ok",
+    )
+    await expect(
+        gw,
+        "rollback: the current revision",
+        PLAN_ROLLBACK,
+        {**ROLLBACK, "revision": 5},
+        "invalid_argument",
+    )
+    kubectl("apply", "-f", str(FIXTURE))
+    await expect(
+        gw,
+        "rollback: GitOps-managed deployment",
+        PLAN_ROLLBACK,
+        {"namespace": NAMESPACE, "name": "argo-managed", "revision": 1},
+        "gitops_managed",
+    )
+
+
+async def rollback_tests(gw: Gateway, approval_mode: str) -> None:
+    await rollback_refusal_tests(gw)
+
+    if approval_mode != "server":
+        envelope = await plan_rollback(gw, 2)
+        target = ((envelope.get("data") or {}).get("diff") or {}).get("replica_set")
+        if not envelope.get("ok"):
+            report("rollback: plan to revision 2", False, code(envelope))
+            return
+        # The ReplicaSet's template changes; the Deployment's generation does not.
+        touch = {"spec": {"template": {"metadata": {"annotations": {"kube-handrail.io/e2e": "1"}}}}}
+        kubectl("patch", "rs", target, "--type=merge", "-p", json.dumps(touch))
+        envelope = await gw.call(
+            APPLY_ROLLBACK, {"plan_id": envelope["data"]["plan_id"], **ROLLBACK, "revision": 2}
+        )
+        details = (envelope.get("error") or {}).get("details") or {}
+        report(
+            "rollback: a ReplicaSet edited between plan and apply is conflict",
+            code(envelope) == "conflict" and "template" in details,
+            code(envelope) or "ok",
+        )
+
+    planned = await plan_rollback(gw, 3)
+    data = planned.get("data") or {}
+    diff = data.get("diff") or {}
+    report(
+        "rollback: plan to revision 3 shows the image change and the changed field names",
+        planned.get("ok") is True
+        and diff.get("revision") == {"from": 5, "to": 3}
+        and [(i.get("from"), i.get("to"), i.get("changed")) for i in diff.get("images") or []]
+        == [(f"{OPEN}{IMAGE}{CLOSE}", f"{OPEN}{OLD_IMAGE}{CLOSE}", True)]
+        and diff.get("fields_changed")
+        == ["spec.containers[nginx].env", "spec.containers[nginx].image"],
+        code(planned) or diff.get("fields_changed"),
+    )
+    if not planned.get("ok"):
+        return
+    plan_id, target = data["plan_id"], diff["replica_set"]
+    await expect(
+        gw,
+        "rollback: apply with another revision is plan_mismatch",
+        APPLY_ROLLBACK,
+        {"plan_id": plan_id, **ROLLBACK, "revision": 4},
+        "plan_mismatch",
+    )
+    if approval_mode == "server":
+        applied = await apply_rollback_through_approval(gw, plan_id)
+    else:
+        applied = await gw.call(APPLY_ROLLBACK, {"plan_id": plan_id, **ROLLBACK, "revision": 3})
+        report(
+            "rollback: apply as planned succeeds", applied.get("ok") is True, code(applied) or "ok"
+        )
+    if not applied.get("ok"):
+        return
+    report(
+        "rollback: spec.template equals the target ReplicaSet's template without its hash label",
+        deployment_template(ROLLBACK["name"]) == template_without_hash(target)
+        and last_plan_id(ROLLBACK["name"]) == plan_id,
+        target,
+    )
+    kubectl("rollout", "status", f"deploy/{ROLLBACK['name']}", "--timeout=120s")
+    wait_for("the target ReplicaSet to be renumbered", lambda: 6 in rollback_replica_sets())
+    report(
+        "rollback: the controller gave the target ReplicaSet the next revision",
+        rollback_replica_sets()[6]["metadata"]["name"] == target,
+    )
+
+    # A deploy by hand on top of the rollback: rolling back again would undo it.
+    roll_forward(IMAGE, "3")
+    await cool_down()
+    envelope = await plan_rollback(gw, 4)
+    details = (envelope.get("error") or {}).get("details") or {}
+    report(
+        "rollback: a template change by hand since the rollback is manual_change",
+        code(envelope) == "manual_change"
+        and details.get("last_applied_template") == diff["template"]["to"]
+        and details.get("current_template") not in (None, diff["template"]["to"]),
+        code(envelope) or "ok",
+    )
+    envelope = await plan_rollback(gw, 4, override_manual_change=True)
+    report(
+        "rollback: the plan with override_manual_change succeeds",
+        envelope.get("ok") is True,
+        code(envelope) or "ok",
+    )
+    if approval_mode == "server" or not envelope.get("ok"):
+        return
+    envelope = await gw.call(
+        APPLY_ROLLBACK,
+        {
+            "plan_id": envelope["data"]["plan_id"],
+            **ROLLBACK,
+            "revision": 4,
+            "override_manual_change": True,
+        },
+    )
+    report(
+        "rollback: the apply with the planned override succeeds",
+        envelope.get("ok") is True,
+        code(envelope) or "ok",
+    )
+
+
 async def run(with_expiry: bool, approval_mode: str, with_rollout: bool) -> None:
     token = fetch_token()
     auth_tests(token)
@@ -1018,6 +1279,7 @@ async def run(with_expiry: bool, approval_mode: str, with_rollout: bool) -> None
                 await breaker_tests(gw)
             if with_rollout:
                 await rollout_tests(gw, approval_mode)
+                await rollback_tests(gw, approval_mode)
 
 
 def describe(exc: BaseException) -> str:
@@ -1031,7 +1293,9 @@ def describe(exc: BaseException) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--with-expiry", action="store_true", help="also wait out a plan TTL")
-    parser.add_argument("--with-rollout", action="store_true", help="also run the restart cases")
+    parser.add_argument(
+        "--with-rollout", action="store_true", help="also run the restart and rollback cases"
+    )
     parser.add_argument(
         "--approval-mode",
         choices=["client", "server"],
