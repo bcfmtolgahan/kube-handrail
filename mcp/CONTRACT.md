@@ -452,7 +452,7 @@ A restart's or rollback's preview describes the rollout instead of a change in t
   - `mutable_image_tag` (rollback only): an image that changes is not pinned by digest (`@sha256:`). The plan pins the image name, and the tag may now point to other content.
   - `config_not_rolled_back` (rollback only): the target template reads a ConfigMap or Secret (`envFrom`, `env[].valueFrom.configMapKeyRef` or `secretKeyRef`, or a `configMap`, `secret` or `projected` volume with such a source). A rollback does not restore their content.
 
-A rollback's preview is the same as a restart's, with the two rollback-only warnings last.
+A rollback's preview is the same as a restart's, with the two rollback-only warnings first, so the cut at 20 never drops them.
 
 `strategy`, `generation` and the status fields are read from the same raw Deployment as `template_from`.
 

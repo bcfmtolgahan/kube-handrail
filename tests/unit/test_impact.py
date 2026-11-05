@@ -500,6 +500,18 @@ def test_rollout_recreate_warns_and_empties_the_service():
     assert result["services"][0]["projected_min_ready_endpoints"] == 0
 
 
+def test_rollout_keeps_the_action_warnings_when_the_list_is_cut():
+    dep = deployment(1, {"type": "Recreate"})
+    services = [service(f"svc-{i:02d}") for i in range(20)]
+    action = [
+        {"code": "mutable_image_tag", "message": "m"},
+        {"code": "config_not_rolled_back", "message": "c"},
+    ]
+    result = rollout_impact(dep, LABELS, 1, 1, [], services, [], action)
+    assert result["truncated"] is True
+    assert codes(result)[:3] == ["mutable_image_tag", "config_not_rolled_back", RECREATE_STRATEGY]
+
+
 @pytest.mark.parametrize(
     ("dep", "in_progress"),
     [
