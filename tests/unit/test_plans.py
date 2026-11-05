@@ -21,6 +21,7 @@ from handrail_common.plans import (
     plan_args_hash,
     restart_args,
     restart_template,
+    revert_plan_id,
     rollback_args,
     scale_args,
     scale_args_hash,
@@ -549,3 +550,29 @@ def test_verification_fields_round_trip():
         reverts_plan_id="p",
     )
     assert Plan.from_item(plan.to_item()) == plan
+
+
+def test_a_revert_id_is_derived_from_its_plan():
+    plan_id = str(uuid.uuid4())
+    assert revert_plan_id(plan_id) == revert_plan_id(plan_id)
+    assert revert_plan_id(plan_id) != revert_plan_id(str(uuid.uuid4()))
+    assert require_plan_id(revert_plan_id(plan_id)) == revert_plan_id(plan_id)
+
+
+def test_create_revert_is_an_idempotent_upsert_scheduled_for_verification(store):
+    revert = dataclasses.replace(
+        make_plan(),
+        plan_id=revert_plan_id("p"),
+        used=True,
+        status="revert",
+        kind="revert",
+        reverts_plan_id="p",
+        verify_window_seconds=60,
+        verify_at=NOW + 60,
+    )
+    store.create_revert(revert)
+    store.create_revert(dataclasses.replace(revert, created_at=NOW + 5))
+    record = store.get(revert.plan_id)
+    assert Plan.from_item(record) == revert
+    assert record["verify_queue"] == "due"
+    assert store.due_plans(NOW + 60, 10) == [revert.plan_id]

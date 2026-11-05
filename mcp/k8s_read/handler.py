@@ -34,12 +34,13 @@ from handrail_common.envelope import (
     INVALID_ARGUMENT,
     KUBERNETES_ERROR,
     NOT_FOUND,
+    OUT_OF_BOUNDS,
     PLAN_NOT_FOUND,
     Envelope,
     ok,
 )
 from handrail_common.gitops import is_gitops_managed
-from handrail_common.impact import rollout_impact, scale_impact
+from handrail_common.impact import revert_warnings, rollout_impact, scale_impact
 from handrail_common.observability import current_correlation_id
 from handrail_common.plans import (
     GLOBAL_BUDGET_WINDOW_SECONDS,
@@ -526,6 +527,8 @@ class Resolved:
     record: Mapping[str, Any] = field(default_factory=dict)
     # Whether a field in `record` was cut (untrusted text at its limit).
     truncated: bool = False
+    # Warnings the checks found for the impact preview (scale: revert_baseline_unhealthy).
+    warnings: tuple[dict[str, str], ...] = ()
 
 
 NOTHING = Resolved()
@@ -625,8 +628,12 @@ def _plan(
         **resolved.record,
     )
     clients.store.create(plan)
+    checks = action.preflight
+    if request.get("revert_on_failure") is True:
+        after = checks.index("blast_radius") + 1
+        checks = (*checks[:after], "revert_target_in_bounds", *checks[after:])
     preflight: list[dict[str, Any]] = []
-    for check in action.preflight:
+    for check in checks:
         preflight.append({"check": check, "passed": True})
         if overridden and check == "no_manual_change":
             preflight[-1]["overridden"] = True
@@ -679,7 +686,7 @@ def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, s
         args, settings.allowed_namespaces, settings.bounds_for
     )
     override = require_override_flag(args)
-    window, revert = _verify_request(args, settings)
+    window, revert = _verify_request(args, settings, revert_allowed=True)
     return namespace, name, scale_args(namespace, name, replicas, override, revert, window)
 
 
@@ -697,7 +704,18 @@ def _check_scale(
             CONFLICT, f"HorizontalPodAutoscaler {', '.join(sorted(hpas))} targets this deployment"
         )
     check_replica_step(current, args["replicas"], settings.max_replica_step_percent)
-    return NOTHING
+    if args.get("revert_on_failure") is not True:
+        return NOTHING
+    # The revert restores the current count, so it must be one a plan could ask for.
+    minimum, maximum = settings.bounds_for(args["namespace"])
+    if not minimum <= current <= maximum:
+        raise GuardError(
+            OUT_OF_BOUNDS,
+            f"the revert target, the current {current} replicas, is outside the bounds "
+            f"{minimum} to {maximum}; plan without revert_on_failure",
+        )
+    available = (deployment.status.available_replicas if deployment.status else None) or 0
+    return Resolved(warnings=tuple(revert_warnings(available, current)))
 
 
 def _scale_breaker(
@@ -753,7 +771,7 @@ SCALE = PlanAction(
     template_to=lambda plan_id, template, resolved: dict(template),
     impact=lambda raw, current, replicas_to, resolved: (
         lambda labels, ready, pdbs, services, slices: scale_impact(
-            labels, ready, current, replicas_to, pdbs, services, slices
+            labels, ready, current, replicas_to, pdbs, services, slices, resolved.warnings
         )
     ),
 )

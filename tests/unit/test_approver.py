@@ -790,3 +790,16 @@ def test_approve_applies_a_plan_with_a_pinned_window_and_schedules_its_check(env
         "revert_on_failure": False,
     }
     assert env.store.get(plan.plan_id)["verify_at"] == NOW + 90
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+def test_a_record_the_server_made_cannot_be_decided(env, decision):
+    plan = dataclasses.replace(
+        make_plan(env.store), plan_id=str(uuid.uuid4()), requested_by="system:revert"
+    )
+    env.store.create(plan)
+    status, body = call(env.rt, ALICE, body={"plan_id": plan.plan_id, "decision": decision})
+    assert (status, body["error"]["code"]) == (403, "forbidden")
+    record = env.store.get(plan.plan_id)
+    assert "approved_by" not in record and "rejected_by" not in record
+    assert env.lam.calls == []

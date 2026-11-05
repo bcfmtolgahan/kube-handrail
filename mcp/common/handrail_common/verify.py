@@ -191,7 +191,8 @@ def revert_view(plan: Plan, verification: str | None) -> dict[str, Any]:
             "reason": plan.revert.get("reason"),
             "revert_plan_id": plan.revert.get("revert_plan_id"),
         }
-    pending = verification in (PENDING, DEGRADED)
+    # Not applied yet, not checked yet, or degraded and not acted on yet.
+    pending = not plan.used or verification in (PENDING, DEGRADED)
     return {"requested": True, "status": REVERT_PENDING if pending else REVERT_NOT_NEEDED}
 
 

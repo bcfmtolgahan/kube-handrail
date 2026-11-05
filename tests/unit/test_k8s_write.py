@@ -2076,13 +2076,6 @@ def test_the_verification_ignores_the_kill_switch(aws, monkeypatch):
     assert verify(plan.plan_id)["data"]["outcome"] == "healthy"
 
 
-def test_revert_on_failure_is_refused_on_apply(verify_rt):
-    runtime_, _ = verify_rt
-    plan = create_verified_plan(runtime_.store, 60)
-    response = apply(plan.plan_id, verify_window_seconds=60, revert_on_failure=True)
-    assert error_code(response) == "invalid_argument"
-
-
 def test_restart_and_rollback_take_a_window_but_never_revert(verify_rt):
     runtime_, _ = verify_rt
     plan = create_restart_plan(runtime_.store)
@@ -2090,3 +2083,356 @@ def test_restart_and_rollback_take_a_window_but_never_revert(verify_rt):
     assert error_code(response) == "invalid_argument"
     assert error_code(apply_rollback(plan.plan_id, revert_on_failure=True)) == "invalid_argument"
     assert item(plan.plan_id)["used"] is False
+
+
+# --- Revert -----------------------------------------------------------------------
+
+
+def create_reverting_plan(store: PlanStore, window: int = 60, **overrides) -> Plan:
+    args = scale_args("sandbox", "web", 3, revert_on_failure=True, verify_window_seconds=window)
+    plan = dataclasses.replace(
+        create_plan(store),
+        plan_id=str(uuid.uuid4()),
+        args=args,
+        args_hash=plan_args_hash(SCALE_DEPLOYMENT, args),
+        verify_window_seconds=window,
+        **overrides,
+    )
+    store.create(plan)
+    return plan
+
+
+def applied_with_revert(runtime_, apps, **overrides) -> Plan:
+    """A plan with revert_on_failure applied at NOW (1 -> 3), degraded when read at NOW + 61."""
+    plan = create_reverting_plan(runtime_.store, **overrides)
+    assert apply(plan.plan_id, verify_window_seconds=60, revert_on_failure=True)["ok"] is True
+    apps.read_namespaced_deployment.reset_mock()
+    apps.patch_namespaced_deployment.reset_mock()
+    apps.read_namespaced_deployment.return_value = live(plan.plan_id, available=1)
+    apps.patch_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(resource_version="20001", generation=6)
+    )
+    at(runtime_, NOW + 61)
+    return plan
+
+
+def test_a_degraded_change_approved_with_revert_is_reverted(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    revert_id = handler.revert_plan_id(plan.plan_id)
+
+    response = verify(plan.plan_id)
+    assert response["data"] == {
+        "plan_id": plan.plan_id,
+        "due": True,
+        "outcome": "degraded",
+        "reason": "target_not_reached",
+        "revert": "reverted",
+    }
+    # One reading for the verdict and the patch: its resourceVersion is the precondition.
+    apps.read_namespaced_deployment.assert_called_once()
+    dry, real = apps.patch_namespaced_deployment.call_args_list
+    assert dry.kwargs == {"dry_run": "All"} and real.args == dry.args
+    assert real.args[2] == {
+        "metadata": {
+            "resourceVersion": "20000",
+            "annotations": {
+                handler.LAST_PLAN_ANNOTATION: revert_id,
+                "kube-handrail.io/correlation-id": "verifier-run-1",
+                handler.REQUESTED_BY_ANNOTATION: "system:revert",
+            },
+        },
+        "spec": {"replicas": 1},
+    }
+    parent = item(plan.plan_id)
+    assert parent["revert"] == {
+        "status": "reverted",
+        "reason": None,
+        "revert_plan_id": revert_id,
+        "at": NOW + 61,
+    }
+    assert "verify_queue" not in parent
+
+    record = Plan.from_item(item(revert_id))
+    assert (record.kind, record.reverts_plan_id, record.status) == (
+        "revert",
+        plan.plan_id,
+        "revert",
+    )
+    assert (record.replicas_from, record.replicas_to, record.generation) == (3, 1, 5)
+    assert (record.used, record.requested_by, record.channel) == (True, "system:revert", "verifier")
+    assert record.args == {"namespace": "sandbox", "name": "web", "replicas": 1}
+    assert not record.revert_on_failure
+    assert (record.result, record.applied_at, record.applied_generation) == ("applied", NOW + 61, 6)
+    assert record.apply_correlation_id == "verifier-run-1"
+    assert (record.verify_at, item(revert_id)["verify_queue"]) == (NOW + 61 + 60, "due")
+    assert record.object_key == plan.object_key
+
+
+def test_a_revert_takes_no_budget_and_skips_the_history_checks(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    # The apply took one unit; a cooldown, an exhausted global budget and any flapping rule
+    # would each refuse a normal apply right now.
+    runtime_.settings = dataclasses.replace(
+        runtime_.settings, global_hourly_apply_budget=1, apply_cooldown_seconds=3600
+    )
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    assert runtime_.store.global_applies(NOW + 61) == 1
+
+
+def test_a_revert_is_not_stopped_by_the_agents_own_switch(identity_rt):
+    runtime_, apps = identity_rt
+    runtime_.settings = load_settings(IDENTITY_ENV | {"VERIFY_ENABLED": "true"}, write=True)
+    plan = dataclasses.replace(
+        create_reverting_plan(runtime_.store),
+        plan_id=str(uuid.uuid4()),
+        requested_by="agent:smoke_test",
+        agent="smoke_test",
+        requested_client_id="client-a",
+    )
+    runtime_.store.create(plan)
+    event = {
+        "plan_id": plan.plan_id,
+        "namespace": "sandbox",
+        "name": "web",
+        "replicas": 3,
+        "verify_window_seconds": 60,
+        "revert_on_failure": True,
+        "_kube_handrail_caller": f"client-a.{caller_signature(CALLER_KEY, 'client-a')}",
+    }
+    apps.patch_namespaced_deployment.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(resource_version="2", generation=5)
+    )
+    assert handler.lambda_handler(event, CONTEXT)["ok"] is True
+    set_agent_switch(runtime_, "smoke_test", "false")
+    apps.read_namespaced_deployment.return_value = live(plan.plan_id, available=1)
+    at(runtime_, NOW + 61)
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    record = item(handler.revert_plan_id(plan.plan_id))
+    assert (record["agent"], record["requested_client_id"]) == ("smoke_test", "client-a")
+    assert runtime_.store.agent_applies("smoke_test", NOW + 61) == 1
+
+
+def test_with_the_kill_switch_off_the_revert_is_skipped_for_good(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    runtime_.kill_switch._ssm.put_parameter(Name=PARAM, Value="false", Overwrite=True)
+
+    assert verify(plan.plan_id)["data"]["revert"] == "skipped"
+    parent = item(plan.plan_id)
+    assert (parent["verification"]["outcome"], parent["revert"]["reason"]) == (
+        "degraded",
+        "remediation_disabled",
+    )
+    assert "verify_queue" not in parent
+    apps.patch_namespaced_deployment.assert_not_called()
+    # Back on: the approved window has passed, so nothing happens any more.
+    runtime_.kill_switch._ssm.put_parameter(Name=PARAM, Value="true", Overwrite=True)
+    assert verify(plan.plan_id)["data"]["revert"] == "skipped"
+    apps.patch_namespaced_deployment.assert_not_called()
+    with pytest.raises(KeyError):
+        item(handler.revert_plan_id(plan.plan_id))
+
+
+def test_an_unreadable_kill_switch_retries_the_revert_until_late(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    switch = runtime_.kill_switch
+    runtime_.kill_switch = KillSwitch(
+        MagicMock(get_parameter=MagicMock(side_effect=OSError)), PARAM
+    )
+
+    assert verify(plan.plan_id)["data"]["revert"] == "pending"
+    parent = item(plan.plan_id)
+    assert parent["verification"]["outcome"] == "degraded"
+    assert "revert" not in parent and parent["verify_queue"] == "due"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+    # Readable again within the grace period: reverted, from a fresh reading.
+    runtime_.kill_switch = switch
+    at(runtime_, NOW + 120)
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    assert apps.read_namespaced_deployment.call_count == 2
+
+
+def test_an_unreadable_kill_switch_past_the_grace_period_skips_the_revert(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    runtime_.kill_switch = KillSwitch(
+        MagicMock(get_parameter=MagicMock(side_effect=OSError)), PARAM
+    )
+    verify(plan.plan_id)
+    at(runtime_, NOW + 60 + 301)
+    assert verify(plan.plan_id)["data"]["revert"] == "skipped"
+    assert item(plan.plan_id)["revert"]["reason"] == "late"
+    assert "verify_queue" not in item(plan.plan_id)
+
+
+def test_a_revert_target_now_out_of_bounds_is_refused(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    runtime_.settings = dataclasses.replace(runtime_.settings, min_replicas=2)
+    assert verify(plan.plan_id)["data"]["revert"] == "refused"
+    assert item(plan.plan_id)["revert"]["reason"] == "out_of_bounds"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_a_deployment_now_managed_by_gitops_is_not_reverted(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    managed = live(plan.plan_id, available=1)
+    managed.metadata.labels = {"app.kubernetes.io/instance": "argo"}
+    apps.read_namespaced_deployment.return_value = managed
+    assert verify(plan.plan_id)["data"]["revert"] == "refused"
+    revert_id = handler.revert_plan_id(plan.plan_id)
+    assert item(plan.plan_id)["revert"] == {
+        "status": "refused",
+        "reason": "gitops_managed",
+        "revert_plan_id": revert_id,
+        "at": NOW + 61,
+    }
+    assert item(revert_id)["result"] == "gitops_managed"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_a_revert_retries_a_conflict_on_a_fresh_reading(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    fresh = live(plan.plan_id, available=1)
+    fresh.metadata.resource_version = "20002"
+    apps.read_namespaced_deployment.side_effect = [live(plan.plan_id, available=1), fresh]
+    apps.patch_namespaced_deployment.side_effect = [conflict(), None, None]
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    versions = patched_versions(apps)
+    assert versions == ["20000", "20002", "20002"]
+
+
+def test_a_spec_change_before_a_retried_revert_is_refused(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    apps.read_namespaced_deployment.side_effect = [
+        live(plan.plan_id, available=1),
+        live(plan.plan_id, generation=6, replicas=2),
+    ]
+    apps.patch_namespaced_deployment.side_effect = [conflict()]
+    assert verify(plan.plan_id)["data"]["revert"] == "refused"
+    assert item(plan.plan_id)["revert"]["reason"] == "conflict"
+
+
+def test_a_revert_whose_patch_landed_before_a_crash_is_not_patched_again(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    runtime_.store.record_once(
+        plan.plan_id, "verification", {"outcome": "degraded", "reason": "target_not_reached"}
+    )
+    revert_id = handler.revert_plan_id(plan.plan_id)
+    runtime_.store.create_revert(handler.revert_record(runtime_, plan, NOW + 61))
+    # The earlier run patched, then stopped before recording anything else.
+    apps.read_namespaced_deployment.return_value = live(revert_id, generation=6, replicas=1)
+    at(runtime_, NOW + 100)
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(revert_id)["result"] == "applied"
+    assert item(revert_id)["created_at"] == NOW + 61
+
+
+def test_a_second_run_after_a_revert_changes_nothing(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    verify(plan.plan_id)
+    apps.patch_namespaced_deployment.reset_mock()
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+@pytest.mark.parametrize("outcome", ["healthy", "unknown"])
+def test_only_a_degraded_change_is_reverted(verify_rt, outcome):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    if outcome == "healthy":
+        apps.read_namespaced_deployment.return_value = live(plan.plan_id)
+    else:
+        apps.read_namespaced_deployment.return_value = live(plan.plan_id, generation=6)
+    response = verify(plan.plan_id)
+    assert (response["data"]["outcome"], response["data"]["revert"]) == (outcome, None)
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_the_revert_is_verified_and_never_reverted(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    verify(plan.plan_id)
+    revert_id = handler.revert_plan_id(plan.plan_id)
+    apps.patch_namespaced_deployment.reset_mock()
+
+    # Even a degraded revert stays as it is.
+    apps.read_namespaced_deployment.return_value = live(
+        revert_id, generation=6, replicas=1, available=0
+    )
+    at(runtime_, NOW + 61 + 61)
+    response = verify(revert_id)
+    assert (response["data"]["outcome"], response["data"]["revert"]) == ("degraded", None)
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert "verify_queue" not in item(revert_id)
+
+
+def test_a_revert_record_is_never_reverted_even_if_it_asks_to(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps, kind="revert")
+    assert verify(plan.plan_id)["data"] == {
+        "plan_id": plan.plan_id,
+        "due": True,
+        "outcome": "degraded",
+        "reason": "target_not_reached",
+        "revert": None,
+    }
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_after_a_revert_the_next_plan_sees_no_manual_change(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    verify(plan.plan_id)
+    revert_id = handler.revert_plan_id(plan.plan_id)
+    after = deployment(
+        generation=6, replicas=1, annotations={handler.LAST_PLAN_ANNOTATION: revert_id}
+    )
+    last = handler.last_applied_plan(runtime_.store, after)
+    assert last is not None and last.plan_id == revert_id
+    assert handler.replica_baseline(runtime_.store, runtime_.settings, last, NOW + 200) == 1
+
+
+def test_replanning_the_reverted_change_is_cooldown_then_flapping(verify_rt):
+    """A revert counts as an applied change: the same change right after it reverses the
+    direction a second time."""
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    verify(plan.plan_id)
+    revert = handler.last_applied_plan(
+        runtime_.store,
+        deployment(
+            generation=6,
+            replicas=1,
+            annotations={handler.LAST_PLAN_ANNOTATION: handler.revert_plan_id(plan.plan_id)},
+        ),
+    )
+
+    def history(now: int) -> None:
+        handler.check_history(
+            runtime_.store,
+            plan.object_key,
+            now,
+            runtime_.settings,
+            1,
+            3,
+            plan_rate=False,
+            last_applied=revert,
+        )
+
+    with pytest.raises(GuardError) as exc:
+        history(NOW + 90)
+    assert exc.value.code == "cooldown"
+    with pytest.raises(GuardError) as exc:
+        history(NOW + 61 + 61)
+    assert exc.value.code == "flapping"

@@ -267,6 +267,8 @@ def with_revert(**overrides) -> Plan:
         (scheduled(args=scale_args("sandbox", "web", 2)), DEGRADED, "not_requested"),
         (with_revert(kind=KIND_REVERT), DEGRADED, "not_requested"),
         (with_revert(), PENDING, "pending"),
+        (with_revert(used=False), NOT_APPLIED, "pending"),
+        (with_revert(), NOT_APPLIED, "not_needed"),
         (with_revert(), DEGRADED, "pending"),
         (with_revert(), HEALTHY, "not_needed"),
         (with_revert(), UNKNOWN, "not_needed"),

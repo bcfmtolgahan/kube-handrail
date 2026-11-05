@@ -2060,7 +2060,7 @@ def test_plan_without_verification_has_no_verification_block(clients, table):
         {"verify_window_seconds": 59},
         {"verify_window_seconds": 1801},
         {"verify_window_seconds": "60"},
-        {"revert_on_failure": True, "verify_window_seconds": 60},
+        {"revert_on_failure": True},
         {"revert_on_failure": "yes"},
     ],
 )
@@ -2179,3 +2179,69 @@ def test_plan_outcome_errors(clients):
     with pytest.raises(GuardError) as exc:
         outcome(clients, "not-a-plan")
     assert exc.value.code == "invalid_argument"
+
+
+def test_plan_with_revert_shows_the_revert_target_and_its_check(clients, table):
+    data = verified_plan(clients, verify_window_seconds=60, revert_on_failure=True)["data"]
+    assert data["verification"] == {"window_seconds": 60, "revert_on_failure": True, "revert_to": 2}
+    checks = [check["check"] for check in data["preflight"]]
+    assert checks[checks.index("blast_radius") + 1] == "revert_target_in_bounds"
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["args"]["revert_on_failure"] is True
+    assert item["args_hash"] == scale_args_hash(
+        "sandbox", "web", 3, revert_on_failure=True, verify_window_seconds=60
+    )
+    # The fixture has 1 of 2 pods available.
+    assert [w["code"] for w in data["impact"]["warnings"]] == ["revert_baseline_unhealthy"]
+    assert "revert_target_in_bounds" not in [
+        c["check"] for c in verified_plan(clients)["data"]["preflight"]
+    ]
+
+
+def test_plan_with_revert_on_a_healthy_deployment_has_no_warning(clients):
+    clients.apps.read_namespaced_deployment.return_value.status.available_replicas = 2
+    data = verified_plan(clients, verify_window_seconds=60, revert_on_failure=True)["data"]
+    assert data["impact"]["warnings"] == []
+
+
+def test_plan_with_revert_needs_a_revert_target_within_bounds(clients, table):
+    settings = dataclasses.replace(VERIFY_SETTINGS, min_replicas=3)
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(
+            {
+                "namespace": "sandbox",
+                "name": "web",
+                "replicas": 3,
+                "verify_window_seconds": 60,
+                "revert_on_failure": True,
+            },
+            settings,
+            clients,
+            NOW,
+        )
+    assert exc.value.code == "out_of_bounds" and "revert target" in exc.value.message
+    assert table.scan()["Count"] == 0
+
+
+def test_plan_with_revert_needs_verification_on_the_server(clients):
+    assert plan_error(clients, verify_window_seconds=60, revert_on_failure=True) == (
+        "invalid_argument"
+    )
+
+
+def test_plan_outcome_of_a_reverted_change_and_its_revert(clients):
+    plan_id = verified_plan(clients, verify_window_seconds=60, revert_on_failure=True)["data"][
+        "plan_id"
+    ]
+    record = clients.store.get(plan_id)
+    clients.store.consume(plan_id, record["args_hash"], "scale_deployment", NOW, verify_window=120)
+    clients.store.record_once(plan_id, "verification", {"outcome": "degraded", "reason": "x"})
+    assert outcome(clients, plan_id)["data"]["revert"] == {"requested": True, "status": "pending"}
+    revert = {"status": "reverted", "reason": None, "revert_plan_id": "r", "at": NOW + 61}
+    clients.store.record_once(plan_id, "revert", revert)
+    assert outcome(clients, plan_id)["data"]["revert"] == {
+        "requested": True,
+        "status": "reverted",
+        "reason": None,
+        "revert_plan_id": "r",
+    }

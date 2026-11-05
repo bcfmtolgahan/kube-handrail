@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -67,6 +68,8 @@ KIND_REVERT = "revert"
 # Requesters of records the server makes itself. They are never approved by anyone.
 SYSTEM_REQUESTER_PREFIX = "system:"
 REQUESTER_REVERT = "system:revert"
+# A revert record's id is derived from the plan it reverts, so a plan has at most one.
+REVERT_ID_NAMESPACE = uuid.UUID("5c1e7a0e-8f0b-4c49-9d43-2a6f3b1e9d70")
 # Reported in approval_required details; never stored.
 APPROVAL_EXPIRED = "approval_expired"
 APPROVAL_INVALID = "approval_invalid"
@@ -182,6 +185,10 @@ def restart_template(template: Mapping[str, Any], plan_id: str) -> dict[str, Any
     metadata = restarted.setdefault("metadata", {})
     metadata["annotations"] = {**(metadata.get("annotations") or {}), RESTART_ANNOTATION: plan_id}
     return restarted
+
+
+def revert_plan_id(plan_id: str) -> str:
+    return str(uuid.uuid5(REVERT_ID_NAMESPACE, f"revert:{plan_id}"))
 
 
 def object_key(namespace: str, name: str, uid: str) -> str:
@@ -779,6 +786,26 @@ class PlanStore:
                 raise
             return _plain((self.get(plan_id) or {}).get(attribute)) or {}
         return dict(value)
+
+    def create_revert(self, plan: Plan) -> None:
+        """Create a revert record, scheduled for its own verification, unless it exists: an
+        earlier run may have created it and stopped before or after its patch. An update with
+        a condition, so the write role needs no PutItem."""
+        item = {**plan.to_item(), "verify_queue": VERIFY_DUE}
+        del item["plan_id"]
+        names = {f"#a{i}": key for i, key in enumerate(item)}
+        values = {f":v{i}": value for i, value in enumerate(item.values())}
+        try:
+            self._table.update_item(
+                Key={"plan_id": plan.plan_id},
+                UpdateExpression="SET " + ", ".join(f"#a{i} = :v{i}" for i in range(len(item))),
+                ConditionExpression="attribute_not_exists(plan_id)",
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+        except ClientError as exc:
+            if not _is_conditional_failure(exc):
+                raise
 
     def finish_verification(self, plan_id: str) -> None:
         """Take the plan out of the verify-due index: its verification is final."""

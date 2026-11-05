@@ -3,8 +3,8 @@ revert). Not a gateway target.
 
 A scheduled sweeper outside the VPC, like the sentinel. Each run reads the plans whose
 verify_at has passed from the verify-due index and invokes the write Lambda's internal
-handler for each, on the verifier channel; the write Lambda reads the Deployment and records
-the outcome. The verifier writes nothing itself, so a failed invoke leaves the plan due for
+handler for each, on the verifier channel; the write Lambda reads the Deployment, records
+the outcome and, for a degraded change approved with revert_on_failure, reverts it. The verifier writes nothing itself, so a failed invoke leaves the plan due for
 the next run.
 """
 

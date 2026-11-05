@@ -2,8 +2,9 @@
 #
 # An apply schedules its verification in the same write that consumes the plan. A scheduled
 # Lambda outside the VPC reads the plans that are due from the verify-due index and runs
-# each verification through the write Lambda's internal handler, which the gateway cannot
-# reach. The verifier itself has no access to the cluster or the kill switch.
+# each verification, and the revert of a degraded change approved with revert_on_failure,
+# through the write Lambda's internal handler, which the gateway cannot reach. The verifier
+# itself has no access to the cluster or the kill switch.
 
 locals {
   verify_count  = var.verify_enabled ? 1 : 0
@@ -157,6 +158,23 @@ resource "aws_cloudwatch_metric_alarm" "verifier_invoke_errors" {
   alarm_description   = "A verification could not run through the write Lambda; find the run in the verifier's log. The plan stays due and is retried every minute until its grace period ends."
   namespace           = local.verifier_metric_namespace
   metric_name         = "InvokeErrors"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts[0].arn]
+}
+
+# A human hears about every automatic revert, whatever the agent reports.
+resource "aws_cloudwatch_metric_alarm" "verifier_reverts" {
+  count = local.verifier_alarm_count
+
+  alarm_name          = "${local.verifier_name}-reverts"
+  alarm_description   = "kube-handrail reverted a degraded change that was approved with revert_on_failure. Find the plan in the verifier's log (results) and read it with get_plan_outcome."
+  namespace           = local.verifier_metric_namespace
+  metric_name         = "Reverts"
   statistic           = "Sum"
   period              = 300
   evaluation_periods  = 1

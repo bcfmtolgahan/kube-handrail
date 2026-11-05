@@ -21,6 +21,7 @@ from handrail_common.breaker import (
     last_applied_plan,
     last_plan_id,
     replica_baseline,
+    retention_seconds,
 )
 from handrail_common.config import ConfigError, Settings, load_settings
 from handrail_common.dispatch import dispatch
@@ -31,6 +32,7 @@ from handrail_common.envelope import (
     INTERNAL,
     KUBERNETES_ERROR,
     NOT_FOUND,
+    OUT_OF_BOUNDS,
     PLAN_EXPIRED,
     PLAN_MISMATCH,
     REMEDIATION_DISABLED,
@@ -41,20 +43,25 @@ from handrail_common.envelope import (
 from handrail_common.gitops import is_gitops_managed
 from handrail_common.killswitch import KillSwitch
 from handrail_common.observability import (
+    CHANNEL_VERIFIER,
     CORRELATION_ANNOTATION,
     current_channel,
     current_correlation_id,
 )
 from handrail_common.plans import (
+    KIND_REVERT,
+    REQUESTER_REVERT,
     RESTART_ANNOTATION,
     RESTART_DEPLOYMENT,
     RESULT_APPLIED,
     ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
+    STATUS_REVERT,
     Plan,
     PlanStore,
     plan_args_hash,
     restart_args,
+    revert_plan_id,
     rollback_args,
     scale_args,
     template_hash,
@@ -442,7 +449,7 @@ def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, s
         args, settings.allowed_namespaces, settings.bounds_for
     )
     override = require_override_flag(args)
-    window, revert = _verify_request(args, settings)
+    window, revert = _verify_request(args, settings, revert_allowed=True)
     return namespace, name, scale_args(namespace, name, replicas, override, revert, window)
 
 
@@ -658,34 +665,146 @@ def _verdict(outcome: str, reason: str | None, now: int, deployment: Any = None)
     }
 
 
-def _check(rt: Runtime, plan: Plan, now: int) -> dict[str, Any]:
-    """One reading of the Deployment, evaluated. A plan that was consumed but whose apply
-    did not patch is not_applied; past the grace period nothing is read (late)."""
+def _check(rt: Runtime, plan: Plan, now: int) -> tuple[dict[str, Any], Any]:
+    """One reading of the Deployment, evaluated; returns the verdict and the Deployment it
+    read, if any. A plan that was consumed but whose apply did not patch is not_applied; past
+    the grace period nothing is read (late)."""
     if not plan.used:
-        return _verdict(verify.NOT_APPLIED, None, now)
-    if now > (plan.verify_at or 0) + rt.settings.verify_grace_seconds:
+        return _verdict(verify.NOT_APPLIED, None, now), None
+    if _late(rt, plan, now):
         # A verdict long after the approved window is not what was approved.
-        return _verdict(verify.UNKNOWN, verify.LATE, now)
+        return _verdict(verify.UNKNOWN, verify.LATE, now), None
     try:
         deployment = rt.apps().read_namespaced_deployment(plan.name, plan.namespace)
     except ApiException as exc:
         logger.error("Kubernetes API error: status=%s reason=%s", exc.status, exc.reason)
-        return _verdict(
-            verify.UNKNOWN, verify.NOT_FOUND if exc.status == 404 else verify.KUBERNETES_ERROR, now
-        )
+        reason = verify.NOT_FOUND if exc.status == 404 else verify.KUBERNETES_ERROR
+        return _verdict(verify.UNKNOWN, reason, now), None
     failed = plan.result is not None and plan.result != RESULT_APPLIED
     if failed and last_plan_id(deployment) != plan.plan_id:
         # The apply was refused before its patch (only a successful patch sets the annotation).
-        return _verdict(verify.NOT_APPLIED, None, now)
+        return _verdict(verify.NOT_APPLIED, None, now), None
     outcome, reason = verify.evaluate(plan, deployment)
-    return _verdict(outcome, reason, now, deployment)
+    return _verdict(outcome, reason, now, deployment), deployment
+
+
+def _late(rt: Runtime, plan: Plan, now: int) -> bool:
+    return now > (plan.verify_at or 0) + rt.settings.verify_grace_seconds
+
+
+def _revert_state(
+    status: str, reason: str | None, now: int, revert_id: str | None = None
+) -> dict[str, Any]:
+    return {"status": status, "reason": reason, "revert_plan_id": revert_id, "at": now}
+
+
+def revert_record(rt: Runtime, plan: Plan, now: int) -> Plan:
+    """The record of the revert of `plan`: a full plan record that restores replicas_from,
+    so history, the manual-change check and the next plan see it as the last apply. It can
+    never be requested, approved or applied (used, status revert, a system requester), and
+    it is verified one window later but never reverted (no revert_on_failure)."""
+    args = scale_args(plan.namespace, plan.name, plan.replicas_from)
+    window = plan.verify_window_seconds or rt.settings.verify_window_default_seconds
+    return Plan(
+        plan_id=revert_plan_id(plan.plan_id),
+        action=SCALE_DEPLOYMENT,
+        namespace=plan.namespace,
+        name=plan.name,
+        replicas_from=plan.replicas_to,
+        replicas_to=plan.replicas_from,
+        args_hash=plan_args_hash(SCALE_DEPLOYMENT, args),
+        args=args,
+        resource_version=plan.resource_version,
+        # The spec the revert expects to find: the one the parent's apply left.
+        generation=plan.generation + 1,
+        uid=plan.uid,
+        created_at=now,
+        expires_at=now,
+        retain_until=now + retention_seconds(rt.settings),
+        used=True,
+        requested_by=REQUESTER_REVERT,
+        status=STATUS_REVERT,
+        agent=plan.agent,
+        requested_client_id=plan.requested_client_id,
+        channel=CHANNEL_VERIFIER,
+        plan_correlation_id=current_correlation_id(),
+        template_from=plan.template_to,
+        template_to=plan.template_to,
+        verify_window_seconds=window,
+        verify_at=now + window,
+        kind=KIND_REVERT,
+        reverts_plan_id=plan.plan_id,
+    )
+
+
+def _patch_revert(
+    apps: k8s.AppsV1Api, plan: Plan, revert: Plan, deployment: Any, correlation_id: str | None
+) -> Any:
+    """Patch replicas back to the parent's replicas_from, only on the spec the parent's
+    apply left: same uid, still annotated with the parent, generation + 1, replicas_to (the
+    revert record's own generation and replicas_from), and not GitOps-managed, with the
+    resourceVersion of that same reading. A Deployment already annotated with the revert
+    was patched by an earlier run that stopped before recording it."""
+    for attempt in range(1, PATCH_ATTEMPTS + 1):
+        if deployment is None or attempt > 1:
+            deployment = _read(apps, plan.namespace, plan.name)
+        if last_plan_id(deployment) == revert.plan_id:
+            return deployment
+        if last_plan_id(deployment) != plan.plan_id:
+            raise GuardError(CONFLICT, "Deployment changed since the apply it would revert")
+        check_target(revert, deployment)
+        body = scale_patch(
+            revert.replicas_to,
+            deployment.metadata.resource_version,
+            revert.plan_id,
+            correlation_id,
+            revert.requested_by,
+        )
+        try:
+            apps.patch_namespaced_deployment(plan.name, plan.namespace, body, dry_run="All")
+            return apps.patch_namespaced_deployment(plan.name, plan.namespace, body)
+        except ApiException as exc:
+            if exc.status == 409 and attempt < PATCH_ATTEMPTS:
+                continue
+            raise _api_error(exc) from None
+    raise AssertionError("unreachable")
+
+
+def _revert(rt: Runtime, plan: Plan, now: int, deployment: Any) -> dict[str, Any] | None:
+    """Undo a degraded change that was approved with revert_on_failure. Only the global kill
+    switch, the replica bounds, GitOps ownership and the spec precondition can stop it; it
+    takes no budget unit and runs no history check (mcp/CONTRACT.md, Verification and
+    revert). Returns the final revert state, or None to try again on the next run."""
+    switch = rt.kill_switch.state()
+    if switch is None:
+        # Unreadable: a transient error must not cancel a pre-approved revert for good.
+        return (
+            _revert_state(verify.REVERT_SKIPPED, verify.LATE, now) if _late(rt, plan, now) else None
+        )
+    if not switch:
+        # Final: by the time the switch is back on, the approved window has long passed.
+        return _revert_state(verify.REVERT_SKIPPED, REMEDIATION_DISABLED, now)
+    minimum, maximum = rt.settings.bounds_for(plan.namespace)
+    if not minimum <= plan.replicas_from <= maximum:
+        return _revert_state(verify.REVERT_REFUSED, OUT_OF_BOUNDS, now)
+    revert = revert_record(rt, plan, now)
+    rt.store.create_revert(revert)
+    correlation_id = current_correlation_id()
+    try:
+        updated = _patch_revert(rt.apps(), plan, revert, deployment, correlation_id)
+    except GuardError as exc:
+        _record(rt, revert.plan_id, exc.code, correlation_id)
+        return _revert_state(verify.REVERT_REFUSED, exc.code, now, revert.plan_id)
+    _record(rt, revert.plan_id, RESULT_APPLIED, correlation_id, _generation(updated))
+    return _revert_state(verify.REVERTED, None, now, revert.plan_id)
 
 
 def verify_applied_plan(args: Mapping[str, Any]) -> Envelope:
-    """Verify one plan whose verify_at has passed (mcp/CONTRACT.md, Verification and
-    revert). Only the verifier channel reaches it. Every write is conditional, so a run that
-    repeats an earlier one, or overlaps it, changes nothing; the plan leaves the verify-due
-    index only once its verification is final."""
+    """Verify one plan whose verify_at has passed, and revert it if it is degraded and was
+    approved with revert_on_failure (mcp/CONTRACT.md, Verification and revert). Only the
+    verifier channel reaches it. Every write is conditional, so a run that repeats an
+    earlier one, or overlaps it, changes nothing; the plan leaves the verify-due index only
+    once its verification and revert are final."""
     rt = get_runtime()
     plan_id = require_plan_id(args.get("plan_id"))
     now = int(rt.clock())
@@ -693,19 +812,29 @@ def verify_applied_plan(args: Mapping[str, Any]) -> Envelope:
     plan = Plan.from_item(item) if item is not None else None
     if plan is None or plan.verify_at is None or plan.verify_at > now:
         return ok({"plan_id": plan_id, "due": False})
-    verification = plan.verification
+    verification, deployment = plan.verification, None
     if verification is None:
-        verification = rt.store.record_once(plan_id, "verification", _check(rt, plan, now))
+        verdict, deployment = _check(rt, plan, now)
+        verification = rt.store.record_once(plan_id, "verification", verdict)
+    revert = plan.revert
+    wanted = plan.revert_on_failure and plan.kind != KIND_REVERT
+    if revert is None and wanted and verification.get("outcome") == verify.DEGRADED:
+        state = _revert(rt, plan, now, deployment)
+        if state is None:
+            return ok(_verified(plan_id, verification, verify.REVERT_PENDING))
+        revert = rt.store.record_once(plan_id, "revert", state)
     rt.store.finish_verification(plan_id)
-    return ok(
-        {
-            "plan_id": plan_id,
-            "due": True,
-            "outcome": verification.get("outcome"),
-            "reason": verification.get("reason"),
-            "revert": None,
-        }
-    )
+    return ok(_verified(plan_id, verification, (revert or {}).get("status")))
+
+
+def _verified(plan_id: str, verification: Mapping[str, Any], revert: str | None) -> dict:
+    return {
+        "plan_id": plan_id,
+        "due": True,
+        "outcome": verification.get("outcome"),
+        "reason": verification.get("reason"),
+        "revert": revert,
+    }
 
 
 HANDLERS = {

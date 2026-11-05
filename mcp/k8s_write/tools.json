@@ -10,6 +10,7 @@
         "name": { "type": "string", "description": "Deployment name." },
         "replicas": { "type": "integer", "description": "Desired replica count; must equal the planned value." },
         "override_manual_change": { "type": "boolean", "description": "Must equal the value given to plan_scale_deployment (default false)." },
+        "revert_on_failure": { "type": "boolean", "description": "Must equal the value given to plan_scale_deployment (default false)." },
         "verify_window_seconds": { "type": "integer", "description": "Must equal the value given to plan_scale_deployment (omit it if the plan did)." }
       },
       "required": ["plan_id", "namespace", "name", "replicas"]
