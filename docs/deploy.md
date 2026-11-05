@@ -2,7 +2,7 @@
 
 What a deployment needs from the account, the cluster and the network, and the order of the steps. The commands for each step, and what the tests check, are in [Milestone 0](milestone-0.md). The runtime calls and IAM permissions are in the [contract](../mcp/CONTRACT.md#network).
 
-Status: implemented and checked with `terraform validate`. A fresh deployment, and one against a private-endpoint cluster, have not been run yet.
+Status: implemented. The VPC placement (`lambda_subnet_ids` with a NAT gateway and `allow_lambda_to_cluster_endpoint`) is tested against the private endpoint of a test cluster that also has public access, including moving the Lambdas into and out of the VPC. `create_vpc_endpoints`, a private-only cluster and a fresh account have not been run.
 
 ## Prerequisites
 
@@ -59,7 +59,7 @@ With `lambda_subnet_ids` set:
 
 If any of these is missing, a tool call does not return an error envelope: the Lambda waits on the connection until its 30-second timeout and the call fails. Check the Lambda's log group for a timeout.
 
-On `terraform destroy`, Lambda releases the network interfaces of VPC functions only some time after the functions are deleted, and needs the role's permissions to do so. Terraform therefore removes the role policies only after the `<prefix>-lambda` security group, and before deleting that group the AWS provider deletes the network interfaces Lambda left behind, with the operator's credentials. Deleting the group can wait many minutes. With your own `lambda_security_group_ids`, or when one apply moves the Lambdas out of a VPC, the role permissions can go first; Lambda then cannot delete the interfaces, and they remain until you delete them. If deleting the group fails on a dependency violation, find the network interfaces that still use the group, delete them, and run `destroy` again.
+On `terraform destroy`, Lambda releases the network interfaces of VPC functions only some time after the functions are deleted, and needs the role's permissions to do so. The network interface permissions are therefore a separate role policy (`vpc-network-interfaces`) that Terraform removes only after the `<prefix>-lambda` security group, and before deleting that group the AWS provider deletes the network interfaces Lambda left behind, with the operator's credentials. Deleting the group can wait many minutes. When one apply moves the Lambdas out of a VPC, the functions are updated first, then the group and that policy are deleted (the group is `create_before_destroy` for this). With your own `lambda_security_group_ids`, the policy can go before Lambda has released the interfaces; Lambda then cannot delete the interfaces, and they remain until you delete them. If deleting the group fails on a dependency violation, find the network interfaces that still use the group, delete them, and run `destroy` again.
 
 ## Order of steps
 
