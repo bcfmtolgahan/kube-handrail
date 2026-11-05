@@ -4,7 +4,7 @@
 - Date: 2026-11-05
 - Amends: [ADR 0002](0002-server-verified-approval.md)
 
-Implemented in [Milestone 2](../roadmap.md#milestone-2-verified-changes-more-actions-accountable-agents) (item 3), not yet tested on a cluster; see [Agent identity](../../mcp/CONTRACT.md#agent-identity) for the exact rules.
+Implemented in [Milestone 2](../roadmap.md#milestone-2-verified-changes-more-actions-accountable-agents) (item 3) and tested on a test cluster; see [Agent identity](../../mcp/CONTRACT.md#agent-identity) for the exact rules.
 
 ## Context
 
