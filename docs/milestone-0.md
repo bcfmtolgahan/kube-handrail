@@ -36,7 +36,7 @@ kubectl -n kube-handrail-sandbox rollout status deployment/web
 This creates:
 
 - `namespace.yaml`: the `kube-handrail-sandbox` namespace (Pod Security `restricted`).
-- `rbac.yaml`: Roles and RoleBindings for the groups `kube-handrail-reader` (get/list Deployments and HPAs; list only on PodDisruptionBudgets, Services and EndpointSlices for the impact preview, and on ReplicaSets and Events for `get_workload_events`; no Pods) and `kube-handrail-writer` (get/patch Deployments). The groups are mapped to the Lambda roles by the EKS access entries created in step 2; nothing outside this namespace is granted.
+- `rbac.yaml`: Roles and RoleBindings for the groups `kube-handrail-reader` (get/list Deployments and HPAs; list only on PodDisruptionBudgets, Services and EndpointSlices for the impact preview, on ReplicaSets for `get_workload_events` and the rollout history and rollback plan, and on Events for `get_workload_events`; no Pods) and `kube-handrail-writer` (get/patch Deployments; get on ReplicaSets, for the rollback apply). The groups are mapped to the Lambda roles by the EKS access entries created in step 2; nothing outside this namespace is granted.
 - `web-deployment.yaml`: an unprivileged nginx with 1 replica. Check the image tag against the registry before use, and consider pinning it by digest.
 
 The Deployment deliberately has no `app.kubernetes.io/instance` label, no Argo CD tracking annotation and no HorizontalPodAutoscaler. Any of these makes the plan step refuse it (`gitops_managed`, or the HPA check).
