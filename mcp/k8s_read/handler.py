@@ -5,6 +5,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from functools import cache, partial
 from typing import Any
@@ -46,7 +47,9 @@ from handrail_common.plans import (
     PlanStore,
     global_budget_error,
     object_key,
-    scale_args_hash,
+    plan_args_hash,
+    scale_args,
+    template_hash,
 )
 from handrail_common.untrusted import fit_list, untrusted_text
 from handrail_common.validation import (
@@ -89,6 +92,27 @@ def _read_deployment(apps: k8s.AppsV1Api, namespace: str, name: str) -> Any:
         return apps.read_namespaced_deployment(name=name, namespace=namespace)
     except ApiException as exc:
         raise _kubernetes_error(exc, f"deployment {namespace}/{name}") from None
+
+
+@cache
+def _models() -> k8s.ApiClient:
+    # Only deserializes; never sends a request.
+    return k8s.ApiClient()
+
+
+def _read_deployment_raw(
+    apps: k8s.AppsV1Api, namespace: str, name: str
+) -> tuple[Any, dict[str, Any]]:
+    """The Deployment as a client model and as the raw JSON the API server returned, from
+    one read. Hashes are taken over the raw JSON: the models drop fields the client does not
+    know."""
+    try:
+        response = apps.read_namespaced_deployment(
+            name=name, namespace=namespace, _preload_content=False
+        )
+    except ApiException as exc:
+        raise _kubernetes_error(exc, f"deployment {namespace}/{name}") from None
+    return _models().deserialize(response, "V1Deployment"), json.loads(response.data)
 
 
 def _targeting_hpas(autoscaling: k8s.AutoscalingV2Api, namespace: str, name: str) -> list[str]:
@@ -410,58 +434,62 @@ def get_workload_events(args: dict[str, Any], settings: Settings, clients: Clien
     return ok(data, truncated=dropped or field_cut)
 
 
-def plan_scale_deployment(
-    args: dict[str, Any], settings: Settings, clients: Clients, now: int
+@dataclass(frozen=True)
+class PlanAction:
+    """What one action adds to the generic plan path (_plan)."""
+
+    # The plan record's `action`.
+    name: str
+    # Argument checks 1-3: (namespace, name, args), where args is the argument payload the
+    # plan stores and args_hash covers: the apply arguments without plan_id, optional ones
+    # only when given.
+    validate: Callable[[Mapping[str, Any], Settings], tuple[str, str, dict[str, Any]]]
+    # The resulting replica count.
+    replicas_to: Callable[[Mapping[str, Any]], int]
+    # Checks on the live Deployment after the GitOps check (scale: HPA and blast radius).
+    checks: Callable[[Clients, Settings, Any, int, Mapping[str, Any]], None]
+    # History checks; returns whether the manual-change override was used.
+    breaker: Callable[[Clients, Settings, Any, int, Mapping[str, Any], int], bool]
+    # Names of the checks reported in preflight, in order.
+    preflight: tuple[str, ...]
+    diff: Callable[[Plan], dict[str, Any]]
+
+
+def _plan(
+    action: PlanAction, args: Mapping[str, Any], settings: Settings, clients: Clients, now: int
 ) -> Envelope:
-    namespace, name, replicas = validate_scale_args(
-        args, settings.allowed_namespaces, settings.min_replicas, settings.max_replicas
-    )
-    override = require_override_flag(args)
-    deployment = _read_deployment(clients.apps, namespace, name)
+    namespace, name, request = action.validate(args, settings)
+    override = request.get("override_manual_change", False) is True
+    deployment, raw = _read_deployment_raw(clients.apps, namespace, name)
     if is_gitops_managed(deployment):
         raise GuardError(GITOPS_MANAGED, "deployment is managed by GitOps; change it in Git")
-    hpas = _targeting_hpas(clients.autoscaling, namespace, name)
-    if hpas:
-        raise GuardError(
-            CONFLICT, f"HorizontalPodAutoscaler {', '.join(sorted(hpas))} targets this deployment"
-        )
-
     current = _desired_replicas(deployment)
-    check_replica_step(current, replicas, settings.max_replica_step_percent)
-    uid = str(deployment.metadata.uid)
+    action.checks(clients, settings, deployment, current, request)
     # History checks give early feedback; apply runs all but the plan rate limit again.
-    last_applied = last_applied_plan(clients.store, deployment)
-    overridden = check_manual_change(last_applied, current, override)
-    check_history(
-        clients.store,
-        object_key(namespace, name, uid),
-        now,
-        settings,
-        current,
-        replicas,
-        plan_rate=True,
-        last_applied=last_applied,
-    )
+    overridden = action.breaker(clients, settings, deployment, current, request, now)
     # Read only here; apply takes a unit of the budget atomically.
     if clients.store.global_applies(now) >= settings.global_hourly_apply_budget:
         raise global_budget_error(
             now - now % GLOBAL_BUDGET_WINDOW_SECONDS, settings.global_hourly_apply_budget
         )
+    replicas_to = action.replicas_to(request)
     # Last, after every check has passed, and before the plan is stored.
-    impact = _impact(clients, namespace, deployment, current, replicas)
+    impact = _impact(clients, namespace, deployment, current, replicas_to)
     correlation_id = current_correlation_id()
+    # No action changes the pod template yet, so the template it leaves is the current one.
+    template = template_hash((raw.get("spec") or {}).get("template") or {})
 
     plan = Plan(
         plan_id=str(uuid.uuid4()),
-        action=SCALE_DEPLOYMENT,
+        action=action.name,
         namespace=namespace,
         name=name,
         replicas_from=current,
-        replicas_to=replicas,
-        args_hash=scale_args_hash(namespace, name, replicas, override),
+        replicas_to=replicas_to,
+        args_hash=plan_args_hash(action.name, request),
         resource_version=str(deployment.metadata.resource_version),
         generation=int(deployment.metadata.generation),
-        uid=uid,
+        uid=str(deployment.metadata.uid),
         created_at=now,
         expires_at=now + settings.plan_ttl_seconds,
         retain_until=now + retention_seconds(settings),
@@ -470,9 +498,84 @@ def plan_scale_deployment(
         override_manual_change=override,
         impact=impact,
         plan_correlation_id=correlation_id,
+        args=request,
+        template_from=template,
+        template_to=template,
     )
     clients.store.create(plan)
-    checks = (
+    preflight: list[dict[str, Any]] = [
+        {"check": check, "passed": True} for check in action.preflight
+    ]
+    if overridden:
+        preflight[action.preflight.index("no_manual_change")]["overridden"] = True
+    return ok(
+        {
+            "plan_id": plan.plan_id,
+            "diff": action.diff(plan),
+            "override_manual_change": override,
+            "preflight": preflight,
+            "impact": impact,
+            "expires_at": plan.expires_at,
+            "correlation_id": correlation_id,
+        },
+        truncated=impact["truncated"],
+    )
+
+
+# --- scale_deployment ---------------------------------------------------------
+
+
+def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, str, dict[str, Any]]:
+    namespace, name, replicas = validate_scale_args(
+        args, settings.allowed_namespaces, settings.bounds_for
+    )
+    override = require_override_flag(args)
+    return namespace, name, scale_args(namespace, name, replicas, override)
+
+
+def _check_scale(
+    clients: Clients, settings: Settings, deployment: Any, current: int, args: Mapping[str, Any]
+) -> None:
+    hpas = _targeting_hpas(clients.autoscaling, args["namespace"], args["name"])
+    if hpas:
+        raise GuardError(
+            CONFLICT, f"HorizontalPodAutoscaler {', '.join(sorted(hpas))} targets this deployment"
+        )
+    check_replica_step(current, args["replicas"], settings.max_replica_step_percent)
+
+
+def _scale_breaker(
+    clients: Clients,
+    settings: Settings,
+    deployment: Any,
+    current: int,
+    args: Mapping[str, Any],
+    now: int,
+) -> bool:
+    last_applied = last_applied_plan(clients.store, deployment)
+    overridden = check_manual_change(
+        last_applied, current, args.get("override_manual_change", False) is True
+    )
+    check_history(
+        clients.store,
+        object_key(args["namespace"], args["name"], str(deployment.metadata.uid)),
+        now,
+        settings,
+        current,
+        args["replicas"],
+        plan_rate=True,
+        last_applied=last_applied,
+    )
+    return overridden
+
+
+SCALE = PlanAction(
+    name=SCALE_DEPLOYMENT,
+    validate=_validate_scale,
+    replicas_to=lambda args: args["replicas"],
+    checks=_check_scale,
+    breaker=_scale_breaker,
+    preflight=(
         "arguments",
         "namespace_allowed",
         "replica_bounds",
@@ -485,22 +588,15 @@ def plan_scale_deployment(
         "object_budget",
         "plan_rate",
         "global_budget",
-    )
-    preflight: list[dict[str, Any]] = [{"check": check, "passed": True} for check in checks]
-    if overridden:
-        preflight[checks.index("no_manual_change")]["overridden"] = True
-    return ok(
-        {
-            "plan_id": plan.plan_id,
-            "diff": {"replicas": {"from": plan.replicas_from, "to": plan.replicas_to}},
-            "override_manual_change": override,
-            "preflight": preflight,
-            "impact": impact,
-            "expires_at": plan.expires_at,
-            "correlation_id": correlation_id,
-        },
-        truncated=impact["truncated"],
-    )
+    ),
+    diff=lambda plan: {"replicas": {"from": plan.replicas_from, "to": plan.replicas_to}},
+)
+
+
+def plan_scale_deployment(
+    args: dict[str, Any], settings: Settings, clients: Clients, now: int
+) -> Envelope:
+    return _plan(SCALE, args, settings, clients, now)
 
 
 def request_approval(

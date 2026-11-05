@@ -20,6 +20,10 @@ from handrail_common.validation import (
 ALLOWED = {"sandbox"}
 
 
+def bounds_for(_namespace: str) -> tuple[int, int]:
+    return 0, 5
+
+
 @pytest.mark.parametrize("value", ["sandbox", "a", "team-1", "x" * 63])
 def test_namespace_valid(value):
     assert require_namespace(value) == value
@@ -52,12 +56,14 @@ def test_int_rejects_non_integers(value):
 
 def test_scale_args_ok():
     args = {"namespace": "sandbox", "name": "web", "replicas": 3}
-    assert validate_scale_args(args, ALLOWED, 0, 5) == ("sandbox", "web", 3)
+    assert validate_scale_args(args, ALLOWED, bounds_for) == ("sandbox", "web", 3)
 
 
 def test_scale_args_forbidden_namespace():
     with pytest.raises(GuardError) as exc:
-        validate_scale_args({"namespace": "prod", "name": "web", "replicas": 1}, ALLOWED, 0, 5)
+        validate_scale_args(
+            {"namespace": "prod", "name": "web", "replicas": 1}, ALLOWED, bounds_for
+        )
     assert exc.value.code == FORBIDDEN_NAMESPACE
 
 
@@ -65,7 +71,7 @@ def test_scale_args_forbidden_namespace():
 def test_scale_args_out_of_bounds(replicas):
     with pytest.raises(GuardError) as exc:
         validate_scale_args(
-            {"namespace": "sandbox", "name": "web", "replicas": replicas}, ALLOWED, 0, 5
+            {"namespace": "sandbox", "name": "web", "replicas": replicas}, ALLOWED, bounds_for
         )
     assert exc.value.code == OUT_OF_BOUNDS
 
@@ -73,12 +79,12 @@ def test_scale_args_out_of_bounds(replicas):
 @pytest.mark.parametrize("replicas", [0, 5])
 def test_scale_args_bounds_inclusive(replicas):
     args = {"namespace": "sandbox", "name": "web", "replicas": replicas}
-    assert validate_scale_args(args, ALLOWED, 0, 5)[2] == replicas
+    assert validate_scale_args(args, ALLOWED, bounds_for)[2] == replicas
 
 
 def test_invalid_argument_checked_before_allowlist():
     with pytest.raises(GuardError) as exc:
-        validate_scale_args({"namespace": "BAD", "name": "web", "replicas": 1}, ALLOWED, 0, 5)
+        validate_scale_args({"namespace": "BAD", "name": "web", "replicas": 1}, ALLOWED, bounds_for)
     assert exc.value.code == INVALID_ARGUMENT
 
 

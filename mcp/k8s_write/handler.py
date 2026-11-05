@@ -1,4 +1,4 @@
-"""k8s_write Lambda: apply a previously planned Deployment scale change."""
+"""k8s_write Lambda: apply a previously planned Deployment change."""
 
 import logging
 import time
@@ -38,7 +38,8 @@ from handrail_common.plans import (
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
-    scale_args_hash,
+    plan_args_hash,
+    scale_args,
 )
 from handrail_common.validation import (
     GuardError,
@@ -83,6 +84,34 @@ def get_runtime() -> Runtime:
             apps=lambda: k8s.AppsV1Api(api_client(settings.cluster_name)),
         )
     return _runtime
+
+
+def _no_checks(plan: Plan, deployment: Any) -> None:
+    pass
+
+
+@dataclass(frozen=True)
+class Action:
+    """What one action adds to the generic apply path (_apply)."""
+
+    # The plan record's `action`.
+    name: str
+    # Argument checks 1-3: (namespace, name, args), where args is the argument payload the
+    # plan stored: the apply arguments without plan_id, optional ones only when given.
+    validate: Callable[[Mapping[str, Any], Settings], tuple[str, str, dict[str, Any]]]
+    # Whether the record's own fields describe these arguments (besides namespace and name).
+    record_matches: Callable[[Plan, Mapping[str, Any]], bool]
+    # After the consume, before the Deployment is read.
+    check_plan: Callable[[Runtime, Plan], None]
+    # History checks (manual change, cooldown, flapping, object budget); the generic path
+    # takes the global budget unit after them.
+    breaker: Callable[[Runtime, Plan, Any, bool, int], None]
+    # The patch body for the Deployment just read and checked.
+    body: Callable[[Plan, Mapping[str, Any], Any, str | None], Any]
+    # Action-specific fields of the response data.
+    result: Callable[[Plan, Mapping[str, Any]], dict[str, Any]]
+    # Further checks on the live Deployment, after the generic ones, before every attempt.
+    extra_checks: Callable[[Plan, Any], None] = _no_checks
 
 
 def scale_patch(
@@ -156,10 +185,17 @@ def check_spec_unchanged(plan: Plan, deployment: Any) -> None:
         )
 
 
-def check_record_matches(plan: Plan, namespace: str, name: str, replicas: int) -> None:
+def check_record_matches(
+    plan: Plan, action: Action, namespace: str, name: str, args: Mapping[str, Any]
+) -> None:
     """The record must describe the requested change, not only carry its hash: a record
-    altered in the table cannot redirect an apply to another object or count."""
-    if (plan.namespace, plan.name, plan.replicas_to) != (namespace, name, replicas):
+    altered in the table cannot redirect an apply to another object or change."""
+    if (
+        plan.args is None
+        or dict(plan.args) != dict(args)
+        or (plan.namespace, plan.name) != (namespace, name)
+        or not action.record_matches(plan, args)
+    ):
         raise GuardError(PLAN_MISMATCH, "the plan record does not match the arguments")
 
 
@@ -170,44 +206,32 @@ def check_target(plan: Plan, deployment: Any) -> None:
     check_spec_unchanged(plan, deployment)
 
 
-def check_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now: int) -> None:
-    """History checks and the global budget, re-run after the spec check; authoritative over
-    the plan step.
-
-    check_spec_unchanged has confirmed that the current replica count is replicas_from.
-    """
-    last_applied = last_applied_plan(rt.store, deployment)
-    check_manual_change(last_applied, plan.replicas_from, override)
-    check_history(
-        rt.store,
-        plan.object_key,
-        now,
-        rt.settings,
-        plan.replicas_from,
-        plan.replicas_to,
-        plan_rate=False,
-        last_applied=last_applied,
-    )
+def check_breaker(
+    rt: Runtime, action: Action, plan: Plan, deployment: Any, override: bool, now: int
+) -> None:
+    """The action's history checks, then the global budget; re-run after the spec check and
+    authoritative over the plan step."""
+    action.breaker(rt, plan, deployment, override, now)
     # Last, so a request refused by another check does not use up the budget.
     rt.store.take_global_budget(now, rt.settings.global_hourly_apply_budget)
 
 
 def _patch(
     apps: k8s.AppsV1Api,
+    action: Action,
     plan: Plan,
-    replicas: int,
+    args: Mapping[str, Any],
     correlation_id: str | None,
     after_first_check: Callable[[Any], None],
 ) -> Any:
     for attempt in range(1, PATCH_ATTEMPTS + 1):
         deployment = _read(apps, plan.namespace, plan.name)
         check_target(plan, deployment)
+        action.extra_checks(plan, deployment)
         if attempt == 1:
             # A retry only follows a 409 on an unchanged spec, so history is checked once.
             after_first_check(deployment)
-        body = scale_patch(
-            replicas, deployment.metadata.resource_version, plan.plan_id, correlation_id
-        )
+        body = action.body(plan, args, deployment, correlation_id)
         try:
             apps.patch_namespaced_deployment(plan.name, plan.namespace, body, dry_run="All")
             return apps.patch_namespaced_deployment(plan.name, plan.namespace, body)
@@ -226,38 +250,36 @@ def _record(rt: Runtime, plan_id: str, result: str, correlation_id: str | None) 
         logger.exception("cannot record result for plan %s", plan_id)
 
 
-def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
+def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
     rt = get_runtime()
     if not rt.kill_switch.enabled():
         raise GuardError(REMEDIATION_DISABLED, "remediation is disabled")
 
     s = rt.settings
-    namespace, name, replicas = validate_scale_args(
-        args, s.allowed_namespaces, s.min_replicas, s.max_replicas
-    )
-    override = require_override_flag(args)
+    namespace, name, request = action.validate(args, s)
+    override = request.get("override_manual_change", False) is True
     plan_id = require_plan_id(args.get("plan_id"))
 
     now = int(rt.clock())
     correlation_id = current_correlation_id()
     plan = rt.store.consume(
         plan_id,
-        scale_args_hash(namespace, name, replicas, override),
-        SCALE_DEPLOYMENT,
+        plan_args_hash(action.name, request),
+        action.name,
         now,
         require_approval=s.approval_required,
     )
 
     try:
-        check_record_matches(plan, namespace, name, replicas)
-        # Re-checked against the current setting; the plan step is not trusted.
-        check_replica_step(plan.replicas_from, plan.replicas_to, s.max_replica_step_percent)
+        check_record_matches(plan, action, namespace, name, request)
+        action.check_plan(rt, plan)
         updated = _patch(
             rt.apps(),
+            action,
             plan,
-            replicas,
+            request,
             correlation_id,
-            lambda deployment: check_breaker(rt, plan, deployment, override, now),
+            lambda deployment: check_breaker(rt, action, plan, deployment, override, now),
         )
     except GuardError as exc:
         _record(rt, plan_id, exc.code, correlation_id)
@@ -272,14 +294,65 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
             "plan_id": plan_id,
             "namespace": namespace,
             "name": name,
-            "replicas_from": plan.replicas_from,
-            "replicas_to": replicas,
+            **action.result(plan, request),
             "resource_version": updated.metadata.resource_version,
             # The approver's identity stays in the plan record and the logs.
             "approved": plan.approved_by is not None,
             "correlation_id": correlation_id,
         }
     )
+
+
+# --- scale_deployment ---------------------------------------------------------
+
+
+def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, str, dict[str, Any]]:
+    namespace, name, replicas = validate_scale_args(
+        args, settings.allowed_namespaces, settings.bounds_for
+    )
+    override = require_override_flag(args)
+    return namespace, name, scale_args(namespace, name, replicas, override)
+
+
+def _check_scale_plan(rt: Runtime, plan: Plan) -> None:
+    # Re-checked against the current setting; the plan step is not trusted.
+    check_replica_step(plan.replicas_from, plan.replicas_to, rt.settings.max_replica_step_percent)
+
+
+def _scale_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now: int) -> None:
+    """check_spec_unchanged has confirmed that the current replica count is replicas_from."""
+    last_applied = last_applied_plan(rt.store, deployment)
+    check_manual_change(last_applied, plan.replicas_from, override)
+    check_history(
+        rt.store,
+        plan.object_key,
+        now,
+        rt.settings,
+        plan.replicas_from,
+        plan.replicas_to,
+        plan_rate=False,
+        last_applied=last_applied,
+    )
+
+
+SCALE = Action(
+    name=SCALE_DEPLOYMENT,
+    validate=_validate_scale,
+    record_matches=lambda plan, args: plan.replicas_to == args["replicas"],
+    check_plan=_check_scale_plan,
+    breaker=_scale_breaker,
+    body=lambda plan, args, deployment, correlation_id: scale_patch(
+        args["replicas"], deployment.metadata.resource_version, plan.plan_id, correlation_id
+    ),
+    result=lambda plan, args: {
+        "replicas_from": plan.replicas_from,
+        "replicas_to": args["replicas"],
+    },
+)
+
+
+def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
+    return _apply(SCALE, args)
 
 
 HANDLERS = {"apply_scale_deployment": apply_scale_deployment}

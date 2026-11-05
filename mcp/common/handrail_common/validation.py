@@ -2,7 +2,7 @@
 
 import re
 import uuid
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
 from handrail_common.envelope import (
@@ -86,16 +86,21 @@ def check_replica_step(replicas_from: int, replicas_to: int, percent: int) -> No
 
 
 def validate_scale_args(
-    args: Mapping[str, Any], allowed: Collection[str], minimum: int, maximum: int
+    args: Mapping[str, Any],
+    allowed: Collection[str],
+    bounds_for: Callable[[str], tuple[int, int]],
 ) -> tuple[str, str, int]:
-    """Guard checks 1-3 for a scale request; returns (namespace, name, replicas)."""
+    """Guard checks 1-3 for a scale request; returns (namespace, name, replicas).
+
+    `bounds_for` gives the (minimum, maximum) replicas of an allowed namespace.
+    """
     if not isinstance(args, Mapping):
         raise GuardError(INVALID_ARGUMENT, "arguments must be an object")
     namespace = require_namespace(args.get("namespace"))
     name = require_name(args.get("name"))
     replicas = require_int(args.get("replicas"), "replicas")
     check_namespace_allowed(namespace, allowed)
-    check_replica_bounds(replicas, minimum, maximum)
+    check_replica_bounds(replicas, *bounds_for(namespace))
     return namespace, name, replicas
 
 

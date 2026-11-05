@@ -29,6 +29,11 @@ def test_settings_parse():
     assert s.approval_topic_arn is None and s.approval_url is None
 
 
+def test_bounds_are_read_per_namespace():
+    s = load_settings(BASE)
+    assert s.bounds_for("sandbox") == s.bounds_for("demo") == (0, 5)
+
+
 @pytest.mark.parametrize(
     ("mode", "required"), [("client", False), ("server", True), ("both", True)]
 )

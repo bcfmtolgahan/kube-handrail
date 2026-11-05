@@ -14,7 +14,10 @@ from handrail_common.plans import (
     args_hash,
     global_budget_key,
     object_key,
+    plan_args_hash,
+    scale_args,
     scale_args_hash,
+    template_hash,
 )
 from handrail_common.validation import GuardError, require_plan_id
 
@@ -52,6 +55,28 @@ def test_override_enters_the_hash_only_when_true():
         }
     )
     assert scale_args_hash("sandbox", "web", 2, True) != plain
+
+
+def test_args_hash_covers_the_stored_payload_and_the_action():
+    args = scale_args("sandbox", "web", 2, True)
+    assert args == {
+        "namespace": "sandbox",
+        "name": "web",
+        "replicas": 2,
+        "override_manual_change": True,
+    }
+    assert "override_manual_change" not in scale_args("sandbox", "web", 2)
+    assert plan_args_hash(SCALE_DEPLOYMENT, args) == scale_args_hash("sandbox", "web", 2, True)
+    assert plan_args_hash("restart_deployment", args) != plan_args_hash(SCALE_DEPLOYMENT, args)
+
+
+def test_template_hash_is_stable_and_changes_with_any_value():
+    template = {"metadata": {"labels": {"app": "web"}}, "spec": {"containers": [{"name": "a"}]}}
+    reordered = {"spec": template["spec"], "metadata": template["metadata"]}
+    digest = template_hash(template)
+    assert digest == template_hash(reordered)
+    assert digest.startswith("sha256:") and len(digest) == len("sha256:") + 64
+    assert template_hash({**template, "spec": {"containers": [{"name": "b"}]}}) != digest
 
 
 @pytest.fixture
@@ -170,6 +195,25 @@ def test_correlation_ids_round_trip():
     steps = ("plan", "approval_request", "decision", "apply")
     assert [item[f"{step}_correlation_id"] for step in steps] == ["a", "b", "c", "d"]
     assert Plan.from_item(item) == plan
+
+
+def test_args_and_template_hashes_round_trip(store):
+    plan = dataclasses.replace(
+        make_plan(),
+        args=scale_args("sandbox", "web", 3),
+        template_from="sha256:a",
+        template_to="sha256:a",
+    )
+    store.create(plan)
+    # DynamoDB returns the numbers in the payload as Decimal.
+    restored = Plan.from_item(store.get(plan.plan_id))
+    assert restored == plan
+    assert type(restored.args["replicas"]) is int
+
+
+def test_from_item_without_args_has_none():
+    plan = Plan.from_item(make_plan().to_item())
+    assert plan.args is None and plan.template_from is None and plan.template_to is None
 
 
 def test_from_item_without_generation_or_uid_never_matches():

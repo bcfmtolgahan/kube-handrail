@@ -5,6 +5,7 @@ import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,7 +15,13 @@ from moto import mock_aws
 
 from handrail_common.breaker import LAST_PLAN_ANNOTATION, retention_seconds
 from handrail_common.config import Settings
-from handrail_common.plans import PlanStore, object_key, scale_args_hash
+from handrail_common.plans import (
+    PlanStore,
+    object_key,
+    plan_args_hash,
+    scale_args_hash,
+    template_hash,
+)
 from handrail_common.validation import GuardError, require_plan_id
 
 HANDLER_PATH = Path(__file__).resolve().parents[2] / "mcp" / "k8s_read" / "handler.py"
@@ -105,10 +112,25 @@ def raw_list(items: list[dict]) -> SimpleNamespace:
     return SimpleNamespace(data=json.dumps({"kind": "List", "items": items}).encode())
 
 
+def raw_object(model) -> SimpleNamespace:
+    """An object read with _preload_content=False, as the plan reads the Deployment."""
+    return SimpleNamespace(
+        data=json.dumps(k8s.ApiClient().sanitize_for_serialization(model)).encode()
+    )
+
+
 @pytest.fixture
 def clients(table):
     apps = MagicMock()
     apps.read_namespaced_deployment.return_value = deployment()
+
+    def read_deployment(*_args, _preload_content=True, **_kwargs):
+        # Serve the raw form of whatever model the test set as the return value.
+        if _preload_content:
+            return mock.DEFAULT
+        return raw_object(apps.read_namespaced_deployment.return_value)
+
+    apps.read_namespaced_deployment.side_effect = read_deployment
     apps.list_namespaced_replica_set.return_value = raw_list([])
     autoscaling = MagicMock()
     autoscaling.list_namespaced_horizontal_pod_autoscaler.return_value = (
@@ -534,6 +556,26 @@ def test_plan_with_override_allows_manual_change_and_pins_it(clients, table):
     item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
     assert item["args_hash"] == scale_args_hash("sandbox", "web", 1, True)
     assert item["args_hash"] != scale_args_hash("sandbox", "web", 1)
+
+
+def test_plan_stores_its_argument_payload_and_template_hashes(clients, table):
+    dep = labelled_deployment()
+    clients.apps.read_namespaced_deployment.return_value = dep
+    data = plan(clients)["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["args"] == {"namespace": "sandbox", "name": "web", "replicas": 3}
+    # A scale leaves the pod template as it is; the hash is over the raw JSON.
+    raw = json.loads(raw_object(dep).data)
+    assert item["template_from"] == item["template_to"] == template_hash(raw["spec"]["template"])
+    clients.apps.read_namespaced_deployment.assert_called_once_with(
+        name="web", namespace="sandbox", _preload_content=False
+    )
+
+    data = plan(clients, replicas=1, override_manual_change=True)["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    args = {"namespace": "sandbox", "name": "web", "replicas": 1, "override_manual_change": True}
+    assert item["args"] == args
+    assert item["args_hash"] == plan_args_hash("scale_deployment", args)
 
 
 def test_override_without_manual_change_is_not_reported(clients):

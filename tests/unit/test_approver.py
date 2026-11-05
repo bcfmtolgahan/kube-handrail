@@ -14,7 +14,13 @@ from moto import mock_aws
 
 from handrail_common.config import ConfigError, load_settings
 from handrail_common.killswitch import KillSwitch
-from handrail_common.plans import SCALE_DEPLOYMENT, Plan, PlanStore, scale_args_hash
+from handrail_common.plans import (
+    SCALE_DEPLOYMENT,
+    Plan,
+    PlanStore,
+    scale_args,
+    scale_args_hash,
+)
 
 
 def _load(name: str, directory: str):
@@ -130,6 +136,7 @@ def make_plan(store: PlanStore, replicas: int = 2, override: bool = False) -> Pl
         replicas_from=1,
         replicas_to=replicas,
         args_hash=scale_args_hash("sandbox", "web", replicas, override),
+        args=scale_args("sandbox", "web", replicas, override),
         resource_version="10",
         generation=4,
         uid=UID,
@@ -396,6 +403,51 @@ def test_approve_used_or_expired_plan_is_refused(env):
 
     status, body = call(env.rt, ALICE, body={"plan_id": str(uuid.uuid4()), "decision": "approve"})
     assert (status, body["error"]["code"]) == (404, "plan_not_found")
+
+
+def test_approve_forwards_the_stored_args_unchanged(env):
+    plan = make_plan(env.store)
+    # Whatever the record's payload holds is what the apply receives; the write guard
+    # compares it with the record.
+    env.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET args.replicas = :r",
+        ExpressionAttributeValues={":r": 4},
+    )
+    approve(env, plan)
+    assert json.loads(env.lam.calls[0]["Payload"]) == {
+        "plan_id": plan.plan_id,
+        "namespace": "sandbox",
+        "name": "web",
+        "replicas": 4,
+    }
+
+
+@pytest.mark.parametrize(
+    ("update", "values", "status", "code"),
+    [
+        ("SET #action = :a", {":a": "drain_node"}, 500, "internal"),
+        ("REMOVE args", None, 409, "plan_expired"),
+    ],
+)
+def test_approve_refuses_a_plan_nothing_can_apply_before_deciding(
+    env, update, values, status, code
+):
+    plan = make_plan(env.store)
+    extra = {"ExpressionAttributeValues": values} if values else {}
+    if "#action" in update:
+        extra["ExpressionAttributeNames"] = {"#action": "action"}
+    env.store._table.update_item(Key={"plan_id": plan.plan_id}, UpdateExpression=update, **extra)
+
+    response_status, body = approve(env, plan)
+
+    assert (response_status, body["error"]["code"]) == (status, code)
+    record = env.store.get(plan.plan_id)
+    assert "approved_by" not in record and record["status"] == "planned"
+    assert env.lam.calls == []
+    # A rejection is still possible.
+    status, _ = call(env.rt, ALICE, body={"plan_id": plan.plan_id, "decision": "reject"})
+    assert status == 200
 
 
 # --- Reject ----------------------------------------------------------------------
