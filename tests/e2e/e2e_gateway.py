@@ -74,17 +74,29 @@ applies of the whole run, 30 in the test setup.
 
 With --with-verify (the deployment has verify_enabled, the default, and a
 verify_window_min_seconds of at most 60), the verification cases also run, with
-windows of 60 and 90 seconds, so they add a few minutes of waiting. In client mode:
-a window below the minimum is refused; e2e-verify-ok scaled 1 -> 2 is pending right
-after the apply and then healthy, and an apply with another window is plan_mismatch;
-e2e-verify-manual scaled by hand inside its window is unknown (spec_changed); and a
-BestEffort fixture (no resource requests) scaled 1 -> 2 under a ResourceQuota
-e2e-besteffort that admits one BestEffort pod is degraded (the reason it reports,
-replica_failure or target_not_reached, shows whether a quota refusal sets
-ReplicaFailure). The quota is created only if the namespace has no LimitRange and no
-BestEffort pod, and deleted again; web and the other fixtures have requests, so it
-does not apply to them. In server mode: an approval applies e2e-verify-ok with a pinned
-window, and the change is verified healthy.
+windows of 60 and 90 seconds; they add about 15 minutes of waiting in client mode and
+about 6 in server mode. A window below the minimum, and revert_on_failure without a
+window, are refused. The degraded cases use BestEffort fixtures (no resource
+requests) under a ResourceQuota e2e-besteffort that admits one BestEffort pod, so
+scaling such a fixture from 1 to 2 leaves the second pod refused; web and the other
+fixtures have requests, so the quota does not apply to them. The quota is created
+only if the namespace has no LimitRange and no BestEffort pod, one BestEffort fixture
+exists at a time, and the quota and fixtures are deleted again. In client mode:
+e2e-verify-ok scaled 1 -> 2 is pending right after the apply and then healthy, and an
+apply with another window is plan_mismatch; e2e-verify-manual scaled by hand inside
+its window is unknown (spec_changed) and left alone; e2e-verify-bad scaled with
+revert_on_failure is degraded (the reason, replica_failure or target_not_reached, shows
+whether a quota refusal sets ReplicaFailure) and reverted to 1 replica, the
+Deployment's annotations name the revert and the verifier run, the revert is verified
+healthy and is never reverted, and planning the change again is refused with cooldown
+or flapping; with the kill switch turned off before the check, e2e-verify-killswitch is
+degraded, its revert skipped, and it stays skipped after the switch is back on for two
+verifier runs (no other case applies meanwhile); and e2e-verify-norevert, without
+revert_on_failure, is degraded and left at 2 replicas. In server mode: approvals apply
+e2e-verify-ok with a pinned window (verified healthy) and e2e-verify-bad with a pinned
+window and revert_on_failure (degraded and reverted, as above); show renders both.
+These cases add 5 applies to the smoke_test agent's budget in client mode and 2 in
+server mode; reverts take no budget unit.
 
 The per-object and global hourly budgets and the plan rate limit are covered by
 unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
@@ -125,8 +137,10 @@ VERIFY_MANUAL = {"namespace": NAMESPACE, "name": "e2e-verify-manual"}
 # BestEffort fixtures (no resource requests), one per case that applies, so no case inherits
 # another's last-plan annotation or object budget. Only one exists at a time: the quota
 # below admits one BestEffort pod.
+VERIFY_BAD = {"namespace": NAMESPACE, "name": "e2e-verify-bad"}
+VERIFY_KILLSWITCH = {"namespace": NAMESPACE, "name": "e2e-verify-killswitch"}
 VERIFY_NOREVERT = {"namespace": NAMESPACE, "name": "e2e-verify-norevert"}
-VERIFY_BEST_EFFORT = (VERIFY_NOREVERT,)
+VERIFY_BEST_EFFORT = (VERIFY_BAD, VERIFY_KILLSWITCH, VERIFY_NOREVERT)
 QUOTA = "e2e-besteffort"
 FIXTURES = (TARGET["name"], FLAP["name"], MANUAL["name"])
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
@@ -1342,14 +1356,25 @@ def besteffort_quota() -> dict[str, Any]:
 
 
 def best_effort_pods() -> list[str]:
+    """BestEffort pods that are not finished, including those still terminating, which the
+    quota may still count."""
     out = json.loads(kubectl("get", "pods", "-o", "json"))
     return [
         pod["metadata"]["name"]
         for pod in out["items"]
         if (pod.get("status") or {}).get("qosClass") == "BestEffort"
-        and not pod["metadata"].get("deletionTimestamp")
         and (pod.get("status") or {}).get("phase") in ("Pending", "Running")
     ]
+
+
+def no_best_effort_pods(timeout: int = 120) -> bool:
+    """Wait for the pods of a deleted BestEffort fixture to go."""
+    deadline = time.time() + timeout
+    while best_effort_pods():
+        if time.time() > deadline:
+            return False
+        time.sleep(2)
+    return True
 
 
 def quota_objects() -> str:
@@ -1361,7 +1386,7 @@ def create_quota() -> bool:
     back: a LimitRange would give the fixtures default requests, and another BestEffort pod
     would take the quota's one pod."""
     limit_ranges = kubectl("get", "limitrange", "-o", "name").split()
-    others = best_effort_pods()
+    others = [] if no_best_effort_pods() else best_effort_pods()
     report(
         "verify: the namespace has no LimitRange and no BestEffort pod",
         not limit_ranges and not others,
@@ -1374,6 +1399,8 @@ def create_quota() -> bool:
 
 
 def create_best_effort(target: dict[str, str]) -> None:
+    if not no_best_effort_pods():
+        raise RuntimeError("a BestEffort pod of an earlier case is still there")
     kubectl("create", "-f", "-", stdin=json.dumps(best_effort(target["name"])))
     kubectl("rollout", "status", f"deploy/{target['name']}", "--timeout=120s")
 
@@ -1433,17 +1460,42 @@ async def apply_verified(
 
 
 async def verify_tests(gw: Gateway, approval_mode: str) -> None:
-    if approval_mode == "server":
-        await verify_approval_tests(gw)
-        return
-    await expect(
-        gw,
-        "verify: a window below the minimum is refused",
-        PLAN,
-        {**VERIFY_OK, "replicas": 2, "verify_window_seconds": 59},
-        "invalid_argument",
-    )
+    """Every BestEffort fixture is created for its case and deleted before the next, so the
+    quota's one pod is always free for the case that needs it."""
+    await verify_argument_tests(gw)
+    quota = create_quota()
+    try:
+        if approval_mode == "server":
+            await verify_approval_tests(gw, quota)
+            return
+        await verify_revert_tests(gw, quota)
+        if quota:
+            await verify_kill_switch_tests(gw)
+            await verify_no_revert_tests(gw)
+    finally:
+        for target in VERIFY_BEST_EFFORT:
+            delete_deployment(target)
+        kubectl("delete", "resourcequota", QUOTA, "--ignore-not-found")
 
+
+async def verify_argument_tests(gw: Gateway) -> None:
+    """Refused before anything is read or stored."""
+    for name, extra in (
+        ("a window below the minimum", {"verify_window_seconds": 59}),
+        ("revert_on_failure without a window", {"revert_on_failure": True}),
+    ):
+        await expect(
+            gw,
+            f"verify: {name} is refused",
+            PLAN,
+            {**VERIFY_OK, "replicas": 2, **extra},
+            "invalid_argument",
+        )
+
+
+async def verify_revert_tests(gw: Gateway, quota: bool) -> None:
+    """A healthy change, a change scaled by hand in its window, and a degraded change
+    approved with revert, checked at the same time; each has its own fixture."""
     healthy = await plan_verified(gw, "healthy", VERIFY_OK, HEALTHY_WINDOW)
     if healthy:
         await expect(
@@ -1471,35 +1523,26 @@ async def verify_tests(gw: Gateway, approval_mode: str) -> None:
     else:
         manual = None
 
-    # The three checks run at the same time; each case has its own fixture.
-    waits = []
-    if healthy:
-        waits.append(("healthy", healthy, HEALTHY_WINDOW))
-    if manual:
-        waits.append(("manual", manual, VERIFY_WINDOW))
-    if create_quota():
-        try:
-            create_best_effort(VERIFY_NOREVERT)
-            degraded = await plan_verified(gw, "degraded", VERIFY_NOREVERT, VERIFY_WINDOW)
-            if await apply_verified(gw, "degraded", VERIFY_NOREVERT, degraded, VERIFY_WINDOW):
-                waits.append(("degraded", degraded, VERIFY_WINDOW))
-            outcomes = await gather_outcomes(gw, waits)
-            check_verify_outcomes(outcomes)
-        finally:
-            delete_deployment(VERIFY_NOREVERT)
-            kubectl("delete", "resourcequota", QUOTA, "--ignore-not-found")
-    else:
-        check_verify_outcomes(await gather_outcomes(gw, waits))
+    degraded = None
+    if quota:
+        create_best_effort(VERIFY_BAD)
+        degraded = await plan_reverting(gw, "revert", VERIFY_BAD)
+        if not await apply_verified(
+            gw, "revert", VERIFY_BAD, degraded, VERIFY_WINDOW, revert_on_failure=True
+        ):
+            degraded = None
 
-
-async def gather_outcomes(
-    gw: Gateway, waits: list[tuple[str, str, int]]
-) -> dict[str, dict[str, Any]]:
+    waits = [
+        (case, plan_id, window)
+        for case, plan_id, window in (
+            ("healthy", healthy, HEALTHY_WINDOW),
+            ("manual", manual, VERIFY_WINDOW),
+            ("revert", degraded, VERIFY_WINDOW),
+        )
+        if plan_id
+    ]
     found = await asyncio.gather(*(wait_outcome(gw, plan_id, w) for _, plan_id, w in waits))
-    return {case: data for (case, _, _), data in zip(waits, found, strict=True)}
-
-
-def check_verify_outcomes(outcomes: dict[str, dict[str, Any]]) -> None:
+    outcomes = {case: data for (case, _, _), data in zip(waits, found, strict=True)}
     if "healthy" in outcomes:
         report(
             "verify: a change that reached its target is healthy and keeps its replicas",
@@ -1514,51 +1557,164 @@ def check_verify_outcomes(outcomes: dict[str, dict[str, Any]]) -> None:
             and replicas_of(VERIFY_MANUAL) == 1,
             outcome_status(outcomes["manual"]),
         )
-    if "degraded" in outcomes:
-        data = outcomes["degraded"]
-        # Whether a quota refusal sets ReplicaFailure or only leaves the target unmet.
+    if "revert" in outcomes:
+        await check_reverted(gw, outcomes["revert"], VERIFY_BAD)
+
+
+async def plan_reverting(gw: Gateway, name: str, target: dict[str, str]) -> str | None:
+    plan_id = await plan_verified(gw, name, target, VERIFY_WINDOW, revert_on_failure=True)
+    if plan_id:
+        envelope = await gw.call(OUTCOME, {"plan_id": plan_id})
         report(
-            "verify: pods refused by the quota make the change degraded, not reverted",
-            outcome_status(data)[0] == "degraded"
-            and outcome_status(data)[1] in ("replica_failure", "target_not_reached")
-            and (data.get("revert") or {}).get("status") == "not_requested"
-            and replicas_of(VERIFY_NOREVERT) == 2,
-            outcome_status(data),
+            f"verify: {name}: the plan records the revert as requested",
+            (envelope.get("data") or {}).get("revert") == {"requested": True, "status": "pending"},
+            code(envelope) or (envelope.get("data") or {}).get("revert"),
         )
+    return plan_id
 
 
-async def verify_approval_tests(gw: Gateway) -> None:
-    """Server mode: the approval's apply carries the pinned window (the record's args), so
-    it matches the plan, and the change is verified."""
+async def check_reverted(gw: Gateway, data: dict[str, Any], target: dict[str, str]) -> None:
+    """A degraded change approved with revert is reverted, the revert names itself on the
+    Deployment, is verified healthy and is never reverted, and the reverted change cannot be
+    planned again right away."""
+    revert = data.get("revert") or {}
+    revert_id = revert.get("revert_plan_id")
+    # Whether a quota refusal sets ReplicaFailure or only leaves the target unmet.
+    report(
+        "verify: pods refused by the quota make the change degraded, and it is reverted",
+        outcome_status(data)[0] == "degraded"
+        and outcome_status(data)[1] in ("replica_failure", "target_not_reached")
+        and revert.get("status") == "reverted"
+        and bool(revert_id),
+        f"{outcome_status(data)}, revert {revert.get('status')} {revert.get('reason') or ''}",
+    )
+    if not revert_id:
+        return
+    report(
+        "verify: the Deployment is back at 1 replica and its annotations name the revert",
+        replicas_of(target) == 1
+        and last_plan_id(target["name"]) == revert_id
+        and annotation(target["name"], CORRELATION_ANNOTATION)
+        == (data.get("correlation_ids") or {}).get("verification"),
+        last_plan_id(target["name"]),
+    )
+    reverted = await wait_outcome(gw, revert_id, VERIFY_WINDOW)
+    report(
+        "verify: the revert is verified healthy and is never reverted itself",
+        outcome_status(reverted) == ("healthy", "target_reached")
+        and reverted.get("kind") == "revert"
+        and reverted.get("reverts_plan_id") == data.get("plan_id")
+        and reverted.get("revert") == {"requested": False, "status": "not_requested"},
+        outcome_status(reverted),
+    )
+    envelope = await gw.call(PLAN, {**target, "replicas": 2})
+    report(
+        "verify: planning the reverted change again is refused (cooldown or flapping)",
+        code(envelope) in ("cooldown", "flapping"),
+        code(envelope) or "ok",
+    )
+    delete_deployment(target)
+
+
+async def verify_kill_switch_tests(gw: Gateway) -> None:
+    """With the kill switch off when the check runs, the degraded verdict is recorded, the
+    revert is skipped, and it stays skipped once the switch is back on. Nothing else applies
+    while the switch is off."""
+    create_best_effort(VERIFY_KILLSWITCH)
+    plan_id = await plan_reverting(gw, "kill switch", VERIFY_KILLSWITCH)
+    applied = await apply_verified(
+        gw, "kill switch", VERIFY_KILLSWITCH, plan_id, VERIFY_WINDOW, revert_on_failure=True
+    )
+    if not applied:
+        delete_deployment(VERIFY_KILLSWITCH)
+        return
+    set_kill_switch("false")
+    try:
+        data = await wait_outcome(gw, plan_id, VERIFY_WINDOW)
+    finally:
+        set_kill_switch("true")
+    revert = data.get("revert") or {}
+    report(
+        "verify: with the kill switch off the degraded change is not reverted",
+        outcome_status(data)[0] == "degraded"
+        and (revert.get("status"), revert.get("reason")) == ("skipped", "remediation_disabled")
+        and replicas_of(VERIFY_KILLSWITCH) == 2,
+        f"{outcome_status(data)}, revert {revert.get('status')} {revert.get('reason') or ''}",
+    )
+    print("waiting two verifier runs with the kill switch on", flush=True)
+    await asyncio.sleep(2 * 60 + 10)
+    data = (await gw.call(OUTCOME, {"plan_id": plan_id})).get("data") or {}
+    report(
+        "verify: the skipped revert stays skipped once the kill switch is back on",
+        (data.get("revert") or {}).get("status") == "skipped"
+        and replicas_of(VERIFY_KILLSWITCH) == 2,
+        (data.get("revert") or {}).get("status"),
+    )
+    delete_deployment(VERIFY_KILLSWITCH)
+
+
+async def verify_no_revert_tests(gw: Gateway) -> None:
+    create_best_effort(VERIFY_NOREVERT)
+    plan_id = await plan_verified(gw, "degraded", VERIFY_NOREVERT, VERIFY_WINDOW)
+    if not await apply_verified(gw, "degraded", VERIFY_NOREVERT, plan_id, VERIFY_WINDOW):
+        return
+    data = await wait_outcome(gw, plan_id, VERIFY_WINDOW)
+    report(
+        "verify: a degraded change without revert_on_failure is reported and left alone",
+        outcome_status(data)[0] == "degraded"
+        and (data.get("revert") or {}).get("status") == "not_requested"
+        and replicas_of(VERIFY_NOREVERT) == 2,
+        outcome_status(data),
+    )
+    delete_deployment(VERIFY_NOREVERT)
+
+
+async def verify_approval_tests(gw: Gateway, quota: bool) -> None:
+    """Server mode: the approval's apply carries the pinned window and revert_on_failure
+    (the record's args), so it matches the plan; the change is verified, and a degraded one
+    reverted."""
     approve = approve_script()
     url = os.environ["APPROVAL_URL"]
     region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
+
+    async def approved(name: str, plan_id: str | None, view: dict[str, Any]) -> bool:
+        if plan_id is None:
+            return False
+        await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+        status, envelope = approve.show(url, region, plan_id)
+        report(
+            f"verify: {name}: show renders the verification",
+            (envelope.get("data") or {}).get("verification") == view,
+            status,
+        )
+        status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
+        applied = (envelope.get("data") or {}).get("apply") or {}
+        report(
+            f"verify: {name}: an approval applies the plan with its pinned arguments",
+            status == 200 and applied.get("ok") is True,
+            (applied.get("error") or {}).get("code") or status,
+        )
+        return applied.get("ok") is True
+
     plan_id = await plan_verified(gw, "approval", VERIFY_OK, HEALTHY_WINDOW)
-    if plan_id is None:
-        return
-    await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
-    status, envelope = approve.show(url, region, plan_id)
-    report(
-        "verify: show renders the window",
-        (envelope.get("data") or {}).get("verification")
-        == {"window_seconds": HEALTHY_WINDOW, "revert_on_failure": False},
-        status,
-    )
-    status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
-    applied = (envelope.get("data") or {}).get("apply") or {}
-    report(
-        "verify: an approval applies a plan with a pinned window",
-        status == 200 and applied.get("ok") is True,
-        (applied.get("error") or {}).get("code") or status,
-    )
-    if not applied.get("ok"):
-        return
-    data = await wait_outcome(gw, plan_id, HEALTHY_WINDOW)
-    report(
-        "verify: the approved change is verified healthy",
-        outcome_status(data) == ("healthy", "target_reached"),
-        outcome_status(data),
-    )
+    view = {"window_seconds": HEALTHY_WINDOW, "revert_on_failure": False}
+    healthy = plan_id if await approved("approval", plan_id, view) else None
+    degraded = None
+    if quota:
+        create_best_effort(VERIFY_BAD)
+        plan_id = await plan_reverting(gw, "approval with revert", VERIFY_BAD)
+        view = {"window_seconds": VERIFY_WINDOW, "revert_on_failure": True, "revert_to": 1}
+        if await approved("approval with revert", plan_id, view):
+            degraded = plan_id
+    if healthy:
+        data = await wait_outcome(gw, healthy, HEALTHY_WINDOW)
+        report(
+            "verify: the approved change is verified healthy",
+            outcome_status(data) == ("healthy", "target_reached"),
+            outcome_status(data),
+        )
+    if degraded:
+        await check_reverted(gw, await wait_outcome(gw, degraded, VERIFY_WINDOW), VERIFY_BAD)
 
 
 AGENT_A = os.environ.get("AGENT_NAME", "smoke_test")
