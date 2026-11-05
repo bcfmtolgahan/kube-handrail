@@ -19,6 +19,7 @@ from handrail_common.plans import (
     PlanStore,
     object_key,
     plan_args_hash,
+    restart_template,
     scale_args_hash,
     template_hash,
 )
@@ -1236,3 +1237,128 @@ def test_lambda_handler_routes_get_workload_events(wired):
     )
     assert result["ok"] is True
     assert result["data"]["events"] == []
+
+
+# --- plan_restart_deployment -------------------------------------------------
+
+
+def restart(clients, **overrides):
+    args = {"namespace": "sandbox", "name": "web", **overrides}
+    return handler.plan_restart_deployment(args, SETTINGS, clients, NOW)
+
+
+def restart_error(clients, **overrides) -> str:
+    with pytest.raises(GuardError) as exc:
+        restart(clients, **overrides)
+    return exc.value.code
+
+
+def test_restart_plan_pins_the_template_with_its_plan_id(clients, table):
+    data = restart(clients)["data"]
+    plan_id = data["plan_id"]
+    item = table.get_item(Key={"plan_id": plan_id})["Item"]
+    raw = json.loads(raw_object(clients.apps.read_namespaced_deployment.return_value).data)
+    template = raw["spec"]["template"]
+
+    assert item["action"] == "restart_deployment"
+    assert item["args"] == {"namespace": "sandbox", "name": "web"}
+    assert item["args_hash"] == plan_args_hash(
+        "restart_deployment", {"namespace": "sandbox", "name": "web"}
+    )
+    assert (item["replicas_from"], item["replicas_to"]) == (2, 2)
+    assert item["template_from"] == template_hash(template)
+    assert item["template_to"] == template_hash(restart_template(template, plan_id))
+    assert item["template_to"] != item["template_from"]
+    assert item["revision_from"] == 7
+    assert item["override_manual_change"] is False
+    assert data["diff"] == {
+        "restart": {"pods_replaced": 2},
+        "template": {"from": item["template_from"], "to": item["template_to"]},
+    }
+    assert [check["check"] for check in data["preflight"]] == [
+        "arguments",
+        "namespace_allowed",
+        "not_gitops_managed",
+        "not_paused",
+        "cooldown",
+        "object_budget",
+        "plan_rate",
+        "global_budget",
+    ]
+
+
+def test_restart_plan_returns_the_rollout_impact(clients):
+    impact = restart(clients)["data"]["impact"]
+    assert impact["pods"]["replaced"] == 2
+    # The fixture sets no strategy: the API server's 25 % defaults on 2 replicas.
+    assert impact["rollout"] == {"strategy": "RollingUpdate", "max_unavailable": 0, "max_surge": 1}
+
+
+def test_scale_plan_records_no_revision(clients, table):
+    data = plan(clients)["data"]
+    assert "revision_from" not in table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+
+
+def test_restart_plan_ignores_an_hpa(clients):
+    clients.autoscaling.list_namespaced_horizontal_pod_autoscaler.return_value = (
+        k8s.V2HorizontalPodAutoscalerList(items=[hpa("web")])
+    )
+    assert restart(clients)["ok"] is True
+    clients.autoscaling.list_namespaced_horizontal_pod_autoscaler.assert_not_called()
+
+
+def test_restart_plan_refuses_a_paused_rollout(clients, table):
+    dep = deployment()
+    dep.spec.paused = True
+    clients.apps.read_namespaced_deployment.return_value = dep
+    with pytest.raises(GuardError) as exc:
+        restart(clients)
+    assert (exc.value.code, exc.value.details) == ("conflict", {"paused": True})
+    assert table.scan()["Count"] == 0
+
+
+def test_restart_plan_refuses_gitops_managed(clients):
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        labels={"app.kubernetes.io/instance": "x"}
+    )
+    assert restart_error(clients) == "gitops_managed"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "code"),
+    [
+        ({"namespace": "other"}, "forbidden_namespace"),
+        ({"name": "Web"}, "invalid_argument"),
+    ],
+)
+def test_restart_plan_rejects_bad_arguments(clients, overrides, code):
+    assert restart_error(clients, **overrides) == code
+    clients.apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_restart_plan_runs_the_cooldown(clients, table):
+    seed(table, 2, 2, NOW - 40, NOW - 30)
+    assert restart_error(clients) == "cooldown"
+
+
+def test_restart_plan_skips_the_manual_change_check(clients, table):
+    # The last apply left 3 replicas and the Deployment has 2: a scale would need the override.
+    last = seed(table, 2, 3, NOW - 500, NOW - 490)
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={LAST_PLAN_ANNOTATION: last}
+    )
+    assert plan_error(clients) == "manual_change"
+    assert restart(clients)["ok"] is True
+
+
+def test_restart_plan_counts_toward_the_object_budget(clients, table):
+    for i in range(6):
+        seed(table, 2, 2, NOW - 3000 + i * 100, NOW - 2990 + i * 100)
+    assert restart_error(clients) == "object_budget_exceeded"
+
+
+def test_lambda_handler_plans_a_restart_through_dispatch(wired):
+    result = handler.lambda_handler(
+        {"namespace": "sandbox", "name": "web"}, context("plan_restart_deployment")
+    )
+    assert result["ok"] is True and "restart" in result["data"]["diff"]

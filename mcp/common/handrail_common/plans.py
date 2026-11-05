@@ -1,5 +1,6 @@
 """Single-use plan records in DynamoDB."""
 
+import copy
 import hashlib
 import json
 from collections.abc import Mapping
@@ -25,6 +26,10 @@ from handrail_common.envelope import (
 from handrail_common.validation import GuardError
 
 SCALE_DEPLOYMENT = "scale_deployment"
+RESTART_DEPLOYMENT = "restart_deployment"
+# Pod-template annotation a restart sets to its plan id: the template it leaves is known when
+# the plan is made, and every pod it creates names the plan.
+RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
 RESULT_APPLIED = "applied"
 # Global secondary index on (object_key, created_at); the same name is set in terraform/main.tf.
 OBJECT_HISTORY_INDEX = "object-history"
@@ -89,10 +94,24 @@ def scale_args_hash(
     )
 
 
+def restart_args(namespace: str, name: str) -> dict[str, Any]:
+    """The argument payload of a restart plan: the apply arguments without plan_id."""
+    return {"namespace": namespace, "name": name}
+
+
 def template_hash(template: Mapping[str, Any]) -> str:
     """Hash of a pod template as the API server returned it (raw JSON, not client models,
     which drop fields the client does not know)."""
     return "sha256:" + hashlib.sha256(_canonical(template)).hexdigest()
+
+
+def restart_template(template: Mapping[str, Any], plan_id: str) -> dict[str, Any]:
+    """The pod template a restart leaves: a copy of `template` with the restart annotation
+    set to `plan_id`."""
+    restarted = copy.deepcopy(dict(template))
+    metadata = restarted.setdefault("metadata", {})
+    metadata["annotations"] = {**(metadata.get("annotations") or {}), RESTART_ANNOTATION: plan_id}
+    return restarted
 
 
 def object_key(namespace: str, name: str, uid: str) -> str:
@@ -145,9 +164,12 @@ class Plan:
     # without plan_id. Plans made before it was recorded have none and cannot be applied.
     args: Mapping[str, Any] | None = None
     # template_hash of the Deployment's pod template at plan time, and of the template the
-    # change leaves; equal for a scale.
+    # change leaves; equal for a scale, restart_template's hash for a restart.
     template_from: str | None = None
     template_to: str | None = None
+    # The Deployment's revision annotation at plan time, for a change that rolls out a new
+    # pod template; information only.
+    revision_from: int | None = None
 
     @property
     def object_key(self) -> str:
@@ -218,6 +240,7 @@ _OPTIONAL_INTS = (
     "approved_at",
     "approval_expires_at",
     "rejected_at",
+    "revision_from",
 )
 _OPTIONAL_STRS = (
     "result",

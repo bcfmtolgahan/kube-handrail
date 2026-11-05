@@ -35,19 +35,24 @@ from handrail_common.gitops import is_gitops_managed
 from handrail_common.killswitch import KillSwitch
 from handrail_common.observability import CORRELATION_ANNOTATION, current_correlation_id
 from handrail_common.plans import (
+    RESTART_ANNOTATION,
+    RESTART_DEPLOYMENT,
     RESULT_APPLIED,
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
     plan_args_hash,
+    restart_args,
     scale_args,
 )
 from handrail_common.validation import (
     GuardError,
+    check_not_paused,
     check_replica_step,
     require_override_flag,
     require_plan_id,
     validate_scale_args,
+    validate_target_args,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,7 +92,7 @@ def get_runtime() -> Runtime:
     return _runtime
 
 
-def _no_checks(plan: Plan, deployment: Any) -> None:
+def _no_checks(*_args: Any) -> None:
     pass
 
 
@@ -115,17 +120,34 @@ class Action:
     extra_checks: Callable[[Plan, Any], None] = _no_checks
 
 
-def scale_patch(
-    replicas: int, resource_version: str, plan_id: str, correlation_id: str | None = None
+def _patch_metadata(
+    resource_version: str, plan_id: str, correlation_id: str | None
 ) -> dict[str, Any]:
     # resourceVersion in the patch body makes the API server reject it with 409 if the
     # object changed between the spec check and the patch.
     annotations = {LAST_PLAN_ANNOTATION: plan_id}
     if correlation_id is not None:
         annotations[CORRELATION_ANNOTATION] = correlation_id
+    return {"resourceVersion": resource_version, "annotations": annotations}
+
+
+def scale_patch(
+    replicas: int, resource_version: str, plan_id: str, correlation_id: str | None = None
+) -> dict[str, Any]:
     return {
-        "metadata": {"resourceVersion": resource_version, "annotations": annotations},
+        "metadata": _patch_metadata(resource_version, plan_id, correlation_id),
         "spec": {"replicas": replicas},
+    }
+
+
+def restart_patch(
+    resource_version: str, plan_id: str, correlation_id: str | None = None
+) -> dict[str, Any]:
+    """Only the restart annotation changes in the pod template, so the template written is
+    the one the plan pinned (template_to)."""
+    return {
+        "metadata": _patch_metadata(resource_version, plan_id, correlation_id),
+        "spec": {"template": {"metadata": {"annotations": {RESTART_ANNOTATION: plan_id}}}},
     }
 
 
@@ -362,7 +384,58 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
     return _apply(SCALE, args)
 
 
-HANDLERS = {"apply_scale_deployment": apply_scale_deployment}
+# --- restart_deployment -------------------------------------------------------
+
+
+def _validate_restart(
+    args: Mapping[str, Any], settings: Settings
+) -> tuple[str, str, dict[str, Any]]:
+    namespace, name = validate_target_args(args, settings.allowed_namespaces)
+    return namespace, name, restart_args(namespace, name)
+
+
+def _restart_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now: int) -> None:
+    """No manual-change check (a restart undoes no change) and no direction (replicas stay)."""
+    check_history(
+        rt.store,
+        plan.object_key,
+        now,
+        rt.settings,
+        plan.replicas_from,
+        plan.replicas_to,
+        plan_rate=False,
+        last_applied=last_applied_plan(rt.store, deployment),
+    )
+
+
+RESTART = Action(
+    name=RESTART_DEPLOYMENT,
+    validate=_validate_restart,
+    # A restart record keeps the replica count and pins the template it leaves.
+    record_matches=lambda plan, args: (
+        plan.replicas_to == plan.replicas_from
+        and plan.template_to is not None
+        and not plan.override_manual_change
+    ),
+    # No blast-radius step: replicas do not change (docs/guards.md).
+    check_plan=_no_checks,
+    breaker=_restart_breaker,
+    body=lambda plan, args, deployment, correlation_id: restart_patch(
+        deployment.metadata.resource_version, plan.plan_id, correlation_id
+    ),
+    result=lambda plan, args: {"pods_replaced": plan.replicas_to, "template": plan.template_to},
+    extra_checks=lambda plan, deployment: check_not_paused(deployment),
+)
+
+
+def apply_restart_deployment(args: Mapping[str, Any]) -> Envelope:
+    return _apply(RESTART, args)
+
+
+HANDLERS = {
+    "apply_scale_deployment": apply_scale_deployment,
+    "apply_restart_deployment": apply_restart_deployment,
+}
 
 
 def lambda_handler(event: Any, context: Any) -> Envelope:

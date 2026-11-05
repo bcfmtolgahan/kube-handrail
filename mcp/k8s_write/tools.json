@@ -13,5 +13,18 @@
       },
       "required": ["plan_id", "namespace", "name", "replicas"]
     }
+  },
+  {
+    "name": "apply_restart_deployment",
+    "description": "Apply a restart previously returned by plan_restart_deployment: every pod of the Deployment is replaced, replicas stay as they are. Arguments must match the plan exactly. The plan is single-use, expires after a few minutes, and is rejected if the Deployment changed since planning.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "plan_id": { "type": "string", "description": "plan_id returned by plan_restart_deployment." },
+        "namespace": { "type": "string", "description": "Kubernetes namespace." },
+        "name": { "type": "string", "description": "Deployment name." }
+      },
+      "required": ["plan_id", "namespace", "name"]
+    }
   }
 ]

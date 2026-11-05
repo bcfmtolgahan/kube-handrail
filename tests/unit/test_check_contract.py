@@ -110,12 +110,35 @@ def test_tools_json_not_loaded_by_terraform_fails(repo):
 
 
 def test_apply_tool_on_the_read_target_must_be_mutative(repo):
-    edit_json(repo / "mcp/k8s_read/tools.json", add_tool("apply_restart"))
+    edit_json(repo / "mcp/k8s_read/tools.json", add_tool("plan_resize"))
+    edit_json(repo / "mcp/k8s_read/tools.json", add_tool("apply_resize"))
     edit_json(
-        repo / "mcp/classification.json", lambda c: c.update({"k8sr___apply_restart": "READ_ONLY"})
+        repo / "mcp/classification.json",
+        lambda c: c.update({"k8sr___plan_resize": "READ_ONLY", "k8sr___apply_resize": "READ_ONLY"}),
     )
     assert check_contract.check(repo) == [
-        "k8sr___apply_restart: write tool must be MUTATIVE, not READ_ONLY"
+        "k8sr___apply_resize: write tool must be MUTATIVE, not READ_ONLY"
+    ]
+
+
+def test_plan_tool_without_apply_tool_fails(repo):
+    edit_json(repo / "mcp/k8s_read/tools.json", add_tool("plan_resize"))
+    edit_json(
+        repo / "mcp/classification.json", lambda c: c.update({"k8sr___plan_resize": "READ_ONLY"})
+    )
+    assert check_contract.check(repo) == ["plan_resize: no apply_resize tool"]
+
+
+def test_apply_tool_without_plan_tool_fails(repo):
+    edit_json(
+        repo / "mcp/k8s_read/tools.json",
+        lambda tools: tools.remove(
+            next(t for t in tools if t["name"] == "plan_restart_deployment")
+        ),
+    )
+    edit_json(repo / "mcp/classification.json", lambda c: c.pop("k8sr___plan_restart_deployment"))
+    assert check_contract.check(repo) == [
+        "apply_restart_deployment: no plan_restart_deployment tool"
     ]
 
 

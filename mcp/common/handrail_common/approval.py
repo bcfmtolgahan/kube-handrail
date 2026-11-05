@@ -8,7 +8,12 @@ from decimal import Decimal
 from typing import Any
 
 from handrail_common.envelope import INVALID_ARGUMENT
-from handrail_common.plans import STATUS_PLANNED, STATUS_REJECTED
+from handrail_common.plans import (
+    RESTART_ANNOTATION,
+    RESTART_DEPLOYMENT,
+    STATUS_PLANNED,
+    STATUS_REJECTED,
+)
 from handrail_common.validation import GuardError
 
 STATUS_APPLIED = "applied"
@@ -42,6 +47,16 @@ def derived_status(item: Mapping[str, Any], now: int) -> str:
     return status
 
 
+def change_view(record: Mapping[str, Any]) -> dict[str, Any]:
+    """What the plan changes, per action, in the shape of the plan response's `diff`."""
+    if record.get("action") == RESTART_DEPLOYMENT:
+        return {
+            "restart": {"pods_replaced": record.get("replicas_from")},
+            "template": {"from": record.get("template_from"), "to": record.get("template_to")},
+        }
+    return {"replicas": {"from": record.get("replicas_from"), "to": record.get("replicas_to")}}
+
+
 def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
     record = plain(item)
     view: dict[str, Any] = {
@@ -51,6 +66,7 @@ def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
         "namespace": record.get("namespace"),
         "name": record.get("name"),
         "replicas": {"from": record.get("replicas_from"), "to": record.get("replicas_to")},
+        "change": change_view(record),
         "override_manual_change": record.get("override_manual_change") is True,
         "impact": record.get("impact"),
         "requested_by": record.get("requested_by"),
@@ -84,19 +100,34 @@ def _impact_lines(impact: Mapping[str, Any] | None) -> list[str]:
     if not impact:
         return ["Impact: not recorded"]
     pods = impact.get("pods") or {}
-    lines = [
-        f"Pods: {pods.get('ready_now')} ready now, {pods.get('added')} added, "
-        f"{pods.get('removed')} removed"
-    ]
+    rollout = impact.get("rollout")
+    if rollout is None:
+        lines = [
+            f"Pods: {pods.get('ready_now')} ready now, {pods.get('added')} added, "
+            f"{pods.get('removed')} removed"
+        ]
+    else:
+        lines = [f"Pods: {pods.get('ready_now')} ready now, {pods.get('replaced')} replaced"]
+        if rollout.get("max_unavailable") is None:
+            lines.append(f"Rollout: {rollout.get('strategy')}, every pod stops first")
+        else:
+            lines.append(
+                f"Rollout: {rollout.get('strategy')}, up to {rollout.get('max_unavailable')} "
+                f"unavailable, {rollout.get('max_surge')} surge"
+            )
     for pdb in impact.get("pod_disruption_budgets") or []:
         lines.append(
             f"PodDisruptionBudget {pdb.get('name')}: disruptions allowed now "
             f"{pdb.get('disruptions_allowed')}"
         )
     for service in impact.get("services") or []:
+        if "projected_min_ready_endpoints" in service:
+            projected = f"{service.get('projected_min_ready_endpoints')} projected at the lowest"
+        else:
+            projected = f"{service.get('projected_ready_endpoints')} projected"
         lines.append(
             f"Service {service.get('name')}: {service.get('ready_endpoints_now')} ready "
-            f"endpoints now, {service.get('projected_ready_endpoints')} projected"
+            f"endpoints now, {projected}"
         )
     warnings = impact.get("warnings") or []
     lines.append("Warnings:" if warnings else "Warnings: none")
@@ -111,13 +142,20 @@ def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
     plan_id = view["plan_id"]
     url = approval_url or "<approval_url output>"
     replicas = view["replicas"]
+    if view.get("action") == RESTART_DEPLOYMENT:
+        change = (
+            f"Restart: every pod replaced, replicas stay at {replicas['from']}; "
+            f"pods get the annotation {RESTART_ANNOTATION}={plan_id}"
+        )
+    else:
+        change = f"Replicas: {replicas['from']} -> {replicas['to']}"
     return "\n".join(
         [
             "kube-handrail: a plan is waiting for approval.",
             "",
             f"Plan: {plan_id}",
             f"Deployment: {view['namespace']}/{view['name']}",
-            f"Replicas: {replicas['from']} -> {replicas['to']}",
+            change,
             f"Override manual change: {'yes' if view['override_manual_change'] else 'no'}",
             f"Requested by: {view['requested_by']}",
             f"Expires at (epoch seconds): {view['expires_at']}",

@@ -15,9 +15,13 @@ from moto import mock_aws
 from handrail_common.config import ConfigError, load_settings
 from handrail_common.killswitch import KillSwitch
 from handrail_common.plans import (
+    RESTART_ANNOTATION,
+    RESTART_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
+    plan_args_hash,
+    restart_args,
     scale_args,
     scale_args_hash,
 )
@@ -263,6 +267,52 @@ def test_approve_triggers_the_apply_with_the_plans_own_arguments(env):
     assert view["result"]["result"] == "applied"
     record = env.store.get(plan.plan_id)
     assert record["approved_by"] == ALICE and record["used"] is True
+
+
+def test_approve_runs_the_restart_apply_with_the_plans_own_arguments(env):
+    plan = Plan(
+        plan_id=str(uuid.uuid4()),
+        action=RESTART_DEPLOYMENT,
+        namespace="sandbox",
+        name="web",
+        replicas_from=1,
+        replicas_to=1,
+        args_hash=plan_args_hash(RESTART_DEPLOYMENT, restart_args("sandbox", "web")),
+        args=restart_args("sandbox", "web"),
+        resource_version="10",
+        generation=4,
+        uid=UID,
+        created_at=NOW,
+        expires_at=NOW + 300,
+        template_from="sha256:a",
+        template_to="sha256:b",
+    )
+    env.store.create(plan)
+
+    status, body = approve(env, plan)
+
+    assert status == 200 and body["data"]["apply"]["ok"] is True
+    (invoke,) = env.lam.calls
+    custom = json.loads(base64.b64decode(invoke["ClientContext"]))["custom"]
+    assert custom["bedrockAgentCoreToolName"] == "k8sw___apply_restart_deployment"
+    assert json.loads(invoke["Payload"]) == {
+        "plan_id": plan.plan_id,
+        "namespace": "sandbox",
+        "name": "web",
+    }
+    patch = env.apps.patch_namespaced_deployment.call_args.args[2]
+    assert patch["spec"] == {
+        "template": {"metadata": {"annotations": {RESTART_ANNOTATION: plan.plan_id}}}
+    }
+    assert body["data"]["plan"]["status"] == "applied"
+
+
+def test_every_apply_tool_is_mapped_from_its_action():
+    classification = json.loads((Path(__file__).parents[2] / "mcp/classification.json").read_text())
+    apply_tools = {name for name in classification if name.split("___", 1)[1].startswith("apply_")}
+    assert set(handler.APPLY_TOOLS.values()) == apply_tools
+    for action, tool in handler.APPLY_TOOLS.items():
+        assert tool == f"k8sw___apply_{action}"
 
 
 def test_the_decision_and_its_apply_share_one_correlation_id(env, capsys):

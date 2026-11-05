@@ -8,6 +8,8 @@ from moto import mock_aws
 
 from handrail_common.envelope import PLAN_EXPIRED, PLAN_MISMATCH, PLAN_NOT_FOUND, PLAN_USED
 from handrail_common.plans import (
+    RESTART_ANNOTATION,
+    RESTART_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
@@ -15,6 +17,8 @@ from handrail_common.plans import (
     global_budget_key,
     object_key,
     plan_args_hash,
+    restart_args,
+    restart_template,
     scale_args,
     scale_args_hash,
     template_hash,
@@ -209,6 +213,40 @@ def test_args_and_template_hashes_round_trip(store):
     restored = Plan.from_item(store.get(plan.plan_id))
     assert restored == plan
     assert type(restored.args["replicas"]) is int
+
+
+def test_restart_template_sets_only_the_annotation_on_a_copy():
+    template = {"metadata": {"labels": {"app": "web"}, "annotations": {"a": "1"}}, "spec": {}}
+    restarted = restart_template(template, "p-1")
+    assert restarted == {
+        "metadata": {
+            "labels": {"app": "web"},
+            "annotations": {"a": "1", RESTART_ANNOTATION: "p-1"},
+        },
+        "spec": {},
+    }
+    assert template["metadata"]["annotations"] == {"a": "1"}
+    assert restart_template({}, "p-1") == {"metadata": {"annotations": {RESTART_ANNOTATION: "p-1"}}}
+    # Unique per plan, so no two restarts leave the same template.
+    assert template_hash(restart_template(template, "p-2")) != template_hash(restarted)
+
+
+def test_restart_record_round_trips(store):
+    plan = dataclasses.replace(
+        make_plan(),
+        action=RESTART_DEPLOYMENT,
+        replicas_to=1,
+        args_hash=plan_args_hash(RESTART_DEPLOYMENT, restart_args("sandbox", "web")),
+        args=restart_args("sandbox", "web"),
+        template_from="sha256:a",
+        template_to="sha256:b",
+        revision_from=7,
+    )
+    store.create(plan)
+    restored = Plan.from_item(store.get(plan.plan_id))
+    assert restored == plan
+    assert type(restored.revision_from) is int
+    assert "revision_from" not in make_plan().to_item()
 
 
 def test_from_item_without_args_has_none():

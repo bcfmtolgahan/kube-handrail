@@ -39,12 +39,24 @@
     }
   },
   {
-    "name": "request_approval",
-    "description": "Ask the human approvers configured on the server to approve or reject a plan returned by plan_scale_deployment. Only when the server requires approval (server or both mode; in client mode it is refused because the client approves). Approves nothing and changes nothing in the cluster: it marks the plan as awaiting approval, keeps it valid for the approval wait counted from its creation, and notifies the approvers with the plan as recorded by the server. Approvers decide outside MCP; in server mode their approval also triggers the apply, in both mode the client applies after its own approval. Repeated calls within a short cooldown notify nobody again, and requests are rate limited.",
+    "name": "plan_restart_deployment",
+    "description": "Plan a restart of a Deployment without changing anything: every pod is replaced at the pace of the Deployment's own rollout strategy and the replica count stays as it is. The restart sets the pod-template annotation kube-handrail.io/restart-plan-id to the plan_id, so the resulting template is known and approved now. Runs preflight checks and returns a single-use plan_id, the diff (pods replaced, template hash before and after), a measured impact preview (rollout strategy with the pods that can be unavailable or added at once, matching PodDisruptionBudgets and their headroom, ready endpoints of Services selecting the Deployment now and at the lowest point of the rollout, and warnings for the approver) and an expiry. The change is only made by apply_restart_deployment with the same arguments and plan_id. Refused when the rollout is paused, or the Deployment was changed too recently or too often.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "plan_id": { "type": "string", "description": "plan_id returned by plan_scale_deployment." }
+        "namespace": { "type": "string", "description": "Kubernetes namespace." },
+        "name": { "type": "string", "description": "Deployment name." }
+      },
+      "required": ["namespace", "name"]
+    }
+  },
+  {
+    "name": "request_approval",
+    "description": "Ask the human approvers configured on the server to approve or reject a plan returned by a plan_* tool (plan_scale_deployment, plan_restart_deployment). Only when the server requires approval (server or both mode; in client mode it is refused because the client approves). Approves nothing and changes nothing in the cluster: it marks the plan as awaiting approval, keeps it valid for the approval wait counted from its creation, and notifies the approvers with the plan as recorded by the server. Approvers decide outside MCP; in server mode their approval also triggers the apply, in both mode the client applies after its own approval. Repeated calls within a short cooldown notify nobody again, and requests are rate limited.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "plan_id": { "type": "string", "description": "plan_id returned by a plan_* tool." }
       },
       "required": ["plan_id"]
     }
