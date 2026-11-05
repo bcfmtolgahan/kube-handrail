@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and not yet tested on a cluster. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -104,7 +104,13 @@ The identity is per OAuth client, not per agent session: two agents sharing a cl
 
 **Goal:** confirm that changes worked, extend the action set, and make every change attributable and provable. Items are listed in implementation order. Spikes on the assumptions they depend on (Cedar with the caller interceptor, JSON Patch resourceVersion preconditions, template hashing, interceptor failure behavior) run first.
 
-### 1. Action framework and restart
+### 1. Action framework and restart (implemented)
+
+See [Restart](../mcp/CONTRACT.md#restart). On a test cluster:
+
+- The Milestone 1 end-to-end suite passed on the generic path, with the restart cases added (`--with-rollout`, `--with-expiry`): 50 of 50 in `client` mode and 44 of 44 in `server` mode, where the restart was approved through `scripts/approve.py`.
+- A restart replaced every pod, kept the replica count, and left the plan ID on the pod template and on every new pod. A second restart right after it was refused with `cooldown`, and with the kill switch off the apply returned `remediation_disabled`.
+- In `client` mode, a DevOps Agent chat asked to restart a Deployment found the restart tools, checked the status, planned, and applied after the chat approval. The drift sentinel reported `ok` after `enable-write` registered the new tools.
 
 **Goal:** add actions without copying the guarded write path.
 
