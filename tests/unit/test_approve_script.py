@@ -109,6 +109,21 @@ def test_show_puts_the_plan_id_in_the_query(monkeypatch):
             "rollback_deployment sandbox/web: revision 5 -> 3 (ReplicaSet web-7d5b9c6f8), "
             "1 image(s) changed, replicas unchanged",
         ),
+        (
+            {
+                "action": "rollback_deployment",
+                "namespace": "sandbox",
+                "name": "web",
+                "change": {
+                    "revision": {"from": 5, "to": 3},
+                    "replica_set": "web-7d5b9c6f8",
+                    "images": [{"changed": False}],
+                    "truncated": True,
+                },
+            },
+            "rollback_deployment sandbox/web: revision 5 -> 3 (ReplicaSet web-7d5b9c6f8), "
+            "0 image(s) changed (list truncated), replicas unchanged",
+        ),
         # A view from an approver without the change block.
         (
             {

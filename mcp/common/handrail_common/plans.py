@@ -190,6 +190,9 @@ class Plan:
     # the other template fields that change (never their values).
     images: Sequence[Mapping[str, Any]] | None = None
     fields_changed: Sequence[str] | None = None
+    # Rollback only: whether images or fields_changed was cut, so the approval channel can
+    # say that more changes than it shows.
+    diff_truncated: bool | None = None
 
     @property
     def object_key(self) -> str:
@@ -223,6 +226,8 @@ class Plan:
             item["images"] = [dict(image) for image in self.images]
         if self.fields_changed is not None:
             item["fields_changed"] = list(self.fields_changed)
+        if self.diff_truncated is not None:
+            item["diff_truncated"] = self.diff_truncated
         for field in (*_OPTIONAL_INTS, *_OPTIONAL_STRS):
             value = getattr(self, field)
             if value is not None:
@@ -258,6 +263,7 @@ class Plan:
                 if isinstance(item.get("fields_changed"), list)
                 else None
             ),
+            diff_truncated=(item["diff_truncated"] is True if "diff_truncated" in item else None),
             **{f: int(item[f]) for f in _OPTIONAL_INTS if item.get(f) is not None},
             **{f: str(item[f]) for f in _OPTIONAL_STRS if item.get(f) is not None},
         )

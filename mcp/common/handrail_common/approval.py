@@ -62,6 +62,7 @@ def change_view(record: Mapping[str, Any]) -> dict[str, Any]:
             "replica_set": record.get("target_rs_name"),
             "images": record.get("images") or [],
             "fields_changed": record.get("fields_changed") or [],
+            "truncated": record.get("diff_truncated") is True,
         }
     return {"replicas": {"from": record.get("replicas_from"), "to": record.get("replicas_to")}}
 
@@ -147,8 +148,9 @@ def _impact_lines(impact: Mapping[str, Any] | None) -> list[str]:
 
 
 def _rollback_lines(change: Mapping[str, Any]) -> list[str]:
-    """The revision, each image change and the other changed fields. Images are shown as
-    the record stores them, wrapped as untrusted text: they come from the cluster."""
+    """The revision, each image change, the other changed fields and whether they were cut.
+    Images are shown as the record stores them, wrapped as untrusted text: they come from
+    the cluster."""
     revision = change.get("revision") or {}
     lines = [
         f"Rollback: revision {revision.get('from')} -> {revision.get('to')} "
@@ -162,6 +164,8 @@ def _rollback_lines(change: Mapping[str, Any]) -> list[str]:
             )
     fields = [f for f in change.get("fields_changed") or [] if not f.endswith("].image")]
     lines.append(f"Other changed fields: {', '.join(fields) if fields else 'none'}")
+    if change.get("truncated"):
+        lines.append("(image or field list truncated)")
     return lines
 
 

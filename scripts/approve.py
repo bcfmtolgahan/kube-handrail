@@ -103,9 +103,10 @@ def summary(view: dict[str, Any]) -> str:
     if "revision" in change:
         revision = change["revision"]
         images = sum(1 for image in change.get("images") or [] if image.get("changed"))
+        more = " (list truncated)" if change.get("truncated") else ""
         return (
             f"{target}: revision {revision.get('from')} -> {revision.get('to')} "
-            f"(ReplicaSet {change.get('replica_set')}), {images} image(s) changed, "
+            f"(ReplicaSet {change.get('replica_set')}), {images} image(s) changed{more}, "
             "replicas unchanged"
         )
     replicas = change.get("replicas") or view.get("replicas") or {}

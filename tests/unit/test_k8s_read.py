@@ -1628,6 +1628,7 @@ def test_rollback_plan_pins_the_replica_set_and_its_template(clients, table):
     }
     assert item["images"] == data["diff"]["images"]
     assert item["fields_changed"] == data["diff"]["fields_changed"]
+    assert item["diff_truncated"] is False
     assert [check["check"] for check in data["preflight"]] == [
         "arguments",
         "namespace_allowed",

@@ -242,6 +242,7 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `revision_from` | N | the Deployment's `deployment.kubernetes.io/revision` annotation at plan time, only for an action that changes the template (restart, rollback) and only when the annotation is an integer. Information only |
 | `revision_to`, `target_rs_name`, `target_rs_uid` | N, S, S | rollback only: the requested revision (the approved argument), and the name and `uid` of the ReplicaSet it resolved to, which apply re-reads |
 | `images`, `fields_changed` | L, L | rollback only: `diff.images` and `diff.fields_changed` of the plan response ([Rollback](#rollback)), so the approval channel shows them from the record. Images are stored as untrusted text; field names only, never values |
+| `diff_truncated` | BOOL | rollback only: whether `images` or `fields_changed` was cut, so the approval channel says the lists are incomplete |
 | `resource_version` | S | Deployment `metadata.resourceVersion` at plan time (informational) |
 | `generation` | N | Deployment `metadata.generation` at plan time; a record without it is treated as `-1` and never matches |
 | `uid` | S | Deployment `metadata.uid` at plan time; a record without it is treated as `""` and never matches |
@@ -346,7 +347,7 @@ Plan, differences from the scale steps above:
 - The revision is resolved as above. A target template with the hash of the current template is `invalid_argument` ("revision N is the current template").
 - History checks: manual change (the template rule in [History checks](#history-checks-oscillation-breaker); the replica rule does not apply, because a rollback leaves the count as it is), cooldown, flapping (never triggered: the change has no direction), object budget, plan rate limit.
 - The impact preview is the rollout preview, with two warnings only a rollback has ([Impact preview](#impact-preview)).
-- The record has `replicas_from = replicas_to = ` the current count, `template_to` as above, `revision_from`, `revision_to`, `target_rs_name`, `target_rs_uid`, `images` and `fields_changed`.
+- The record has `replicas_from = replicas_to = ` the current count, `template_to` as above, `revision_from`, `revision_to`, `target_rs_name`, `target_rs_uid`, `images`, `fields_changed` and `diff_truncated`.
 
 `data.diff`:
 
@@ -365,7 +366,7 @@ Plan, differences from the scale steps above:
 }
 ```
 
-- `images` covers every container and init container in either template, matched by name and sorted by `init` and then name. `from` and `to` are the images as untrusted text, `null` for a container in only one of the two templates; `changed` says whether they differ; `pinned_by_digest` is about `to`. At most 20; more set the envelope's `truncated`.
+- `images` covers every container and init container in either template, matched by name and sorted by `init` and then name. `from` and `to` are the images as untrusted text, `null` for a container in only one of the two templates; `changed` says whether they differ; `pinned_by_digest` is about `to`. At most 20; more set the envelope's `truncated`, and the cut drops unchanged containers first, so a changed image is never hidden behind unchanged ones.
 - `fields_changed` names the paths whose values differ, at most two levels below the template's `metadata` and `spec`: `metadata.<key>`, `spec.<key>`, and per container matched by name `spec.containers[<name>].<key>` (likewise `initContainers`), or `spec.containers[<name>]` for a container in only one template, or `spec.containers` when only their order differs. Names only, never values. At most 50; more set the envelope's `truncated`.
 - `preflight` lists `arguments`, `namespace_allowed`, `not_gitops_managed`, `not_paused`, `revision_found`, `template_differs`, `no_manual_change` (with `"overridden": true` when the override was used), `cooldown`, `object_budget`, `plan_rate`, `global_budget`.
 
@@ -615,7 +616,7 @@ Authorization, before anything else:
 
 Requests (responses are the JSON envelope in the body):
 
-- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `change` (what the plan changes, in the shape of the plan response's `diff`: `{"replicas": {from, to}}` for a scale, `{"restart": {"pods_replaced"}, "template": {from, to}}` for a restart, `{"revision": {from, to}, "template": {from, to}, "replica_set", "images", "fields_changed"}` for a rollback), `override_manual_change`, `impact`, `requested_by`, `created_at`, `expires_at`, and when present `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
+- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `change` (what the plan changes, in the shape of the plan response's `diff`: `{"replicas": {from, to}}` for a scale, `{"restart": {"pods_replaced"}, "template": {from, to}}` for a restart, `{"revision": {from, to}, "template": {from, to}, "replica_set", "images", "fields_changed", "truncated"}` for a rollback, where `truncated` is the record's `diff_truncated`), `override_manual_change`, `impact`, `requested_by`, `created_at`, `expires_at`, and when present `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
 - `POST /` with a JSON object of at most 4096 bytes and only these fields: `plan_id` (UUID), `decision` (`approve` or `reject`), optional `reason` (string, at most 500 characters, control characters removed), optional `apply` (boolean, default `true`). Any other field is `invalid_argument`.
   - `approve`: first the record is read; if its `action` has no apply tool the request fails with `internal`, and if it has no `args` with `plan_expired` ("plan again"), before any decision is recorded, so an approval never names a plan that nothing can apply. Then one conditional update, `status IN (planned, awaiting_approval) AND used = false AND expires_at > now AND requested_by <> caller`, sets `status = approved`, `approved_by`, `approved_at`, `approved_args_hash = args_hash` (copied from the record in the same update), `approval_channel = api`, `approval_expires_at = expires_at = now + APPLY_AFTER_APPROVAL_TTL_SECONDS` and `decision_correlation_id` (the approver's request ID).
   - `reject`: the same condition; sets `status = rejected`, `rejected_by`, `rejected_at`, `reject_reason`, `decision_correlation_id`, `expires_at = now`.
@@ -626,7 +627,7 @@ Requests (responses are the JSON envelope in the body):
 
 HTTP status: 200 for `ok` (also when the triggered apply failed; see `data.apply`), 400 `invalid_argument`, 403 `forbidden`, 404 `plan_not_found`, 409 `plan_used`, `plan_expired`, `plan_decided`, `conflict`, 500 otherwise. Each decision is logged as one JSON line with the caller ARN, `plan_id` and correlation ID ([Observability](#observability)); each `forbidden` refusal is logged with the caller ARN.
 
-`scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and a one-line summary of the change (action, Deployment, and the replica change, the pods a restart replaces, or a rollback's revisions, ReplicaSet and number of changed images) and asks for confirmation unless `--yes`. When an approval ran no apply, it says that the client must now apply the plan.
+`scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and a one-line summary of the change (action, Deployment, and the replica change, the pods a restart replaces, or a rollback's revisions, ReplicaSet and number of changed images, noting when the list was truncated) and asks for confirmation unless `--yes`. When an approval ran no apply, it says that the client must now apply the plan.
 
 ### MFA and who can reach the URL
 

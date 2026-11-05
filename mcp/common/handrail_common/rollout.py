@@ -157,7 +157,7 @@ def container_images(template: Obj) -> tuple[list[dict[str, Any]], bool]:
 
 def image_diff(template_from: Obj, template_to: Obj) -> tuple[list[dict[str, Any]], bool]:
     """The image before and after per container, matched by name, sorted by (init, name),
-    and whether anything was cut. A container in only one template has `from` or `to` null;
+    and whether anything was cut; a cut drops unchanged containers first. A container in only one template has `from` or `to` null;
     `pinned_by_digest` is about the image after."""
     before, after = _containers(template_from), _containers(template_to)
     diff = []
@@ -178,7 +178,9 @@ def image_diff(template_from: Obj, template_to: Obj) -> tuple[list[dict[str, Any
                 "pinned_by_digest": _pinned(new),
             }
         )
-    return diff[:IMAGE_LIMIT], truncated or len(diff) > IMAGE_LIMIT
+    # When cutting, unchanged containers go first, so no image change is hidden behind them.
+    kept = sorted(range(len(diff)), key=lambda i: not diff[i]["changed"])[:IMAGE_LIMIT]
+    return [diff[i] for i in sorted(kept)], truncated or len(diff) > IMAGE_LIMIT
 
 
 def _by_name(containers: Any) -> dict[str, Obj]:

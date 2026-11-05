@@ -841,6 +841,7 @@ def _check_rollback(
             "target_rs_uid": str(meta.get("uid")),
             "images": images,
             "fields_changed": fields,
+            "diff_truncated": images_cut or fields_cut,
         },
         truncated=images_cut or fields_cut,
     )

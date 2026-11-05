@@ -226,6 +226,16 @@ def test_image_lists_are_capped():
     assert len(images) == IMAGE_LIMIT and truncated
 
 
+def test_a_cut_image_diff_keeps_the_changed_images():
+    many = {"spec": {"containers": [{"name": f"c{i:02}", "image": "x:1"} for i in range(30)]}}
+    changed = {"spec": {"containers": [dict(c) for c in many["spec"]["containers"]]}}
+    changed["spec"]["containers"][25]["image"] = "evil:1"
+    diff, truncated = image_diff(many, changed)
+    assert len(diff) == IMAGE_LIMIT and truncated
+    assert [d["container"] for d in diff if d["changed"]] == ["c25"]
+    assert [d["container"] for d in diff] == sorted(d["container"] for d in diff)
+
+
 def test_container_images():
     images, truncated = container_images(template(DIGEST, init="busybox:1"))
     assert not truncated

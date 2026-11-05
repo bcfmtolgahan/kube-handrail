@@ -499,7 +499,7 @@ def test_recreate_notification_says_every_pod_stops_first(store):
     assert "Rollout: Recreate, every pod stops first" in message
 
 
-def make_rollback_plan(store: PlanStore) -> Plan:
+def make_rollback_plan(store: PlanStore, **fields) -> Plan:
     plan = Plan(
         plan_id=str(uuid.uuid4()),
         action=ROLLBACK_DEPLOYMENT,
@@ -543,6 +543,7 @@ def make_rollback_plan(store: PlanStore) -> Plan:
             },
         ],
         fields_changed=["spec.containers[nginx].env", "spec.containers[nginx].image"],
+        **fields,
     )
     store.create(plan)
     return plan
@@ -558,6 +559,7 @@ def test_rollback_view_shows_the_revision_replica_set_images_and_fields(store):
         "replica_set": "web-7d5b9c6f8",
         "images": plan.images,
         "fields_changed": ["spec.containers[nginx].env", "spec.containers[nginx].image"],
+        "truncated": False,
     }
 
 
@@ -575,6 +577,14 @@ def test_rollback_notification_lists_image_changes_and_other_fields(store):
     assert "Other changed fields: spec.containers[nginx].env" in message
     assert "- mutable_image_tag: not pinned by digest" in message
     assert "Replicas:" not in message
+    assert "truncated" not in message
+
+
+def test_rollback_notification_says_when_the_change_lists_were_cut(store):
+    plan = make_rollback_plan(store, diff_truncated=True)
+    view = plan_view(item(store, plan.plan_id), NOW)
+    assert view["change"]["truncated"] is True
+    assert "(image or field list truncated)" in notification(view, None)
 
 
 def test_sanitize_reason():
