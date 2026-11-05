@@ -41,7 +41,7 @@ alert_email                 = ""
 caller_interceptor_enabled = true
 agents = {
   devops_agent = {}
-  smoke_test   = {} # { hourly_apply_budget = 30 } for the end-to-end tests
+  smoke_test   = { hourly_apply_budget = 30 } # the smoke and end-to-end tests
 }
 agent_hourly_apply_budget = 10
 

@@ -194,7 +194,8 @@ variable "agents" {
   }))
   default = {
     devops_agent = {}
-    smoke_test   = {}
+    # The smoke test and the end-to-end suite apply more than the default budget per hour.
+    smoke_test = { hourly_apply_budget = 30 }
   }
 
   validation {

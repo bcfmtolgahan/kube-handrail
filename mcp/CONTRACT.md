@@ -308,7 +308,7 @@ Plan (`k8s_read`):
 
 In identity mode the caller is resolved to its agent right after checks 1-3, before the Deployment is read (`forbidden`, `agent_unknown`; [Agent identity](#agent-identity)), and the agent's kill switch must be on (`remediation_disabled`, `details.scope = "agent"`). After check 8, the agent's counter for the current hour, read consistently, must be below its budget (`agent_budget_exceeded`); planning only reads it.
 
-The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact`, `expires_at` and `correlation_id`. `preflight` lists the checks that passed, in this order: `arguments`, `agent_enabled`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`, `agent_budget`. In legacy mode `agent_enabled` and `agent_budget` are `{"passed": true, "skipped": true}`, so a client can see that the per-agent checks did not run.
+The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact`, `expires_at`, `requested_by` and `correlation_id`. `preflight` lists the checks that passed, in this order: `arguments`, `agent_enabled`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`, `agent_budget`. In legacy mode `agent_enabled` and `agent_budget` are `{"passed": true, "skipped": true}`, so a client can see that the per-agent checks did not run.
 
 `blast_radius_exceeded` `details`:
 
@@ -735,7 +735,7 @@ Agent identity, set on both tool Lambdas ([Agent identity](#agent-identity)):
 |---|---|---|
 | `CALLER_INTERCEPTOR` | `true` turns on identity mode; anything else is legacy mode | `caller_interceptor_enabled` (default `true`) |
 | `CALLER_KEY` | The key the interceptor signs the caller with, also set on the interceptor. Without it no caller is trusted, and identity mode refuses every write path with `agent_unknown` | generated once (`terraform_data.caller_key`), identity mode only |
-| `AGENTS` | JSON `{"<client_id>": {"name": "<agent>", "hourly_apply_budget": N}}`. Required in identity mode, with at least one agent; names match `^[a-z][a-z0-9_]{0,31}$` and are unique; the budget, when given, is a positive integer. Ignored in legacy mode | `agents`: a map from agent name to `{client_id = optional(string), hourly_apply_budget = optional(number)}`, default `{devops_agent = {}, smoke_test = {}}`; an entry without `client_id` gets a Cognito app client |
+| `AGENTS` | JSON `{"<client_id>": {"name": "<agent>", "hourly_apply_budget": N}}`. Required in identity mode, with at least one agent; names match `^[a-z][a-z0-9_]{0,31}$` and are unique; the budget, when given, is a positive integer. Ignored in legacy mode | `agents`: a map from agent name to `{client_id = optional(string), hourly_apply_budget = optional(number)}`, default `{devops_agent = {}, smoke_test = {hourly_apply_budget = 30}}`; an entry without `client_id` gets a Cognito app client |
 | `AGENT_HOURLY_APPLY_BUDGET` | 10; a positive integer. The budget of an agent that `AGENTS` gives none, and of a plan's agent no longer in `AGENTS` | `agent_hourly_apply_budget` |
 | `AGENT_KILL_SWITCH_PREFIX` | `/<name_prefix>/agents/`; required in identity mode | set from `name_prefix` |
 
