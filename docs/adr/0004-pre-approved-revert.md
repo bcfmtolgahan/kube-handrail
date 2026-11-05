@@ -28,7 +28,7 @@ ADR 0002 makes every change a human approval pinned to exact arguments. An autom
 - The guards are deliberately narrower for a revert. The exemption is bounded: exactly the inverse of one approved change, only after a `degraded` verdict, only under the precondition, once per plan, and never for a revert.
 - Disabling a misbehaving agent does not block the undo of a change a human approved with its revert. Stopping reverts needs the global kill switch.
 - The verdict is one reading at the end of the window. A brief dip at that moment, or a failure that existed before the change, can make it `degraded`; the impact preview warns when the Deployment is already short of available pods, and the human chooses the window.
-- A kill switch that is off when the check runs skips the revert for good: by the time it is back on, the approved window has passed. An unreadable switch is retried until the grace period ends.
+- A kill switch that is off when the check runs skips the revert for good: by the time it is back on, the approved window has passed. An unreadable switch, or any other failure, is retried until the grace period ends, and the revert is then skipped as late; a patch an earlier run already made is reported as a revert even after that.
 
 ## Alternatives considered
 

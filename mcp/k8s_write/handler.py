@@ -774,13 +774,30 @@ def _revert(rt: Runtime, plan: Plan, now: int, deployment: Any) -> dict[str, Any
     """Undo a degraded change that was approved with revert_on_failure. Only the global kill
     switch, the replica bounds, GitOps ownership and the spec precondition can stop it; it
     takes no budget unit and runs no history check (mcp/CONTRACT.md, Verification and
-    revert). Returns the final revert state, or None to try again on the next run."""
+    revert). Returns the final revert state, or None to try again on the next run; any
+    other failure also leaves the plan due, and verify_applied_plan ends it once late."""
+    revert_id = revert_plan_id(plan.plan_id)
+    if deployment is None:
+        try:
+            deployment = _read(rt.apps(), plan.namespace, plan.name)
+        except GuardError as exc:
+            if exc.code != NOT_FOUND:
+                raise
+            return _revert_state(verify.REVERT_REFUSED, NOT_FOUND, now)
+    if last_plan_id(deployment) == revert_id:
+        # An earlier run's patch landed and that run stopped before recording it: whatever
+        # changed since, the revert is done.
+        record = rt.store.get(revert_id) or {}
+        if record.get("result") != RESULT_APPLIED:
+            _record(rt, revert_id, RESULT_APPLIED, current_correlation_id())
+        return _revert_state(verify.REVERTED, None, now, revert_id)
+    if _late(rt, plan, now):
+        # A revert long after the approved window is not what was approved.
+        return _revert_state(verify.REVERT_SKIPPED, verify.LATE, now)
     switch = rt.kill_switch.state()
     if switch is None:
         # Unreadable: a transient error must not cancel a pre-approved revert for good.
-        return (
-            _revert_state(verify.REVERT_SKIPPED, verify.LATE, now) if _late(rt, plan, now) else None
-        )
+        return None
     if not switch:
         # Final: by the time the switch is back on, the approved window has long passed.
         return _revert_state(verify.REVERT_SKIPPED, REMEDIATION_DISABLED, now)
@@ -819,7 +836,14 @@ def verify_applied_plan(args: Mapping[str, Any]) -> Envelope:
     revert = plan.revert
     wanted = plan.revert_on_failure and plan.kind != KIND_REVERT
     if revert is None and wanted and verification.get("outcome") == verify.DEGRADED:
-        state = _revert(rt, plan, now, deployment)
+        try:
+            state = _revert(rt, plan, now, deployment)
+        except Exception:
+            if not _late(rt, plan, now):
+                raise
+            # Past the grace period every failure is final, as an unreadable switch is.
+            logger.exception("revert of plan %s failed after its grace period", plan_id)
+            state = _revert_state(verify.REVERT_SKIPPED, verify.LATE, now)
         if state is None:
             return ok(_verified(plan_id, verification, verify.REVERT_PENDING))
         revert = rt.store.record_once(plan_id, "revert", state)

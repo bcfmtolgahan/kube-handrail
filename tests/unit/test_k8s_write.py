@@ -2337,6 +2337,100 @@ def test_a_revert_whose_patch_landed_before_a_crash_is_not_patched_again(verify_
     assert item(revert_id)["created_at"] == NOW + 61
 
 
+def landed_revert(runtime_, apps, plan: Plan) -> str:
+    """An earlier run created the revert record and patched, then stopped before recording
+    anything else; returns the revert record's id."""
+    runtime_.store.record_once(
+        plan.plan_id, "verification", {"outcome": "degraded", "reason": "target_not_reached"}
+    )
+    revert_id = handler.revert_plan_id(plan.plan_id)
+    runtime_.store.create_revert(handler.revert_record(runtime_, plan, NOW + 61))
+    apps.read_namespaced_deployment.return_value = live(revert_id, generation=6, replicas=1)
+    return revert_id
+
+
+def test_a_landed_revert_is_reported_even_with_the_kill_switch_now_off(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    revert_id = landed_revert(runtime_, apps, plan)
+    runtime_.kill_switch._ssm.put_parameter(Name=PARAM, Value="false", Overwrite=True)
+    at(runtime_, NOW + 100)
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    assert item(plan.plan_id)["revert"]["revert_plan_id"] == revert_id
+    assert item(revert_id)["result"] == "applied"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_a_landed_revert_is_reported_even_with_its_target_now_out_of_bounds(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    landed_revert(runtime_, apps, plan)
+    runtime_.settings = dataclasses.replace(runtime_.settings, min_replicas=2)
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_a_landed_revert_is_reported_even_after_the_grace_period(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    revert_id = landed_revert(runtime_, apps, plan)
+    runtime_.store.record_result(revert_id, NOW + 61, "applied", "verifier-run-0", 6)
+    at(runtime_, NOW + 3600)
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    # The result the earlier run recorded is kept.
+    assert item(revert_id)["apply_correlation_id"] == "verifier-run-0"
+
+
+def test_a_revert_that_keeps_failing_is_skipped_once_late(verify_rt):
+    """Any failure, not only an unreadable switch: a cluster that comes back an hour later
+    must not get the revert."""
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    apps.patch_namespaced_deployment.side_effect = ConnectionError
+    assert verify(plan.plan_id)["ok"] is False
+    assert item(plan.plan_id)["verify_queue"] == "due"
+
+    apps.patch_namespaced_deployment.reset_mock(side_effect=True)
+    apps.read_namespaced_deployment.return_value = live(plan.plan_id, available=1)
+    at(runtime_, NOW + 3600)
+    assert verify(plan.plan_id)["data"]["revert"] == "skipped"
+    parent = item(plan.plan_id)
+    assert parent["revert"]["reason"] == "late"
+    assert "verify_queue" not in parent
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_an_unreachable_cluster_past_the_grace_period_skips_the_revert(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    runtime_.kill_switch = KillSwitch(
+        MagicMock(get_parameter=MagicMock(side_effect=OSError)), PARAM
+    )
+    verify(plan.plan_id)
+    apps.read_namespaced_deployment.side_effect = ConnectionError
+    assert verify(plan.plan_id)["ok"] is False
+    at(runtime_, NOW + 60 + 301)
+    assert verify(plan.plan_id)["data"]["revert"] == "skipped"
+    assert item(plan.plan_id)["revert"]["reason"] == "late"
+
+
+def test_a_deployment_deleted_before_a_retried_revert_is_refused(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    runtime_.kill_switch = KillSwitch(
+        MagicMock(get_parameter=MagicMock(side_effect=OSError)), PARAM
+    )
+    verify(plan.plan_id)
+    apps.read_namespaced_deployment.side_effect = ApiException(status=404)
+    assert verify(plan.plan_id)["data"]["revert"] == "refused"
+    assert item(plan.plan_id)["revert"] == {
+        "status": "refused",
+        "reason": "not_found",
+        "revert_plan_id": None,
+        "at": NOW + 61,
+    }
+
+
 def test_a_second_run_after_a_revert_changes_nothing(verify_rt):
     runtime_, apps = verify_rt
     plan = applied_with_revert(runtime_, apps)
