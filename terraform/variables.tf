@@ -187,9 +187,10 @@ variable "caller_interceptor_enabled" {
 }
 
 variable "agents" {
-  description = "Agents by name, one OAuth client each. An entry without client_id gets a Cognito app client created here; with client_id, that existing client of the user pool is allowed instead. The default keys are the app clients earlier versions created, so they are kept on upgrade."
+  description = "Agents by name, one OAuth client each. An entry without client_id gets a Cognito app client created here; with client_id, that existing client of the user pool is allowed instead. hourly_apply_budget overrides agent_hourly_apply_budget for that agent. The default keys are the app clients earlier versions created, so they are kept on upgrade."
   type = map(object({
-    client_id = optional(string)
+    client_id           = optional(string)
+    hourly_apply_budget = optional(number)
   }))
   default = {
     devops_agent = {}
@@ -204,6 +205,22 @@ variable "agents" {
   validation {
     condition     = alltrue([for a in values(var.agents) : a.client_id == null || try(length(a.client_id) > 0, false)])
     error_message = "An agent's client_id must not be empty; leave it out to create a client."
+  }
+
+  validation {
+    condition     = alltrue([for a in values(var.agents) : a.hourly_apply_budget == null || try(a.hourly_apply_budget > 0 && floor(a.hourly_apply_budget) == a.hourly_apply_budget, false)])
+    error_message = "An agent's hourly_apply_budget must be a positive integer."
+  }
+}
+
+variable "agent_hourly_apply_budget" {
+  description = "Applies allowed per agent in one clock hour, for agents without their own hourly_apply_budget. The global budget applies as well."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.agent_hourly_apply_budget > 0 && floor(var.agent_hourly_apply_budget) == var.agent_hourly_apply_budget
+    error_message = "agent_hourly_apply_budget must be a positive integer."
   }
 }
 

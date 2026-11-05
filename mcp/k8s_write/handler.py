@@ -11,7 +11,7 @@ import boto3
 from kubernetes import client as k8s
 from kubernetes.client.exceptions import ApiException
 
-from handrail_common.agents import check_plan_agent, guard_apply
+from handrail_common.agents import check_plan_agent, guard_apply, take_agent_budget
 from handrail_common.breaker import (
     LAST_PLAN_ANNOTATION,
     check_history,
@@ -85,6 +85,8 @@ class Runtime:
     store: PlanStore
     apps: Callable[[], k8s.AppsV1Api]
     clock: Callable[[], float] = time.time
+    # For the per-agent kill switches; the global one has its own client.
+    ssm: Any = None
 
 
 _runtime: Runtime | None = None
@@ -98,11 +100,13 @@ def get_runtime() -> Runtime:
         param = settings.remediation_enabled_param
         if param is None:
             raise ConfigError("REMEDIATION_ENABLED_PARAM is required")
+        ssm = boto3.client("ssm", region_name=settings.region)
         _runtime = Runtime(
             settings=settings,
-            kill_switch=KillSwitch(boto3.client("ssm", region_name=settings.region), param),
+            kill_switch=KillSwitch(ssm, param),
             store=PlanStore.from_name(settings.plans_table, settings.region),
             apps=lambda: k8s.AppsV1Api(api_client(settings.cluster_name)),
+            ssm=ssm,
         )
     return _runtime
 
@@ -305,10 +309,11 @@ def check_target(plan: Plan, deployment: Any) -> None:
 def check_breaker(
     rt: Runtime, action: Action, plan: Plan, deployment: Any, override: bool, now: int
 ) -> None:
-    """The action's history checks, then the global budget; re-run after the spec check and
-    authoritative over the plan step."""
+    """The action's history checks, then the agent's and the global budget; re-run after the
+    spec check and authoritative over the plan step."""
     action.breaker(rt, plan, deployment, override, now)
-    # Last, so a request refused by another check does not use up the budget.
+    # Last, so a request refused by another check does not use up a budget.
+    take_agent_budget(rt.store, rt.settings, plan, now)
     rt.store.take_global_budget(now, rt.settings.global_hourly_apply_budget)
 
 
@@ -371,7 +376,7 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
     )
 
     try:
-        check_plan_agent(s, plan)
+        check_plan_agent(s, rt.ssm, plan)
         check_record_matches(plan, action, namespace, name, request)
         action.check_plan(rt, plan)
         updated = _patch(

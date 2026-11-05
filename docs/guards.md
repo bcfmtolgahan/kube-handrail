@@ -35,4 +35,13 @@ History is kept per object, identified by namespace, name and `uid`: deleting an
 
 The history index is eventually consistent and the outcome of an apply is recorded after the patch, so the most recent apply is also taken from the Deployment itself: the plan named by its `kube-handrail.io/last-plan-id` annotation counts as applied whatever the table says about it, because only a successful patch sets that annotation. Two applies cannot race each other on one object either: the first bumps the Deployment's `generation`, which makes the second a `conflict`. A no-op request (the count stays the same) is allowed and counts toward the budget. Rejected plans are not stored, so they are not rate-limited; they change nothing and cost a few reads.
 
-Not covered yet: per-agent limits, which need the caller's identity on the server. See the [roadmap](roadmap.md).
+## Per-agent budget and kill switch
+
+Each agent is one OAuth client, and every plan names the agent that asked for it ([Agent identity](../mcp/CONTRACT.md#agent-identity)). That makes two limits per agent possible, next to the global ones, so one misbehaving agent can be slowed down or stopped without stopping the others.
+
+- **Per-agent budget.** At most `hourly_apply_budget` applies (default `AGENT_HOURLY_APPLY_BUDGET`, 10) by one agent in one clock hour (`agent_budget_exceeded`). An apply is charged to the agent that planned it, also when the approval channel runs it. The global budget still applies; the agent's unit is taken first, so an apply refused by the global budget has used up a unit of its agent's budget as well.
+- **Per-agent kill switch.** An SSM parameter per agent, `/<name_prefix>/agents/<name>/enabled`. Anything but the exact value `true`, or a parameter that cannot be read, stops that agent's plans, approval requests and applies at once (`remediation_disabled` with `details.scope = "agent"`), including the apply that an approval runs for a plan the agent made. The global kill switch still stops every agent. The drift sentinel never writes these switches, so turning an agent back on is always a deliberate step.
+
+Both are checked when planning, for early feedback, and again when applying, which is the decision that counts. Only the agent that planned a change can request its approval or apply it through the gateway, so one agent cannot spend another agent's approved plan or the budget behind it. Without the caller interceptor (legacy mode) every plan names the gateway instead of an agent, and neither limit applies.
+
+To stop one agent: `aws ssm put-parameter --overwrite --name /<name_prefix>/agents/<name>/enabled --value false`; set it back to `true` to let it act again.

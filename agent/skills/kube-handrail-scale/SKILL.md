@@ -30,7 +30,7 @@ Call `plan_scale_deployment(namespace, name, replicas)`. Nothing changes in the 
 
 Warnings do not block the plan. Never omit them. If a warning makes the change unsafe, say so and do not continue without the human.
 
-On an error, follow the AGENTS.md error table. In short: `blast_radius_exceeded` means plan a smaller step; `cooldown` means wait until `details.retry_after`; `manual_change`, `flapping`, budgets, `gitops_managed` and `remediation_disabled` mean stop and report.
+On an error, follow the AGENTS.md error table. In short: `blast_radius_exceeded` means plan a smaller step; `cooldown` means wait until `details.retry_after`; `manual_change`, `flapping`, budgets, `gitops_managed` and `remediation_disabled` (also when it names only your agent) mean stop and report.
 
 ## Step 4: Get the approval
 

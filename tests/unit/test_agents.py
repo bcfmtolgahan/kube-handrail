@@ -4,13 +4,20 @@ import dataclasses
 
 import pytest
 
-from handrail_common.agents import check_plan_agent, guard_apply, requester, resolve_caller
+from handrail_common.agents import (
+    check_agent_enabled,
+    check_plan_agent,
+    guard_apply,
+    guard_plan,
+    requester,
+    resolve_caller,
+)
 from handrail_common.config import Agent, Settings
 from handrail_common.observability import bind_caller, unbind_caller
 from handrail_common.plans import SCALE_DEPLOYMENT, Plan
 from handrail_common.validation import GuardError
 
-SMOKE = Agent(name="smoke_test", client_id="client-a")
+SMOKE = Agent(name="smoke_test", client_id="client-a", hourly_apply_budget=3)
 LEGACY = Settings(
     cluster_name="c",
     plans_table="t",
@@ -21,7 +28,12 @@ LEGACY = Settings(
     remediation_enabled_param=None,
     region=None,
 )
-IDENTITY = dataclasses.replace(LEGACY, identity_required=True, agents={"client-a": SMOKE})
+IDENTITY = dataclasses.replace(
+    LEGACY,
+    identity_required=True,
+    agents={"client-a": SMOKE},
+    agent_kill_switch_prefix="/kh/agents/",
+)
 
 
 @pytest.fixture
@@ -96,7 +108,65 @@ def test_the_approval_channel_expects_no_caller(caller):
     assert guard_apply(IDENTITY) is None
 
 
+class Switches:
+    """An SSM client holding the parameters given."""
+
+    def __init__(self, values: dict[str, str] | None = None, error: bool = False) -> None:
+        self.values = values or {}
+        self.error = error
+        self.names: list[str] = []
+
+    def get_parameter(self, Name):
+        self.names.append(Name)
+        if self.error or Name not in self.values:
+            raise RuntimeError("cannot read")
+        return {"Parameter": {"Value": self.values[Name]}}
+
+
+SWITCH = "/kh/agents/smoke_test/enabled"
+
+
 def test_a_plan_must_name_its_agent_in_identity_mode():
-    check_plan_agent(IDENTITY, plan("smoke_test"))
-    check_plan_agent(LEGACY, plan(None))
-    assert forbidden(check_plan_agent, IDENTITY, plan(None)) == {"reason": "agent_unknown"}
+    on = Switches({SWITCH: "true"})
+    check_plan_agent(IDENTITY, on, plan("smoke_test"))
+    check_plan_agent(LEGACY, Switches(error=True), plan(None))
+    assert forbidden(check_plan_agent, IDENTITY, on, plan(None)) == {"reason": "agent_unknown"}
+
+
+@pytest.mark.parametrize(
+    "ssm",
+    [
+        Switches({SWITCH: "false"}),
+        Switches({SWITCH: "TRUE"}),
+        Switches({SWITCH: "true "}),
+        Switches({}),
+        Switches({SWITCH: "true"}, error=True),
+    ],
+)
+def test_only_an_exact_true_lets_the_agent_act(ssm):
+    with pytest.raises(GuardError) as exc:
+        check_agent_enabled(ssm, IDENTITY, "smoke_test")
+    assert exc.value.code == "remediation_disabled"
+    assert exc.value.details == {"scope": "agent", "agent": "smoke_test"}
+
+
+def test_the_switch_is_read_on_every_call(caller):
+    ssm = Switches({SWITCH: "true"})
+    caller("client-a")
+    assert guard_plan(IDENTITY, ssm) == SMOKE
+    ssm.values[SWITCH] = "false"
+    with pytest.raises(GuardError):
+        guard_plan(IDENTITY, ssm)
+    assert ssm.names == [SWITCH, SWITCH]
+
+
+def test_legacy_mode_reads_no_switch(caller):
+    caller("client-a")
+    ssm = Switches(error=True)
+    assert guard_plan(LEGACY, ssm) is None
+    assert ssm.names == []
+
+
+def test_an_agent_removed_from_agents_gets_the_default_budget():
+    assert IDENTITY.agent_budget("smoke_test") == 3
+    assert IDENTITY.agent_budget("gone") == IDENTITY.agent_hourly_apply_budget == 10

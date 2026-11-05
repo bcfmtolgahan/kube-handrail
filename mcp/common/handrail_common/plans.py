@@ -12,6 +12,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from handrail_common.envelope import (
+    AGENT_BUDGET_EXCEEDED,
     APPROVAL_RATE_LIMITED,
     APPROVAL_REQUIRED,
     CONFLICT,
@@ -37,6 +38,9 @@ OBJECT_HISTORY_INDEX = "object-history"
 # Global apply counters share the plan table under keys that can never be a plan id (a UUID).
 GLOBAL_BUDGET_PREFIX = "budget#global#"
 GLOBAL_BUDGET_WINDOW_SECONDS = 3600
+# Per-agent apply counters, per clock hour like the global one. `#` cannot occur in an
+# agent name, so one agent's key can never be another's.
+AGENT_BUDGET_PREFIX = "budget#agent#"
 # Approval requests (notifications) across all plans, counted per clock window like the budget.
 APPROVAL_REQUEST_PREFIX = "approval#global#"
 APPROVAL_REQUEST_WINDOW_SECONDS = 600
@@ -60,6 +64,10 @@ CHANNEL_API = "api"
 def global_budget_key(now: int) -> str:
     """Counter for the clock hour that contains `now`."""
     return f"{GLOBAL_BUDGET_PREFIX}{now - now % GLOBAL_BUDGET_WINDOW_SECONDS}"
+
+
+def agent_budget_key(name: str, now: int) -> str:
+    return f"{AGENT_BUDGET_PREFIX}{name}#{now - now % GLOBAL_BUDGET_WINDOW_SECONDS}"
 
 
 def approval_request_key(now: int) -> str:
@@ -660,6 +668,26 @@ class PlanStore:
             global_budget_error(start, limit),
         )
 
+    def agent_applies(self, name: str, now: int) -> int:
+        """Applies counted for one agent so far in the current clock hour, read consistently."""
+        item = self._table.get_item(
+            Key={"plan_id": agent_budget_key(name, now)}, ConsistentRead=True
+        ).get("Item")
+        return int(item.get("applies", 0)) if item else 0
+
+    def take_agent_budget(self, name: str, now: int, limit: int) -> None:
+        """Count one apply against the agent's hourly budget, or raise if it is spent. Taken
+        before the global unit, as a separate conditional update: if the global budget is
+        spent, this unit is not given back."""
+        start = now - now % GLOBAL_BUDGET_WINDOW_SECONDS
+        self._take_counter(
+            agent_budget_key(name, now),
+            "applies",
+            limit,
+            start + 2 * GLOBAL_BUDGET_WINDOW_SECONDS,
+            agent_budget_error(name, start, limit),
+        )
+
     def _take_counter(
         self, key: str, attribute: str, limit: int, retain_until: int, error: GuardError
     ) -> None:
@@ -728,6 +756,19 @@ def global_budget_error(window_start: int, limit: int) -> GuardError:
         GLOBAL_BUDGET_EXCEEDED,
         f"the global limit of {limit} applies in this clock hour has been reached",
         {
+            "limit": limit,
+            "window_start": window_start,
+            "retry_after": window_start + GLOBAL_BUDGET_WINDOW_SECONDS,
+        },
+    )
+
+
+def agent_budget_error(name: str, window_start: int, limit: int) -> GuardError:
+    return GuardError(
+        AGENT_BUDGET_EXCEEDED,
+        f"agent {name} has reached its limit of {limit} applies in this clock hour",
+        {
+            "agent": name,
             "limit": limit,
             "window_start": window_start,
             "retry_after": window_start + GLOBAL_BUDGET_WINDOW_SECONDS,

@@ -1,8 +1,8 @@
 # --- Cluster and network (docs/deploy.md, Network) ---------------------------
 #
 # Only the two tool Lambdas call the EKS API, so only they can run in a VPC. At runtime
-# they call eks:DescribeCluster, the cluster's API server, DynamoDB, SSM (write) and SNS
-# (read). The EKS token is presigned locally and never sent to STS by the Lambda, and
+# they call eks:DescribeCluster, the cluster's API server, DynamoDB, SSM (the kill
+# switches) and SNS (read). The EKS token is presigned locally and never sent to STS by the Lambda, and
 # Lambda delivers logs outside the function's network, so neither STS nor CloudWatch Logs
 # needs to be reachable from the subnets.
 

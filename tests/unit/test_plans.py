@@ -14,6 +14,7 @@ from handrail_common.plans import (
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
+    agent_budget_key,
     args_hash,
     global_budget_key,
     object_key,
@@ -358,6 +359,30 @@ def test_global_budget_counts_applies_per_clock_hour(store):
     # The next clock hour starts from zero.
     store.take_global_budget(hour + 3600, 2)
     assert store.global_applies(hour + 3600) == 1
+
+
+def test_agent_budget_counts_per_agent_and_clock_hour(store):
+    hour = NOW - NOW % 3600
+    store.take_agent_budget("smoke_test", NOW, 2)
+    store.take_agent_budget("smoke_test", NOW + 10, 2)
+    with pytest.raises(GuardError) as exc:
+        store.take_agent_budget("smoke_test", NOW + 20, 2)
+    assert exc.value.code == "agent_budget_exceeded"
+    assert exc.value.details == {
+        "agent": "smoke_test",
+        "limit": 2,
+        "window_start": hour,
+        "retry_after": hour + 3600,
+    }
+    assert store.agent_applies("smoke_test", NOW) == 2
+    # Another agent, and the next clock hour, count on their own.
+    store.take_agent_budget("devops_agent", NOW, 2)
+    assert store.agent_applies("devops_agent", NOW) == 1
+    store.take_agent_budget("smoke_test", hour + 3600, 2)
+    assert store.agent_applies("smoke_test", hour + 3600) == 1
+    record = store.get(agent_budget_key("smoke_test", NOW))
+    assert record["plan_id"] == f"budget#agent#smoke_test#{hour}"
+    assert record["retain_until"] == hour + 7200 and "object_key" not in record
 
 
 def test_global_budget_counter_is_not_a_plan(store):

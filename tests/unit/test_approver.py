@@ -616,14 +616,48 @@ def test_identity_mode_apply_after_approval_runs_on_the_approval_channel(env, mo
     monkeypatch.setenv("CALLER_INTERCEPTOR", "true")
     env.write_rt.settings = load_settings(
         WRITE_ENV
-        | {"CALLER_INTERCEPTOR": "true", "AGENTS": '{"client-a": {"name": "smoke_test"}}'},
+        | {
+            "CALLER_INTERCEPTOR": "true",
+            "AGENTS": '{"client-a": {"name": "smoke_test"}}',
+            "AGENT_KILL_SWITCH_PREFIX": "/handrail/agents/",
+        },
         write=True,
     )
+    env.write_rt.ssm = boto3.client("ssm", region_name=REGION)
+    switch = "/handrail/agents/smoke_test/enabled"
+    env.write_rt.ssm.put_parameter(Name=switch, Value="true", Type="String")
     plan = agent_plan(env.store)
     status, body = approve(env, plan)
     assert status == 200 and body["data"]["apply"]["ok"] is True
     record = env.store.get(plan.plan_id)
     assert (record["channel"], record["result"]) == ("approval-api", "applied")
+    # Charged to the plan's agent, although the apply carried no caller.
+    assert env.store.agent_applies("smoke_test", NOW) == 1
+
+
+def test_identity_mode_agent_switched_off_after_approval_consumes_the_plan(env, monkeypatch):
+    monkeypatch.setenv("CALLER_INTERCEPTOR", "true")
+    env.write_rt.settings = load_settings(
+        WRITE_ENV
+        | {
+            "CALLER_INTERCEPTOR": "true",
+            "AGENTS": '{"client-a": {"name": "smoke_test"}}',
+            "AGENT_KILL_SWITCH_PREFIX": "/handrail/agents/",
+        },
+        write=True,
+    )
+    env.write_rt.ssm = boto3.client("ssm", region_name=REGION)
+    env.write_rt.ssm.put_parameter(
+        Name="/handrail/agents/smoke_test/enabled", Value="false", Type="String"
+    )
+    plan = agent_plan(env.store)
+    status, body = approve(env, plan)
+    applied = body["data"]["apply"]
+    assert status == 200 and applied["error"]["code"] == "remediation_disabled"
+    assert applied["error"]["details"] == {"scope": "agent", "agent": "smoke_test"}
+    record = env.store.get(plan.plan_id)
+    assert (record["used"], record["result"]) == (True, "remediation_disabled")
+    env.apps.patch_namespaced_deployment.assert_not_called()
 
 
 def test_show_requires_an_approver_too(env):

@@ -1544,7 +1544,12 @@ def test_server_mode_rollback_after_approval(server_rt):
 # --- Agent identity -----------------------------------------------------------
 
 AGENTS = '{"client-a": {"name": "smoke_test"}, "client-b": {"name": "devops_agent"}}'
-IDENTITY_ENV = ENV | {"CALLER_INTERCEPTOR": "true", "AGENTS": AGENTS}
+SWITCHES = "/handrail/agents/"
+IDENTITY_ENV = ENV | {
+    "CALLER_INTERCEPTOR": "true",
+    "AGENTS": AGENTS,
+    "AGENT_KILL_SWITCH_PREFIX": SWITCHES,
+}
 APPROVAL_CONTEXT = SimpleNamespace(
     client_context=SimpleNamespace(
         custom={
@@ -1562,8 +1567,17 @@ def identity_rt(aws, monkeypatch):
     monkeypatch.setenv("CALLER_INTERCEPTOR", "true")
     rt, apps = runtime()
     rt.settings = load_settings(IDENTITY_ENV, write=True)
+    rt.ssm = boto3.client("ssm", region_name=REGION)
+    for name in ("smoke_test", "devops_agent"):
+        set_agent_switch(rt, name, "true")
     monkeypatch.setattr(handler, "get_runtime", lambda: rt)
     return rt, apps
+
+
+def set_agent_switch(rt, name: str, value: str) -> None:
+    rt.ssm.put_parameter(
+        Name=f"{SWITCHES}{name}/enabled", Value=value, Type="String", Overwrite=True
+    )
 
 
 def create_agent_plan(store: PlanStore, agent: str | None = "smoke_test") -> Plan:
@@ -1671,10 +1685,73 @@ def test_rollback_patch_sets_the_requested_by_annotation():
 def test_every_apply_tool_runs_the_agent_guard(rt, monkeypatch, tool):
     runtime_, apps = rt
 
-    def refuse(settings):
+    def refuse(*args):
         raise GuardError("forbidden", "guard ran", {"reason": "agent_unknown"})
 
     monkeypatch.setattr(handler, "guard_apply", refuse)
     with pytest.raises(GuardError, match="guard ran"):
         handler.HANDLERS[tool]({"plan_id": str(uuid.uuid4())})
     apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_identity_apply_of_an_agent_switched_off_consumes_the_plan(identity_rt):
+    runtime_, apps = identity_rt
+    plan = create_agent_plan(runtime_.store)
+    set_agent_switch(runtime_, "smoke_test", "false")
+
+    response = apply_as(plan.plan_id, "client-a")
+    assert (error_code(response), response["error"]["details"]) == (
+        "remediation_disabled",
+        {"scope": "agent", "agent": "smoke_test"},
+    )
+    record = item(plan.plan_id)
+    assert (record["used"], record["result"]) == (True, "remediation_disabled")
+    apps.read_namespaced_deployment.assert_not_called()
+    assert runtime_.store.agent_applies("smoke_test", NOW) == 0
+
+
+def test_identity_apply_takes_one_unit_of_the_agents_and_the_global_budget(identity_rt):
+    runtime_, _ = identity_rt
+    assert apply_as(create_agent_plan(runtime_.store).plan_id, "client-a")["ok"] is True
+    assert runtime_.store.agent_applies("smoke_test", NOW) == 1
+    assert runtime_.store.agent_applies("devops_agent", NOW) == 0
+    assert runtime_.store.global_applies(NOW) == 1
+
+
+def test_identity_apply_over_the_agent_budget_leaves_the_global_budget(identity_rt):
+    runtime_, apps = identity_rt
+    runtime_.settings = dataclasses.replace(
+        runtime_.settings,
+        agents={
+            cid: dataclasses.replace(a, hourly_apply_budget=1)
+            for cid, a in runtime_.settings.agents.items()
+        },
+    )
+    runtime_.store.take_agent_budget("smoke_test", NOW, 1)
+    plan = create_agent_plan(runtime_.store)
+
+    response = apply_as(plan.plan_id, "client-a")
+    assert error_code(response) == "agent_budget_exceeded"
+    assert response["error"]["details"]["agent"] == "smoke_test"
+    assert item(plan.plan_id)["result"] == "agent_budget_exceeded"
+    assert runtime_.store.global_applies(NOW) == 0
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_identity_apply_loses_the_agent_unit_when_the_global_budget_is_spent(identity_rt):
+    """Documented: the two units are separate updates, and the agent's is taken first."""
+    runtime_, _ = identity_rt
+    runtime_.settings = dataclasses.replace(runtime_.settings, global_hourly_apply_budget=1)
+    runtime_.store.take_global_budget(NOW, 1)
+    response = apply_as(create_agent_plan(runtime_.store).plan_id, "client-a")
+    assert error_code(response) == "global_budget_exceeded"
+    assert runtime_.store.agent_applies("smoke_test", NOW) == 1
+
+
+def test_identity_apply_refused_by_another_check_takes_no_agent_unit(identity_rt):
+    runtime_, apps = identity_rt
+    apps.read_namespaced_deployment.return_value = deployment(generation=5)
+    assert error_code(apply_as(create_agent_plan(runtime_.store).plan_id, "client-a")) == (
+        "conflict"
+    )
+    assert runtime_.store.agent_applies("smoke_test", NOW) == 0

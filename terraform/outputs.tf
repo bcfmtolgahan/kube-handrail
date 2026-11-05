@@ -23,6 +23,11 @@ output "agent_client_ids" {
   value       = local.agent_client_ids
 }
 
+output "agent_kill_switch_parameters" {
+  description = "Per-agent kill switch parameters by agent name; only the value \"true\" lets the agent act."
+  value       = { for name, p in aws_ssm_parameter.agent_enabled : name => p.name }
+}
+
 output "plans_table_name" {
   description = "DynamoDB table holding plans."
   value       = aws_dynamodb_table.plans.name

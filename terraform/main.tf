@@ -64,7 +64,9 @@ locals {
     APPROVAL_REQUEST_COOLDOWN_SECONDS = tostring(var.approval_request_cooldown_seconds)
     APPROVAL_REQUEST_LIMIT            = tostring(var.approval_request_limit)
 
-    AGENTS = local.agents_env
+    AGENTS                    = local.agents_env
+    AGENT_KILL_SWITCH_PREFIX  = local.agent_kill_switch_prefix
+    AGENT_HOURLY_APPLY_BUDGET = tostring(var.agent_hourly_apply_budget)
 
     METRIC_NAMESPACE = local.tools_metric_namespace
   }
@@ -97,10 +99,15 @@ locals {
   )
   # Sorted by agent name; with the default agents this is the list earlier versions allowed.
   allowed_clients = [for name in sort(keys(local.agent_client_ids)) : local.agent_client_ids[name]]
-  # client_id => {name}, as mcp/CONTRACT.md (Agent identity) defines AGENTS.
+  # client_id => {name, hourly_apply_budget}, as mcp/CONTRACT.md (Agent identity) defines AGENTS.
   agents_env = jsonencode({
-    for name, client_id in local.agent_client_ids : client_id => { name = name }
+    for name, client_id in local.agent_client_ids : client_id => {
+      name                = name
+      hourly_apply_budget = coalesce(var.agents[name].hourly_apply_budget, var.agent_hourly_apply_budget)
+    }
   })
+  # Per-agent kill switches are <prefix><name>/enabled.
+  agent_kill_switch_prefix = "/${var.name_prefix}/agents/"
 
   cognito_domain        = "${var.name_prefix}-${local.account_id}"
   cognito_discovery_url = "https://cognito-idp.${local.region}.amazonaws.com/${aws_cognito_user_pool.this.id}/.well-known/openid-configuration"
@@ -214,6 +221,13 @@ data "aws_iam_policy_document" "lambda" {
       actions   = ["ssm:GetParameter"]
       resources = [aws_ssm_parameter.kill_switch.arn]
     }
+  }
+
+  # Both Lambdas read the per-agent kill switches: plan and request_approval as well as apply.
+  statement {
+    sid       = "AgentKillSwitches"
+    actions   = ["ssm:GetParameter"]
+    resources = ["arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${local.agent_kill_switch_prefix}*"]
   }
 
   dynamic "statement" {
@@ -416,6 +430,20 @@ resource "aws_ssm_parameter" "kill_switch" {
   value       = "true"
 
   # Operators flip this out of band; a later apply must not reset it.
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# One kill switch per agent. Only operators write them; the drift sentinel never does.
+resource "aws_ssm_parameter" "agent_enabled" {
+  for_each = var.agents
+
+  name        = "${local.agent_kill_switch_prefix}${each.key}/enabled"
+  description = "Only the exact value \"true\" lets agent ${each.key} plan, request approval and apply."
+  type        = "String"
+  value       = "true"
+
   lifecycle {
     ignore_changes = [value]
   }
