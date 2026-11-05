@@ -1,0 +1,1 @@
+# The verifier needs nothing beyond the Lambda runtime: boto3 and the shared handrail_common.

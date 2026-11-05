@@ -72,6 +72,20 @@ with the switch back on an approved plan of B's is applied and counted against
 B's budget. A must have a budget (smoke_test's hourly_apply_budget) of at least the
 applies of the whole run, 30 in the test setup.
 
+With --with-verify (the deployment has verify_enabled, the default, and a
+verify_window_min_seconds of at most 60), the verification cases also run, with
+windows of 60 and 90 seconds, so they add a few minutes of waiting. In client mode:
+a window below the minimum is refused; e2e-verify-ok scaled 1 -> 2 is pending right
+after the apply and then healthy, and an apply with another window is plan_mismatch;
+e2e-verify-manual scaled by hand inside its window is unknown (spec_changed); and a
+BestEffort fixture (no resource requests) scaled 1 -> 2 under a ResourceQuota
+e2e-besteffort that admits one BestEffort pod is degraded (the reason it reports,
+replica_failure or target_not_reached, shows whether a quota refusal sets
+ReplicaFailure). The quota is created only if the namespace has no LimitRange and no
+BestEffort pod, and deleted again; web and the other fixtures have requests, so it
+does not apply to them. In server mode: an approval applies e2e-verify-ok with a pinned
+window, and the change is verified healthy.
+
 The per-object and global hourly budgets and the plan rate limit are covered by
 unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
 scale_to_zero and service_without_endpoints warnings: they need a plan to 0
@@ -106,6 +120,14 @@ MANUAL = {"namespace": NAMESPACE, "name": "e2e-manual"}
 RESTART = {"namespace": NAMESPACE, "name": "e2e-restart"}
 ROLLBACK = {"namespace": NAMESPACE, "name": "e2e-rollback"}
 IDENTITY = [{"namespace": NAMESPACE, "name": f"e2e-identity-{i}"} for i in (1, 2, 3)]
+VERIFY_OK = {"namespace": NAMESPACE, "name": "e2e-verify-ok"}
+VERIFY_MANUAL = {"namespace": NAMESPACE, "name": "e2e-verify-manual"}
+# BestEffort fixtures (no resource requests), one per case that applies, so no case inherits
+# another's last-plan annotation or object budget. Only one exists at a time: the quota
+# below admits one BestEffort pod.
+VERIFY_NOREVERT = {"namespace": NAMESPACE, "name": "e2e-verify-norevert"}
+VERIFY_BEST_EFFORT = (VERIFY_NOREVERT,)
+QUOTA = "e2e-besteffort"
 FIXTURES = (TARGET["name"], FLAP["name"], MANUAL["name"])
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
 RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
@@ -121,6 +143,12 @@ PLAN_ROLLBACK, APPLY_ROLLBACK = (
     "k8sw___apply_rollback_deployment",
 )
 HISTORY = "k8sr___get_rollout_history"
+OUTCOME = "k8sr___get_plan_outcome"
+# Must be within the deployment's verify_window_min_seconds..max (default 60..1800). A
+# check runs up to one verifier run (a minute) after its window, plus the invoke.
+VERIFY_WINDOW = 60
+HEALTHY_WINDOW = 90
+VERIFY_SLACK_SECONDS = 2 * 60 + 30
 REQUEST_APPROVAL = "k8sr___request_approval"
 EVENTS = "k8sr___get_workload_events"
 # AWS's documented example key ID, split so the source holds no key-shaped literal.
@@ -245,17 +273,25 @@ def delete_fixtures() -> None:
         RESTART["name"],
         ROLLBACK["name"],
         *(target["name"] for target in IDENTITY),
+        VERIFY_OK["name"],
+        VERIFY_MANUAL["name"],
+        *(target["name"] for target in VERIFY_BEST_EFFORT),
         "--ignore-not-found",
         "--wait=true",
     )
+    kubectl("delete", "resourcequota", QUOTA, "--ignore-not-found")
 
 
-def create_fixtures(with_rollout: bool, with_identity: bool = False) -> None:
+def create_fixtures(
+    with_rollout: bool, with_identity: bool = False, with_verify: bool = False
+) -> None:
     # Delete leftovers from an aborted run first: a new object (new uid) has no history.
     delete_fixtures()
     names = [*FIXTURES]
     if with_identity:
         names += [target["name"] for target in IDENTITY]
+    if with_verify:
+        names += [VERIFY_OK["name"], VERIFY_MANUAL["name"]]
     for name in names:
         kubectl("create", "-f", "-", stdin=json.dumps(fixture(name)))
     if with_rollout:
@@ -1282,6 +1318,249 @@ async def rollback_tests(gw: Gateway, approval_mode: str) -> None:
     )
 
 
+def best_effort(name: str) -> dict[str, Any]:
+    """A fixture whose pods have no resource requests or limits: QoS class BestEffort."""
+    deployment = fixture(name)
+    for container in deployment["spec"]["template"]["spec"]["containers"]:
+        container.pop("resources")
+    return deployment
+
+
+def besteffort_quota() -> dict[str, Any]:
+    """Admits one BestEffort pod in the namespace; pods with requests (web, every other
+    fixture) are outside its scope."""
+    return {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+            "name": QUOTA,
+            "namespace": NAMESPACE,
+            "labels": {"app.kubernetes.io/part-of": NAMESPACE},
+        },
+        "spec": {"hard": {"pods": "1"}, "scopes": ["BestEffort"]},
+    }
+
+
+def best_effort_pods() -> list[str]:
+    out = json.loads(kubectl("get", "pods", "-o", "json"))
+    return [
+        pod["metadata"]["name"]
+        for pod in out["items"]
+        if (pod.get("status") or {}).get("qosClass") == "BestEffort"
+        and not pod["metadata"].get("deletionTimestamp")
+        and (pod.get("status") or {}).get("phase") in ("Pending", "Running")
+    ]
+
+
+def quota_objects() -> str:
+    return kubectl("get", "resourcequota,limitrange", "-o", "name")
+
+
+def create_quota() -> bool:
+    """The quota for the degraded cases, only in a namespace where it holds nothing else
+    back: a LimitRange would give the fixtures default requests, and another BestEffort pod
+    would take the quota's one pod."""
+    limit_ranges = kubectl("get", "limitrange", "-o", "name").split()
+    others = best_effort_pods()
+    report(
+        "verify: the namespace has no LimitRange and no BestEffort pod",
+        not limit_ranges and not others,
+        limit_ranges + others,
+    )
+    if limit_ranges or others:
+        return False
+    kubectl("create", "-f", "-", stdin=json.dumps(besteffort_quota()))
+    return True
+
+
+def create_best_effort(target: dict[str, str]) -> None:
+    kubectl("create", "-f", "-", stdin=json.dumps(best_effort(target["name"])))
+    kubectl("rollout", "status", f"deploy/{target['name']}", "--timeout=120s")
+
+
+def delete_deployment(target: dict[str, str]) -> None:
+    kubectl("delete", "deployment", target["name"], "--ignore-not-found", "--wait=true")
+
+
+def replicas_of(target: dict[str, str]) -> int:
+    return int(kubectl("get", f"deploy/{target['name']}", "-o", "jsonpath={.spec.replicas}"))
+
+
+def outcome_status(data: dict[str, Any]) -> tuple[Any, Any]:
+    verification = data.get("verification") or {}
+    return verification.get("status"), verification.get("reason")
+
+
+async def wait_outcome(gw: Gateway, plan_id: str, window: int) -> dict[str, Any]:
+    """get_plan_outcome once the check has run (and a requested revert was acted on), or
+    the last answer when the deadline passes."""
+    deadline = time.time() + window + VERIFY_SLACK_SECONDS
+    while True:
+        envelope = await gw.call(OUTCOME, {"plan_id": plan_id})
+        data = envelope.get("data") or {}
+        waiting = outcome_status(data)[0] == "pending" or (
+            (data.get("revert") or {}).get("status") == "pending"
+        )
+        if not envelope.get("ok") or not waiting or time.time() > deadline:
+            return data
+        await asyncio.sleep(10)
+
+
+async def plan_verified(
+    gw: Gateway, name: str, target: dict[str, str], window: int, **extra: Any
+) -> str | None:
+    """Plan 1 -> 2 with a verification window; returns the plan id."""
+    envelope = await gw.call(
+        PLAN, {**target, "replicas": 2, "verify_window_seconds": window, **extra}
+    )
+    verification = (envelope.get("data") or {}).get("verification") or {}
+    report(
+        f"verify: {name}: the plan shows the window",
+        envelope.get("ok") is True and verification.get("window_seconds") == window,
+        code(envelope) or verification,
+    )
+    return (envelope.get("data") or {}).get("plan_id")
+
+
+async def apply_verified(
+    gw: Gateway, name: str, target: dict[str, str], plan_id: str | None, window: int, **extra
+) -> bool:
+    if plan_id is None:
+        return False
+    envelope = await gw.apply(target, plan_id, 2, verify_window_seconds=window, **extra)
+    report(f"verify: {name}: the apply succeeds", envelope.get("ok") is True, code(envelope))
+    return envelope.get("ok") is True
+
+
+async def verify_tests(gw: Gateway, approval_mode: str) -> None:
+    if approval_mode == "server":
+        await verify_approval_tests(gw)
+        return
+    await expect(
+        gw,
+        "verify: a window below the minimum is refused",
+        PLAN,
+        {**VERIFY_OK, "replicas": 2, "verify_window_seconds": 59},
+        "invalid_argument",
+    )
+
+    healthy = await plan_verified(gw, "healthy", VERIFY_OK, HEALTHY_WINDOW)
+    if healthy:
+        await expect(
+            gw,
+            "verify: an apply with another window is plan_mismatch",
+            APPLY,
+            {"plan_id": healthy, **VERIFY_OK, "replicas": 2, "verify_window_seconds": 60},
+            "plan_mismatch",
+        )
+    if await apply_verified(gw, "healthy", VERIFY_OK, healthy, HEALTHY_WINDOW):
+        data = (await gw.call(OUTCOME, {"plan_id": healthy})).get("data") or {}
+        report(
+            "verify: right after the apply the outcome is pending",
+            outcome_status(data)[0] == "pending"
+            and data.get("revert") == {"requested": False, "status": "not_requested"},
+            outcome_status(data),
+        )
+    else:
+        healthy = None
+
+    manual = await plan_verified(gw, "manual change", VERIFY_MANUAL, VERIFY_WINDOW)
+    if await apply_verified(gw, "manual change", VERIFY_MANUAL, manual, VERIFY_WINDOW):
+        # Inside the window: the check then reads a spec kube-handrail did not write.
+        kubectl("scale", f"deploy/{VERIFY_MANUAL['name']}", "--replicas=1")
+    else:
+        manual = None
+
+    # The three checks run at the same time; each case has its own fixture.
+    waits = []
+    if healthy:
+        waits.append(("healthy", healthy, HEALTHY_WINDOW))
+    if manual:
+        waits.append(("manual", manual, VERIFY_WINDOW))
+    if create_quota():
+        try:
+            create_best_effort(VERIFY_NOREVERT)
+            degraded = await plan_verified(gw, "degraded", VERIFY_NOREVERT, VERIFY_WINDOW)
+            if await apply_verified(gw, "degraded", VERIFY_NOREVERT, degraded, VERIFY_WINDOW):
+                waits.append(("degraded", degraded, VERIFY_WINDOW))
+            outcomes = await gather_outcomes(gw, waits)
+            check_verify_outcomes(outcomes)
+        finally:
+            delete_deployment(VERIFY_NOREVERT)
+            kubectl("delete", "resourcequota", QUOTA, "--ignore-not-found")
+    else:
+        check_verify_outcomes(await gather_outcomes(gw, waits))
+
+
+async def gather_outcomes(
+    gw: Gateway, waits: list[tuple[str, str, int]]
+) -> dict[str, dict[str, Any]]:
+    found = await asyncio.gather(*(wait_outcome(gw, plan_id, w) for _, plan_id, w in waits))
+    return {case: data for (case, _, _), data in zip(waits, found, strict=True)}
+
+
+def check_verify_outcomes(outcomes: dict[str, dict[str, Any]]) -> None:
+    if "healthy" in outcomes:
+        report(
+            "verify: a change that reached its target is healthy and keeps its replicas",
+            outcome_status(outcomes["healthy"]) == ("healthy", "target_reached")
+            and replicas_of(VERIFY_OK) == 2,
+            outcome_status(outcomes["healthy"]),
+        )
+    if "manual" in outcomes:
+        report(
+            "verify: a scale by hand in the window is unknown (spec_changed) and left alone",
+            outcome_status(outcomes["manual"]) == ("unknown", "spec_changed")
+            and replicas_of(VERIFY_MANUAL) == 1,
+            outcome_status(outcomes["manual"]),
+        )
+    if "degraded" in outcomes:
+        data = outcomes["degraded"]
+        # Whether a quota refusal sets ReplicaFailure or only leaves the target unmet.
+        report(
+            "verify: pods refused by the quota make the change degraded, not reverted",
+            outcome_status(data)[0] == "degraded"
+            and outcome_status(data)[1] in ("replica_failure", "target_not_reached")
+            and (data.get("revert") or {}).get("status") == "not_requested"
+            and replicas_of(VERIFY_NOREVERT) == 2,
+            outcome_status(data),
+        )
+
+
+async def verify_approval_tests(gw: Gateway) -> None:
+    """Server mode: the approval's apply carries the pinned window (the record's args), so
+    it matches the plan, and the change is verified."""
+    approve = approve_script()
+    url = os.environ["APPROVAL_URL"]
+    region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
+    plan_id = await plan_verified(gw, "approval", VERIFY_OK, HEALTHY_WINDOW)
+    if plan_id is None:
+        return
+    await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+    status, envelope = approve.show(url, region, plan_id)
+    report(
+        "verify: show renders the window",
+        (envelope.get("data") or {}).get("verification")
+        == {"window_seconds": HEALTHY_WINDOW, "revert_on_failure": False},
+        status,
+    )
+    status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
+    applied = (envelope.get("data") or {}).get("apply") or {}
+    report(
+        "verify: an approval applies a plan with a pinned window",
+        status == 200 and applied.get("ok") is True,
+        (applied.get("error") or {}).get("code") or status,
+    )
+    if not applied.get("ok"):
+        return
+    data = await wait_outcome(gw, plan_id, HEALTHY_WINDOW)
+    report(
+        "verify: the approved change is verified healthy",
+        outcome_status(data) == ("healthy", "target_reached"),
+        outcome_status(data),
+    )
+
+
 AGENT_A = os.environ.get("AGENT_NAME", "smoke_test")
 AGENT_B = os.environ.get("AGENT_NAME_B", "e2e_peer")
 AGENT_BUDGET_B = int(os.environ.get("AGENT_BUDGET_B", "2"))
@@ -1485,7 +1764,11 @@ async def identity_approval_tests(gw_b: Gateway) -> None:
 
 
 async def run(
-    with_expiry: bool, approval_mode: str, with_rollout: bool, with_identity: bool = False
+    with_expiry: bool,
+    approval_mode: str,
+    with_rollout: bool,
+    with_identity: bool = False,
+    with_verify: bool = False,
 ) -> None:
     token = fetch_token()
     auth_tests(token)
@@ -1514,6 +1797,8 @@ async def run(
                 await rollback_tests(gw, approval_mode)
             if with_identity:
                 await run_identity(gw, approval_mode)
+            if with_verify:
+                await verify_tests(gw, approval_mode)
 
 
 async def run_identity(gw_a: Gateway, approval_mode: str) -> None:
@@ -1547,6 +1832,11 @@ def main() -> None:
         help="also run the per-agent identity cases (needs CLIENT_ID_B and CLIENT_SECRET_B)",
     )
     parser.add_argument(
+        "--with-verify",
+        action="store_true",
+        help="also run the verification cases (needs verify_enabled, the default)",
+    )
+    parser.add_argument(
         "--approval-mode",
         choices=["client", "server"],
         default="client",
@@ -1555,10 +1845,17 @@ def main() -> None:
     args = parser.parse_args()
     started = time.time()
     web_before = web_spec()
+    quotas_before = quota_objects() if args.with_verify else ""
     try:
-        create_fixtures(args.with_rollout, args.with_identity)
+        create_fixtures(args.with_rollout, args.with_identity, args.with_verify)
         asyncio.run(
-            run(args.with_expiry, args.approval_mode, args.with_rollout, args.with_identity)
+            run(
+                args.with_expiry,
+                args.approval_mode,
+                args.with_rollout,
+                args.with_identity,
+                args.with_verify,
+            )
         )
     except Exception as exc:
         # A case that raised (for example a plan that failed unexpectedly) still gets the
@@ -1567,6 +1864,12 @@ def main() -> None:
     finally:
         delete_fixtures()
     report("web was not changed", web_spec() == web_before, web_before)
+    if args.with_verify:
+        report(
+            "verify: no ResourceQuota or LimitRange is left behind",
+            quota_objects() == quotas_before,
+            quota_objects().split(),
+        )
     print(f"{sum(results)}/{len(results)} passed in {int(time.time() - started)}s")
     sys.exit(0 if results and all(results) else 1)
 
