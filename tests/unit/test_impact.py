@@ -466,6 +466,19 @@ def test_rollout_projects_the_lowest_ready_endpoints():
     ]
 
 
+def test_rollout_of_a_degraded_deployment_projects_no_more_than_are_ready_now():
+    # One replica, not ready: the Service has no ready endpoint before the rollout starts.
+    result = rollout(deployment(1), services=[service()], slices=[], ready_now=0)
+    assert result["services"] == [
+        {"name": "web", "ready_endpoints_now": 0, "projected_min_ready_endpoints": 0}
+    ]
+    assert codes(result) == [SERVICE_WITHOUT_ENDPOINTS]
+    # Four replicas, two ready, one other backend; one pod can be down.
+    slices = [endpoint_slice("web", [endpoint(address=f"10.0.0.{i}") for i in range(3)])]
+    result = rollout(deployment(4, rolling(1, 0)), services=[service()], slices=slices)
+    assert result["services"][0]["projected_min_ready_endpoints"] == 3
+
+
 def test_rollout_pdb_headroom_counts_the_pods_down_at_once():
     assert codes(rollout(deployment(4, rolling(1, 1)), pdbs=[pdb(allowed=1)])) == []
     result = rollout(deployment(4, rolling(2, 0)), pdbs=[pdb(allowed=1)])

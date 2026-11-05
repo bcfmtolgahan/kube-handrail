@@ -269,8 +269,9 @@ def rollout_impact(
         name = _get(service, "metadata", "name")
         now = ready_endpoints(endpoints.get(name, []))
         # The lowest point of the rollout, assuming new pods become ready and the Service's
-        # other backends stay as they are.
-        projected = max(0, now - ready_now) + (replicas - down)
+        # other backends stay as they are. It includes the start, so this Deployment's ready
+        # pods count no more than are ready now.
+        projected = max(0, now - ready_now) + min(ready_now, replicas - down)
         matching_services.append(
             {"name": name, "ready_endpoints_now": now, "projected_min_ready_endpoints": projected}
         )
