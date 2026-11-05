@@ -23,11 +23,10 @@ locals {
   lambda_security_group_ids = local.create_lambda_sg ? aws_security_group.lambda[*].id : var.lambda_security_group_ids
 
   # An interface endpoint takes at most one subnet per Availability Zone.
-  lambda_subnets_by_az   = { for s in data.aws_subnet.lambda : s.availability_zone => s.id... }
-  endpoint_subnet_ids    = [for az in sort(keys(local.lambda_subnets_by_az)) : sort(local.lambda_subnets_by_az[az])[0]]
-  interface_endpoints    = toset(["eks", "ssm", "sns"])
-  cluster_https_sources  = local.lambda_in_vpc && var.allow_lambda_to_cluster_endpoint ? local.lambda_security_group_ids : []
-  endpoint_https_sources = local.create_vpc_endpoints ? local.lambda_security_group_ids : []
+  lambda_subnets_by_az  = { for s in data.aws_subnet.lambda : s.availability_zone => s.id... }
+  endpoint_subnet_ids   = [for az in sort(keys(local.lambda_subnets_by_az)) : sort(local.lambda_subnets_by_az[az])[0]]
+  interface_endpoints   = toset(["eks", "ssm", "sns"])
+  cluster_https_sources = local.lambda_in_vpc && var.allow_lambda_to_cluster_endpoint ? local.lambda_security_group_ids : []
 
   # A subnet without an explicit association uses the VPC's main route table.
   endpoint_route_table_ids = local.create_vpc_endpoints ? sort(distinct(flatten([
@@ -131,19 +130,22 @@ resource "aws_security_group" "endpoints" {
   count = local.create_vpc_endpoints ? 1 : 0
 
   name        = "${var.name_prefix}-vpc-endpoints"
-  description = "kube-handrail interface endpoints: inbound HTTPS from the tool Lambdas."
+  description = "kube-handrail interface endpoints: inbound HTTPS from the VPC."
   vpc_id      = local.lambda_vpc_id
 }
 
-resource "aws_vpc_security_group_ingress_rule" "endpoints_from_lambda" {
-  count = length(local.endpoint_https_sources)
+# Private DNS sends every client in the VPC to these endpoints, not only the tool Lambdas.
+# Accepting only the Lambdas would cut off other workloads that call EKS, SSM or SNS, so
+# the endpoints accept HTTPS from the VPC's address ranges; IAM still authorizes each call.
+resource "aws_vpc_security_group_ingress_rule" "endpoints_from_vpc" {
+  for_each = local.create_vpc_endpoints ? toset([for a in data.aws_vpc.lambda[0].cidr_block_associations : a.cidr_block]) : toset([])
 
-  security_group_id            = aws_security_group.endpoints[0].id
-  description                  = "${var.name_prefix} tool Lambdas"
-  ip_protocol                  = "tcp"
-  from_port                    = 443
-  to_port                      = 443
-  referenced_security_group_id = local.endpoint_https_sources[count.index]
+  security_group_id = aws_security_group.endpoints[0].id
+  description       = "HTTPS from the VPC"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = each.value
 }
 
 resource "aws_vpc_endpoint" "interface" {
