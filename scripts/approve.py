@@ -93,7 +93,12 @@ def emit(envelope: dict[str, Any]) -> None:
 
 
 def summary(view: dict[str, Any]) -> str:
-    """One line naming the action, the Deployment and what changes, from the server's view."""
+    """One line naming the action, the Deployment and what changes, from the server's view,
+    and the verification the apply schedules."""
+    return change_summary(view) + verification_summary(view.get("verification"))
+
+
+def change_summary(view: dict[str, Any]) -> str:
     change = view.get("change") or {}
     target = f"{view.get('action')} {view.get('namespace')}/{view.get('name')}"
     if "restart" in change:
@@ -111,6 +116,15 @@ def summary(view: dict[str, Any]) -> str:
         )
     replicas = change.get("replicas") or view.get("replicas") or {}
     return f"{target}: replicas {replicas.get('from')} -> {replicas.get('to')}"
+
+
+def verification_summary(verification: dict[str, Any] | None) -> str:
+    if not verification:
+        return ""
+    text = f"; verified {verification.get('window_seconds')} s after the apply"
+    if verification.get("revert_on_failure"):
+        text += f", reverted to {verification.get('revert_to')} replica(s) if degraded"
+    return text
 
 
 def build_parser() -> argparse.ArgumentParser:

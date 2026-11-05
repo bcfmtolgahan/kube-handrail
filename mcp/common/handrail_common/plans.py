@@ -35,6 +35,11 @@ RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
 RESULT_APPLIED = "applied"
 # Global secondary index on (object_key, created_at); the same name is set in terraform/main.tf.
 OBJECT_HISTORY_INDEX = "object-history"
+# Sparse global secondary index on (verify_queue, verify_at): the plans whose verification is
+# scheduled and not yet final (mcp/CONTRACT.md, Verification and revert). The same name is set
+# in terraform/main.tf.
+VERIFY_DUE_INDEX = "verify-due"
+VERIFY_DUE = "due"
 # Global apply counters share the plan table under keys that can never be a plan id (a UUID).
 GLOBAL_BUDGET_PREFIX = "budget#global#"
 GLOBAL_BUDGET_WINDOW_SECONDS = 3600
@@ -55,6 +60,13 @@ STATUS_PLANNED = "planned"
 STATUS_AWAITING = "awaiting_approval"
 STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
+# A revert record's status: it can never be requested, approved or applied.
+STATUS_REVERT = "revert"
+# The kind of a revert record; a plan made by an agent has none.
+KIND_REVERT = "revert"
+# Requesters of records the server makes itself. They are never approved by anyone.
+SYSTEM_REQUESTER_PREFIX = "system:"
+REQUESTER_REVERT = "system:revert"
 # Reported in approval_required details; never stored.
 APPROVAL_EXPIRED = "approval_expired"
 APPROVAL_INVALID = "approval_invalid"
@@ -87,38 +99,74 @@ def plan_args_hash(action: str, args: Mapping[str, Any]) -> str:
     return args_hash({"action": action, **args})
 
 
+def _verify_args(
+    args: dict[str, Any], verify_window_seconds: int | None, revert_on_failure: bool = False
+) -> dict[str, Any]:
+    # Like the override, each enters the payload only when given, so hashes without them
+    # are unchanged.
+    if verify_window_seconds is not None:
+        args["verify_window_seconds"] = verify_window_seconds
+    if revert_on_failure:
+        args["revert_on_failure"] = True
+    return args
+
+
 def scale_args(
-    namespace: str, name: str, replicas: int, override_manual_change: bool = False
+    namespace: str,
+    name: str,
+    replicas: int,
+    override_manual_change: bool = False,
+    revert_on_failure: bool = False,
+    verify_window_seconds: int | None = None,
 ) -> dict[str, Any]:
     """The argument payload of a scale plan: the apply arguments without plan_id."""
     args: dict[str, Any] = {"namespace": namespace, "name": name, "replicas": replicas}
     # Only a true override enters the payload, so hashes without it are unchanged.
     if override_manual_change:
         args["override_manual_change"] = True
-    return args
+    return _verify_args(args, verify_window_seconds, revert_on_failure)
 
 
 def scale_args_hash(
-    namespace: str, name: str, replicas: int, override_manual_change: bool = False
+    namespace: str,
+    name: str,
+    replicas: int,
+    override_manual_change: bool = False,
+    revert_on_failure: bool = False,
+    verify_window_seconds: int | None = None,
 ) -> str:
     return plan_args_hash(
-        SCALE_DEPLOYMENT, scale_args(namespace, name, replicas, override_manual_change)
+        SCALE_DEPLOYMENT,
+        scale_args(
+            namespace,
+            name,
+            replicas,
+            override_manual_change,
+            revert_on_failure,
+            verify_window_seconds,
+        ),
     )
 
 
-def restart_args(namespace: str, name: str) -> dict[str, Any]:
+def restart_args(
+    namespace: str, name: str, verify_window_seconds: int | None = None
+) -> dict[str, Any]:
     """The argument payload of a restart plan: the apply arguments without plan_id."""
-    return {"namespace": namespace, "name": name}
+    return _verify_args({"namespace": namespace, "name": name}, verify_window_seconds)
 
 
 def rollback_args(
-    namespace: str, name: str, revision: int, override_manual_change: bool = False
+    namespace: str,
+    name: str,
+    revision: int,
+    override_manual_change: bool = False,
+    verify_window_seconds: int | None = None,
 ) -> dict[str, Any]:
     """The argument payload of a rollback plan: the apply arguments without plan_id."""
     args: dict[str, Any] = {"namespace": namespace, "name": name, "revision": revision}
     if override_manual_change:
         args["override_manual_change"] = True
-    return args
+    return _verify_args(args, verify_window_seconds)
 
 
 def template_hash(template: Mapping[str, Any]) -> str:
@@ -210,10 +258,28 @@ class Plan:
     requested_client_id: str | None = None
     # Written by the consume: the channel the apply ran under (gateway or approval-api).
     channel: str | None = None
+    # The verification window in seconds: the argument, or the server default when it was
+    # not given. Absent when verification is off.
+    verify_window_seconds: int | None = None
+    # Written by the consume that schedules the verification; absent until then.
+    verify_at: int | None = None
+    # The Deployment's generation after a successful apply, from the patch response.
+    applied_generation: int | None = None
+    # Written once each by the verifier channel (mcp/CONTRACT.md, Verification and revert).
+    verification: Mapping[str, Any] | None = None
+    revert: Mapping[str, Any] | None = None
+    # Revert records only: KIND_REVERT and the plan whose apply the record undoes.
+    kind: str | None = None
+    reverts_plan_id: str | None = None
 
     @property
     def object_key(self) -> str:
         return object_key(self.namespace, self.name, self.uid)
+
+    @property
+    def revert_on_failure(self) -> bool:
+        """Whether the approved arguments ask to revert the change if it is degraded."""
+        return self.args is not None and self.args.get("revert_on_failure") is True
 
     def to_item(self) -> dict[str, Any]:
         item = {
@@ -245,6 +311,10 @@ class Plan:
             item["fields_changed"] = list(self.fields_changed)
         if self.diff_truncated is not None:
             item["diff_truncated"] = self.diff_truncated
+        for field in ("verification", "revert"):
+            value = getattr(self, field)
+            if value is not None:
+                item[field] = dict(value)
         for field in (*_OPTIONAL_INTS, *_OPTIONAL_STRS):
             value = getattr(self, field)
             if value is not None:
@@ -281,6 +351,8 @@ class Plan:
                 else None
             ),
             diff_truncated=(item["diff_truncated"] is True if "diff_truncated" in item else None),
+            verification=_plain(item.get("verification")),
+            revert=_plain(item.get("revert")),
             **{f: int(item[f]) for f in _OPTIONAL_INTS if item.get(f) is not None},
             **{f: str(item[f]) for f in _OPTIONAL_STRS if item.get(f) is not None},
         )
@@ -295,6 +367,9 @@ _OPTIONAL_INTS = (
     "rejected_at",
     "revision_from",
     "revision_to",
+    "verify_window_seconds",
+    "verify_at",
+    "applied_generation",
 )
 _OPTIONAL_STRS = (
     "result",
@@ -314,6 +389,8 @@ _OPTIONAL_STRS = (
     "agent",
     "requested_client_id",
     "channel",
+    "kind",
+    "reverts_plan_id",
 )
 
 
@@ -322,6 +399,17 @@ def _args(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
     return {str(k): int(v) if isinstance(v, Decimal) else v for k, v in value.items()}
+
+
+def _plain(value: Any) -> Any:
+    """A stored map with DynamoDB's Decimal numbers back as integers, at any depth."""
+    if isinstance(value, Decimal):
+        return int(value)
+    if isinstance(value, Mapping):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return value
 
 
 def _images(value: Any) -> list[dict[str, Any]] | None:
@@ -396,13 +484,16 @@ class PlanStore:
         require_approval: bool = False,
         requester: str | None = None,
         channel: str | None = None,
+        verify_window: int | None = None,
     ) -> Plan:
         """Atomically mark the plan used; raise GuardError with the precise reason otherwise.
 
         With `require_approval`, the same conditional write also requires a server approval
         of exactly these arguments, by someone other than the requester, that has not expired.
         With `requester`, it requires that the plan was requested by exactly that requester.
-        `channel` is recorded in the same write.
+        `channel` is recorded in the same write. With `verify_window` (the default window),
+        the same write also schedules the verification, `verify_window_seconds` after now, or
+        `verify_window` for a plan made before it had one.
         """
         # A rejection also ends the plan's validity; this holds even if clocks disagree.
         condition = (
@@ -433,6 +524,14 @@ class PlanStore:
             update += ", #channel = :channel"
             names["#channel"] = "channel"
             values[":channel"] = channel
+        if verify_window is not None:
+            # Nothing after the patch has to succeed for the plan to be verified.
+            update += (
+                ", verify_at = :now + if_not_exists(verify_window_seconds, :window),"
+                " verify_queue = :due"
+            )
+            values[":window"] = verify_window
+            values[":due"] = VERIFY_DUE
         try:
             response = self._table.update_item(
                 Key={"plan_id": plan_id},
@@ -631,7 +730,12 @@ class PlanStore:
         return sorted(entries, key=lambda e: (e.created_at, e.plan_id))
 
     def record_result(
-        self, plan_id: str, applied_at: int, result: str, correlation_id: str | None = None
+        self,
+        plan_id: str,
+        applied_at: int,
+        result: str,
+        correlation_id: str | None = None,
+        applied_generation: int | None = None,
     ) -> None:
         update, values = _with_correlation(
             "SET applied_at = :t, #result = :r",
@@ -639,11 +743,49 @@ class PlanStore:
             "apply_correlation_id",
             correlation_id,
         )
+        if applied_generation is not None:
+            update += ", applied_generation = :g"
+            values[":g"] = applied_generation
         self._table.update_item(
             Key={"plan_id": plan_id},
             UpdateExpression=update,
             ExpressionAttributeNames={"#result": "result"},
             ExpressionAttributeValues=values,
+        )
+
+    def due_plans(self, now: int, limit: int) -> list[str]:
+        """Plan ids whose verification is due at `now`, the longest due first."""
+        response = self._table.query(
+            IndexName=VERIFY_DUE_INDEX,
+            KeyConditionExpression="verify_queue = :due AND verify_at <= :now",
+            ExpressionAttributeValues={":due": VERIFY_DUE, ":now": now},
+            Limit=limit,
+        )
+        return [str(item["plan_id"]) for item in response.get("Items", [])]
+
+    def record_once(self, plan_id: str, attribute: str, value: Mapping[str, Any]) -> dict:
+        """Write `verification` or `revert` unless the record already has one; return the
+        value the record holds afterwards, so a second run continues with the first verdict."""
+        try:
+            self._table.update_item(
+                Key={"plan_id": plan_id},
+                UpdateExpression="SET #a = :v",
+                ConditionExpression="attribute_exists(plan_id) AND attribute_not_exists(#a)",
+                ExpressionAttributeNames={"#a": attribute},
+                ExpressionAttributeValues={":v": dict(value)},
+            )
+        except ClientError as exc:
+            if not _is_conditional_failure(exc):
+                raise
+            return _plain((self.get(plan_id) or {}).get(attribute)) or {}
+        return dict(value)
+
+    def finish_verification(self, plan_id: str) -> None:
+        """Take the plan out of the verify-due index: its verification is final."""
+        self._table.update_item(
+            Key={"plan_id": plan_id},
+            UpdateExpression="REMOVE verify_queue",
+            ConditionExpression="attribute_exists(plan_id)",
         )
 
     def global_applies(self, now: int) -> int:

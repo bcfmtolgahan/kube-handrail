@@ -34,6 +34,7 @@ from handrail_common.envelope import (
     INVALID_ARGUMENT,
     KUBERNETES_ERROR,
     NOT_FOUND,
+    PLAN_NOT_FOUND,
     Envelope,
     ok,
 )
@@ -82,9 +83,11 @@ from handrail_common.validation import (
     require_namespace,
     require_override_flag,
     require_plan_id,
+    require_verify_args,
     validate_scale_args,
     validate_target_args,
 )
+from handrail_common.verify import outcome_view
 
 APPROVAL_SUBJECT = "kube-handrail: approval requested"
 # The API server defaults spec.replicas to 1 when it is omitted.
@@ -588,6 +591,10 @@ def _plan(
     plan_id = str(uuid.uuid4())
     template_from = template_hash(template)
     template_to = template_hash(action.template_to(plan_id, template, resolved))
+    window = request.get("verify_window_seconds")
+    if window is None and settings.verify_enabled:
+        # The default is recorded, not hashed: the consume schedules the check with it.
+        window = settings.verify_window_default_seconds
 
     plan = Plan(
         plan_id=plan_id,
@@ -614,6 +621,7 @@ def _plan(
         template_from=template_from,
         template_to=template_to,
         revision_from=_revision(deployment) if template_to != template_from else None,
+        verify_window_seconds=window,
         **resolved.record,
     )
     clients.store.create(plan)
@@ -628,18 +636,38 @@ def _plan(
             preflight.append({"check": follows, "passed": True})
             if agent is None:
                 preflight[-1]["skipped"] = True
-    return ok(
-        {
-            "plan_id": plan.plan_id,
-            "diff": action.diff(plan),
-            "override_manual_change": override,
-            "preflight": preflight,
-            "impact": impact,
-            "expires_at": plan.expires_at,
-            "requested_by": plan.requested_by,
-            "correlation_id": correlation_id,
-        },
-        truncated=impact["truncated"] or resolved.truncated,
+    data: dict[str, Any] = {
+        "plan_id": plan.plan_id,
+        "diff": action.diff(plan),
+        "override_manual_change": override,
+        "preflight": preflight,
+        "impact": impact,
+        "expires_at": plan.expires_at,
+        "requested_by": plan.requested_by,
+        "correlation_id": correlation_id,
+    }
+    if settings.verify_enabled:
+        data["verification"] = _verification(plan)
+    return ok(data, truncated=impact["truncated"] or resolved.truncated)
+
+
+def _verification(plan: Plan) -> dict[str, Any]:
+    """What the apply schedules: the window, and whether a degraded result is reverted, to
+    which replica count."""
+    view: dict[str, Any] = {
+        "window_seconds": plan.verify_window_seconds,
+        "revert_on_failure": plan.revert_on_failure,
+    }
+    if plan.revert_on_failure:
+        view["revert_to"] = plan.replicas_from
+    return view
+
+
+def _verify_request(
+    args: Mapping[str, Any], settings: Settings, revert_allowed: bool = False
+) -> tuple[int | None, bool]:
+    return require_verify_args(
+        args, settings.verify_enabled, settings.verify_window_bounds, revert_allowed
     )
 
 
@@ -651,7 +679,8 @@ def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, s
         args, settings.allowed_namespaces, settings.bounds_for
     )
     override = require_override_flag(args)
-    return namespace, name, scale_args(namespace, name, replicas, override)
+    window, revert = _verify_request(args, settings)
+    return namespace, name, scale_args(namespace, name, replicas, override, revert, window)
 
 
 def _check_scale(
@@ -743,7 +772,8 @@ def _validate_restart(
     args: Mapping[str, Any], settings: Settings
 ) -> tuple[str, str, dict[str, Any]]:
     namespace, name = validate_target_args(args, settings.allowed_namespaces)
-    return namespace, name, restart_args(namespace, name)
+    window, _ = _verify_request(args, settings)
+    return namespace, name, restart_args(namespace, name, window)
 
 
 def _check_restart(
@@ -828,7 +858,8 @@ def _validate_rollback(
     namespace, name = validate_target_args(args, settings.allowed_namespaces)
     revision = require_revision(args.get("revision"))
     override = require_override_flag(args)
-    return namespace, name, rollback_args(namespace, name, revision, override)
+    window, _ = _verify_request(args, settings)
+    return namespace, name, rollback_args(namespace, name, revision, override, window)
 
 
 def _check_rollback(
@@ -987,6 +1018,19 @@ def request_approval(
     return ok(data)
 
 
+def get_plan_outcome(
+    args: dict[str, Any], settings: Settings, clients: Clients, now: int
+) -> Envelope:
+    """Whether an applied plan reached its target, and whether it was reverted, from the plan
+    record alone: one consistent read, no cluster access."""
+    plan_id = require_plan_id(args.get("plan_id"))
+    item = clients.store.get(plan_id)
+    if item is None:
+        raise GuardError(PLAN_NOT_FOUND, "plan not found")
+    view, truncated = outcome_view(item, now, settings.verify_grace_seconds)
+    return ok(view, truncated=truncated)
+
+
 @cache
 def _settings() -> Settings:
     return load_settings()
@@ -1012,6 +1056,9 @@ HANDLERS = {
         args, _settings(), Clients(_settings()), int(time.time())
     ),
     "request_approval": lambda args: request_approval(
+        args, _settings(), Clients(_settings()), int(time.time())
+    ),
+    "get_plan_outcome": lambda args: get_plan_outcome(
         args, _settings(), Clients(_settings()), int(time.time())
     ),
 }

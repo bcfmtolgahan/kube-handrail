@@ -765,3 +765,28 @@ def test_settings_parse():
 def test_settings_invalid(override):
     with pytest.raises(ConfigError):
         handler.load_approver_settings(BASE_ENV | override)
+
+
+# --- Verification ----------------------------------------------------------------
+
+
+def test_approve_applies_a_plan_with_a_pinned_window_and_schedules_its_check(env):
+    """The record's args carry the window, so the approval's apply matches its plan."""
+    env.write_rt.settings = load_settings(WRITE_ENV | {"VERIFY_ENABLED": "true"}, write=True)
+    args = scale_args("sandbox", "web", 2, verify_window_seconds=90)
+    plan = dataclasses.replace(
+        make_plan(env.store),
+        plan_id=str(uuid.uuid4()),
+        args=args,
+        args_hash=plan_args_hash(SCALE_DEPLOYMENT, args),
+        verify_window_seconds=90,
+    )
+    env.store.create(plan)
+    status, body = approve(env, plan)
+    assert status == 200 and body["data"]["apply"]["ok"] is True
+    assert json.loads(env.lam.calls[0]["Payload"])["verify_window_seconds"] == 90
+    assert body["data"]["plan"]["verification"] == {
+        "window_seconds": 90,
+        "revert_on_failure": False,
+    }
+    assert env.store.get(plan.plan_id)["verify_at"] == NOW + 90

@@ -4,8 +4,9 @@
 Fails if a tool has no classification, the classification names a tool that does
 not exist, a write tool is not MUTATIVE, a full tool name is invalid, a plan_<x>
 tool has no apply_<x> tool or the reverse, terraform/main.tf does not load each
-target's tools.json under that target name, or AGENTS.md does not name every
-error code listed in mcp/CONTRACT.md.
+target's tools.json under that target name, a target has the reserved name of the
+internal handlers or a tools.json names one of them, or AGENTS.md does not name
+every error code listed in mcp/CONTRACT.md.
 Standard library only, so it runs before any dependency is installed.
 """
 
@@ -22,6 +23,11 @@ WRITE_TOOL_PREFIX = "apply_"
 # Every action is planned by plan_<action> and applied by apply_<action>.
 PLAN_TOOL_PREFIX = "plan_"
 WRITE_DIR = "k8s_write"
+# Internal handlers run only as kh_internal___<name> on the verifier channel (mcp/CONTRACT.md,
+# Dispatch). Must match INTERNAL_TARGET in handrail_common/dispatch.py and the keys of
+# INTERNAL_HANDLERS in mcp/k8s_write/handler.py.
+INTERNAL_TARGET = "kh_internal"
+INTERNAL_TOOLS = frozenset({"verify_applied_plan"})
 CLASSIFICATIONS = {"READ_ONLY", "MUTATIVE"}
 NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
 MAX_NAME_LENGTH = 64
@@ -108,8 +114,14 @@ def check(root: Path) -> list[str]:
             f"terraform/main.tf must load mcp/{WRITE_DIR}/tools.json as target {WRITE_TARGET}"
         )
 
+    if INTERNAL_TARGET in targets:
+        errors.append(f"terraform/main.tf: {INTERNAL_TARGET} is reserved for internal handlers")
+
     tools: set[str] = set()
     names: set[str] = set()
+    for directory in sorted(p.parent.name for p in (root / "mcp").glob("*/tools.json")):
+        for name in sorted(INTERNAL_TOOLS & set(schema_tools(root, directory))):
+            errors.append(f"mcp/{directory}/tools.json: {name} is an internal handler")
     for target, directory in sorted(targets.items()):
         for name in schema_tools(root, directory):
             full = f"{target}{DELIMITER}{name}"

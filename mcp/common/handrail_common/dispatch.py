@@ -10,6 +10,7 @@ from typing import Any
 
 from handrail_common.envelope import INTERNAL, UNKNOWN_TOOL, Envelope, err
 from handrail_common.observability import (
+    CHANNEL_VERIFIER,
     DEFAULT_METRIC_NAMESPACE,
     OK,
     bind_caller,
@@ -28,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 TOOL_NAME_KEY = "bedrockAgentCoreToolName"
 TARGET_DELIMITER = "___"
+# Reserved target of the internal handlers (mcp/CONTRACT.md, Dispatch): a tool name
+# kh_internal___<name> runs INTERNAL_HANDLERS[<name>], and only on the verifier channel. No
+# gateway target has this name (scripts/check_contract.py), and a gateway client can set
+# neither the tool name nor the channel.
+INTERNAL_TARGET = "kh_internal"
 # Reserved argument the gateway request interceptor sets to the verified caller, signed with
 # CALLER_KEY (CONTRACT.md, Agent identity): "<client_id>.<hex HMAC-SHA256 of client_id>". It is
 # trusted only when CALLER_INTERCEPTOR is "true" and the signature matches; a client can send
@@ -37,17 +43,38 @@ CALLER_ARGUMENT = "_kube_handrail_caller"
 Handler = Callable[[dict[str, Any]], Envelope]
 
 
-def tool_name(context: Any) -> str | None:
-    """Return the tool name after `<target>___`, or None when absent."""
+def target_and_tool(context: Any) -> tuple[str | None, str | None]:
+    """The target before `___` and the tool name after it, each None when absent."""
     client_context = getattr(context, "client_context", None)
     custom = getattr(client_context, "custom", None)
     if not isinstance(custom, Mapping):
-        return None
+        return None, None
     full = custom.get(TOOL_NAME_KEY)
     if not isinstance(full, str) or TARGET_DELIMITER not in full:
+        return None, None
+    target, name = full.split(TARGET_DELIMITER, 1)
+    return target or None, name or None
+
+
+def tool_name(context: Any) -> str | None:
+    """Return the tool name after `<target>___`, or None when absent."""
+    return target_and_tool(context)[1]
+
+
+def select_handler(
+    handlers: Mapping[str, Handler],
+    internal: Mapping[str, Handler],
+    target: str | None,
+    name: str | None,
+    channel_name: str,
+) -> Handler | None:
+    """An internal handler for the reserved target on the verifier channel; a tool handler
+    for any other target on any other channel; otherwise None (unknown_tool)."""
+    if not name:
         return None
-    name = full.split(TARGET_DELIMITER, 1)[1]
-    return name or None
+    if (target == INTERNAL_TARGET) != (channel_name == CHANNEL_VERIFIER):
+        return None
+    return (internal if target == INTERNAL_TARGET else handlers).get(name)
 
 
 def caller_signature(key: str, caller: str) -> str:
@@ -110,17 +137,19 @@ def dispatch(
     event: Any,
     context: Any,
     env: Mapping[str, str] | None = None,
+    internal: Mapping[str, Handler] | None = None,
 ) -> Envelope:
     env = os.environ if env is None else env
     started = time.monotonic()
-    name = tool_name(context)
-    handler = handlers.get(name) if name else None
+    target, name = target_and_tool(context)
+    channel_name = channel(context)
+    handler = select_handler(handlers, internal or {}, target, name, channel_name)
     args = dict(event) if isinstance(event, dict) else {}
     caller = pop_caller(args, env)
     correlation = correlation_id(context)
     token = bind_correlation_id(correlation)
     # Handlers read the caller and channel through observability, as the correlation id.
-    tokens = bind_caller(caller, channel(context))
+    tokens = bind_caller(caller, channel_name)
     try:
         envelope = _run(handler, name, args)
     finally:

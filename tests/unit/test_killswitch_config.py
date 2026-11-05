@@ -211,3 +211,47 @@ def test_killswitch_reads_every_time():
 @pytest.mark.parametrize("value", ["TRUE", "yes", "", RuntimeError("boom")])
 def test_killswitch_fails_closed(value):
     assert not KillSwitch(FakeSSM(value), "/p").enabled()
+
+
+def test_killswitch_state_tells_unreadable_from_off():
+    assert KillSwitch(FakeSSM("true"), "/p").state() is True
+    assert KillSwitch(FakeSSM("false"), "/p").state() is False
+    assert KillSwitch(FakeSSM(""), "/p").state() is False
+    assert KillSwitch(FakeSSM(RuntimeError("throttled")), "/p").state() is None
+
+
+def test_verify_settings_parse():
+    s = load_settings(BASE)
+    assert s.verify_enabled is False
+    assert (s.verify_window_default_seconds, s.verify_window_bounds) == (120, (60, 1800))
+    assert s.verify_grace_seconds == 300
+    s = load_settings(
+        BASE
+        | {
+            "VERIFY_ENABLED": "true",
+            "VERIFY_WINDOW_DEFAULT_SECONDS": "90",
+            "VERIFY_WINDOW_MIN_SECONDS": "90",
+            "VERIFY_WINDOW_MAX_SECONDS": "600",
+            "VERIFY_GRACE_SECONDS": "120",
+        }
+    )
+    assert s.verify_enabled is True
+    assert (s.verify_window_default_seconds, s.verify_window_bounds) == (90, (90, 600))
+    assert s.verify_grace_seconds == 120
+    assert load_settings(BASE | {"VERIFY_ENABLED": "yes"}).verify_enabled is False
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"VERIFY_WINDOW_MIN_SECONDS": "59", "VERIFY_WINDOW_DEFAULT_SECONDS": "59"},
+        {"VERIFY_WINDOW_DEFAULT_SECONDS": "30"},
+        {"VERIFY_WINDOW_DEFAULT_SECONDS": "2000"},
+        {"VERIFY_WINDOW_MAX_SECONDS": "100"},
+        {"VERIFY_GRACE_SECONDS": "0"},
+        {"VERIFY_WINDOW_MAX_SECONDS": "x"},
+    ],
+)
+def test_verify_settings_invalid(override):
+    with pytest.raises(ConfigError):
+        load_settings(BASE | override)

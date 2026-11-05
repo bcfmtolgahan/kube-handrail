@@ -11,6 +11,7 @@ import boto3
 from kubernetes import client as k8s
 from kubernetes.client.exceptions import ApiException
 
+from handrail_common import verify
 from handrail_common.agents import check_plan_agent, guard_apply, take_agent_budget
 from handrail_common.breaker import (
     LAST_PLAN_ANNOTATION,
@@ -18,6 +19,7 @@ from handrail_common.breaker import (
     check_manual_change,
     check_template_manual_change,
     last_applied_plan,
+    last_plan_id,
     replica_baseline,
 )
 from handrail_common.config import ConfigError, Settings, load_settings
@@ -64,6 +66,7 @@ from handrail_common.validation import (
     check_replica_step,
     require_override_flag,
     require_plan_id,
+    require_verify_args,
     validate_scale_args,
     validate_target_args,
 )
@@ -291,9 +294,11 @@ def check_record_matches(
     if plan.args is None:
         # Made before the argument payload was recorded; the approver says the same.
         raise GuardError(PLAN_EXPIRED, "plan predates the argument record; plan again")
+    window = args.get("verify_window_seconds")
     if (
         dict(plan.args) != dict(args)
         or (plan.namespace, plan.name) != (namespace, name)
+        or (window is not None and plan.verify_window_seconds != window)
         or not action.record_matches(plan, args)
     ):
         raise GuardError(PLAN_MISMATCH, "the plan record does not match the arguments")
@@ -343,10 +348,16 @@ def _patch(
     raise AssertionError("unreachable")
 
 
-def _record(rt: Runtime, plan_id: str, result: str, correlation_id: str | None) -> None:
+def _record(
+    rt: Runtime,
+    plan_id: str,
+    result: str,
+    correlation_id: str | None,
+    applied_generation: int | None = None,
+) -> None:
     # Best effort: the change itself has already succeeded or failed.
     try:
-        rt.store.record_result(plan_id, int(rt.clock()), result, correlation_id)
+        rt.store.record_result(plan_id, int(rt.clock()), result, correlation_id, applied_generation)
     except Exception:
         logger.exception("cannot record result for plan %s", plan_id)
 
@@ -373,6 +384,7 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
         require_approval=s.approval_required,
         requester=expected_requester,
         channel=current_channel(),
+        verify_window=s.verify_window_default_seconds if s.verify_enabled else None,
     )
 
     try:
@@ -393,7 +405,7 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
     except Exception:
         _record(rt, plan_id, INTERNAL, correlation_id)
         raise
-    _record(rt, plan_id, RESULT_APPLIED, correlation_id)
+    _record(rt, plan_id, RESULT_APPLIED, correlation_id, _generation(updated))
 
     return ok(
         {
@@ -409,6 +421,19 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
     )
 
 
+def _generation(deployment: Any) -> int | None:
+    generation = getattr(getattr(deployment, "metadata", None), "generation", None)
+    return generation if isinstance(generation, int) else None
+
+
+def _verify_request(
+    args: Mapping[str, Any], settings: Settings, revert_allowed: bool = False
+) -> tuple[int | None, bool]:
+    return require_verify_args(
+        args, settings.verify_enabled, settings.verify_window_bounds, revert_allowed
+    )
+
+
 # --- scale_deployment ---------------------------------------------------------
 
 
@@ -417,7 +442,8 @@ def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, s
         args, settings.allowed_namespaces, settings.bounds_for
     )
     override = require_override_flag(args)
-    return namespace, name, scale_args(namespace, name, replicas, override)
+    window, revert = _verify_request(args, settings)
+    return namespace, name, scale_args(namespace, name, replicas, override, revert, window)
 
 
 def _check_scale_plan(rt: Runtime, plan: Plan) -> None:
@@ -477,7 +503,8 @@ def _validate_restart(
     args: Mapping[str, Any], settings: Settings
 ) -> tuple[str, str, dict[str, Any]]:
     namespace, name = validate_target_args(args, settings.allowed_namespaces)
-    return namespace, name, restart_args(namespace, name)
+    window, _ = _verify_request(args, settings)
+    return namespace, name, restart_args(namespace, name, window)
 
 
 def _restart_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now: int) -> None:
@@ -527,7 +554,8 @@ def _validate_rollback(
     namespace, name = validate_target_args(args, settings.allowed_namespaces)
     revision = require_revision(args.get("revision"))
     override = require_override_flag(args)
-    return namespace, name, rollback_args(namespace, name, revision, override)
+    window, _ = _verify_request(args, settings)
+    return namespace, name, rollback_args(namespace, name, revision, override, window)
 
 
 def _read_target_template(apps: k8s.AppsV1Api, plan: Plan, deployment: Any) -> dict[str, Any]:
@@ -617,12 +645,80 @@ def apply_rollback_deployment(args: Mapping[str, Any]) -> Envelope:
     return _apply(ROLLBACK, args)
 
 
+# --- verification (internal) --------------------------------------------------
+
+
+def _verdict(outcome: str, reason: str | None, now: int, deployment: Any = None) -> dict[str, Any]:
+    return {
+        "outcome": outcome,
+        "reason": reason,
+        "checked_at": now,
+        "observed": verify.observed(deployment) if deployment is not None else None,
+        "correlation_id": current_correlation_id(),
+    }
+
+
+def _check(rt: Runtime, plan: Plan, now: int) -> dict[str, Any]:
+    """One reading of the Deployment, evaluated. A plan that was consumed but whose apply
+    did not patch is not_applied; past the grace period nothing is read (late)."""
+    if not plan.used:
+        return _verdict(verify.NOT_APPLIED, None, now)
+    if now > (plan.verify_at or 0) + rt.settings.verify_grace_seconds:
+        # A verdict long after the approved window is not what was approved.
+        return _verdict(verify.UNKNOWN, verify.LATE, now)
+    try:
+        deployment = rt.apps().read_namespaced_deployment(plan.name, plan.namespace)
+    except ApiException as exc:
+        logger.error("Kubernetes API error: status=%s reason=%s", exc.status, exc.reason)
+        return _verdict(
+            verify.UNKNOWN, verify.NOT_FOUND if exc.status == 404 else verify.KUBERNETES_ERROR, now
+        )
+    failed = plan.result is not None and plan.result != RESULT_APPLIED
+    if failed and last_plan_id(deployment) != plan.plan_id:
+        # The apply was refused before its patch (only a successful patch sets the annotation).
+        return _verdict(verify.NOT_APPLIED, None, now)
+    outcome, reason = verify.evaluate(plan, deployment)
+    return _verdict(outcome, reason, now, deployment)
+
+
+def verify_applied_plan(args: Mapping[str, Any]) -> Envelope:
+    """Verify one plan whose verify_at has passed (mcp/CONTRACT.md, Verification and
+    revert). Only the verifier channel reaches it. Every write is conditional, so a run that
+    repeats an earlier one, or overlaps it, changes nothing; the plan leaves the verify-due
+    index only once its verification is final."""
+    rt = get_runtime()
+    plan_id = require_plan_id(args.get("plan_id"))
+    now = int(rt.clock())
+    item = rt.store.get(plan_id)
+    plan = Plan.from_item(item) if item is not None else None
+    if plan is None or plan.verify_at is None or plan.verify_at > now:
+        return ok({"plan_id": plan_id, "due": False})
+    verification = plan.verification
+    if verification is None:
+        verification = rt.store.record_once(plan_id, "verification", _check(rt, plan, now))
+    rt.store.finish_verification(plan_id)
+    return ok(
+        {
+            "plan_id": plan_id,
+            "due": True,
+            "outcome": verification.get("outcome"),
+            "reason": verification.get("reason"),
+            "revert": None,
+        }
+    )
+
+
 HANDLERS = {
     "apply_scale_deployment": apply_scale_deployment,
     "apply_restart_deployment": apply_restart_deployment,
     "apply_rollback_deployment": apply_rollback_deployment,
 }
+# Reached only as kh_internal___<name> on the verifier channel (handrail_common.dispatch);
+# scripts/check_contract.py keeps these names out of every tools.json.
+INTERNAL_HANDLERS = {
+    "verify_applied_plan": verify_applied_plan,
+}
 
 
 def lambda_handler(event: Any, context: Any) -> Envelope:
-    return dispatch(HANDLERS, event, context)
+    return dispatch(HANDLERS, event, context, internal=INTERNAL_HANDLERS)

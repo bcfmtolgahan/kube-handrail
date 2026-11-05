@@ -694,3 +694,24 @@ def test_sanitize_reason():
     for bad in ("a" * (REASON_MAX_LENGTH + 1), 5, ["x"]):
         with pytest.raises(GuardError):
             sanitize_reason(bad)
+
+
+def test_view_and_notification_show_the_scheduled_verification(store):
+    plan = make_plan(store)
+    view = plan_view(item(store, plan.plan_id), NOW)
+    assert "verification" not in view
+    assert "Verify window" not in notification(view, None)
+
+    store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET verify_window_seconds = :w, args = :a",
+        ExpressionAttributeValues={
+            ":w": 90,
+            ":a": {"namespace": "sandbox", "name": "web", "replicas": 3, "revert_on_failure": True},
+        },
+    )
+    view = plan_view(item(store, plan.plan_id), NOW)
+    assert view["verification"] == {"window_seconds": 90, "revert_on_failure": True, "revert_to": 1}
+    message = notification(view, None)
+    assert "Verify window: 90 s after the apply" in message
+    assert "Revert on failure: yes, back to 1 replica(s) if the change is degraded" in message

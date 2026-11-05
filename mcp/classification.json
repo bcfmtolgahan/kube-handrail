@@ -6,6 +6,7 @@
   "k8sr___get_rollout_history": "READ_ONLY",
   "k8sr___plan_rollback_deployment": "READ_ONLY",
   "k8sr___request_approval": "READ_ONLY",
+  "k8sr___get_plan_outcome": "READ_ONLY",
   "k8sw___apply_scale_deployment": "MUTATIVE",
   "k8sw___apply_restart_deployment": "MUTATIVE",
   "k8sw___apply_rollback_deployment": "MUTATIVE"
