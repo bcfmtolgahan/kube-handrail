@@ -1,6 +1,6 @@
 ---
 name: kube-handrail-rollout
-description: Procedure for restarting a Kubernetes Deployment (replacing every pod without changing the replica count) or rolling it back to an exact earlier revision through the kube-handrail MCP tools (get_workload_status, get_workload_events, get_rollout_history, plan_restart_deployment, apply_restart_deployment, plan_rollback_deployment, apply_rollback_deployment, request_approval). Use this skill when a mitigation or a user request calls for restarting or rolling a Deployment's pods, or for rolling back a bad deploy, when a kube-handrail restart or rollback plan or apply returns an error, or when one is waiting for human approval.
+description: Procedure for restarting a Kubernetes Deployment (replacing every pod without changing the replica count) or rolling it back to an exact earlier revision through the kube-handrail MCP tools (get_workload_status, get_workload_events, get_rollout_history, plan_restart_deployment, apply_restart_deployment, plan_rollback_deployment, apply_rollback_deployment, request_approval, get_plan_outcome). Use this skill when a mitigation or a user request calls for restarting or rolling a Deployment's pods, or for rolling back a bad deploy, when a kube-handrail restart or rollback plan or apply returns an error, or when one is waiting for human approval.
 ---
 <!-- kube-handrail:skill -->
 
@@ -21,7 +21,7 @@ For a restart, go to Step 2. For a rollback, go to Step R1.
 
 ## Step 2: Plan the restart
 
-Call `plan_restart_deployment(namespace, name)`. Nothing changes in the cluster. On success, show the human:
+Call `plan_restart_deployment(namespace, name)`, optionally with `verify_window_seconds`: how long after the apply the server checks that the rollout completed (60 to 1800 by default; without it the server uses its default, 120). Make it at least the time the whole rollout needs at the pace of the Deployment's strategy. A restart or rollback is never reverted automatically: `revert_on_failure` is refused. Nothing changes in the cluster. On success, show the human:
 
 1. `diff.restart.pods_replaced`: every current pod is replaced; the replica count does not change;
 2. `impact.rollout`: the strategy and, for `RollingUpdate`, how many pods can be unavailable (`max_unavailable`) or added (`max_surge`) at once;
@@ -45,13 +45,13 @@ If a human rejects the plan, or the approval expires, stop. Do not plan the chan
 
 ## Step 4: Apply
 
-For a restart, call `apply_restart_deployment` with the same `plan_id`, `namespace` and `name` as the plan. For a rollback, call `apply_rollback_deployment` with the same `plan_id`, `namespace`, `name`, `revision` and `override_manual_change` (omit the flag if the plan did). Do not change any value.
+For a restart, call `apply_restart_deployment` with the same `plan_id`, `namespace`, `name` and `verify_window_seconds` as the plan. For a rollback, call `apply_rollback_deployment` with the same `plan_id`, `namespace`, `name`, `revision`, `override_manual_change` and `verify_window_seconds`. Omit what the plan omitted, and do not change any value.
 
 On `conflict`, read the status first: the Deployment changed since the plan, possibly by a human, or for a rollback the ReplicaSet it pinned was replaced (`details.replica_set`) or edited (`details.template`); re-plan only if the change is still wanted. On `revision_not_found`, the revision's ReplicaSet is gone: read `get_rollout_history` again and choose with the human. On `plan_expired` or `plan_not_found`, re-plan once (the new plan needs its own approval). On `plan_used`, check status instead: the plan was already applied.
 
 ## Step 5: Verify
 
-Call `get_workload_status` until the updated, ready and desired replicas are equal, or a condition shows a problem, and report the result. After a restart, every new pod carries the annotation `kube-handrail.io/restart-plan-id` with the plan ID. After a rollback, the revision you rolled back to has a new number: the controller reuses its ReplicaSet as the newest revision. If the new pods are not ready, read `get_workload_events` and report; do not restart or roll back again on your own.
+After the window, call `get_plan_outcome(plan_id)` until `verification.status` is no longer `pending`, and report it: `healthy` (every pod runs the new template and is available), `degraded` with its reason (the rollout did not complete in the window; read `get_workload_events`), or `unknown` with its reason (the check cannot tell, for example because someone else changed the Deployment since; report it and do not act). Use `get_workload_status` for the live state. After a restart, every new pod carries the annotation `kube-handrail.io/restart-plan-id` with the plan ID. After a rollback, the revision you rolled back to has a new number: the controller reuses its ReplicaSet as the newest revision. If the new pods are not ready, read `get_workload_events` and report; do not restart or roll back again on your own.
 
 ## Step R1: Choose the revision with the human
 
@@ -64,7 +64,7 @@ Call `get_rollout_history(namespace, name)`. It lists the revisions that still e
 
 ## Step R2: Plan the rollback
 
-Call `plan_rollback_deployment(namespace, name, revision)`. Nothing changes in the cluster. On success, show the human:
+Call `plan_rollback_deployment(namespace, name, revision)`, optionally with `verify_window_seconds` as for a restart in Step 2. Nothing changes in the cluster. On success, show the human:
 
 1. `diff.revision.from` and `to`, and `diff.replica_set`;
 2. `diff.images`: for each container, the image now (`from`) and after (`to`), and whether it changes;
