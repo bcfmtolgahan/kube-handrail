@@ -135,3 +135,19 @@ def test_remove_needs_exactly_one_selection(ssm):
 def test_the_parameter_name_comes_from_the_environment():
     assert freeze.parameter_name(None, {"FREEZES_PARAM": "/x/freezes"}) == "/x/freezes"
     assert freeze.parameter_name("/y/freezes", {"FREEZES_PARAM": "/x/freezes"}) == "/y/freezes"
+
+
+def test_a_missing_parameter_is_reported_without_a_traceback(ssm):
+    with pytest.raises(SystemExit) as exc:
+        freeze.main(["--parameter", "/handrail/absent", "list"], ssm=ssm, now=NOW)
+    assert "not found" in str(exc.value)
+
+
+def test_add_refuses_a_value_over_the_parameter_size_limit(ssm):
+    with pytest.raises(SystemExit) as exc:
+        for _ in range(20):
+            before = stored(ssm)
+            add(ssm, "--reason", "x" * 200)
+    assert "4096" in str(exc.value)
+    assert stored(ssm) == before
+    assert len(json.dumps(before, separators=(",", ":"))) <= freeze.MAX_VALUE_BYTES

@@ -67,8 +67,15 @@ def parameter_name(explicit: str | None, env: dict[str, str]) -> str:
     return out
 
 
+# A standard SSM String parameter holds at most 4096 bytes.
+MAX_VALUE_BYTES = 4096
+
+
 def read(ssm: Any, name: str) -> list[Freeze]:
-    raw = ssm.get_parameter(Name=name)["Parameter"]["Value"]
+    try:
+        raw = ssm.get_parameter(Name=name)["Parameter"]["Value"]
+    except ssm.exceptions.ParameterNotFound:
+        sys.exit(f"parameter {name} not found; check --parameter or FREEZES_PARAM")
     try:
         return parse_freezes(raw)
     except FreezeConfigError as exc:
@@ -82,6 +89,11 @@ def write(ssm: Any, name: str, freezes: list[Freeze]) -> None:
     value = dump_freezes(freezes)
     # Re-parsed, as the Lambdas will: refuse before storing anything they would refuse.
     parse_freezes(value)
+    if len(value.encode()) > MAX_VALUE_BYTES:
+        raise FreezeConfigError(
+            f"the freezes would take {len(value.encode())} bytes, over the parameter's "
+            f"{MAX_VALUE_BYTES}; remove expired freezes or shorten reasons"
+        )
     ssm.put_parameter(Name=name, Value=value, Type="String", Overwrite=True)
 
 
@@ -144,7 +156,10 @@ def cmd_remove(ssm: Any, name: str, args: argparse.Namespace, now: int) -> None:
         unknown = sorted(i for i in drop if not 0 <= i < len(freezes))
         if unknown:
             sys.exit(f"no freeze with index {', '.join(map(str, unknown))}; see `list`")
-    write(ssm, name, [f for i, f in enumerate(freezes) if i not in drop])
+    try:
+        write(ssm, name, [f for i, f in enumerate(freezes) if i not in drop])
+    except FreezeConfigError as exc:
+        sys.exit(f"cannot store the freezes: {exc}")
     for i in sorted(drop):
         print("removed:", describe(i, freezes[i], now))
 

@@ -27,7 +27,8 @@ ACTIONS = {
     "rollback": "rollback_deployment",
 }
 ALL_NAMESPACES = "*"
-# A standard SSM parameter holds 4 KB; 50 short entries fit.
+# A standard SSM parameter holds 4096 bytes, so long reasons fit fewer entries;
+# scripts/freeze.py refuses a write over that size.
 MAX_FREEZES = 50
 MAX_REASON_CHARS = 200
 FIELDS = frozenset({"namespaces", "start", "until", "reason", "actions"})
