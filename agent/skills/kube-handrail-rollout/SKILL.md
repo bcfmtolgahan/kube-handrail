@@ -33,7 +33,7 @@ Warnings do not block the plan. Never omit them. `recreate_strategy` and `servic
 
 On an error, follow the AGENTS.md error table. In short: `conflict` with `details.paused` means a human paused the rollout, so stop; `cooldown` means wait until `details.retry_after`; budgets, `gitops_managed` and `remediation_disabled` (also when it names only your agent) mean stop and report.
 
-`change_frozen` (on a plan, or on an apply even after the approval) means an operator froze changes in the namespace: stop, and report `details.reason` and `details.until` (UTC) to the human. Do not retry before `until`, do not re-plan to get past it, and never work around it with another tool or path; only an operator lifts a freeze. A plan refused at apply is not consumed, so once the freeze is over the human can still have it applied if it has not expired.
+`change_frozen` (on a plan, or on an apply even after the approval) means an operator froze changes in the namespace: stop, and report `details.reason` and `details.until` (UTC) to the human. Do not retry before `until`, do not re-plan to get past it, and never work around it with another tool or path; only an operator lifts a freeze. A plan refused at apply is not consumed, so once the freeze is over the human can still have it applied if it has not expired: apply it only when the human asks you to (in server mode the approval cannot be triggered again, so the apply goes through you).
 
 ## Step 3: Get the approval
 
@@ -79,6 +79,6 @@ Never omit the images, the changed fields or the warnings. If they make the roll
 
 On an error, follow the AGENTS.md error table. In short: `revision_not_found` means read the history again and ask the human (`details.available` lists what exists); `invalid_argument` for the current template means choose another revision with the human; `manual_change` means someone changed the template since kube-handrail's last apply, so stop and ask; `conflict` with `details.paused`, budgets, `gitops_managed` and `remediation_disabled` (also when it names only your agent) mean stop and report; `cooldown` means wait until `details.retry_after`.
 
-`change_frozen` (on a plan, or on an apply even after the approval) means an operator froze changes in the namespace: stop, and report `details.reason` and `details.until` (UTC) to the human. Do not retry before `until`, do not re-plan to get past it, and never work around it with another tool or path; only an operator lifts a freeze. A plan refused at apply is not consumed, so once the freeze is over the human can still have it applied if it has not expired.
+`change_frozen` (on a plan, or on an apply even after the approval) means an operator froze changes in the namespace: stop, and report `details.reason` and `details.until` (UTC) to the human. Do not retry before `until`, do not re-plan to get past it, and never work around it with another tool or path; only an operator lifts a freeze. A plan refused at apply is not consumed, so once the freeze is over the human can still have it applied if it has not expired: apply it only when the human asks you to (in server mode the approval cannot be triggered again, so the apply goes through you).
 
 Then continue with Step 3 (approval), Step 4 (apply) and Step 5 (verify).

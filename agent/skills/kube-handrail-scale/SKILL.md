@@ -35,7 +35,7 @@ Warnings do not block the plan. Never omit them. If a warning makes the change u
 
 On an error, follow the AGENTS.md error table. In short: `blast_radius_exceeded` means plan a smaller step; `cooldown` means wait until `details.retry_after`; `manual_change`, `flapping`, budgets, `gitops_managed` and `remediation_disabled` (also when it names only your agent) mean stop and report.
 
-`change_frozen` (on a plan, or on an apply even after the approval) means an operator froze changes in the namespace: stop, and report `details.reason` and `details.until` (UTC) to the human. Do not retry before `until`, do not re-plan to get past it, and never work around it with another tool or path; only an operator lifts a freeze. A plan refused at apply is not consumed, so once the freeze is over the human can still have it applied if it has not expired.
+`change_frozen` (on a plan, or on an apply even after the approval) means an operator froze changes in the namespace: stop, and report `details.reason` and `details.until` (UTC) to the human. Do not retry before `until`, do not re-plan to get past it, and never work around it with another tool or path; only an operator lifts a freeze. A plan refused at apply is not consumed, so once the freeze is over the human can still have it applied if it has not expired: apply it only when the human asks you to (in server mode the approval cannot be triggered again, so the apply goes through you).
 
 ## Step 4: Get the approval
 
