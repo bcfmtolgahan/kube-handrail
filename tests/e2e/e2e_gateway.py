@@ -117,8 +117,9 @@ own: they take a plan this run applied (read from PLANS_TABLE), wait up to 120 s
 its creation and its consume to appear under plans/<plan_id>/ in the bucket, check that
 scripts/audit.py export names the requesting agent and the result, and try to overwrite
 the first entry as the operator: with If-None-Match it is PreconditionFailed (412), without
-it the bucket policy denies it (403). The operator needs s3:ListBucket, s3:GetObject and
-s3:PutObject on the bucket; nothing is written.
+it (sent with an If-Match no object matches, so the probe cannot replace the entry even if
+the policy were missing) the bucket policy denies it (403). The operator needs
+s3:ListBucket, s3:GetObject and s3:PutObject on the bucket; nothing is written.
 
 The per-object and global hourly budgets and the plan rate limit are covered by
 unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
@@ -2219,9 +2220,12 @@ async def audit_tests(started: int) -> None:
         "audit: overwriting an entry with If-None-Match is PreconditionFailed",
         put_code(IfNoneMatch="*") == "PreconditionFailed",
     )
+    # If-Match with an ETag no object has: the put lacks If-None-Match, so the bucket policy
+    # denies it, and if the policy were missing it would fail as 412 instead of replacing
+    # the entry. The probe never writes.
     report(
         "audit: a put without If-None-Match is denied by the bucket policy",
-        put_code() == "AccessDenied",
+        put_code(IfMatch='"00000000000000000000000000000000"') == "AccessDenied",
     )
 
 
