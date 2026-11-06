@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from typing import Any
 
-from handrail_common.envelope import INTERNAL, KUBERNETES_ERROR
+from handrail_common.envelope import ADMISSION_DENIED, INTERNAL, KUBERNETES_ERROR
 
 # Tried in this order. The gateway sets the first in client_context.custom; the approver
 # sets the second when it runs an apply, so the apply shares its id, and so does the
@@ -30,8 +30,9 @@ DEFAULT_METRIC_NAMESPACE = "kube-handrail/tools"
 UNKNOWN_TOOL_DIMENSION = "unknown"
 OK = "ok"
 # Outcomes counted as ToolErrors (the alarm) instead of GuardRejections: the tool could not
-# do its job, as opposed to a guard refusing the request.
-ERROR_OUTCOMES = (INTERNAL, KUBERNETES_ERROR)
+# do its job, as opposed to a guard refusing the request. admission_denied is here too: the
+# cluster refused a change the guard allowed, so the bounds drifted or the guard is wrong.
+ERROR_OUTCOMES = (INTERNAL, KUBERNETES_ERROR, ADMISSION_DENIED)
 
 # Only a short token is accepted: the value goes into logs, the plan record and a
 # Kubernetes annotation.
