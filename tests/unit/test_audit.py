@@ -133,7 +133,7 @@ def test_verification_and_revert_in_summary():
     old = {**APPLIED}
     new = {
         **APPLIED,
-        "verification": {"status": "degraded", "reason": "replica_failure"},
+        "verification": {"outcome": "degraded", "reason": "replica_failure"},
         "revert": {"status": "reverted", "revert_plan_id": "r-1"},
     }
     _, entry = handler.build_entry(stream_record("MODIFY", "102", old=old, new=new))

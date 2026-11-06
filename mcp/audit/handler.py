@@ -141,7 +141,7 @@ def summarize(
             summary[name] = after
     verification = current.get("verification")
     if isinstance(verification, Mapping):
-        summary["verification"] = verification.get("status")
+        summary["verification"] = verification.get("outcome")
     revert = current.get("revert")
     if isinstance(revert, Mapping):
         summary["revert"] = {

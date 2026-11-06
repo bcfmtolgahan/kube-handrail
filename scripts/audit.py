@@ -126,7 +126,7 @@ def summarize(plan_id: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
     verification = image.get("verification")
     if isinstance(verification, Mapping):
         summary["verification"] = {
-            "status": verification.get("status"),
+            "outcome": verification.get("outcome"),
             "reason": verification.get("reason"),
         }
     revert = image.get("revert")

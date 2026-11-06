@@ -55,7 +55,7 @@ APPLIED = {**APPROVED, "used": True, "channel": "approval-api"}
 RESULT = {**APPLIED, "result": "applied", "applied_at": 1_700_000_030}
 VERIFIED = {
     **RESULT,
-    "verification": {"status": "degraded", "reason": "replica_failure"},
+    "verification": {"outcome": "degraded", "reason": "replica_failure"},
     "revert": {"status": "reverted", "reason": None, "revert_plan_id": REVERT_ID},
 }
 REVERT = {
@@ -102,7 +102,7 @@ def test_export_summary_names_the_chain(s3):
     assert summary["channel"] == "approval-api"
     assert summary["result"] == "applied"
     assert summary["status_history"] == ["planned", "awaiting_approval", "approved"]
-    assert summary["verification"] == {"status": "degraded", "reason": "replica_failure"}
+    assert summary["verification"] == {"outcome": "degraded", "reason": "replica_failure"}
     assert summary["revert"]["revert_plan_id"] == REVERT_ID
     assert summary["has_creation"] is True
     assert summary["removed"] is None
