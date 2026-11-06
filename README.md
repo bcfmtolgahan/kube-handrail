@@ -111,6 +111,8 @@ Milestone 2, item 5 (change freezes): an operator sets windows in which plans an
 
 Milestone 2, item 4 (verify and revert): plans take a verification window and, for a scale, `revert_on_failure`, pinned in the approval; the apply schedules the check, a scheduled verifier runs it through an internal entry point of the write Lambda, `get_plan_outcome` reports `healthy`, `degraded` or `unknown`, and a degraded change approved with revert is reverted under the spec-level precondition. Implemented and tested on a test cluster. See [Verification and revert](mcp/CONTRACT.md#verification-and-revert).
 
+Milestone 2, item 6 (durable audit record): every change to a plan record is written once, from the plan table's stream, to an S3 bucket with Object Lock that the tool Lambdas cannot write to, and `scripts/audit.py export` shows a plan's requesting agent, approver, channel, result, verification and revert. Implemented, not yet tested on a cluster. See [Audit record](mcp/CONTRACT.md#audit-record).
+
 ## Planned layout
 
 Subject to change as the design is validated.
@@ -143,6 +145,7 @@ AGENTS.md        tool contract for MCP clients
 - [ADR 0003: Agent identity per OAuth client](docs/adr/0003-agent-identity.md) - which agent asked for each change, and per-agent limits
 - [ADR 0004: Pre-approved revert](docs/adr/0004-pre-approved-revert.md) - verifying every change, and reverting a degraded one the human approved with its revert
 - [ADR 0005: Change freezes](docs/adr/0005-change-freezes.md) - windows in which no change is planned or applied, and why there is no break-glass
+- [ADR 0007: Durable audit record](docs/adr/0007-durable-audit-record.md) - a write-once record of every plan change, outside the executor's reach
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
 - [Deploying to a new account](docs/deploy.md) - prerequisites, names, RBAC, networking for clusters with a private endpoint, and the order of steps
 - [Guards](docs/guards.md) - blast-radius budget, impact preview, what a rollback trusts, the oscillation breaker (flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks), the per-agent budget and kill switch, and verify and revert

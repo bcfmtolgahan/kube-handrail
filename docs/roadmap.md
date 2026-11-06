@@ -207,14 +207,17 @@ Change freezes from this item are implemented and tested on a test cluster: wind
 - In `client` mode, a DevOps Agent chat asked to scale a Deployment in a frozen namespace reported `change_frozen` with the reason and the end of the freeze, did not retry, and did not look for another way to make the change.
 
 ### 6. Tamper-evident audit ledger and evidence export
+### 6. Durable audit record and evidence export (implemented, not yet tested on a cluster)
 
-**Goal:** prove afterwards who asked for each change, who approved it, and what ran it, even if the executor is compromised.
+See [Audit record](../mcp/CONTRACT.md#audit-record) and [ADR 0007](adr/0007-durable-audit-record.md).
 
-- Every change to a plan record is captured from the table's stream by a separate writer and appended as a signed, hash-chained entry to write-once storage. The executor writes no ledger records and cannot alter them.
-- The approval channel writes a write-once receipt for each decision. An approval, consume or result that does not match its receipts or the expected transitions is flagged as an anomaly and alerts.
-- `scripts/ledger.py` verifies the chain and signatures offline and exports one plan's evidence: the requesting agent, the approver or approvers, the executing role and channel, and the verification and revert outcome.
+**Goal:** show afterwards who asked for each change, who approved it, and how it ran, in a record the executor cannot alter.
 
-**Done when:** a forged approval or rewritten result written with the executor's own credentials is detected, and a change can be exported with its full approval chain and verified offline.
+- Every change to a plan record is captured from the table's stream by a separate Lambda and written once, as one object, to an S3 bucket with Object Lock. The tool Lambdas, the approver and the verifier are denied any write to the bucket.
+- A redelivered record maps to the same key and bytes; an existing key with other content stops the shard and alarms. Failed records go to a dead-letter queue, with alarms on it, the iterator age and the Lambda's errors.
+- `scripts/audit.py export` gives one plan's entries and a summary: the requesting agent, the approver, the channel, the result, and the verification and revert outcome, following the link to a revert record.
+
+**Done when:** a change can be exported with its approval chain after its plan record has expired, and an overwrite of an entry is refused.
 
 ### Deferred from this milestone
 
@@ -256,6 +259,7 @@ Not committed; listed for discussion.
 - Revert of a rollback (a rollback to the previous template, by hash).
 - An agent-facing evidence tool, weekly freeze windows and per-agent Cedar permits.
 - Moving the scheduled sentinel and sweeper to EventBridge Scheduler.
+- A signed, hash-chained audit ledger with write-once approval receipts, automatic detection of unexpected plan-record transitions, and offline verification of an export ([ADR 0007](adr/0007-durable-audit-record.md), alternative A).
 
 ## Open questions
 

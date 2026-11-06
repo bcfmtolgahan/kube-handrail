@@ -22,7 +22,7 @@ locals {
   # Roles that may never write, delete or unlock audit objects or change the bucket.
   audit_denied_role_arns = concat(
     [for r in aws_iam_role.lambda : r.arn],
-    [aws_iam_role.approver.arn],
+    [aws_iam_role.approver.arn, aws_iam_role.gateway.arn],
     aws_iam_role.verifier[*].arn,
     aws_iam_role.sentinel[*].arn,
     aws_iam_role.interceptor[*].arn,
