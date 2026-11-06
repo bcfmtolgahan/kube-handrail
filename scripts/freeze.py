@@ -167,7 +167,11 @@ def cmd_remove(ssm: Any, name: str, args: argparse.Namespace, now: int) -> None:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--parameter", help="the freezes SSM parameter name")
-    p.add_argument("--region", help="AWS Region (default: your AWS configuration)")
+    p.add_argument(
+        "--region",
+        default=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"),
+        help="defaults to AWS_REGION or AWS_DEFAULT_REGION",
+    )
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="show every freeze with its index and state")
     add = sub.add_parser("add", help="add a freeze")
