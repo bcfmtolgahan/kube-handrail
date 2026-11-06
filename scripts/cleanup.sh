@@ -5,8 +5,10 @@
 #   1. disassociate the MCP server from the agent space  (AGENT_SPACE_ID, ASSOCIATION_ID)
 #   2. deregister the MCP server                         (SERVICE_ID)
 #   3. delete the agent space                            (only with --delete-space)
-#   4. terraform destroy in TF_DIR                       (default: terraform)
-#   5. kubectl delete -f k8s/sandbox                     (KUBECONFIG must be set)
+#   4. empty the audit bucket, bypassing GOVERNANCE retention  (AUDIT_BUCKET; needs
+#      s3:BypassGovernanceRetention; COMPLIANCE objects cannot be deleted before they expire)
+#   5. terraform destroy in TF_DIR                       (default: terraform)
+#   6. kubectl delete -f k8s/sandbox                     (KUBECONFIG must be set)
 # Steps whose IDs are unset are skipped. Every step asks for confirmation unless --yes.
 set -euo pipefail
 
@@ -81,6 +83,39 @@ if $delete_space; then
   fi
 else
   echo "skip: delete agent space (pass --delete-space)"
+fi
+
+if $skip_terraform; then
+  echo "skip: empty the audit bucket (--skip-terraform)"
+elif [[ -n "${AUDIT_BUCKET:-}" ]]; then
+  if confirm "Delete every object version in audit bucket ${AUDIT_BUCKET}, bypassing GOVERNANCE retention?"; then
+    "$python" - "$AUDIT_BUCKET" <<'PY'
+import sys
+
+import boto3
+
+bucket = sys.argv[1]
+s3 = boto3.client("s3")
+deleted = 0
+for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
+    objects = [
+        {"Key": v["Key"], "VersionId": v["VersionId"]}
+        for v in page.get("Versions", []) + page.get("DeleteMarkers", [])
+    ]
+    if not objects:
+        continue
+    response = s3.delete_objects(
+        Bucket=bucket, Delete={"Objects": objects, "Quiet": True}, BypassGovernanceRetention=True
+    )
+    errors = response.get("Errors", [])
+    if errors:
+        sys.exit(f"could not delete {len(errors)} versions, first: {errors[0]}")
+    deleted += len(objects)
+print(f"deleted {deleted} object versions from {bucket}")
+PY
+  fi
+else
+  echo "skip: empty the audit bucket (AUDIT_BUCKET not set)"
 fi
 
 if $skip_terraform; then
