@@ -56,7 +56,7 @@ The end-to-end guard tests only run against `kube-handrail-sandbox`.
 Roll it out in three steps:
 
 1. **Audit.** Apply it as committed (`kubectl apply -f k8s/sandbox/admission-policy.yaml`, or the `sed` above). The binding has `validationActions: [Warn, Audit]`: nothing is refused.
-2. **Check.** `kubectl get validatingadmissionpolicy kube-handrail-writer-bounds -o jsonpath='{.status.typeChecking}'` shows no `expressionWarnings`. Run `tests/admission/run.sh` (with `MAX_REPLICAS=<max>` when it is not 5; it impersonates the writer group, so it needs cluster-admin, makes only server-side dry runs, and switches the binding to `Deny` and back). Leave `OTHER_NAMESPACE` unset on a shared cluster: it creates and deletes a namespace. Then run the smoke test, and look in the API server audit log, if it is enabled, for the annotation `validation.policy.admission.k8s.io/validation_failure` on requests of the writer.
+2. **Check.** `kubectl get validatingadmissionpolicy kube-handrail-writer-bounds -o jsonpath='{.status.typeChecking}'` shows no `expressionWarnings`. Run `tests/admission/run.sh` (with `MIN_REPLICAS=<min>` and `MAX_REPLICAS=<max>` when they are not 0 and 5; it impersonates the writer group, so it needs cluster-admin, makes only server-side dry runs, and switches the binding to `Deny` and back). Leave `OTHER_NAMESPACE` unset on a shared cluster: it creates and deletes a namespace. Then run the smoke test, and look in the API server audit log, if it is enabled, for the annotation `validation.policy.admission.k8s.io/validation_failure` on requests of the writer.
 3. **Deny.**
 
    ```sh

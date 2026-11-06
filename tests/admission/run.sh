@@ -9,7 +9,8 @@
 #
 # Environment:
 #   NAMESPACE        sandbox namespace (default kube-handrail-sandbox)
-#   DEPLOYMENT       Deployment in it, at a count within the bounds (default web)
+#   DEPLOYMENT       Deployment in it, at a count below the maximum (default web)
+#   MIN_REPLICAS     the policy's minimum (default 0)
 #   MAX_REPLICAS     the policy's maximum (default 5)
 #   OTHER_NAMESPACE  if set, create this namespace with a Deployment, check that the policy
 #                    does not touch it, and delete it again. Leave it unset on a shared cluster.
@@ -19,6 +20,7 @@ set -euo pipefail
 
 NAMESPACE=${NAMESPACE:-kube-handrail-sandbox}
 DEPLOYMENT=${DEPLOYMENT:-web}
+MIN_REPLICAS=${MIN_REPLICAS:-0}
 MAX_REPLICAS=${MAX_REPLICAS:-5}
 POLICY=kube-handrail-writer-bounds
 WRITER=(--as kube-handrail-admission-test --as-group kube-handrail-writer)
@@ -100,8 +102,11 @@ if ((current >= MAX_REPLICAS)); then
   echo "Deployment $NAMESPACE/$DEPLOYMENT must be below MAX_REPLICAS ($MAX_REPLICAS); it has $current." >&2
   exit 2
 fi
-in_bounds=$((current + 1))
+# A changed count within the bounds: one more, or the minimum if that is higher.
+in_bounds=$((current + 1 > MIN_REPLICAS ? current + 1 : MIN_REPLICAS))
 over=$((MAX_REPLICAS + 1))
+# Below the minimum, only when that is a change (an unchanged count is always admitted).
+under=$((MIN_REPLICAS - 1))
 actions=$(kubectl get validatingadmissionpolicybinding "$POLICY" -o jsonpath='{.spec.validationActions}')
 
 restore() {
@@ -157,6 +162,12 @@ expect_allowed "deny mode: writer scale within bounds ($current -> $in_bounds)" 
   patch_replicas "$NAMESPACE" "$DEPLOYMENT" "$in_bounds" "${WRITER[@]}"
 expect_denied "deny mode: writer scale over the maximum ($current -> $over)" \
   patch_replicas "$NAMESPACE" "$DEPLOYMENT" "$over" "${WRITER[@]}"
+if ((MIN_REPLICAS > 0 && under != current)); then
+  expect_denied "deny mode: writer scale below the minimum ($current -> $under)" \
+    patch_replicas "$NAMESPACE" "$DEPLOYMENT" "$under" "${WRITER[@]}"
+else
+  echo "SKIP  below the minimum: MIN_REPLICAS is 0 or the count is already one below it"
+fi
 expect_denied "deny mode: writer over the maximum is refused even past RBAC" \
   patch_replicas "$NAMESPACE" "$DEPLOYMENT" "$over" "${WRITER_ADMIN[@]}"
 expect_denied "deny mode: writer over the maximum through deployments/scale, past RBAC" \

@@ -921,7 +921,7 @@ A denial is HTTP 422 (the validation's `reason` is left at its default, `Invalid
 - **Revert.** A revert refused by the policy is `revert = {status: refused, reason: admission_denied}` and its revert record's `result` is `admission_denied`, final like any other refusal ([Revert](#revert)).
 - **Tool record.** `admission_denied` counts as `ToolErrors`, not `GuardRejections`, so it raises the `<name_prefix>-tool-errors` alarm: the cluster refused a change the guard allowed, which means the bounds in the policy differ from the Terraform values, or the guard is wrong or was bypassed. A human must look. The record's `outcome` is `admission_denied`.
 
-`tests/admission/run.sh` runs server-side dry runs against a cluster where the policy is applied, impersonating the writer group: a scale within the bounds is admitted; over the maximum it is admitted with the policy's warning in `Warn`, and refused in `Deny`, also past RBAC and through `deployments/scale`; a restart is admitted; another user, and with `OTHER_NAMESPACE` the writer in another namespace, are not affected. It switches the binding to `Deny` and back. The CI job `admission` runs it on kind.
+`tests/admission/run.sh` runs server-side dry runs against a cluster where the policy is applied, impersonating the writer group: a scale within the bounds is admitted; over the maximum it is admitted with the policy's warning in `Warn`, and refused in `Deny`, also past RBAC and through `deployments/scale`; with `MIN_REPLICAS` above 0, a change below the minimum is refused in `Deny`; a restart is admitted; another user, and with `OTHER_NAMESPACE` the writer in another namespace, are not affected. It switches the binding to `Deny` and back. The CI job `admission` runs it on kind.
 
 ## Network
 
