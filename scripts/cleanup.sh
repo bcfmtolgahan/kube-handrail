@@ -5,8 +5,9 @@
 #   1. disassociate the MCP server from the agent space  (AGENT_SPACE_ID, ASSOCIATION_ID)
 #   2. deregister the MCP server                         (SERVICE_ID)
 #   3. delete the agent space                            (only with --delete-space)
-#   4. empty the audit bucket, bypassing GOVERNANCE retention  (AUDIT_BUCKET; needs
-#      s3:BypassGovernanceRetention; COMPLIANCE objects cannot be deleted before they expire)
+#   4. empty the audit bucket, bypassing GOVERNANCE retention  (AUDIT_BUCKET, else the
+#      audit_bucket_name output in TF_DIR; needs s3:BypassGovernanceRetention; COMPLIANCE
+#      objects cannot be deleted before they expire)
 #   5. terraform destroy in TF_DIR                       (default: terraform)
 #   6. kubectl delete -f k8s/sandbox                     (KUBECONFIG must be set)
 # Steps whose IDs are unset are skipped. Every step asks for confirmation unless --yes.
@@ -85,6 +86,14 @@ else
   echo "skip: delete agent space (pass --delete-space)"
 fi
 
+if [[ -z "${AUDIT_BUCKET:-}" && -d "$tf_dir" ]] && ! $skip_terraform; then
+  # An empty or failed output (audit disabled, no state) leaves the step skipped.
+  AUDIT_BUCKET="$(terraform -chdir="$tf_dir" output -raw audit_bucket_name 2>/dev/null || true)"
+  if [[ "$AUDIT_BUCKET" == "null" || "$AUDIT_BUCKET" == *[[:space:]]* ]]; then
+    AUDIT_BUCKET=""
+  fi
+fi
+
 if $skip_terraform; then
   echo "skip: empty the audit bucket (--skip-terraform)"
 elif [[ -n "${AUDIT_BUCKET:-}" ]]; then
@@ -115,7 +124,7 @@ print(f"deleted {deleted} object versions from {bucket}")
 PY
   fi
 else
-  echo "skip: empty the audit bucket (AUDIT_BUCKET not set)"
+  echo "skip: empty the audit bucket (AUDIT_BUCKET not set and no audit_bucket_name output)"
 fi
 
 if $skip_terraform; then

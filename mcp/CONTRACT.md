@@ -836,7 +836,7 @@ The approver Lambda (`mcp/approver/`) is not a gateway target and has no MCP too
 Authorization, before anything else:
 
 1. A request without an IAM identity is `forbidden`.
-2. A caller matching `DENIED_PRINCIPALS` (the roles of the read, write, sentinel and approver Lambdas and of the gateway, set by Terraform) is `forbidden`, even if it is also listed as an approver: machine identities never approve.
+2. A caller matching `DENIED_PRINCIPALS` (the roles of the read, write, sentinel and approver Lambdas, of the gateway, and, when deployed, of the interceptor, verifier and audit Lambdas, set by Terraform) is `forbidden`, even if it is also listed as an approver: machine identities never approve.
 3. The caller must match `APPROVER_PRINCIPALS`: an IAM user ARN matches exactly that ARN (including its path); an IAM role ARN `arn:aws:iam::<account>:role[/path]/<name>` matches its sessions `arn:aws:sts::<account>:assumed-role/<name>/<any session>`. Otherwise `forbidden`.
 
 Requests (responses are the JSON envelope in the body):
