@@ -101,9 +101,11 @@ server mode; reverts take no budget unit.
 With --with-freeze, the change freeze cases also run, against a fixture Deployment
 e2e-freeze created for this run. They write the freezes parameter (FREEZES_PARAM, the
 freezes_parameter output, through the Lambdas' own validator), so the operator's
-credentials need ssm:PutParameter on it, and they always set it back to [] at the end,
-even when a case fails. Every freeze they set names kube-handrail-sandbox or a namespace
-that does not exist. A freeze on another namespace leaves a plan in the sandbox ok; a
+credentials need ssm:GetParameter and ssm:PutParameter on it. They add their windows to
+the stored freezes (never dropping an operator's freeze) and always restore the stored
+value exactly at the end, even when a case fails. They refuse to run while a stored
+freeze covers kube-handrail-sandbox. Every freeze they add names kube-handrail-sandbox
+or a namespace that does not exist. A freeze on another namespace leaves a plan in the sandbox ok; a
 freeze on the sandbox makes a plan change_frozen with its reason and until; a plan made
 before a freeze is refused at apply (client mode) or by the approval's apply (server mode)
 with change_frozen and is not consumed, and once the freeze is removed the same plan
@@ -1951,36 +1953,77 @@ def freezes_module() -> Any:
     return freezes
 
 
-def set_freezes(*namespaces: str) -> None:
-    """One active window (from a minute ago, for 30 minutes) per namespace, or none."""
+FREEZE_WINDOW_SECONDS = 1800
+
+
+def freezes_param() -> str:
+    name = os.environ.get("FREEZES_PARAM", "").strip()
+    if not name:
+        raise SystemExit("--with-freeze needs FREEZES_PARAM (the freezes_parameter output)")
+    return name
+
+
+def ssm_client() -> Any:
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    return boto3.client("ssm", region_name=region)
+
+
+def freeze_value(original: str, namespaces: tuple[str, ...], now: int) -> str:
+    """The operator's stored freezes plus one active test window (from a minute ago, for
+    30 minutes) per namespace: the test never drops a freeze someone else set."""
     freezes = freezes_module()
-    now = int(time.time())
+    kept = json.loads(original)
     value = json.dumps(
         [
-            {
-                "namespaces": [namespace],
-                "start": freezes.format_time(now - 60),
-                "until": freezes.format_time(now + 1800),
-                "reason": FREEZE_REASON,
-            }
-            for namespace in namespaces
+            *kept,
+            *(
+                {
+                    "namespaces": [namespace],
+                    "start": freezes.format_time(now - 60),
+                    "until": freezes.format_time(now + FREEZE_WINDOW_SECONDS),
+                    "reason": FREEZE_REASON,
+                }
+                for namespace in namespaces
+            ),
         ]
     )
     freezes.parse_freezes(value)
-    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-    boto3.client("ssm", region_name=region).put_parameter(
-        Name=os.environ["FREEZES_PARAM"], Value=value, Type="String", Overwrite=True
+    return value
+
+
+def sandbox_freeze_during_run(original: str, now: int) -> bool:
+    """Whether a stored freeze covers the sandbox while the cases run: they would then
+    report wrong results, so the run refuses instead of overriding it."""
+    freezes = freezes_module()
+    end = now + 2 * FREEZE_WINDOW_SECONDS
+    return any(
+        f.covers(NAMESPACE, action) and f.start < end and f.until > now
+        for f in freezes.parse_freezes(original)
+        for action in freezes.ACTIONS.values()
     )
 
 
+def put_freezes(value: str) -> None:
+    ssm_client().put_parameter(Name=freezes_param(), Value=value, Type="String", Overwrite=True)
+
+
 async def freeze_tests(gw: Gateway, approval_mode: str) -> None:
+    """Runs the cases on top of the stored freezes and restores the stored value exactly."""
+    original = ssm_client().get_parameter(Name=freezes_param())["Parameter"]["Value"]
+    if sandbox_freeze_during_run(original, int(time.time())):
+        report("freeze: no operator freeze covers the sandbox during the run", False)
+        return
+
+    def set_freezes(*namespaces: str) -> None:
+        put_freezes(freeze_value(original, namespaces, int(time.time())))
+
     try:
-        await freeze_cases(gw, approval_mode)
+        await freeze_cases(gw, approval_mode, set_freezes)
     finally:
-        set_freezes()
+        put_freezes(original)
 
 
-async def freeze_cases(gw: Gateway, approval_mode: str) -> None:
+async def freeze_cases(gw: Gateway, approval_mode: str, set_freezes: Any) -> None:
     set_freezes(OTHER_NAMESPACE)
     envelope = await gw.call(PLAN, {**FREEZE_TARGET, "replicas": 2})
     report(
@@ -2124,6 +2167,8 @@ def main() -> None:
     started = time.time()
     web_before = web_spec()
     quotas_before = quota_objects() if args.with_verify else ""
+    if args.with_freeze:
+        freezes_param()
     try:
         create_fixtures(args.with_rollout, args.with_identity, args.with_verify, args.with_freeze)
         asyncio.run(
