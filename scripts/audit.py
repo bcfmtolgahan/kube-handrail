@@ -71,12 +71,16 @@ def bucket_name(explicit: str | None) -> str:
     return out
 
 
-def check_plan_id(plan_id: str) -> str:
+def is_plan_id(value: Any) -> bool:
     try:
-        if str(uuid.UUID(plan_id)) == plan_id:
-            return plan_id
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
     except ValueError:
-        pass
+        return False
+
+
+def check_plan_id(plan_id: str) -> str:
+    if is_plan_id(plan_id):
+        return plan_id
     raise argparse.ArgumentTypeError(f"not a plan id: {plan_id!r}")
 
 
@@ -88,13 +92,35 @@ def list_keys(s3: Any, bucket: str, prefix: str) -> list[str]:
     return sorted(keys)
 
 
-def read_entries(s3: Any, bucket: str, plan_id: str) -> list[dict[str, Any]]:
-    entries = []
+def well_formed(entry: Any) -> bool:
+    """An entry in the shape the audit Lambda writes (its stream time is what is relied on)."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("stream"), dict):
+        return False
+    when = entry["stream"].get("approximate_creation_time")
+    return isinstance(when, int) and not isinstance(when, bool)
+
+
+def read_entries(s3: Any, bucket: str, plan_id: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """The plan's entries in order, and the keys of objects under its prefix that are not
+    entries the Lambda wrote (reported, not trusted)."""
+    entries, malformed = [], []
     for key in list_keys(s3, bucket, f"{PLAN_PREFIX}{plan_id}/"):
-        entry = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        try:
+            entry = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        except ValueError:
+            entry = None
+        if not well_formed(entry):
+            malformed.append(key)
+            continue
         entry["key"] = key
         entries.append(entry)
-    return entries
+    return entries, malformed
+
+
+def decoded(entries: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Entries whose images are plain JSON; undecoded ones (DynamoDB JSON) are kept in the
+    bundle but not read for the summary."""
+    return [e for e in entries if e.get("image_format", "plain") == "plain"]
 
 
 def latest_image(entries: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -104,15 +130,18 @@ def latest_image(entries: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     return dict(image)
 
 
-def summarize(plan_id: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
-    image = latest_image(entries)
+def summarize(
+    plan_id: str, entries: list[dict[str, Any]], malformed: list[str] | None = None
+) -> dict[str, Any]:
+    readable = decoded(entries)
+    image = latest_image(readable)
     summary: dict[str, Any] = {"plan_id": plan_id, "entries": len(entries)}
     for name in LATEST_ATTRIBUTES:
         if image.get(name) is not None:
             summary[name] = image[name]
     approvers: list[str] = []
     statuses: list[str] = []
-    for entry in entries:
+    for entry in readable:
         new = entry.get("new_image") or {}
         if new.get("approved_by") and new["approved_by"] not in approvers:
             approvers.append(new["approved_by"])
@@ -136,6 +165,8 @@ def summarize(plan_id: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
             "reason": revert.get("reason"),
             "revert_plan_id": revert.get("revert_plan_id"),
         }
+    summary["undecoded"] = len(entries) - len(readable)
+    summary["malformed"] = len(malformed or [])
     events = [entry.get("event") for entry in entries]
     # A plan created before the stream was enabled, or written to the DLQ, lacks its INSERT.
     summary["has_creation"] = "created" in events
@@ -160,25 +191,29 @@ def links(summary: Mapping[str, Any]) -> list[tuple[str, str]]:
 
 
 def export(s3: Any, bucket: str, plan_id: str, follow_links: bool = True) -> dict[str, Any]:
-    entries = read_entries(s3, bucket, plan_id)
-    summary = summarize(plan_id, entries)
+    entries, malformed = read_entries(s3, bucket, plan_id)
+    summary = summarize(plan_id, entries, malformed)
     bundle: dict[str, Any] = {
         "plan_id": plan_id,
         "bucket": bucket,
         "exported_at": int(time.time()),
         "summary": summary,
         "entries": entries,
+        "malformed": malformed,
         "linked": [],
     }
     if follow_links:
         for relation, linked_id in links(summary):
-            linked_entries = read_entries(s3, bucket, linked_id)
+            if not is_plan_id(linked_id):
+                continue
+            linked_entries, linked_malformed = read_entries(s3, bucket, linked_id)
             bundle["linked"].append(
                 {
                     "relation": relation,
                     "plan_id": linked_id,
-                    "summary": summarize(linked_id, linked_entries),
+                    "summary": summarize(linked_id, linked_entries, linked_malformed),
                     "entries": linked_entries,
+                    "malformed": linked_malformed,
                 }
             )
     return bundle
@@ -192,7 +227,11 @@ def list_plans(s3: Any, bucket: str, limit: int) -> list[dict[str, Any]]:
         if len(parts) != 3:
             continue
         plan_id, name = parts[1], parts[2]
-        when = int(name.split("-", 1)[0])
+        try:
+            when = int(name.split("-", 1)[0])
+        except ValueError:
+            # Not a key the Lambda wrote; export reports it as malformed.
+            continue
         plan = plans.setdefault(plan_id, {"plan_id": plan_id, "entries": 0, "last_seen": 0})
         plan["entries"] += 1
         plan["last_seen"] = max(plan["last_seen"], when)

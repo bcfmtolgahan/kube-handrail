@@ -166,3 +166,31 @@ def test_main_unknown_plan_fails(s3, monkeypatch, capsys):
 def test_plan_id_is_validated():
     with pytest.raises(SystemExit):
         audit.main(["--bucket", BUCKET, "export", "../etc"], s3=object())
+
+
+def test_objects_the_lambda_did_not_write_are_flagged(s3):
+    prefix = f"plans/{PLAN_ID}/"
+    s3.put_object(Bucket=BUCKET, Key=prefix + "0000000001-junk.json", Body=b"{}")
+    s3.put_object(Bucket=BUCKET, Key=prefix + "not-json.json", Body=b"\x00")
+    s3.put_object(Bucket=BUCKET, Key=prefix + "x.json", Body=b"[]")
+    bundle = audit.export(s3, BUCKET, PLAN_ID)
+    assert bundle["summary"]["entries"] == 6
+    assert bundle["summary"]["result"] == "applied"
+    assert bundle["summary"]["malformed"] == 3
+    assert sorted(bundle["malformed"]) == sorted(
+        [prefix + "0000000001-junk.json", prefix + "not-json.json", prefix + "x.json"]
+    )
+    plans = audit.list_plans(s3, BUCKET, 10)
+    assert plans[0]["plan_id"] == PLAN_ID
+
+
+def test_undecoded_entries_do_not_feed_the_summary(s3, monkeypatch):
+    monkeypatch.setattr(handler, "summarize", lambda *_: (_ for _ in ()).throw(TypeError()))
+    forged = {**VERIFIED, "approved_by": "someone-else"}
+    handler.process(
+        [record("MODIFY", "300", PLAN_ID, VERIFIED, forged, when=1_700_000_200)], s3, BUCKET
+    )
+    summary = audit.export(s3, BUCKET, PLAN_ID)["summary"]
+    assert summary["entries"] == 7
+    assert summary["undecoded"] == 1
+    assert summary["approved_by"] == ["approver-a"]

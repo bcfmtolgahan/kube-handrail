@@ -2180,7 +2180,7 @@ async def audit_tests(started: int) -> None:
     deadline = time.time() + 120
     entries: list[dict[str, Any]] = []
     while time.time() < deadline:
-        entries = audit.read_entries(s3, bucket, plan_id)
+        entries, _ = audit.read_entries(s3, bucket, plan_id)
         events = [e["event"] for e in entries]
         consumed = any(
             (e.get("old_image") or {}).get("used") is False
