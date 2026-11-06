@@ -39,6 +39,42 @@ sed 's/kube-handrail-sandbox/<namespace>/' k8s/sandbox/rbac.yaml | kubectl apply
 
 The end-to-end guard tests only run against `kube-handrail-sandbox`.
 
+## Admission policy
+
+`k8s/sandbox/admission-policy.yaml` is a second check of the replica bounds in the cluster, for the writer group in the sandbox namespace only ([Admission policy](../mcp/CONTRACT.md#admission-policy)). Status: implemented, not yet tested on a cluster; CI runs its cases on kind.
+
+- **Kubernetes 1.30 or later** (`admissionregistration.k8s.io/v1`). On an older cluster `kubectl apply -f k8s/sandbox/` fails for this file only; apply the other files one by one and skip it.
+- **Bounds.** The file commits `0` and `5`, the defaults of `min_replicas` and `max_replicas`. They must equal the Terraform values. For other values or another namespace:
+
+  ```sh
+  sed -e 's/"[0-9]*" # min_replicas/"<min>" # min_replicas/' \
+      -e 's/"[0-9]*" # max_replicas/"<max>" # max_replicas/' \
+      -e 's/kube-handrail-sandbox/<namespace>/' \
+      k8s/sandbox/admission-policy.yaml | kubectl apply -f -
+  ```
+
+Roll it out in three steps:
+
+1. **Audit.** Apply it as committed (`kubectl apply -f k8s/sandbox/admission-policy.yaml`, or the `sed` above). The binding has `validationActions: [Warn, Audit]`: nothing is refused.
+2. **Check.** `kubectl get validatingadmissionpolicy kube-handrail-writer-bounds -o jsonpath='{.status.typeChecking}'` shows no `expressionWarnings`. Run `tests/admission/run.sh` (with `MAX_REPLICAS=<max>` when it is not 5; it impersonates the writer group, so it needs cluster-admin, makes only server-side dry runs, and switches the binding to `Deny` and back). Leave `OTHER_NAMESPACE` unset on a shared cluster: it creates and deletes a namespace. Then run the smoke test, and look in the API server audit log, if it is enabled, for the annotation `validation.policy.admission.k8s.io/validation_failure` on requests of the writer.
+3. **Deny.**
+
+   ```sh
+   kubectl patch validatingadmissionpolicybinding kube-handrail-writer-bounds \
+     --type merge -p '{"spec":{"validationActions":["Deny"]}}'
+   ```
+
+   A later `kubectl apply` of the file sets the binding back to `[Warn, Audit]`; patch it again afterwards, or apply a copy with `validationActions: [Deny]`.
+
+To go back to audit, patch `validationActions` to `["Warn","Audit"]`. To remove it:
+
+```sh
+kubectl delete validatingadmissionpolicybinding kube-handrail-writer-bounds
+kubectl delete validatingadmissionpolicy kube-handrail-writer-bounds
+```
+
+`scripts/cleanup.sh` deletes it with the rest of `k8s/sandbox`.
+
 ## Agents
 
 Each agent is one OAuth client ([Agent identity](../mcp/CONTRACT.md#agent-identity)). The `agents` variable maps agent names (`^[a-z][a-z0-9_]{0,31}$`) to `{client_id = optional(string), hourly_apply_budget = optional(number)}`. An entry without `client_id` gets a Cognito app client with the `read` and `remediate` scopes; with `client_id`, that existing client of the user pool is allowed instead. The default is `{devops_agent = {}, smoke_test = { hourly_apply_budget = 30 }}`: one client for DevOps Agent and one for the smoke and end-to-end tests, whose runs apply more than the default budget of 10 in an hour. If you set `agents` yourself, keep that budget for `smoke_test`, or the smoke test followed by the end-to-end suite is refused with `agent_budget_exceeded`. The gateway allows exactly the agents' clients, and the drift sentinel reports any other.
@@ -147,3 +183,4 @@ Plans open across an upgrade may have to be planned again; their expiry is short
   - After the apply, run `scripts/freeze.py list` (it reads the `freezes_parameter` output) and the smoke test; a plan must still succeed with no freezes.
   - The end-to-end cases (`tests/e2e/e2e_gateway.py --with-freeze`, with `--approval-mode server` in server mode) need `FREEZES_PARAM` set to the `freezes_parameter` output and the operator's credentials need `ssm:GetParameter` and `ssm:PutParameter` on it. They add windows only for `kube-handrail-sandbox` and a namespace that does not exist on top of the stored freezes, never drop an operator's freeze, and always restore the stored value exactly. They refuse to run while a stored freeze covers `kube-handrail-sandbox`.
   - If `/<prefix>/freezes` already exists outside Terraform (created by hand), the apply fails with `ParameterAlreadyExists`: import it first (`terraform import 'aws_ssm_parameter.freezes' /<prefix>/freezes`) or delete it.
+- **Admission policy** (Milestone 2). Nothing changes in Terraform or the Lambdas' environment. Deploy the write Lambda (it maps a refusal by the policy to `admission_denied`), re-run `install-guidance` so agents get the new `AGENTS.md` row and skill text, then roll out the policy in audit mode and switch it to `Deny` after the check ([Admission policy](#admission-policy)). Implemented, not yet tested on a cluster. On a cluster below 1.30 skip the policy; the rest works as before.
