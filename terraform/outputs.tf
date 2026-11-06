@@ -38,6 +38,11 @@ output "kill_switch_parameter" {
   value       = aws_ssm_parameter.kill_switch.name
 }
 
+output "freezes_parameter" {
+  description = "SSM parameter holding the change freezes; write it with scripts/freeze.py."
+  value       = aws_ssm_parameter.freezes.name
+}
+
 output "lambda_role_arns" {
   description = "IAM role ARNs of the Lambda functions, by function."
   value       = { for k, r in aws_iam_role.lambda : k => r.arn }
