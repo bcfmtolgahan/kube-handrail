@@ -60,3 +60,21 @@ A scale plan can also pin `revert_on_failure`, with an explicit window, so the h
 - is verified like any change, and never reverted itself.
 
 The check is one reading at the end of the window, not a comparison with the state before the change. A Deployment that was already short of available pods can be found degraded for a cause the change did not bring; the plan warns about it (`revert_baseline_unhealthy`). The reasons for this design are in [ADR 0004](adr/0004-pre-approved-revert.md).
+
+## Change freezes
+
+Status: implemented, not yet tested on a cluster.
+
+An operator can freeze changes in one or more namespaces, or all of them, for a window: over a release, a migration or a holiday. The windows live in one SSM parameter, `/<name_prefix>/freezes`, which `scripts/freeze.py` lists and edits; each window names its namespaces, a start, an end (`until`, excluded), a reason and optionally the actions it covers (`scale`, `restart`, `rollback`). See [Change freezes](../mcp/CONTRACT.md#change-freezes).
+
+- A plan in a frozen namespace is refused with `change_frozen`, before the cluster is read. The refusal carries the reason and the moment changes are allowed again, so the agent can tell the human.
+- An apply is checked again with its own time, before the plan is consumed. An approval given before a freeze is therefore not applied during it, whether the agent applies or the approval's own apply runs it. The plan is left unconsumed and expires unless the freeze ends first.
+- A parameter that cannot be read, or that does not validate, refuses every write (`remediation_disabled` with `details.scope = "freezes"`), as an unreadable kill switch does. `scripts/freeze.py` validates every write with the Lambdas' own code, and `remove --all` resets a broken value.
+- A pre-approved revert is not stopped by a freeze, and the verification still runs: the revert undoes a change a human approved together with its revert. Only the global kill switch stops reverts.
+- There is no break-glass path. To make a change during a freeze, an operator removes or shortens the freeze; the reasons are in [ADR 0005](adr/0005-change-freezes.md).
+
+```sh
+scripts/freeze.py add --namespace <namespace> --until 2026-12-27T00:00:00Z --reason "release freeze"
+scripts/freeze.py list
+scripts/freeze.py remove 0
+```

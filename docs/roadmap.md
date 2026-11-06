@@ -187,6 +187,8 @@ See [Verification and revert](../mcp/CONTRACT.md#verification-and-revert) and [A
 
 **Done when:** CI shows the three policy layers agreeing on the shared test cases; on a test deployment Cedar ran in log-only mode and admission policy in audit mode before both were enforced; a freeze refuses changes; and a break-glass change needs a ticket and two distinct approvers.
 
+Change freezes from this item are implemented, not yet tested on a cluster: windows in one SSM parameter, checked by the guard on plan and on apply (including approval-triggered applies), with a pre-approved revert exempt and no break-glass path. See [Change freezes](../mcp/CONTRACT.md#change-freezes) and [ADR 0005](adr/0005-change-freezes.md).
+
 ### 6. Tamper-evident audit ledger and evidence export
 
 **Goal:** prove afterwards who asked for each change, who approved it, and what ran it, even if the executor is compromised.

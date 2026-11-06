@@ -83,4 +83,4 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 | `change_frozen` | An operator froze changes in this namespace (on plan, or on apply even after an approval). `details` has `namespace`, `reason` and `until` (RFC 3339, UTC: the first moment changes are allowed again). | Stop. Report `reason` and `until` to the human. Do not retry, do not re-plan before `until`, and never work around the freeze (another tool, `kubectl`, another namespace). Only an operator lifts a freeze. |
 | `kubernetes_error`, `internal` | Cluster or server error. | Retry a read or re-plan once, then stop. |
 
-The guards behind these codes are in "Guard checks", "History checks (oscillation breaker)", "Verification and revert", "Change freezes" and "Server-side approval".
+The guards behind these codes are in "Guard checks", "History checks (oscillation breaker)", "Verification and revert" and "Server-side approval".
