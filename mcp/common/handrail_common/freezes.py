@@ -33,8 +33,9 @@ MAX_REASON_CHARS = 200
 FIELDS = frozenset({"namespaces", "start", "until", "reason", "actions"})
 REQUIRED = frozenset({"namespaces", "start", "until", "reason"})
 # RFC 3339 in UTC, to the second: 2026-12-23T00:00:00Z.
-_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-_DNS1123_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+# fullmatch, not match: "$" also matches before a trailing newline.
+_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_DNS1123_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
 # details.reason of remediation_disabled when the freeze parameter cannot be used.
 UNREADABLE = "unreadable"
 INVALID = "invalid"
@@ -76,7 +77,7 @@ class Freeze:
 
 
 def parse_time(value: Any, field: str) -> int:
-    if not isinstance(value, str) or not _TIMESTAMP.match(value):
+    if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value):
         raise FreezeConfigError(f"{field} must be RFC 3339 in UTC, like 2026-12-23T00:00:00Z")
     try:
         moment = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
@@ -93,7 +94,7 @@ def _namespaces(value: Any) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise FreezeConfigError("namespaces must be a non-empty list")
     for ns in value:
-        valid_label = isinstance(ns, str) and len(ns) <= 63 and _DNS1123_LABEL.match(ns)
+        valid_label = isinstance(ns, str) and len(ns) <= 63 and _DNS1123_LABEL.fullmatch(ns)
         if ns != ALL_NAMESPACES and not valid_label:
             raise FreezeConfigError(
                 f"namespaces: {ns!r} is not a DNS-1123 label or {ALL_NAMESPACES!r}"
