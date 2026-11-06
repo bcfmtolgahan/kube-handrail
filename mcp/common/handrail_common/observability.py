@@ -10,18 +10,21 @@ from typing import Any
 from handrail_common.envelope import INTERNAL, KUBERNETES_ERROR
 
 # Tried in this order. The gateway sets the first in client_context.custom; the approver
-# sets the second when it runs an apply, so the apply shares its id. The gateway's MCP
+# sets the second when it runs an apply, so the apply shares its id, and so does the
+# verifier for the verifications it runs. The gateway's MCP
 # message id is not used: the client chooses it, so it is not unique across sessions.
 GATEWAY_REQUEST_ID_KEY = "bedrockAgentCoreAwsRequestId"
 APPROVER_CORRELATION_KEY = "kubeHandrailCorrelationId"
 CORRELATION_KEYS = (GATEWAY_REQUEST_ID_KEY, APPROVER_CORRELATION_KEY)
 # The channel an invocation came through (mcp/CONTRACT.md, Agent identity). Only the approver
-# sets it, next to its correlation id; the gateway never does, and a gateway client cannot
-# set client_context.custom. Anything but an exact known value counts as the gateway, which
-# is the channel that requires a verified caller.
+# and the verifier set it, next to their correlation id; the gateway never does, and a
+# gateway client cannot set client_context.custom. Anything but an exact known value counts
+# as the gateway, which is the channel that requires a verified caller.
 CHANNEL_KEY = "kubeHandrailChannel"
 CHANNEL_GATEWAY = "gateway"
 CHANNEL_APPROVAL_API = "approval-api"
+CHANNEL_VERIFIER = "verifier"
+CHANNELS = (CHANNEL_APPROVAL_API, CHANNEL_VERIFIER)
 CORRELATION_ANNOTATION = "kube-handrail.io/correlation-id"
 DEFAULT_METRIC_NAMESPACE = "kube-handrail/tools"
 UNKNOWN_TOOL_DIMENSION = "unknown"
@@ -74,12 +77,12 @@ def unbind_correlation_id(token: Any) -> None:
 
 
 def channel(context: Any) -> str:
-    """The channel named in the client context: approval-api only when set exactly so."""
+    """The channel named in the client context: approval-api or verifier only when set
+    exactly so."""
     client_context = getattr(context, "client_context", None)
     custom = getattr(client_context, "custom", None)
-    if isinstance(custom, Mapping) and custom.get(CHANNEL_KEY) == CHANNEL_APPROVAL_API:
-        return CHANNEL_APPROVAL_API
-    return CHANNEL_GATEWAY
+    value = custom.get(CHANNEL_KEY) if isinstance(custom, Mapping) else None
+    return value if value in CHANNELS else CHANNEL_GATEWAY
 
 
 def current_caller() -> str | None:

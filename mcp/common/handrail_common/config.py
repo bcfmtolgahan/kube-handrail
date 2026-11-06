@@ -17,6 +17,8 @@ BOTH = "both"
 APPROVAL_MODES = (CLIENT, SERVER, BOTH)
 # The keys of the Terraform agents map; also part of SSM parameter names and counter keys.
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+# The verifier runs every minute, so a shorter window could not be kept.
+MIN_VERIFY_WINDOW_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,14 @@ class Settings:
     agent_kill_switch_prefix: str | None = None
     # Applies per agent in one clock hour, unless AGENTS sets the agent's own.
     agent_hourly_apply_budget: int = 10
+    # VERIFY_ENABLED is "true": applies schedule a verification (mcp/CONTRACT.md,
+    # Verification and revert), and plans may pin a window and revert_on_failure.
+    verify_enabled: bool = False
+    verify_window_default_seconds: int = 120
+    verify_window_min_seconds: int = 60
+    verify_window_max_seconds: int = 1800
+    # How long after verify_at a verification may still run; later it is unknown (late).
+    verify_grace_seconds: int = 300
 
     @property
     def approval_required(self) -> bool:
@@ -73,6 +83,10 @@ class Settings:
         """(minimum, maximum) replicas in an allowed namespace. Every replica bounds check
         reads them through here; today the same bounds apply to every namespace."""
         return self.min_replicas, self.max_replicas
+
+    @property
+    def verify_window_bounds(self) -> tuple[int, int]:
+        return self.verify_window_min_seconds, self.verify_window_max_seconds
 
     def agent_budget(self, name: str) -> int:
         """The hourly apply budget of the agent with this name. An agent no longer in AGENTS
@@ -163,6 +177,10 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
             ("APPROVAL_REQUEST_COOLDOWN_SECONDS", 60),
             ("APPROVAL_REQUEST_LIMIT", 10),
             ("AGENT_HOURLY_APPLY_BUDGET", 10),
+            ("VERIFY_WINDOW_DEFAULT_SECONDS", 120),
+            ("VERIFY_WINDOW_MIN_SECONDS", 60),
+            ("VERIFY_WINDOW_MAX_SECONDS", 1800),
+            ("VERIFY_GRACE_SECONDS", 300),
         )
     }
     may_be_zero = ("APPLY_COOLDOWN_SECONDS", "APPROVAL_REQUEST_COOLDOWN_SECONDS")
@@ -173,6 +191,16 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
     # Otherwise requesting an approval would shorten the plan's validity.
     if limits["APPROVAL_WAIT_TTL_SECONDS"] < ttl:
         raise ConfigError("APPROVAL_WAIT_TTL_SECONDS must be at least PLAN_TTL_SECONDS")
+    if not (
+        MIN_VERIFY_WINDOW_SECONDS
+        <= limits["VERIFY_WINDOW_MIN_SECONDS"]
+        <= limits["VERIFY_WINDOW_DEFAULT_SECONDS"]
+        <= limits["VERIFY_WINDOW_MAX_SECONDS"]
+    ):
+        raise ConfigError(
+            f"require {MIN_VERIFY_WINDOW_SECONDS} <= VERIFY_WINDOW_MIN_SECONDS <= "
+            "VERIFY_WINDOW_DEFAULT_SECONDS <= VERIFY_WINDOW_MAX_SECONDS"
+        )
 
     param = env.get("REMEDIATION_ENABLED_PARAM", "").strip() or None
     if write and param is None:
@@ -213,4 +241,9 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         agents=agents,
         agent_kill_switch_prefix=switch_prefix,
         agent_hourly_apply_budget=default_budget,
+        verify_enabled=env.get("VERIFY_ENABLED") == "true",
+        verify_window_default_seconds=limits["VERIFY_WINDOW_DEFAULT_SECONDS"],
+        verify_window_min_seconds=limits["VERIFY_WINDOW_MIN_SECONDS"],
+        verify_window_max_seconds=limits["VERIFY_WINDOW_MAX_SECONDS"],
+        verify_grace_seconds=limits["VERIFY_GRACE_SECONDS"],
     )

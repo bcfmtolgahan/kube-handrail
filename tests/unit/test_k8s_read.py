@@ -2016,3 +2016,232 @@ def test_identity_request_approval_refuses_an_agent_switched_off(approvals, tabl
     assert exc.value.code == "remediation_disabled"
     assert approvals.sns.messages == []
     assert table.get_item(Key={"plan_id": plan_id})["Item"]["status"] == "planned"
+
+
+# --- Verification ---------------------------------------------------------------
+
+VERIFY_SETTINGS = dataclasses.replace(SETTINGS, verify_enabled=True)
+
+
+def verified_plan(clients, **overrides):
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3, **overrides}
+    return handler.plan_scale_deployment(args, VERIFY_SETTINGS, clients, NOW)
+
+
+def test_plan_records_the_default_window_without_hashing_it(clients, table):
+    data = verified_plan(clients)["data"]
+    assert data["verification"] == {"window_seconds": 120, "revert_on_failure": False}
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["verify_window_seconds"] == 120
+    assert item["args_hash"] == scale_args_hash("sandbox", "web", 3)
+    assert "verify_window_seconds" not in item["args"]
+    assert item["retain_until"] == NOW + retention_seconds(VERIFY_SETTINGS)
+    assert retention_seconds(VERIFY_SETTINGS) == retention_seconds(SETTINGS) + 1800 + 300
+
+
+def test_plan_pins_a_window_it_was_given(clients, table):
+    data = verified_plan(clients, verify_window_seconds=60)["data"]
+    assert data["verification"]["window_seconds"] == 60
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["verify_window_seconds"] == 60
+    assert item["args"]["verify_window_seconds"] == 60
+    assert item["args_hash"] == scale_args_hash("sandbox", "web", 3, verify_window_seconds=60)
+
+
+def test_plan_without_verification_has_no_verification_block(clients, table):
+    data = plan(clients)["data"]
+    assert "verification" not in data
+    assert "verify_window_seconds" not in table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"verify_window_seconds": 59},
+        {"verify_window_seconds": 1801},
+        {"verify_window_seconds": "60"},
+        {"revert_on_failure": True},
+        {"revert_on_failure": "yes"},
+    ],
+)
+def test_plan_refuses_bad_verify_arguments(clients, table, overrides):
+    with pytest.raises(GuardError) as exc:
+        verified_plan(clients, **overrides)
+    assert exc.value.code == "invalid_argument"
+    assert table.scan()["Count"] == 0
+    clients.apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_plan_refuses_a_window_when_verification_is_off(clients):
+    assert plan_error(clients, verify_window_seconds=60) == "invalid_argument"
+
+
+def test_restart_and_rollback_plans_take_a_window(clients, table):
+    data = handler.plan_restart_deployment(
+        {"namespace": "sandbox", "name": "web", "verify_window_seconds": 300},
+        VERIFY_SETTINGS,
+        clients,
+        NOW,
+    )["data"]
+    assert data["verification"] == {"window_seconds": 300, "revert_on_failure": False}
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["args"] == {"namespace": "sandbox", "name": "web", "verify_window_seconds": 300}
+    with pytest.raises(GuardError, match="not supported"):
+        handler.plan_restart_deployment(
+            {
+                "namespace": "sandbox",
+                "name": "web",
+                "verify_window_seconds": 300,
+                "revert_on_failure": True,
+            },
+            VERIFY_SETTINGS,
+            clients,
+            NOW,
+        )
+    with pytest.raises(GuardError, match="not supported"):
+        handler.plan_rollback_deployment(
+            {
+                "namespace": "sandbox",
+                "name": "web",
+                "revision": 5,
+                "verify_window_seconds": 300,
+                "revert_on_failure": True,
+            },
+            VERIFY_SETTINGS,
+            clients,
+            NOW,
+        )
+
+
+def outcome(clients, plan_id: str, now: int = NOW) -> dict:
+    return handler.get_plan_outcome({"plan_id": plan_id}, VERIFY_SETTINGS, clients, now)
+
+
+def test_plan_outcome_of_a_plan_not_applied_yet(clients):
+    plan_id = verified_plan(clients)["data"]["plan_id"]
+    data = outcome(clients, plan_id)["data"]
+    assert data["plan_status"] == "planned"
+    assert data["verification"]["status"] == "not_applied"
+    assert data["revert"] == {"requested": False, "status": "not_requested"}
+    assert data["kind"] == "change"
+    clients.apps.read_namespaced_deployment.reset_mock()
+    outcome(clients, plan_id)
+    clients.apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_plan_outcome_pending_then_recorded(clients):
+    plan_id = verified_plan(clients, verify_window_seconds=60)["data"]["plan_id"]
+    record = clients.store.get(plan_id)
+    clients.store.consume(plan_id, record["args_hash"], "scale_deployment", NOW, verify_window=120)
+    data = outcome(clients, plan_id, NOW + 30)["data"]
+    assert data["plan_status"] == "applied"
+    assert data["verification"]["status"] == "pending"
+    assert data["verification"]["verify_at"] == NOW + 60
+    assert outcome(clients, plan_id, NOW + 60 + 301)["data"]["verification"]["reason"] == (
+        "check_overdue"
+    )
+    clients.store.record_once(
+        plan_id,
+        "verification",
+        {
+            "outcome": "degraded",
+            "reason": "replica_failure",
+            "checked_at": NOW + 70,
+            "observed": {
+                "conditions": [
+                    {"type": "ReplicaFailure", "status": "True", "reason": "FailedCreate"}
+                ]
+            },
+            "correlation_id": "run-1",
+        },
+    )
+    result = outcome(clients, plan_id, NOW + 9999)
+    verification = result["data"]["verification"]
+    assert (verification["status"], verification["reason"]) == ("degraded", "replica_failure")
+    assert verification["observed"]["conditions"][0]["reason"] == (
+        "<untrusted>FailedCreate</untrusted>"
+    )
+    assert result["data"]["correlation_ids"]["verification"] == "run-1"
+
+
+def test_plan_outcome_of_a_plan_consumed_without_a_schedule(clients):
+    plan_id = plan(clients)["data"]["plan_id"]
+    record = clients.store.get(plan_id)
+    clients.store.consume(plan_id, record["args_hash"], "scale_deployment", NOW)
+    data = outcome(clients, plan_id)["data"]["verification"]
+    assert (data["status"], data["reason"]) == ("unknown", "not_scheduled")
+
+
+def test_plan_outcome_errors(clients):
+    with pytest.raises(GuardError) as exc:
+        outcome(clients, str(uuid.uuid4()))
+    assert exc.value.code == "plan_not_found"
+    with pytest.raises(GuardError) as exc:
+        outcome(clients, "not-a-plan")
+    assert exc.value.code == "invalid_argument"
+
+
+def test_plan_with_revert_shows_the_revert_target_and_its_check(clients, table):
+    data = verified_plan(clients, verify_window_seconds=60, revert_on_failure=True)["data"]
+    assert data["verification"] == {"window_seconds": 60, "revert_on_failure": True, "revert_to": 2}
+    checks = [check["check"] for check in data["preflight"]]
+    assert checks[checks.index("blast_radius") + 1] == "revert_target_in_bounds"
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["args"]["revert_on_failure"] is True
+    assert item["args_hash"] == scale_args_hash(
+        "sandbox", "web", 3, revert_on_failure=True, verify_window_seconds=60
+    )
+    # The fixture has 1 of 2 pods available.
+    assert [w["code"] for w in data["impact"]["warnings"]] == ["revert_baseline_unhealthy"]
+    assert "revert_target_in_bounds" not in [
+        c["check"] for c in verified_plan(clients)["data"]["preflight"]
+    ]
+
+
+def test_plan_with_revert_on_a_healthy_deployment_has_no_warning(clients):
+    clients.apps.read_namespaced_deployment.return_value.status.available_replicas = 2
+    data = verified_plan(clients, verify_window_seconds=60, revert_on_failure=True)["data"]
+    assert data["impact"]["warnings"] == []
+
+
+def test_plan_with_revert_needs_a_revert_target_within_bounds(clients, table):
+    settings = dataclasses.replace(VERIFY_SETTINGS, min_replicas=3)
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(
+            {
+                "namespace": "sandbox",
+                "name": "web",
+                "replicas": 3,
+                "verify_window_seconds": 60,
+                "revert_on_failure": True,
+            },
+            settings,
+            clients,
+            NOW,
+        )
+    assert exc.value.code == "out_of_bounds" and "revert target" in exc.value.message
+    assert table.scan()["Count"] == 0
+
+
+def test_plan_with_revert_needs_verification_on_the_server(clients):
+    assert plan_error(clients, verify_window_seconds=60, revert_on_failure=True) == (
+        "invalid_argument"
+    )
+
+
+def test_plan_outcome_of_a_reverted_change_and_its_revert(clients):
+    plan_id = verified_plan(clients, verify_window_seconds=60, revert_on_failure=True)["data"][
+        "plan_id"
+    ]
+    record = clients.store.get(plan_id)
+    clients.store.consume(plan_id, record["args_hash"], "scale_deployment", NOW, verify_window=120)
+    clients.store.record_once(plan_id, "verification", {"outcome": "degraded", "reason": "x"})
+    assert outcome(clients, plan_id)["data"]["revert"] == {"requested": True, "status": "pending"}
+    revert = {"status": "reverted", "reason": None, "revert_plan_id": "r", "at": NOW + 61}
+    clients.store.record_once(plan_id, "revert", revert)
+    assert outcome(clients, plan_id)["data"]["revert"] == {
+        "requested": True,
+        "status": "reverted",
+        "reason": None,
+        "revert_plan_id": "r",
+    }

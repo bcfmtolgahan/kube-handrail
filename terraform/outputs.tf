@@ -48,6 +48,11 @@ output "sentinel_function_name" {
   value       = one(aws_lambda_function.sentinel[*].function_name)
 }
 
+output "verifier_function_name" {
+  description = "Name of the verifier Lambda, or null when verification is disabled."
+  value       = one(aws_lambda_function.verifier[*].function_name)
+}
+
 output "alert_topic_arn" {
   description = "SNS topic for drift alerts and sentinel alarms, or null when the sentinel is disabled."
   value       = one(aws_sns_topic.alerts[*].arn)

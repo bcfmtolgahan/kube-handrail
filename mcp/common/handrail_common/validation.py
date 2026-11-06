@@ -132,6 +132,34 @@ def require_override_flag(args: Mapping[str, Any]) -> bool:
     return value
 
 
+def require_verify_args(
+    args: Mapping[str, Any], enabled: bool, window_bounds: tuple[int, int], revert_allowed: bool
+) -> tuple[int | None, bool]:
+    """Optional `verify_window_seconds` and `revert_on_failure` (mcp/CONTRACT.md, Verification
+    and revert); returns (the window, or None when not given, and the revert flag)."""
+    window = args.get("verify_window_seconds")
+    revert = args.get("revert_on_failure", False)
+    if not isinstance(revert, bool):
+        raise GuardError(INVALID_ARGUMENT, "revert_on_failure must be a boolean")
+    if window is not None:
+        window = require_int(window, "verify_window_seconds")
+        minimum, maximum = window_bounds
+        if not minimum <= window <= maximum:
+            raise GuardError(
+                INVALID_ARGUMENT, f"verify_window_seconds must be between {minimum} and {maximum}"
+            )
+    if revert and not revert_allowed:
+        raise GuardError(INVALID_ARGUMENT, "revert_on_failure is not supported for this action")
+    if revert and window is None:
+        # The human approving the apply then sees both values, not a server default.
+        raise GuardError(
+            INVALID_ARGUMENT, "revert_on_failure needs an explicit verify_window_seconds"
+        )
+    if (window is not None or revert) and not enabled:
+        raise GuardError(INVALID_ARGUMENT, "verification is not enabled on this server")
+    return window, revert
+
+
 def require_plan_id(value: Any) -> str:
     """Plan ids are lowercase canonical UUIDs, exactly as issued."""
     try:

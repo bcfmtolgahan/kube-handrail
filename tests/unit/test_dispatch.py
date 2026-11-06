@@ -311,7 +311,7 @@ def test_without_a_key_no_caller_is_trusted(capsys):
     assert seen == [None, None]
 
 
-@pytest.mark.parametrize("value", ["verifier", "APPROVAL-API", "", 1, None])
+@pytest.mark.parametrize("value", ["VERIFIER", "APPROVAL-API", "", 1, None])
 def test_any_other_channel_value_is_the_gateway(capsys, value):
     seen = []
     handlers = {"x": lambda args: seen.append(current_channel()) or ok({})}
@@ -330,3 +330,51 @@ def test_rejection_reason_and_scope_are_recorded(capsys):
         "not_requester",
         None,
     )
+
+
+# --- Internal handlers --------------------------------------------------------
+
+VERIFIER = {"kubeHandrailChannel": "verifier"}
+
+
+def internal_ctx(full: str, custom: dict | None = None) -> SimpleNamespace:
+    return full_ctx({"bedrockAgentCoreToolName": full, **(custom or {})})
+
+
+def routed(full: str, custom: dict | None = None) -> str:
+    """Which handler map ran the tool, or the error code."""
+    handlers = {"verify_applied_plan": lambda args: ok("tool"), "x": lambda args: ok("tool")}
+    internal = {"verify_applied_plan": lambda args: ok("internal")}
+    result = dispatch(handlers, {}, internal_ctx(full, custom), {}, internal)
+    return result["data"] if result["ok"] else result["error"]["code"]
+
+
+def test_an_internal_handler_runs_only_on_the_verifier_channel(capsys):
+    assert routed("kh_internal___verify_applied_plan", VERIFIER) == "internal"
+    assert routed("kh_internal___verify_applied_plan") == UNKNOWN_TOOL
+    assert routed("kh_internal___verify_applied_plan", {"kubeHandrailChannel": "approval-api"}) == (
+        UNKNOWN_TOOL
+    )
+
+
+def test_an_internal_name_on_a_gateway_target_is_not_internal(capsys):
+    # The tool map here has the name too; the internal map is never consulted.
+    assert routed("k8sw___verify_applied_plan") == "tool"
+    assert routed("k8sw___verify_applied_plan", VERIFIER) == UNKNOWN_TOOL
+
+
+def test_the_verifier_channel_reaches_no_tool_handler(capsys):
+    assert routed("t___x", VERIFIER) == UNKNOWN_TOOL
+    assert routed("kh_internal___x", VERIFIER) == UNKNOWN_TOOL
+
+
+def test_an_internal_call_is_recorded_under_its_name(capsys):
+    dispatch(
+        {},
+        {"plan_id": PLAN_ID},
+        internal_ctx("kh_internal___v", VERIFIER),
+        {},
+        {"v": lambda args: ok({})},
+    )
+    (record,) = records(capsys)
+    assert (record["tool"], record["outcome"], record["plan_id"]) == ("v", "ok", PLAN_ID)

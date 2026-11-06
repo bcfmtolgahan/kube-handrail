@@ -30,14 +30,21 @@ DETAIL_HISTORY_LIMIT = 20
 
 
 def retention_seconds(settings: Settings) -> int:
-    """How long a plan record must stay in the table to serve as history."""
+    """How long a plan record must stay in the table to serve as history, and with
+    verification on, until its verification has run (at most the longest window plus the
+    grace period after the apply)."""
     window = max(
         BUDGET_WINDOW_SECONDS,
         settings.flap_window_seconds,
         settings.plan_rate_window_seconds,
         settings.apply_cooldown_seconds,
     )
-    return window + max_plan_lifetime(settings) + APPLY_GRACE_SECONDS
+    verify = (
+        settings.verify_window_max_seconds + settings.verify_grace_seconds
+        if settings.verify_enabled
+        else 0
+    )
+    return window + max_plan_lifetime(settings) + APPLY_GRACE_SECONDS + verify
 
 
 def max_plan_lifetime(settings: Settings) -> int:

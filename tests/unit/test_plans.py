@@ -21,6 +21,7 @@ from handrail_common.plans import (
     plan_args_hash,
     restart_args,
     restart_template,
+    revert_plan_id,
     rollback_args,
     scale_args,
     scale_args_hash,
@@ -442,3 +443,150 @@ def test_rollback_record_round_trips(store):
         item
     )
     assert Plan.from_item(item).images is None and Plan.from_item(item).fields_changed is None
+
+
+# --- Verification -------------------------------------------------------------
+
+
+def test_verify_arguments_enter_the_hash_only_when_given():
+    plain = scale_args_hash("sandbox", "web", 2)
+    assert scale_args_hash("sandbox", "web", 2, False, False, None) == plain
+    windowed = scale_args("sandbox", "web", 2, verify_window_seconds=120)
+    assert windowed == {
+        "namespace": "sandbox",
+        "name": "web",
+        "replicas": 2,
+        "verify_window_seconds": 120,
+    }
+    reverting = scale_args("sandbox", "web", 2, revert_on_failure=True, verify_window_seconds=120)
+    assert reverting["revert_on_failure"] is True
+    hashes = {
+        plain,
+        plan_args_hash(SCALE_DEPLOYMENT, windowed),
+        plan_args_hash(SCALE_DEPLOYMENT, reverting),
+        scale_args_hash("sandbox", "web", 2, verify_window_seconds=121),
+    }
+    assert len(hashes) == 4
+    assert restart_args("sandbox", "web") == {"namespace": "sandbox", "name": "web"}
+    assert restart_args("sandbox", "web", 60)["verify_window_seconds"] == 60
+    assert rollback_args("sandbox", "web", 3, False, 60) == {
+        "namespace": "sandbox",
+        "name": "web",
+        "revision": 3,
+        "verify_window_seconds": 60,
+    }
+
+
+def test_consume_schedules_the_verification_only_when_asked(store):
+    plan = dataclasses.replace(make_plan(), verify_window_seconds=60)
+    store.create(plan)
+    store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW)
+    item = store.get(plan.plan_id)
+    assert "verify_at" not in item and "verify_queue" not in item
+
+    plan = dataclasses.replace(make_plan(), verify_window_seconds=60)
+    store.create(plan)
+    consumed = store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, verify_window=120)
+    assert consumed.verify_at == NOW + 60
+    assert store.get(plan.plan_id)["verify_queue"] == "due"
+
+
+def test_consume_of_a_plan_without_a_window_uses_the_default(store):
+    """A plan made before verification was deployed can still be applied after it."""
+    plan = make_plan()
+    store.create(plan)
+    consumed = store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, verify_window=120)
+    assert consumed.verify_at == NOW + 120 and consumed.verify_window_seconds is None
+
+
+def test_a_refused_consume_schedules_nothing(store):
+    plan = make_plan()
+    store.create(plan)
+    with pytest.raises(GuardError):
+        store.consume(plan.plan_id, "other", SCALE_DEPLOYMENT, NOW, verify_window=120)
+    assert "verify_at" not in store.get(plan.plan_id)
+
+
+def test_consume_pins_the_revert_target_only_when_asked(store):
+    plan = make_plan()
+    store.create(plan)
+    assert store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW).revert_to is None
+    assert "revert_to" not in store.get(plan.plan_id)
+
+    plan = make_plan()
+    store.create(plan)
+    consumed = store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, pin_revert=True)
+    # In the same write that marks it used, from the replicas_from the apply then checks.
+    assert (consumed.used, consumed.revert_to) == (True, plan.replicas_from)
+    assert store.get(plan.plan_id)["revert_to"] == plan.replicas_from
+
+
+def test_due_plans_reads_the_index_longest_due_first(store):
+    ids = []
+    for window in (90, 30, 600, 60):
+        plan = dataclasses.replace(make_plan(), verify_window_seconds=window)
+        store.create(plan)
+        store.consume(plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, verify_window=120)
+        ids.append(plan.plan_id)
+    store.create(make_plan())  # never consumed: not in the index
+    assert store.due_plans(NOW + 100, 10) == [ids[1], ids[3], ids[0]]
+    assert store.due_plans(NOW + 100, 2) == [ids[1], ids[3]]
+    store.finish_verification(ids[1])
+    assert store.due_plans(NOW + 100, 10) == [ids[3], ids[0]]
+
+
+def test_record_once_keeps_the_first_value(store):
+    plan = make_plan()
+    store.create(plan)
+    first = {"outcome": "degraded", "reason": "target_not_reached", "checked_at": NOW}
+    assert store.record_once(plan.plan_id, "verification", first) == first
+    second = {"outcome": "healthy", "reason": "target_reached", "checked_at": NOW + 1}
+    assert store.record_once(plan.plan_id, "verification", second) == first
+    assert Plan.from_item(store.get(plan.plan_id)).verification == first
+
+
+def test_record_result_with_the_applied_generation(store):
+    plan = make_plan()
+    store.create(plan)
+    store.record_result(plan.plan_id, NOW + 1, "applied", "req-1", 5)
+    assert Plan.from_item(store.get(plan.plan_id)).applied_generation == 5
+
+
+def test_verification_fields_round_trip():
+    plan = dataclasses.replace(
+        make_plan(),
+        verify_window_seconds=60,
+        verify_at=NOW + 60,
+        applied_generation=5,
+        verification={"outcome": "healthy", "observed": {"conditions": []}},
+        revert={"status": "skipped", "reason": "late"},
+        kind="revert",
+        reverts_plan_id="p",
+    )
+    assert Plan.from_item(plan.to_item()) == plan
+
+
+def test_a_revert_id_is_derived_from_its_plan():
+    plan_id = str(uuid.uuid4())
+    assert revert_plan_id(plan_id) == revert_plan_id(plan_id)
+    assert revert_plan_id(plan_id) != revert_plan_id(str(uuid.uuid4()))
+    assert require_plan_id(revert_plan_id(plan_id)) == revert_plan_id(plan_id)
+
+
+def test_create_revert_is_an_idempotent_upsert_scheduled_for_verification(store):
+    revert = dataclasses.replace(
+        make_plan(),
+        plan_id=revert_plan_id("p"),
+        used=True,
+        status="revert",
+        kind="revert",
+        reverts_plan_id="p",
+        verify_window_seconds=60,
+        verify_at=NOW + 60,
+    )
+    store.create_revert(revert)
+    store.create_revert(dataclasses.replace(revert, created_at=NOW + 5))
+    record = store.get(revert.plan_id)
+    assert Plan.from_item(record) == revert
+    assert record["verify_queue"] == "due"
+    assert store.due_plans(NOW + 60, 10) == [revert.plan_id]

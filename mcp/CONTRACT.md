@@ -6,10 +6,10 @@ Single source of truth for handlers, infrastructure code and tests. Change this 
 
 | Gateway target | Lambda | Classification | Tools (schema file) |
 |---|---|---|---|
-| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `get_workload_events`, `get_rollout_history`, `plan_scale_deployment`, `plan_restart_deployment`, `plan_rollback_deployment`, `request_approval` (`mcp/k8s_read/tools.json`) |
+| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `get_workload_events`, `get_rollout_history`, `plan_scale_deployment`, `plan_restart_deployment`, `plan_rollback_deployment`, `request_approval`, `get_plan_outcome` (`mcp/k8s_read/tools.json`) |
 | `k8sw` | `k8s_write` | `MUTATIVE` | `apply_scale_deployment`, `apply_restart_deployment`, `apply_rollback_deployment` (`mcp/k8s_write/tools.json`) |
 
-Each action has one `plan_<action>` tool and one `apply_<action>` tool; apply takes the plan's arguments plus `plan_id`. `plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`). See [History checks](#history-checks-oscillation-breaker). `plan_restart_deployment` and `apply_restart_deployment` take `namespace` and `name`; see [Restart](#restart). `plan_rollback_deployment` and `apply_rollback_deployment` take `namespace`, `name`, `revision` (an integer from 1 to 999999999999999999) and an optional boolean `override_manual_change`; see [Rollback](#rollback). `request_approval` takes only `plan_id`; see [Server-side approval](#server-side-approval). `get_workload_status` takes `namespace` and `name`; `get_workload_events` also takes an optional `limit`; see [Workload events](#workload-events). `get_rollout_history` takes `namespace` and `name`; see [Rollout history](#rollout-history).
+Each action has one `plan_<action>` tool and one `apply_<action>` tool; apply takes the plan's arguments plus `plan_id`. `plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`). See [History checks](#history-checks-oscillation-breaker). `plan_restart_deployment` and `apply_restart_deployment` take `namespace` and `name`; see [Restart](#restart). `plan_rollback_deployment` and `apply_rollback_deployment` take `namespace`, `name`, `revision` (an integer from 1 to 999999999999999999) and an optional boolean `override_manual_change`; see [Rollback](#rollback). Every `plan_*` and `apply_*` tool also takes an optional integer `verify_window_seconds`, and the scale tools an optional boolean `revert_on_failure`; see [Verification and revert](#verification-and-revert). `request_approval` takes only `plan_id`; see [Server-side approval](#server-side-approval). `get_plan_outcome` takes only `plan_id`; see [Verification and revert](#verification-and-revert). `get_workload_status` takes `namespace` and `name`; `get_workload_events` also takes an optional `limit`; see [Workload events](#workload-events). `get_rollout_history` takes `namespace` and `name`; see [Rollout history](#rollout-history).
 
 Clients see `<target>___<tool>`, for example `k8sw___apply_scale_deployment`. Full names must be at most 64 characters and match `^[a-z0-9_]+$`.
 
@@ -19,11 +19,14 @@ The classification of every tool is in `mcp/classification.json`, a map from ful
 - every tool of the write target `k8sw` (`mcp/k8s_write/tools.json`), and every `apply_*` tool on any target, is `MUTATIVE`. The sentinel and the registration script refuse a classification that breaks this rule as well, so a tampered `TOOL_CLASSIFICATION` cannot make a downgraded write tool look expected;
 - every full name is at most 64 characters and matches `^[a-z0-9_]+$`;
 - every `plan_<action>` tool has an `apply_<action>` tool and every `apply_<action>` tool a `plan_<action>` tool;
-- `terraform/main.tf` loads each `mcp/<function>/tools.json` under the target name used in the classification.
+- `terraform/main.tf` loads each `mcp/<function>/tools.json` under the target name used in the classification;
+- no target is named `kh_internal`, and no `tools.json` names an internal handler (below).
 
 ## Dispatch
 
 The tool name is the part after `___` in `context.client_context.custom["bedrockAgentCoreToolName"]`. The event is the tool arguments object. There is no `tool_name` argument and no fallback. An unknown tool returns error code `unknown_tool`.
+
+The write Lambda also has internal handlers, which no MCP client can call: the full name `kh_internal___<name>` runs the internal handler `<name>` (today only `verify_applied_plan`, [Verification and revert](#verification-and-revert)), and only when the invocation's [channel](#agent-identity) is `verifier`. Every other combination is `unknown_tool`: the reserved target on another channel, a gateway target on the `verifier` channel, and an internal handler's name under a gateway target (`k8sw___verify_applied_plan`). The gateway always calls a tool as `<target>___<tool>` of a configured target, and a gateway client can set neither the tool name nor `client_context.custom`. `scripts/check_contract.py` refuses a target named `kh_internal` and an internal handler's name in any `tools.json`.
 
 ## Agent identity
 
@@ -48,7 +51,7 @@ Before any handler runs, dispatch removes `_kube_handrail_caller` from the argum
 
 **Legacy mode** (`caller_interceptor_enabled = false`, for gateways where interceptors are not available). No caller is verified and `AGENTS` is ignored. Every plan records `requested_by = "mcp-gateway"`, the class of the gateway's machine identities, without `agent`; there are no per-agent checks. Terraform warns (a `check` block) when this mode is chosen.
 
-**Channels.** The approver adds `"kubeHandrailChannel": "approval-api"` to the `ClientContext` of the apply it runs ([Approval API](#approval-api)), next to `kubeHandrailCorrelationId`. Dispatch reads it as the invocation's channel: exactly `approval-api`, or `gateway` for anything else, including no value. Gateway clients cannot set `client_context.custom`; anyone who can invoke the write Lambda directly can set it, and can already forge every argument, which is administrator-level access. The approval channel grants nothing that server mode does not: the consume condition still requires the human approval. The apply records its channel in the plan record (`channel`), in the same conditional write that consumes the plan.
+**Channels.** The approver adds `"kubeHandrailChannel": "approval-api"` to the `ClientContext` of the apply it runs ([Approval API](#approval-api)), next to `kubeHandrailCorrelationId`, and the verifier adds `"kubeHandrailChannel": "verifier"` to the verifications it runs ([Verification and revert](#verification-and-revert)). Dispatch reads it as the invocation's channel: exactly `approval-api`, exactly `verifier`, or `gateway` for anything else, including no value. The `verifier` channel reaches only the internal handlers ([Dispatch](#dispatch)), and they take no caller. Gateway clients cannot set `client_context.custom`; anyone who can invoke the write Lambda directly can set it, and can already forge every argument, which is administrator-level access. The approval channel grants nothing that server mode does not: the consume condition still requires the human approval. The `verifier` channel grants no apply at all. The apply records its channel in the plan record (`channel`), in the same conditional write that consumes the plan.
 
 Known limits:
 
@@ -63,14 +66,14 @@ Known limits:
 Dispatch takes each invocation's correlation ID from `context.client_context.custom`, using the first of these that is a string (or integer) matching `^[A-Za-z0-9._:-]{1,128}$`:
 
 1. `bedrockAgentCoreAwsRequestId`, the gateway's ID for the request;
-2. `kubeHandrailCorrelationId`, set only by the approver when it runs an apply (see [Approval API](#approval-api));
+2. `kubeHandrailCorrelationId`, set only by the approver when it runs an apply (see [Approval API](#approval-api)), and by the verifier, to its own request ID, for the verifications it runs;
 
 and otherwise the Lambda's own `aws_request_id`. A value that does not match is skipped, never logged. The gateway's `bedrockAgentCoreMcpMessageId` is not used: the client chooses the JSON-RPC message ID, so it is not unique across sessions. The approver is not behind the gateway; its correlation ID is its own Lambda request ID.
 
 The ID is carried to:
 
 - the tool record below, for every tool invocation;
-- the plan record: `plan_correlation_id` (plan), `approval_request_correlation_id` (the `request_approval` call that notified), `decision_correlation_id` (the approver's request that approved or rejected) and `apply_correlation_id` (the apply that recorded its `result`, whether it succeeded or not). See [Plan record](#plan-record-dynamodb);
+- the plan record: `plan_correlation_id` (plan), `approval_request_correlation_id` (the `request_approval` call that notified), `decision_correlation_id` (the approver's request that approved or rejected), `apply_correlation_id` (the apply that recorded its `result`, whether it succeeded or not) and `verification.correlation_id` (the verifier run that checked it). See [Plan record](#plan-record-dynamodb);
 - the Deployment: the apply's patch sets the annotation `kube-handrail.io/correlation-id` to the apply's ID, next to `kube-handrail.io/last-plan-id`. Both are set by the same patch, which bumps `generation` once, as before;
 - `data.correlation_id` in successful `plan_*`, `request_approval` and `apply_*` responses (`null` only outside a Lambda).
 
@@ -96,7 +99,7 @@ Every tool invocation, including `unknown_tool`, prints exactly one JSON line wh
 }
 ```
 
-- `tool`: the tool name, `null` for an unknown tool (whose `Tool` dimension is `unknown`).
+- `tool`: the tool name, `null` for an unknown tool (whose `Tool` dimension is `unknown`). An internal handler is logged under its name (`verify_applied_plan`).
 - `caller`: the verified caller's `client_id` ([Agent identity](#agent-identity)), otherwise `null`.
 - `plan_id`: the `plan_id` of a successful response's `data`, otherwise the `plan_id` argument, and only if it is a UUID; otherwise `null`.
 - `outcome`: `ok` or the error code.
@@ -109,8 +112,9 @@ Terraform creates these alarms on the drift sentinel's alert topic; they exist o
 
 - `<name_prefix>-tool-errors`: `ToolErrors` across all tools, sum over 5 minutes greater than 0, missing data not breaching.
 - `<name_prefix>-k8s-read-errors` and `<name_prefix>-k8s-write-errors`: `AWS/Lambda` `Errors` of each tool Lambda, sum over 5 minutes at least 1. An invocation that times out, runs out of memory or fails to start prints no tool record, so only this alarm sees it.
+- With `verify_enabled`, the verifier's alarms ([Verification and revert](#verification-and-revert)).
 
-The approver prints one JSON line per decision: `{"event": "decision", "plan_id", "decision", "approver", "correlation_id", "apply_outcome"}`, where `apply_outcome` is `ok`, the apply's error code, or `null` when no apply ran. The rejection reason is not logged.
+The verifier prints one JSON line per run ([Verification and revert](#verification-and-revert)). The approver prints one JSON line per decision: `{"event": "decision", "plan_id", "decision", "approver", "correlation_id", "apply_outcome"}`, where `apply_outcome` is `ok`, the apply's error code, or `null` when no apply ran. The rejection reason is not logged.
 
 ## Response envelope
 
@@ -260,8 +264,8 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `action` | S | `scale_deployment`, `restart_deployment` or `rollback_deployment` |
 | `namespace`, `name` | S | target |
 | `replicas_from`, `replicas_to` | N | for a restart or a rollback both are the current `spec.replicas` (unset counts as 1) |
-| `args_hash` | S | SHA-256 of `json.dumps({"action": action, **args}, sort_keys=True, separators=(",", ":"))`. For a scale that is `{action, namespace, name, replicas}`, for a restart `{action, namespace, name}`, for a rollback `{action, namespace, name, revision}`; the scale and rollback objects gain `"override_manual_change": true` only when the override is true, so a hash without the override is the same as before the flag existed |
-| `args` | M | the argument payload `args_hash` covers, without `action`: the apply arguments without `plan_id`, optional arguments only when given (scale: `namespace`, `name`, `replicas`, and `override_manual_change: true` only when the override is true; restart: `namespace`, `name`; rollback: `namespace`, `name`, `revision`, and the override as for a scale). The approval channel forwards it unchanged as the apply arguments, and apply compares the request's arguments with it. Records made before it have none; they can be neither approved nor applied and must be planned again |
+| `args_hash` | S | SHA-256 of `json.dumps({"action": action, **args}, sort_keys=True, separators=(",", ":"))`. For a scale that is `{action, namespace, name, replicas}`, for a restart `{action, namespace, name}`, for a rollback `{action, namespace, name, revision}`; the scale and rollback objects gain `"override_manual_change": true` only when the override is true, every object gains `"verify_window_seconds": N` only when the window was given, and the scale object `"revert_on_failure": true` only when it is true, so a hash without them is the same as before they existed |
+| `args` | M | the argument payload `args_hash` covers, without `action`: the apply arguments without `plan_id`, optional arguments only when given (scale: `namespace`, `name`, `replicas`, and `override_manual_change: true` only when the override is true; restart: `namespace`, `name`; rollback: `namespace`, `name`, `revision`, and the override as for a scale; each also `verify_window_seconds` when given, and a scale `revert_on_failure: true` when it is true). The approval channel forwards it unchanged as the apply arguments, and apply compares the request's arguments with it. Records made before it have none; they can be neither approved nor applied and must be planned again |
 | `template_from`, `template_to` | S | `sha256:` and the hex SHA-256 of `json.dumps(template, sort_keys=True, separators=(",", ":"))`, where `template` is the Deployment's `spec.template` as the API server returned it at plan time (raw JSON, not client models, which drop fields the client does not know), and the template the change leaves. A scale does not change the template, so both are the current hash. A restart's `template_to` is the hash of the current template with the pod-template annotation `kube-handrail.io/restart-plan-id` set to the plan's own `plan_id` ([Restart](#restart)), so the template it leaves is pinned when the plan is made. A rollback's `template_to` is the hash of the target ReplicaSet's template ([Rollback](#rollback)). Recorded for every action; the template manual-change rule reads them back ([History checks](#history-checks-oscillation-breaker)). Records made before them have neither |
 | `revision_from` | N | the Deployment's `deployment.kubernetes.io/revision` annotation at plan time, only for an action that changes the template (restart, rollback) and only when the annotation is an integer. Information only |
 | `revision_to`, `target_rs_name`, `target_rs_uid` | N, S, S | rollback only: the requested revision (the approved argument), and the name and `uid` of the ReplicaSet it resolved to, which apply re-reads |
@@ -273,12 +277,19 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `object_key` | S | `<namespace>/<name>/<uid>`; partition key of the `object-history` index |
 | `created_at` | N | epoch seconds; sort key of the `object-history` index |
 | `expires_at` | N | epoch seconds, end of plan validity: `created_at + PLAN_TTL_SECONDS` (default 300 s); `created_at + APPROVAL_WAIT_TTL_SECONDS` once an approval is requested; `approved_at + APPLY_AFTER_APPROVAL_TTL_SECONDS` once approved; `rejected_at` once rejected |
-| `retain_until` | N | epoch seconds, the table TTL attribute: `created_at + max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60`, the longest window plus the longest a plan can stay valid, so a record stays readable as history after the plan expired. A record without it is kept until deleted |
+| `retain_until` | N | epoch seconds, the table TTL attribute: `created_at + max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60`, the longest window plus the longest a plan can stay valid, so a record stays readable as history after the plan expired; with `VERIFY_ENABLED`, plus `VERIFY_WINDOW_MAX_SECONDS + VERIFY_GRACE_SECONDS`, so it stays until its verification has run. A record without it is kept until deleted |
 | `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a AND attribute_not_exists(rejected_by)`, extended in `server` and `both` mode (see [Server-side approval](#server-side-approval)) |
-| `requested_by` | S | the requesting principal: `agent:<name>` in identity mode, the constant `mcp-gateway` (the class of the gateway's machine identities) in legacy mode and on records made before identity mode ([Agent identity](#agent-identity)) |
-| `agent`, `requested_client_id` | S, S | identity mode only: the requesting agent's name and the verified OAuth `client_id` it planned with, kept as evidence because the name-to-client mapping can change |
-| `channel` | S | the channel the apply ran under, `gateway` or `approval-api`, written by the conditional update that consumes the plan; absent until then |
-| `status` | S | `planned`, `awaiting_approval`, `approved` or `rejected`. `applied` (`used = true`) and `expired` (`expires_at <= now`) are derived, never stored. Records made before server approval have no `status` and `requested_by`; they can be applied in `client` mode until they expire but never requested or approved |
+| `requested_by` | S | the requesting principal: `agent:<name>` in identity mode, the constant `mcp-gateway` (the class of the gateway's machine identities) in legacy mode and on records made before identity mode ([Agent identity](#agent-identity)), and `system:revert` on a revert record ([Revert](#revert)). The approver refuses to decide on a record whose requester starts with `system:` |
+| `agent`, `requested_client_id` | S, S | identity mode only: the requesting agent's name and the verified OAuth `client_id` it planned with, kept as evidence because the name-to-client mapping can change; a revert record copies them from the plan it reverts |
+| `channel` | S | the channel the apply ran under, `gateway` or `approval-api`, written by the conditional update that consumes the plan; absent until then. `verifier` on a revert record |
+| `verify_window_seconds` | N | with `VERIFY_ENABLED`: the verification window, the `verify_window_seconds` argument or, when it was not given, `VERIFY_WINDOW_DEFAULT_SECONDS`. Whether it was given is visible in `args` ([Verification and revert](#verification-and-revert)) |
+| `verify_at`, `verify_queue` | N, S | with `VERIFY_ENABLED`, written by the conditional update that consumes the plan: `verify_at = now + verify_window_seconds` (`VERIFY_WINDOW_DEFAULT_SECONDS` for a record without it) and `verify_queue = "due"`, the partition key of the `verify-due` index. `verify_queue` is removed once the verification is final |
+| `revert_to` | N | only for an apply with `revert_on_failure`: `replicas_from`, copied by the conditional update that consumes the plan, from the same record the apply then checks against the Deployment. The count a revert restores ([Revert](#revert)); a later change to `replicas_from` does not move it |
+| `applied_generation` | N | written with `result` after a successful patch: the Deployment's `metadata.generation` from the patch response. Evidence only |
+| `verification` | M | written once by the verifier channel: `{outcome, reason, checked_at, observed, correlation_id}` ([Verification and revert](#verification-and-revert)) |
+| `revert` | M | written once by the verifier channel, only for a plan with `revert_on_failure` whose verification is `degraded`: `{status, reason, revert_plan_id, at}` ([Revert](#revert)) |
+| `kind`, `reverts_plan_id` | S, S | revert records only: `revert`, and the `plan_id` of the plan whose apply the record undoes |
+| `status` | S | `planned`, `awaiting_approval`, `approved` or `rejected`, and `revert` on a revert record, which can never be requested, approved or applied. `applied` (`used = true`) and `expired` (`expires_at <= now`) are derived, never stored. Records made before server approval have no `status` and `requested_by`; they can be applied in `client` mode until they expire but never requested or approved |
 | `override_manual_change` | BOOL | the value pinned in `args_hash` |
 | `impact` | M | the impact preview returned with the plan, so the approval channel renders the server's own record |
 | `approval_requested_at` | N | last `request_approval` that notified |
@@ -288,6 +299,8 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `plan_correlation_id`, `approval_request_correlation_id`, `decision_correlation_id` | S | the correlation IDs of the plan, of the last `request_approval` that notified, and of the approval or rejection ([Observability](#observability)). Each is absent until its step happens; records made before them have none |
 
 Global secondary index `object-history`: partition key `object_key` (S), sort key `created_at` (N), projection `ALL`. It is eventually consistent, so a plan or apply from the last moment may not be visible yet.
+
+Global secondary index `verify-due`: partition key `verify_queue` (S), sort key `verify_at` (N), projection `KEYS_ONLY`. It is sparse: only records with `verify_queue` are in it, the plans whose verification is scheduled and not final.
 
 The table also holds one global budget counter per clock hour: `plan_id = "budget#global#<hour start, epoch seconds>"` (never a UUID, so it cannot be named as a plan), `applies` (N), and `retain_until` two hours after the hour starts; and one approval request counter per 600-second clock window: `plan_id = "approval#global#<window start>"`, `requests` (N), `retain_until` two windows after the window starts. In identity mode it also holds one apply counter per agent and clock hour: `plan_id = "budget#agent#<name>#<hour start>"` (`#` cannot occur in an agent name), `applies` (N), `retain_until` as for the global counter. They have no `object_key`, so they are not in the index.
 
@@ -306,9 +319,11 @@ Plan (`k8s_read`):
 8. Global budget: the current hour's counter, read consistently, must be below `GLOBAL_HOURLY_APPLY_BUDGET`. Planning only reads it.
 9. Impact preview: list the PodDisruptionBudgets, Services and EndpointSlices in the namespace (below). Any error fails the plan with `kubernetes_error`, so the approver never sees a preview with gaps. Only then is the plan record written.
 
+The optional `verify_window_seconds` and `revert_on_failure` are checked with checks 1-3, and the revert target after check 6 ([Verification and revert](#verification-and-revert)).
+
 In identity mode the caller is resolved to its agent right after checks 1-3, before the Deployment is read (`forbidden`, `agent_unknown`; [Agent identity](#agent-identity)), and the agent's kill switch must be on (`remediation_disabled`, `details.scope = "agent"`). After check 8, the agent's counter for the current hour, read consistently, must be below its budget (`agent_budget_exceeded`); planning only reads it.
 
-The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact`, `expires_at`, `requested_by` and `correlation_id`. `preflight` lists the checks that passed, in this order: `arguments`, `agent_enabled`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`, `agent_budget`. In legacy mode `agent_enabled` and `agent_budget` are `{"passed": true, "skipped": true}`, so a client can see that the per-agent checks did not run.
+The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact`, `expires_at`, `requested_by`, `correlation_id` and, with `VERIFY_ENABLED`, `verification` ([Verification and revert](#verification-and-revert)). `preflight` lists the checks that passed, in this order: `arguments`, `agent_enabled`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `revert_target_in_bounds` (only with `revert_on_failure`), `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`, `agent_budget`. In legacy mode `agent_enabled` and `agent_budget` are `{"passed": true, "skipped": true}`, so a client can see that the per-agent checks did not run.
 
 `blast_radius_exceeded` `details`:
 
@@ -326,6 +341,8 @@ Apply (`k8s_write`), all re-checked independently of the plan step:
 5. Server-side dry run (`dryRun=All`) before each real patch. A plan is consumed before the dry run, so any failure after step 3 requires a new plan.
 6. The patch also sets the annotations `kube-handrail.io/last-plan-id` to the applied `plan_id` and `kube-handrail.io/correlation-id` to the apply's [correlation ID](#observability).
 7. History checks, after step 3 and after the first read in step 4 has passed: manual change, cooldown, flapping and object budget (not the plan rate limit), then the global budget: one conditional update adds 1 to the current hour's counter only if it is below `GLOBAL_HOURLY_APPLY_BUDGET`, so concurrent applies cannot overshoot it. The unit is taken before the patch and not returned if the patch then fails. They use the planned `replicas_from` and `replicas_to`; the check in step 4 has confirmed that `replicas_from` is the current count. A 409 retry re-runs step 4 but not the history checks. A rejection here leaves the plan consumed, with the error code as its `result`.
+
+With `VERIFY_ENABLED`, step 3's conditional update also schedules the verification ([Verification and revert](#verification-and-revert)).
 
 In identity mode, a gateway apply resolves its caller to an agent between steps 1 and 2 (`forbidden`, `agent_unknown`), and step 3's conditional update also requires the plan's `requested_by` to be that agent's ([Apply condition](#apply-condition)). Step 3 records the apply's `channel` in the same update. Right after it, on every channel, a plan without `agent` is refused in identity mode (`forbidden`, `agent_unknown`; only the approval channel can get that far with one), and the kill switch of the plan's agent must be on (`remediation_disabled`, `details.scope = "agent"`); either refusal leaves the plan consumed with its code as `result`, like a blast-radius refusal. In step 7, one conditional update adds 1 to the plan's agent's counter for the current hour, only while it is below the agent's budget (`agent_budget_exceeded`), right before the global unit is taken, whichever channel applies the plan.
 
@@ -452,6 +469,7 @@ A revision is only as trustworthy as the namespace's RBAC ([Guards](../docs/guar
 - `pod_disruption_budgets`: PodDisruptionBudgets in the namespace whose `spec.selector` matches the Deployment's pod template labels (`matchLabels` and `matchExpressions` with `In`, `NotIn`, `Exists`, `DoesNotExist`). As in `policy/v1`, an empty selector matches every pod and a missing selector matches none. `min_available` and `max_unavailable` are as given (an integer or a percentage string, `null` when unset); `current_healthy`, `desired_healthy` and `disruptions_allowed` are from `status` (`null` when unset). Sorted by name.
 - `services`: Services in the namespace with a non-empty `spec.selector` that is a subset of the pod template labels; Services without a selector are skipped. `ready_endpoints_now` counts endpoints with `conditions.ready` true in the EndpointSlices labelled `kubernetes.io/service-name=<service>`; an unset `ready` counts as not ready, so the count can be low but never high, and a pod listed in several slices (dual-stack) is counted once (by `targetRef.uid`, otherwise by its addresses). `projected_ready_endpoints = max(0, ready_endpoints_now - ready_now) + to` is a projection: it assumes the new pods become ready and the Service's other backends stay as they are. While `status.readyReplicas` lags behind the EndpointSlices, the difference is counted as other backends, so the projection can be too high and miss `service_without_endpoints`; `scale_to_zero` still flags a scale to 0. Sorted by name.
 - `warnings`, each `{code, message}`, in this order:
+  - `revert_baseline_unhealthy`: the plan has `revert_on_failure` and the Deployment's `status.availableReplicas` (unset counts as 0) is below its current replica count. The verification compares with the target, not with the state before the change, so it may find the change degraded for a cause the change did not bring, and the revert would then undo it.
   - `scale_to_zero`: `to` is 0.
   - `pdb_headroom`: `removed` is greater than `disruptions_allowed` of a matching PodDisruptionBudget (unset counts as 0). A scale-down is not an eviction, so the PodDisruptionBudget will not stop it.
   - `service_without_endpoints`: a matching Service's `projected_ready_endpoints` is 0.
@@ -531,9 +549,132 @@ Known limits:
 - A request that keeps the count unchanged is allowed, has no direction, and once applied counts toward the budget.
 - Rejected plans are not stored, so the plan rate limit does not bound requests refused by an earlier check. Each of those costs one Deployment read, one HPA list and two table reads, and changes nothing.
 - Plans that are pending (created but not applied) do not count toward flapping, the cooldown or the budgets.
+- A revert ([Revert](#revert)) is an applied record in the history like any other, with its own direction: it counts toward the cooldown, flapping, the object budget and the plan rate limit of later plans, and the Deployment's annotation names it as the last apply. Planning the reverted change again right after the revert is therefore `cooldown`, and after the cooldown `flapping` (a second reversal within the window). The revert itself runs none of these checks and takes no global or agent budget unit.
 - The global and per-agent budgets count clock hours, not a sliding window, so up to twice the limit can be applied across an hour boundary.
 - The agent unit is taken before the global unit, as two separate conditional updates: an apply refused because the global budget is spent has already used a unit of its agent's budget, which is not given back (like the units of an apply whose patch fails).
 - The windows compare `applied_at` and `created_at`, written by one Lambda, with `now` on another; Lambda clocks are NTP-synchronised, so the skew is negligible against windows of minutes.
+
+## Verification and revert
+
+With `VERIFY_ENABLED` (Terraform `verify_enabled`, default `true`), every applied plan is checked once, `verify_window_seconds` after its apply, and `get_plan_outcome` reports whether the change reached its target.
+
+### Arguments
+
+- `verify_window_seconds` (every `plan_*` and `apply_*` tool): an integer from `VERIFY_WINDOW_MIN_SECONDS` to `VERIFY_WINDOW_MAX_SECONDS` (default 60 to 1800); anything else is `invalid_argument`, and so is any value while `VERIFY_ENABLED` is off ("verification is not enabled on this server"). When given, it enters `args` and `args_hash` like `override_manual_change`, so the approval pins it and apply must pass the same value (`plan_mismatch` otherwise), and after the consume the record's `verify_window_seconds` must equal it. When it is not given, the record's window is `VERIFY_WINDOW_DEFAULT_SECONDS` (120), which is not part of `args_hash`, and apply must not pass it either.
+- `revert_on_failure` (scale only): a boolean, default `false` (any other type is `invalid_argument`). `true` asks the server to revert the change if its verification is `degraded` ([Revert](#revert)). It needs an explicit `verify_window_seconds`, so the human approving the apply sees both values rather than a server default; without one, and on a restart or rollback, it is `invalid_argument`, and so is `true` while `VERIFY_ENABLED` is off. Like the window it enters `args` and `args_hash` only when true. When planning, after the blast-radius budget, the revert target (the current replica count) must be within the replica bounds (`out_of_bounds`, naming the revert target); `preflight` then lists `revert_target_in_bounds`, and the impact preview can warn `revert_baseline_unhealthy` ([Impact preview](#impact-preview)).
+
+The plan response `data.verification` is `{"window_seconds": 60, "revert_on_failure": true, "revert_to": 1}`, where `revert_to`, the current replica count, appears only with `revert_on_failure`.
+
+### Scheduling
+
+The conditional update that consumes the plan ([Guard checks](#guard-checks), apply step 3) also sets `verify_at = now + verify_window_seconds` and `verify_queue = "due"`, in the same write, so nothing after the patch has to succeed for the plan to be verified. A record without `verify_window_seconds` (planned before verification was deployed, or while it was off) is scheduled with `VERIFY_WINDOW_DEFAULT_SECONDS`. A plan whose apply is refused after the consume is scheduled too; its verification records `not_applied`. For a request with `revert_on_failure`, the same write copies `replicas_from` to `revert_to`: apply step 4 then confirms that it is the Deployment's current count, so it is the count the change replaced.
+
+### The verifier
+
+A scheduled Lambda (`mcp/verifier/`, EventBridge `rate(1 minute)`, the shortest rate a scheduled rule supports) outside any VPC, with reserved concurrency 1 and a 300-second timeout. It is not a gateway target. Each run:
+
+1. queries `verify-due` for `verify_queue = "due" AND verify_at <= now`, longest due first, at most `VERIFY_BATCH_LIMIT` (10) plans; the rest wait for the next run;
+2. invokes the write Lambda synchronously for each, with the payload `{"plan_id": "<id>"}` and the `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "kh_internal___verify_applied_plan", "kubeHandrailChannel": "verifier", "kubeHandrailCorrelationId": "<the run's request ID>"}}`.
+
+The verifier writes nothing itself: a failed invoke leaves the plan due for the next run. A check therefore runs up to a minute after `verify_at`, later when the queue is long, which is what `VERIFY_GRACE_SECONDS` absorbs.
+
+Each run prints one JSON line, also a CloudWatch embedded metric record in `<name_prefix>/verifier` (no dimensions): `Runs` (1), `Due` (plans read), `Processed`, `InvokeErrors` (an invoke that failed, a function error or an error envelope), `Degraded` and `Reverts` (verifications that reported `degraded` with a final revert state, or reverted, so each plan counts once), plus `correlation_id` and `results`, one `{plan_id, outcome, reason, revert}` or `{plan_id, error}` per plan, where `error` is an exception class or an error code. Terraform creates these alarms on the alert topic, with `sentinel_enabled` and `verify_enabled`:
+
+- `<name_prefix>-verifier-stalled`: sum of `Runs` below 1 for 3 consecutive 5-minute periods, missing data breaching.
+- `<name_prefix>-verifier-errors`: `AWS/Lambda` `Errors` of the verifier, sum over 5 minutes at least 1.
+- `<name_prefix>-verifier-invoke-errors`: `InvokeErrors`, sum over 5 minutes greater than 0.
+- `<name_prefix>-verifier-reverts`: `Reverts`, sum over 5 minutes greater than 0, so a human hears about every automatic revert.
+
+### `verify_applied_plan(plan_id)`
+
+The internal handler in the write Lambda ([Dispatch](#dispatch)). The verification changes nothing in the cluster, so it reads no kill switch, runs no agent check and takes no budget unit; only a revert reads the kill switch. Every write it makes is conditional, so a run that repeats or overlaps an earlier one changes nothing.
+
+1. Read the record consistently. If it does not exist, has no `verify_at`, `verify_at` is later than now, or it has no `verify_queue` (its verification is final; the index is eventually consistent and can still return it), return `ok` with `{"plan_id", "due": false}` and change nothing.
+2. If it already has a `verification`, keep it and go to step 5.
+3. Decide the outcome:
+   - not consumed (`used = false`): `not_applied`;
+   - now later than `verify_at + VERIFY_GRACE_SECONDS` (default 300): `unknown`, reason `late`, without reading anything: a verdict long after the approved window is not what was approved;
+   - otherwise read the Deployment once (the writer's `get`). If the record's `result` is an error code and the Deployment's `kube-handrail.io/last-plan-id` does not name the plan, the apply was refused before its patch: `not_applied`. Otherwise evaluate the reading with the table below.
+4. Write `verification = {outcome, reason, checked_at, observed, correlation_id}` with the condition `attribute_not_exists(verification)`. If another run wrote one first, that one is kept and used.
+5. If the outcome is `degraded`, `args` has `revert_on_failure`, the record is not a revert record (`kind`) and it has no `revert` yet, revert ([Revert](#revert)). When the kill switch cannot be read, or the revert fails with an error, the run stops here and the plan stays due; past `verify_at + VERIFY_GRACE_SECONDS` any such failure records `revert = {status: skipped, reason: late}` instead.
+6. Remove `verify_queue`, so the plan leaves the index.
+
+The response `data` is `{"plan_id", "due": true, "outcome", "reason", "revert"}`, where `revert` is the revert's `status`, `pending` when it is retried on the next run, or `null`; only the verifier sees it.
+
+| Outcome | Reason | Condition (the first match wins) |
+|---|---|---|
+| `unknown` | `not_found`, `kubernetes_error` | The read returned 404, or failed otherwise. |
+| `unknown` | `replaced` | `metadata.uid` is not the plan's `uid`. |
+| `unknown` | `superseded` | `kube-handrail.io/last-plan-id` does not name the plan: another apply or a human changed the Deployment since. |
+| `unknown` | `spec_changed` | `metadata.generation` is not the plan's `generation + 1` (the apply bumps it exactly once), or `spec.replicas` (unset counts as 1) is not `replicas_to`. |
+| `unknown` | `paused` | `spec.paused` is true: Kubernetes does not check the progress of a paused rollout. |
+| `unknown` | `not_observed` | `status.observedGeneration` is below `metadata.generation`. |
+| `degraded` | `progress_deadline_exceeded` | Condition `Progressing` is `False` with reason `ProgressDeadlineExceeded`. |
+| `degraded` | `replica_failure` | Condition `ReplicaFailure` is `True`: the ReplicaSet controller could not create pods. |
+| `degraded` | `target_not_reached` | The target below is not reached. |
+| `healthy` | `target_reached` | Otherwise. |
+
+The target: with `replicas_to` 0, `status.replicas` is 0. Otherwise condition `Available` is `True` and, for a change that keeps the pod template (a scale), `status.availableReplicas` is at least `replicas_to`; for one that rolls out a new template (a restart or rollback, whose `template_from` and `template_to` differ), as `kubectl rollout status` decides it: `status.updatedReplicas` is at least `replicas_to`, `status.replicas` is at most `status.updatedReplicas`, and `status.availableReplicas` is at least `status.updatedReplicas`. Unset counts are 0. An unchanged `generation + 1` also means the pod template is still the one the apply wrote (`template_to`).
+
+The outcome answers one question: did this change reach its target within the approved window? It is one reading at `verify_at`, not a comparison with the state before the change: a Deployment that was already failing is `degraded` after a change that did not cause it, and a brief dip at the moment of the reading counts. Scaling counts as progress for `ProgressDeadlineExceeded` (default `progressDeadlineSeconds` 600), so with a shorter window a scale-up whose pods cannot start is normally `target_not_reached`.
+
+`observed` is `{desired, replicas, ready, available, updated, generation, observed_generation, conditions}`, from the same reading: the counts, and each condition's `type`, `status` and `reason`, the reason cut to 256 characters. Condition messages are never stored.
+
+### Revert
+
+A revert undoes exactly one change that a human approved together with `revert_on_failure`, after its verification found it `degraded`. Its authority is that approval; it needs no approval of its own, and an `unknown` outcome never triggers it. The decision for each control ([ADR 0004](../docs/adr/0004-pre-approved-revert.md)):
+
+| Control | Stops a revert |
+|---|---|
+| Global kill switch | Yes |
+| Replica bounds, GitOps ownership, the spec precondition below | Yes |
+| The agent's own kill switch | No |
+| Blast radius, cooldown, flapping, object, global and agent budgets, manual change | No |
+
+1. **Already done, or late.** A record without `revert_to` (`revert_on_failure` that was not in the request the consume checked) is `refused` with reason `plan_mismatch`. The Deployment the verification read, or a fresh read on a later run (404: `refused` with reason `not_found`). If its `kube-handrail.io/last-plan-id` already names the revert record (below), an earlier run's patch landed and that run stopped before recording it: the revert is done, whatever changed since, and the revert record gets `result = applied` unless it has it. Otherwise, once `now` is later than `verify_at + VERIFY_GRACE_SECONDS`, `revert = {status: skipped, reason: late}`: a revert long after the approved window is not what was approved. Any error before the revert is recorded (an unreadable kill switch, a failed read or patch, a table error) records nothing and leaves the plan due, so the next run tries again until then.
+2. **Kill switch.** The global kill switch, read without caching. Any value but `true`: `revert = {status: skipped, reason: remediation_disabled}`, final; turning the switch back on does not revert later, because the approved window has passed by then.
+3. **Bounds.** The plan's `revert_to` must be within the replica bounds now: otherwise `refused` with reason `out_of_bounds`.
+4. **Revert record.** A full plan record, created with one conditional `UpdateItem` (`attribute_not_exists(plan_id)`, so the write role needs no `PutItem`); if it exists, an earlier run created it and that one is used. `plan_id` is `uuid5(<fixed namespace>, "revert:" + parent plan_id)`, so a plan has at most one. `action` `scale_deployment`, `kind` `revert`, `reverts_plan_id`, the parent's `namespace`, `name`, `uid`, `object_key`, `resource_version`, `agent` and `requested_client_id`, `replicas_from = parent.replicas_to`, `replicas_to = parent.revert_to`, `generation = parent.generation + 1` (the spec the parent's apply left), `args` of the revert itself (`namespace`, `name`, `replicas`) with its `args_hash`, `template_from = template_to = ` the parent's `template_to`, `created_at = expires_at = now`, `retain_until`, `used = true`, `status = revert`, `requested_by = system:revert`, `channel = verifier`, `plan_correlation_id` (the verifier run), and the parent's window with `verify_at = now + window` and `verify_queue = "due"`. It never has `revert_on_failure`.
+5. **Patch**, from the Deployment read in step 1. Its `kube-handrail.io/last-plan-id` must still name the parent (a re-read after a 409 that finds the revert record means a concurrent run's patch landed: the revert is done), and the [apply checks](#guard-checks) of step 4 run against the revert record: the same `uid`, not GitOps-managed, `metadata.generation = parent.generation + 1` and `spec.replicas = parent.replicas_to`; a failure is `conflict` (with `details`) or `gitops_managed`. Then a server-side dry run and the merge patch `spec.replicas = parent.revert_to` with `metadata.resourceVersion` from that same read, `kube-handrail.io/last-plan-id` set to the revert record, `kube-handrail.io/correlation-id` to the verifier run's ID and `kube-handrail.io/requested-by` to `system:revert`. A 409 reads again, re-runs these checks and patches again, up to 3 attempts.
+6. **Record.** On the revert record, `result` (`applied` or the code that stopped the patch), `applied_at`, `apply_correlation_id` and `applied_generation`. On the parent, with `attribute_not_exists(revert)`: `revert = {status: reverted, reason: null, revert_plan_id, at}`, or `{status: refused, reason: <code>, revert_plan_id, at}` when step 5 failed. A refusal is final.
+
+The revert record is verified one window later like any applied plan and reports `healthy`, `degraded` or `unknown`. It is never reverted, for two independent reasons: it never has `revert_on_failure`, and step 5 of `verify_applied_plan` skips every record whose `kind` is `revert`. It counts in the history of later plans ([History checks](#history-checks-oscillation-breaker)).
+
+### `get_plan_outcome(plan_id)`
+
+`READ_ONLY` tool on `k8sr`. One consistent `GetItem` of the plan record; it never reads the cluster. `plan_id` must be a UUID (`invalid_argument`); an unknown plan is `plan_not_found`. A revert record can be read the same way, by its `revert_plan_id`.
+
+```json
+{
+  "plan_id": "...", "action": "scale_deployment", "namespace": "sandbox", "name": "web",
+  "kind": "change", "reverts_plan_id": null,
+  "replicas": { "from": 1, "to": 2 },
+  "plan_status": "applied",
+  "verification": {
+    "window_seconds": 120, "verify_at": 1700000120,
+    "status": "degraded", "reason": "target_not_reached", "checked_at": 1700000150,
+    "observed": { "desired": 2, "replicas": 2, "ready": 1, "available": 1, "updated": 2,
+                  "generation": 6, "observed_generation": 6,
+                  "conditions": [ { "type": "Available", "status": "True",
+                                    "reason": "<untrusted>MinimumReplicasAvailable</untrusted>" } ] }
+  },
+  "revert": { "requested": true, "status": "reverted", "reason": null, "revert_plan_id": "..." },
+  "correlation_ids": { "plan": "...", "apply": "...", "verification": "..." }
+}
+```
+
+- `plan_status` is the derived status of [Approval API](#approval-api) (`applied` once consumed).
+- `verification.status` is the recorded outcome, with its `reason`, `checked_at` and `observed`, or, before there is one: `not_applied` (not consumed yet), `pending` (scheduled, and now is at most `verify_at + VERIFY_GRACE_SECONDS`), `unknown` with reason `check_overdue` (scheduled, and the check has not run within the grace period) or `unknown` with reason `not_scheduled` (consumed without a schedule: before verification was deployed, or while it was off). `checked_at` and `observed` are then `null`.
+- `kind` is `change`, or `revert` for a revert record, with `reverts_plan_id`.
+- `revert` is `{"requested": false, "status": "not_requested"}` without `revert_on_failure` and on a revert record. With it, `{"requested": true, "status"}`: `pending` (no verdict yet, or `degraded` and not yet acted on), `not_needed` (the outcome is not `degraded`), or the recorded `reverted`, `skipped` or `refused` with its `reason` and `revert_plan_id`.
+- `correlation_ids` holds those recorded, by step: `plan`, `apply`, `verification`.
+- Condition reasons in `observed` are returned as [untrusted text](#untrusted-output): anyone who can write the Deployment's status sets them. A reason cut at its limit sets the envelope's `truncated`. Every other value was set by the server.
+
+Known limits:
+
+- Records made before verification have no schedule; `get_plan_outcome` reports them as `not_scheduled`.
+- If the verifier cannot run within `VERIFY_GRACE_SECONDS` of `verify_at`, the outcome is `unknown` with reason `late`, and nothing is reverted.
+- A revert of a restart or rollback is not supported: `revert_on_failure` is a scale argument only.
 
 ## Drift sentinel
 
@@ -635,7 +776,7 @@ After the consume, the record's `args` must equal the request's arguments withou
 4. If it already notified less than `APPROVAL_REQUEST_COOLDOWN_SECONDS` ago, nothing changes and nobody is notified: `ok` with `notified: false` and `retry_after`.
 5. One conditional update adds 1 to the current window's approval request counter only while it is below `APPROVAL_REQUEST_LIMIT` (`approval_rate_limited`, `details: {"limit", "window_seconds": 600, "window_start", "retry_after"}`). Clock windows, so up to twice the limit can pass across a window boundary.
 6. One conditional update sets `status = awaiting_approval`, `approval_requested_at = now`, `approval_request_correlation_id` and `expires_at = created_at + APPROVAL_WAIT_TTL_SECONDS` (from creation, so asking again never extends a plan). If the record changed between the read and this update and the cooldown does not explain it, the call fails with `conflict` ("plan changed concurrently; try again"); calling it again is safe.
-7. The notification is published to the server's SNS topic, rendered from the record: Deployment, the change (the replica change for a scale; for a restart, that every pod is replaced with the replica count unchanged and the annotation the pods get; for a rollback, the revision and ReplicaSet, each image that changes, as stored, and the other changed field names), override flag, requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
+7. The notification is published to the server's SNS topic, rendered from the record: Deployment, the change (the replica change for a scale; for a restart, that every pod is replaced with the replica count unchanged and the annotation the pods get; for a rollback, the revision and ReplicaSet, each image that changes, as stored, and the other changed field names), override flag, the verification window when the record has one (`Verify window: N s after the apply`, and `Revert on failure: no`, or `yes, back to N replica(s) if the change is degraded`), requester, expiry, the impact summary and warnings, and the `scripts/approve.py` commands with the approval URL. The agent cannot choose or add a destination. Publishing happens after the update; if it fails, the call fails with `internal`, the plan stays awaiting approval and the next notification is possible after the cooldown.
 
 Response `data`: `plan_id`, `status` (`awaiting_approval`), `expires_at`, `notified`, `approval_mode`, `correlation_id`, and `retry_after` when `notified` is false.
 
@@ -651,18 +792,18 @@ Authorization, before anything else:
 
 Requests (responses are the JSON envelope in the body):
 
-- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `change` (what the plan changes, in the shape of the plan response's `diff`: `{"replicas": {from, to}}` for a scale, `{"restart": {"pods_replaced"}, "template": {from, to}}` for a restart, `{"revision": {from, to}, "template": {from, to}, "replica_set", "images", "fields_changed", "truncated"}` for a rollback, where `truncated` is the record's `diff_truncated`), `override_manual_change`, `impact`, `requested_by`, `agent` (`null` in legacy mode), `created_at`, `expires_at`, and when present `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
+- `GET /?plan_id=<uuid>`: the plan rendered from the record: `plan_id`, `status` (derived: `planned`, `awaiting_approval`, `approved`, `rejected`, `applied`, `expired`), `action`, `namespace`, `name`, `replicas: {from, to}`, `change` (what the plan changes, in the shape of the plan response's `diff`: `{"replicas": {from, to}}` for a scale, `{"restart": {"pods_replaced"}, "template": {from, to}}` for a restart, `{"revision": {from, to}, "template": {from, to}, "replica_set", "images", "fields_changed", "truncated"}` for a rollback, where `truncated` is the record's `diff_truncated`), `override_manual_change`, `impact`, `requested_by`, `agent` (`null` in legacy mode), `created_at`, `expires_at`, and when present `verification` (`{"window_seconds", "revert_on_failure"}`, plus `revert_to` with `revert_on_failure`, from the record's `verify_window_seconds`, `args` and `replicas_from`), `approval`, `rejection`, `result` and `correlation_ids` (the record's correlation IDs by step: `plan`, `approval_request`, `decision`, `apply`, each only when recorded).
 - `POST /` with a JSON object of at most 4096 bytes and only these fields: `plan_id` (UUID), `decision` (`approve` or `reject`), optional `reason` (string, at most 500 characters, control characters removed), optional `apply` (boolean, default `true`). Any other field is `invalid_argument`.
   - `approve`: first the record is read; if its `action` has no apply tool the request fails with `internal`, and if it has no `args` with `plan_expired` ("plan again"), before any decision is recorded, so an approval never names a plan that nothing can apply. Then one conditional update, `status IN (planned, awaiting_approval) AND used = false AND expires_at > now AND requested_by <> caller`, sets `status = approved`, `approved_by`, `approved_at`, `approved_args_hash = args_hash` (copied from the record in the same update), `approval_channel = api`, `approval_expires_at = expires_at = now + APPLY_AFTER_APPROVAL_TTL_SECONDS` and `decision_correlation_id` (the approver's request ID).
   - `reject`: the same condition; sets `status = rejected`, `rejected_by`, `rejected_at`, `reject_reason`, `decision_correlation_id`, `expires_at = now`.
-  - Refusals: `plan_not_found`, `plan_used`, `plan_decided`, `plan_expired`, `forbidden` (the requester), `conflict` (changed concurrently).
+  - Refusals: `plan_not_found`, `plan_used`, `plan_decided`, `plan_expired`, `forbidden` (the requester), `conflict` (changed concurrently). Before either decision, a record whose `requested_by` starts with `system:` (a revert record) is `forbidden`: nobody decides on a record the server made itself.
   - In `server` mode only, after a successful approval with `apply` true, the approver invokes the write Lambda synchronously with the plan's own arguments from the record (`plan_id` and the record's `args`, unchanged) and `ClientContext` `{"custom": {"bedrockAgentCoreToolName": "<apply tool>", "kubeHandrailChannel": "approval-api", "kubeHandrailCorrelationId": "<approver request ID>"}}`, where the apply tool is the one for the plan's `action` (`scale_deployment`: `k8sw___apply_scale_deployment`, `restart_deployment`: `k8sw___apply_restart_deployment`, `rollback_deployment`: `k8sw___apply_rollback_deployment`), as the gateway calls it except that the correlation ID is the approver's ([Observability](#observability)). The write guard is unchanged and authoritative.
   - Response `data`: `plan` (the view above, read again after the apply), `apply` (the write Lambda's envelope, or `null` when no apply ran, as always in `client` and `both` mode) and `approval_mode`. If the write Lambda cannot be invoked at all, `apply` is `internal` with the message `approval recorded; apply could not be started: <error code>`. A failed apply does not undo the approval: an approval whose apply was refused before the consume (for example `remediation_disabled`) can still be applied through the gateway until it expires.
 - Any other method: `invalid_argument`.
 
 HTTP status: 200 for `ok` (also when the triggered apply failed; see `data.apply`), 400 `invalid_argument`, 403 `forbidden`, 404 `plan_not_found`, 409 `plan_used`, `plan_expired`, `plan_decided`, `conflict`, 500 otherwise. Each decision is logged as one JSON line with the caller ARN, `plan_id` and correlation ID ([Observability](#observability)); each `forbidden` refusal is logged with the caller ARN.
 
-`scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and a one-line summary of the change (action, Deployment, and the replica change, the pods a restart replaces, or a rollback's revisions, ReplicaSet and number of changed images, noting when the list was truncated) and asks for confirmation unless `--yes`. When an approval ran no apply, it says that the client must now apply the plan.
+`scripts/approve.py` (`show`, `approve [--no-apply]`, `reject [--reason]`; `--url` or `APPROVAL_URL`) signs with the operator's own AWS credentials, prints the server-rendered plan and a one-line summary of the change (action, Deployment, and the replica change, the pods a restart replaces, or a rollback's revisions, ReplicaSet and number of changed images, noting when the list was truncated, and the verification window when there is one) and asks for confirmation unless `--yes`. When an approval ran no apply, it says that the client must now apply the plan.
 
 ### MFA and who can reach the URL
 
@@ -696,12 +837,13 @@ Existing assets are found with `ListAssets` and checked before the first write; 
 ## Runtime and packaging
 
 - Python 3.12, `x86_64`, pinned in one Terraform local.
-- Dependencies installed by Terraform-driven build into `build/<function>/` with `pip install --target build/<function> --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 -r <requirements>`, plus `mcp/common/`. `archive_file` zips `build/<function>/`. The tool Lambdas use `requirements.txt`; the approver uses `mcp/approver/requirements.txt`, which installs nothing (it needs only the runtime's `boto3` and `handrail_common`, never `kubernetes`); the sentinel uses `mcp/sentinel/requirements.txt`, which bundles its own `boto3` because the runtime's copy may not know the `devops-agent` service. That pin must match the `boto3` pin in `requirements-dev.txt`, whose service models include `devops-agent` and `bedrock-agentcore-control`.
+- Dependencies installed by Terraform-driven build into `build/<function>/` with `pip install --target build/<function> --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12 -r <requirements>`, plus `mcp/common/`. `archive_file` zips `build/<function>/`. The tool Lambdas use `requirements.txt`; the approver and the verifier use `mcp/approver/requirements.txt` and `mcp/verifier/requirements.txt`, which install nothing (they need only the runtime's `boto3` and `handrail_common`, never `kubernetes`); the sentinel uses `mcp/sentinel/requirements.txt`, which bundles its own `boto3` because the runtime's copy may not know the `devops-agent` service. That pin must match the `boto3` pin in `requirements-dev.txt`, whose service models include `devops-agent` and `bedrock-agentcore-control`.
 
 ## Identity
 
-- Two IAM roles, one per tool Lambda. On the plan table: read role `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:UpdateItem` (for `request_approval` and its counter); write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only. Both roles have `ssm:GetParameter` on the per-agent kill switches (`parameter/<name_prefix>/agents/*`); only the write role reads the global kill switch. The read role also has `sns:Publish` on the approval topic, and an explicit deny of `PutItem` and `UpdateItem` that name any approval attribute (`approved_*`, `approval_channel`, `approval_expires_at`, `rejected_*`, `reject_reason`, `decision_correlation_id`, through `dynamodb:Attributes`). The write role has no such deny, because its consume condition reads those attributes; nothing in IAM keeps it from writing them. What is guaranteed: the read role cannot write an approval, the approver refuses the Lambda and gateway roles, and the write guard re-validates the consumed record against the request's arguments before it touches the cluster.
+- Two IAM roles, one per tool Lambda. On the plan table: read role `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:UpdateItem` (for `request_approval` and its counter); write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only. Both roles have `ssm:GetParameter` on the per-agent kill switches (`parameter/<name_prefix>/agents/*`); only the write role reads the global kill switch. The read role also has `sns:Publish` on the approval topic, and an explicit deny of `PutItem` and `UpdateItem` that name any approval attribute (`approved_*`, `approval_channel`, `approval_expires_at`, `rejected_*`, `reject_reason`, `decision_correlation_id`, through `dynamodb:Attributes`), and of the attributes that schedule, record and target a verification or revert (`verify_at`, `verify_queue`, `verification`, `revert`, `revert_to`, `kind`, `reverts_plan_id`), which it never writes. The write role has no such deny, because its consume condition reads those attributes; nothing in IAM keeps it from writing them. What is guaranteed: the read role cannot write an approval, the approver refuses the Lambda and gateway roles, and the write guard re-validates the consumed record against the request's arguments before it touches the cluster.
 - Approver role: `dynamodb:GetItem` and `dynamodb:UpdateItem` on the plan table, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS access: the apply it triggers runs as the write Lambda.
+- Verifier role (with `verify_enabled`): `dynamodb:Query` on the `verify-due` index ARN only, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS, SSM or table item access: the verification runs as the write Lambda, whose role needs nothing new. The approver refuses the verifier role as an approver, like the other Lambda roles.
 - Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the global kill switch parameter only; `bedrock-agentcore:ListGatewayTargets`, `bedrock-agentcore:GetGatewayTarget` and `bedrock-agentcore:GetGateway` on this gateway (a denial shows as `unknown`); `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
 - With `lambda_subnet_ids` set, both tool roles also have, in a separate role policy, the network interface actions Lambda needs to run in a VPC (`ec2:CreateNetworkInterface`, `ec2:DescribeNetworkInterfaces`, `ec2:DescribeSubnets`, `ec2:DeleteNetworkInterface`, `ec2:AssignPrivateIpAddresses`, `ec2:UnassignPrivateIpAddresses`, on `*`). This is the EC2 part of `AWSLambdaVPCAccessExecutionRole`, without its `logs` actions on every log group. A `Deny` on these actions and `ec2:DetachNetworkInterface`, conditioned on `lambda:SourceFunctionArn` being the function itself, keeps them from the function's code: only the Lambda service can use them.
 - Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations. The group names are fixed, not derived from `name_prefix`: deployments that share a cluster share the groups and their RoleBindings. The cluster's authentication mode must be `API` or `API_AND_CONFIG_MAP`; Terraform checks it before creating the entries.
@@ -721,7 +863,7 @@ Only the two tool Lambdas talk to the cluster. At runtime they make these calls,
 | `ssm:GetParameter` (the global kill switch on apply; an agent's kill switch on plan, `request_approval` and apply, in identity mode) | write; both | `ssm.<region>.amazonaws.com` |
 | `sns:Publish` (`request_approval`) | read | `sns.<region>.amazonaws.com` |
 
-The EKS token is a presigned `sts:GetCallerIdentity` URL built locally; the Lambdas never call STS, the API server does. Lambda delivers function logs itself, outside the function's network. So neither STS nor CloudWatch Logs has to be reachable from the Lambdas' subnets. The approver, sentinel and interceptor Lambdas never run in a VPC.
+The EKS token is a presigned `sts:GetCallerIdentity` URL built locally; the Lambdas never call STS, the API server does. Lambda delivers function logs itself, outside the function's network. So neither STS nor CloudWatch Logs has to be reachable from the Lambdas' subnets. The approver, sentinel, interceptor and verifier Lambdas never run in a VPC; the verifier reaches the write Lambda through the Lambda API, and the verification's own calls are the write Lambda's.
 
 `lambda_subnet_ids` (default empty) puts both tool Lambdas in those subnets, with `lambda_security_group_ids` or, when that is empty, a created security group that allows outbound TCP 443 only. Terraform refuses a cluster without a public endpoint unless `lambda_subnet_ids` is set. `allow_lambda_to_cluster_endpoint` (default `false`) adds inbound TCP 443 from those security groups to the cluster security group. `create_vpc_endpoints` (default `false`) creates interface endpoints with private DNS for `eks`, `ssm` and `sns` in one Lambda subnet per Availability Zone, with a security group that allows TCP 443 from the VPC's address ranges (private DNS sends every client in the VPC to them), and a DynamoDB gateway endpoint on the route tables of the Lambda subnets (the main route table for a subnet without an explicit association). Both options need private endpoint access on the cluster; Terraform refuses them without it. Deployment steps are in [Deploying to a new account](../docs/deploy.md).
 
@@ -740,6 +882,18 @@ Agent identity, set on both tool Lambdas ([Agent identity](#agent-identity)):
 | `AGENT_KILL_SWITCH_PREFIX` | `/<name_prefix>/agents/`; required in identity mode | set from `name_prefix` |
 
 Outputs: `agent_client_ids` (every agent's `client_id` by name), `cognito_client_ids` (the clients created here) and `agent_kill_switch_parameters` (every agent's kill switch parameter by name).
+
+Verification, set on both tool Lambdas ([Verification and revert](#verification-and-revert)); the numbers must be positive integers with `60 <= VERIFY_WINDOW_MIN_SECONDS <= VERIFY_WINDOW_DEFAULT_SECONDS <= VERIFY_WINDOW_MAX_SECONDS`:
+
+| Variable | Default | Terraform variable |
+|---|---|---|
+| `VERIFY_ENABLED` | `true` turns verification on; anything else, including unset, is off | `verify_enabled` (default `true`) |
+| `VERIFY_WINDOW_DEFAULT_SECONDS` | 120 | `verify_window_default_seconds` |
+| `VERIFY_WINDOW_MIN_SECONDS` | 60 | `verify_window_min_seconds` |
+| `VERIFY_WINDOW_MAX_SECONDS` | 1800 | `verify_window_max_seconds` |
+| `VERIFY_GRACE_SECONDS` | 300 | `verify_grace_seconds` |
+
+Verifier: `PLANS_TABLE`, `WRITE_FUNCTION_NAME`, `VERIFY_BATCH_LIMIT` (10), `METRIC_NAMESPACE` (`<name_prefix>/verifier`). Output: `verifier_function_name` (`null` without `verify_enabled`).
 
 Server-side approval, set on both tool Lambdas (the approver reads `APPROVAL_MODE` and `APPLY_AFTER_APPROVAL_TTL_SECONDS` as well):
 

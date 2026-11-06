@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from handrail_common.dispatch import INTERNAL_TARGET
+
 REPO = Path(__file__).parents[2]
 _SPEC = importlib.util.spec_from_file_location(
     "check_contract", REPO / "scripts" / "check_contract.py"
@@ -158,3 +160,33 @@ def test_contract_error_codes_match_envelope():
 def test_agents_md_absent_fails_without_traceback(repo):
     (repo / "AGENTS.md").unlink()
     assert "AGENTS.md is missing" in check_contract.check(repo)
+
+
+def test_a_target_named_like_the_internal_handlers_fails(repo):
+    main_tf = repo / "terraform/main.tf"
+    main_tf.write_text(
+        main_tf.read_text().replace('target      = "k8sr"', 'target      = "kh_internal"')
+    )
+    assert any("kh_internal is reserved" in e for e in check_contract.check(repo))
+
+
+def test_an_internal_handler_in_a_tools_json_fails(repo):
+    edit_json(repo / "mcp/k8s_read/tools.json", add_tool("verify_applied_plan"))
+    assert any(
+        "verify_applied_plan is an internal handler" in e for e in check_contract.check(repo)
+    )
+
+
+def test_the_internal_names_match_the_write_lambda():
+    spec = importlib.util.spec_from_file_location(
+        "k8s_write_handler_contract", REPO / "mcp" / "k8s_write" / "handler.py"
+    )
+    write = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(write)
+    assert check_contract.INTERNAL_TOOLS == set(write.INTERNAL_HANDLERS)
+    assert check_contract.INTERNAL_TARGET == INTERNAL_TARGET
+
+
+def test_get_plan_outcome_is_read_only():
+    classification = json.loads((REPO / "mcp/classification.json").read_text())
+    assert classification["k8sr___get_plan_outcome"] == "READ_ONLY"

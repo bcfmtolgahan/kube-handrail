@@ -67,6 +67,18 @@ def change_view(record: Mapping[str, Any]) -> dict[str, Any]:
     return {"replicas": {"from": record.get("replicas_from"), "to": record.get("replicas_to")}}
 
 
+def verification_view(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The verification the apply schedules, from the record; None when it schedules none."""
+    window = record.get("verify_window_seconds")
+    if window is None:
+        return None
+    revert = (record.get("args") or {}).get("revert_on_failure") is True
+    view: dict[str, Any] = {"window_seconds": window, "revert_on_failure": revert}
+    if revert:
+        view["revert_to"] = record.get("replicas_from")
+    return view
+
+
 def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
     record = plain(item)
     view: dict[str, Any] = {
@@ -84,6 +96,9 @@ def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
         "created_at": record.get("created_at"),
         "expires_at": record.get("expires_at"),
     }
+    verification = verification_view(record)
+    if verification is not None:
+        view["verification"] = verification
     if "approved_by" in record:
         view["approval"] = {
             key: record.get(key)
@@ -170,6 +185,20 @@ def _rollback_lines(change: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _verification_lines(verification: Mapping[str, Any] | None) -> list[str]:
+    if verification is None:
+        return []
+    revert = (
+        f"yes, back to {verification.get('revert_to')} replica(s) if the change is degraded"
+        if verification.get("revert_on_failure")
+        else "no"
+    )
+    return [
+        f"Verify window: {verification.get('window_seconds')} s after the apply",
+        f"Revert on failure: {revert}",
+    ]
+
+
 def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
     """The approval request sent to approvers, built from plan_view only."""
     plan_id = view["plan_id"]
@@ -192,6 +221,7 @@ def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
             f"Deployment: {view['namespace']}/{view['name']}",
             *change,
             f"Override manual change: {'yes' if view['override_manual_change'] else 'no'}",
+            *_verification_lines(view.get("verification")),
             f"Requested by: {view['requested_by']}",
             f"Expires at (epoch seconds): {view['expires_at']}",
             "",

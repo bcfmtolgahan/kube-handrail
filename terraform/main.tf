@@ -18,6 +18,8 @@ locals {
 
   # Must match OBJECT_HISTORY_INDEX in mcp/common/handrail_common/plans.py.
   history_index = "object-history"
+  # Must match VERIFY_DUE_INDEX in mcp/common/handrail_common/plans.py.
+  verify_due_index = "verify-due"
 
   # Gateway target name => Lambda settings. Tool schemas come from the contract's tools.json files.
   functions = {
@@ -68,16 +70,23 @@ locals {
     AGENT_KILL_SWITCH_PREFIX  = local.agent_kill_switch_prefix
     AGENT_HOURLY_APPLY_BUDGET = tostring(var.agent_hourly_apply_budget)
 
+    VERIFY_ENABLED                = tostring(var.verify_enabled)
+    VERIFY_WINDOW_DEFAULT_SECONDS = tostring(var.verify_window_default_seconds)
+    VERIFY_WINDOW_MIN_SECONDS     = tostring(var.verify_window_min_seconds)
+    VERIFY_WINDOW_MAX_SECONDS     = tostring(var.verify_window_max_seconds)
+    VERIFY_GRACE_SECONDS          = tostring(var.verify_grace_seconds)
+
     METRIC_NAMESPACE = local.tools_metric_namespace
   }
 
-  # Every packaged Lambda => its requirements file. The sentinel and the approver are packaged
-  # but are not gateway targets.
+  # Every packaged Lambda => its requirements file. The sentinel, the approver and the verifier
+  # are packaged but are not gateway targets.
   packages = merge(
     { for fn in keys(local.functions) : fn => "requirements.txt" },
     var.sentinel_enabled ? { sentinel = "mcp/sentinel/requirements.txt" } : {},
     { approver = "mcp/approver/requirements.txt" },
     var.caller_interceptor_enabled ? { interceptor = "mcp/interceptor/requirements.txt" } : {},
+    var.verify_enabled ? { verifier = "mcp/verifier/requirements.txt" } : {},
   )
 
   # Tolerates a function directory that has no Python sources yet.
@@ -239,8 +248,9 @@ data "aws_iam_policy_document" "lambda" {
     }
   }
 
-  # The read role cannot write approval attributes, even if its code is compromised. Not on
-  # the write role: its consume condition reads these attributes.
+  # The read role cannot write approval attributes, or the verification and revert
+  # attributes, even if its code is compromised. Not on the write role: its consume
+  # condition reads the approval attributes, and it writes the others.
   dynamic "statement" {
     for_each = each.value.approval_requests ? [1] : []
     content {
@@ -251,7 +261,7 @@ data "aws_iam_policy_document" "lambda" {
       condition {
         test     = "ForAnyValue:StringEquals"
         variable = "dynamodb:Attributes"
-        values   = local.approval_attributes
+        values   = concat(local.approval_attributes, local.verify_attributes)
       }
     }
   }
@@ -359,6 +369,10 @@ resource "aws_lambda_function" "this" {
       error_message = "Require 0 <= min_replicas <= max_replicas."
     }
     precondition {
+      condition     = var.verify_window_min_seconds <= var.verify_window_default_seconds && var.verify_window_default_seconds <= var.verify_window_max_seconds
+      error_message = "Require verify_window_min_seconds <= verify_window_default_seconds <= verify_window_max_seconds."
+    }
+    precondition {
       condition     = local.cluster_vpc_config.endpoint_public_access || local.lambda_in_vpc
       error_message = "The cluster has no public endpoint. Set lambda_subnet_ids to subnets that reach its private endpoint (docs/deploy.md, Network)."
     }
@@ -401,6 +415,16 @@ resource "aws_dynamodb_table" "plans" {
     type = "N"
   }
 
+  attribute {
+    name = "verify_queue"
+    type = "S"
+  }
+
+  attribute {
+    name = "verify_at"
+    type = "N"
+  }
+
   # Plan history per object (namespace/name/uid), read by the oscillation breaker.
   global_secondary_index {
     name            = local.history_index
@@ -413,6 +437,23 @@ resource "aws_dynamodb_table" "plans" {
 
     key_schema {
       attribute_name = "created_at"
+      key_type       = "RANGE"
+    }
+  }
+
+  # Plans whose verification is scheduled and not yet final, read by the verifier. Sparse:
+  # only records with verify_queue are in it. Added to an existing table online.
+  global_secondary_index {
+    name            = local.verify_due_index
+    projection_type = "KEYS_ONLY"
+
+    key_schema {
+      attribute_name = "verify_queue"
+      key_type       = "HASH"
+    }
+
+    key_schema {
+      attribute_name = "verify_at"
       key_type       = "RANGE"
     }
   }

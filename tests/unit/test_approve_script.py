@@ -138,3 +138,19 @@ def test_show_puts_the_plan_id_in_the_query(monkeypatch):
 )
 def test_summary_names_the_change(view, line):
     assert approve.summary(view) == line
+
+
+def test_summary_names_the_scheduled_verification():
+    view = {
+        "action": "scale_deployment",
+        "namespace": "sandbox",
+        "name": "web",
+        "change": {"replicas": {"from": 1, "to": 2}},
+        "verification": {"window_seconds": 60, "revert_on_failure": True, "revert_to": 1},
+    }
+    assert approve.summary(view) == (
+        "scale_deployment sandbox/web: replicas 1 -> 2; verified 60 s after the apply, "
+        "reverted to 1 replica(s) if degraded"
+    )
+    view["verification"] = {"window_seconds": 120, "revert_on_failure": False}
+    assert approve.summary(view).endswith("; verified 120 s after the apply")

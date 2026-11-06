@@ -43,6 +43,7 @@ from handrail_common.plans import (
     RESTART_DEPLOYMENT,
     ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
+    SYSTEM_REQUESTER_PREFIX,
     PlanStore,
 )
 from handrail_common.validation import GuardError, require_plan_id
@@ -179,6 +180,13 @@ class Runtime:
     clock: Callable[[], float] = time.time
 
 
+def check_decidable(item: Mapping[str, Any]) -> None:
+    """Records the server made itself (a revert: system:revert) carry their authority from
+    the plan they belong to; nobody approves or rejects them."""
+    if str(item.get("requested_by") or "").startswith(SYSTEM_REQUESTER_PREFIX):
+        raise GuardError(FORBIDDEN, "records the server made itself cannot be decided")
+
+
 def check_appliable(item: Mapping[str, Any]) -> None:
     """Refuse, before any decision is recorded, a plan that no apply tool could run."""
     if item.get("action") not in APPLY_TOOLS:
@@ -256,9 +264,11 @@ def decide(
 
     now = int(rt.clock())
     s = rt.settings
+    current = rt.store.get(plan_id)
+    # A missing plan is left to the decision itself, which says why it cannot be made.
+    if current is not None:
+        check_decidable(current)
     if decision == APPROVE:
-        current = rt.store.get(plan_id)
-        # A missing plan is left to the approval itself, which says why it cannot be approved.
         if current is not None:
             check_appliable(current)
         item = rt.store.approve(

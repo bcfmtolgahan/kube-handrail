@@ -225,6 +225,56 @@ variable "agent_hourly_apply_budget" {
   }
 }
 
+variable "verify_enabled" {
+  description = "Verify every applied plan once its verification window has passed (mcp/CONTRACT.md, Verification and revert): applies schedule the check, a scheduled verifier Lambda runs it, and get_plan_outcome reports it. false: plans refuse verify_window_seconds and revert_on_failure, and nothing is verified."
+  type        = bool
+  default     = true
+}
+
+variable "verify_window_default_seconds" {
+  description = "Verification window of a plan that gives no verify_window_seconds: seconds after the apply at which the result is checked."
+  type        = number
+  default     = 120
+
+  validation {
+    condition     = var.verify_window_default_seconds > 0 && floor(var.verify_window_default_seconds) == var.verify_window_default_seconds
+    error_message = "verify_window_default_seconds must be a positive integer."
+  }
+}
+
+variable "verify_window_min_seconds" {
+  description = "Shortest verify_window_seconds a plan may give; at least 60, because the verifier runs once a minute."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.verify_window_min_seconds >= 60 && floor(var.verify_window_min_seconds) == var.verify_window_min_seconds
+    error_message = "verify_window_min_seconds must be an integer of at least 60."
+  }
+}
+
+variable "verify_window_max_seconds" {
+  description = "Longest verify_window_seconds a plan may give."
+  type        = number
+  default     = 1800
+
+  validation {
+    condition     = var.verify_window_max_seconds > 0 && floor(var.verify_window_max_seconds) == var.verify_window_max_seconds
+    error_message = "verify_window_max_seconds must be a positive integer."
+  }
+}
+
+variable "verify_grace_seconds" {
+  description = "How long after its window a verification may still run; a check that could not run by then is reported as unknown (late) and never reverts."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.verify_grace_seconds > 0 && floor(var.verify_grace_seconds) == var.verify_grace_seconds
+    error_message = "verify_grace_seconds must be a positive integer."
+  }
+}
+
 variable "approval_mode" {
   description = "client: the MCP client approves (DevOps Agent chat), the server requires no approval record. server: every apply requires a server approval. both: as server on the server side; the client approves as well."
   type        = string

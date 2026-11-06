@@ -31,6 +31,8 @@ Two actors who disagree about a Deployment (an agent and a human, or two agents)
 
 A restart or rollback counts like any other apply for the cooldown and the budgets. It leaves the replica count unchanged, so it has no direction: it is never flapping and does not affect the flapping check of later scales. A restart's pod template carries a new annotation each time, so it never reverses anything either. Rolling back and forth between two templates has no flapping rule of its own: every rollback needs a human approval, and the cooldown and the budgets bound how often it can happen.
 
+A revert ([below](#verify-and-revert)) counts as an apply too, with its own direction. Planning the reverted change again right after the revert is therefore refused with `cooldown`, and after the cooldown with `flapping`: a change that failed once should not be retried by an agent without a human.
+
 History is kept per object, identified by namespace, name and `uid`: deleting and recreating a Deployment starts over. All checks run when planning, for early feedback, and again when applying (except the rate limit), which is the decision that counts. If the history cannot be read, the request fails; the checks are never skipped. Each rejection lists the recent applies so the agent and the approver can see why.
 
 The history index is eventually consistent and the outcome of an apply is recorded after the patch, so the most recent apply is also taken from the Deployment itself: the plan named by its `kube-handrail.io/last-plan-id` annotation counts as applied whatever the table says about it, because only a successful patch sets that annotation. Two applies cannot race each other on one object either: the first bumps the Deployment's `generation`, which makes the second a `conflict`. A no-op request (the count stays the same) is allowed and counts toward the budget. Rejected plans are not stored, so they are not rate-limited; they change nothing and cost a few reads.
@@ -45,3 +47,16 @@ Each agent is one OAuth client, and every plan names the agent that asked for it
 Both are checked when planning, for early feedback, and again when applying, which is the decision that counts. Only the agent that planned a change can request its approval or apply it through the gateway, so one agent cannot spend another agent's approved plan or the budget behind it. Without the caller interceptor (legacy mode) every plan names the gateway instead of an agent, and neither limit applies.
 
 To stop one agent: `aws ssm put-parameter --overwrite --name /<name_prefix>/agents/<name>/enabled --value false`; set it back to `true` to let it act again.
+
+## Verify and revert
+
+An approved change is checked once, after a window the plan names (`verify_window_seconds`, default 120 seconds), from the server's own reading of the Deployment: `healthy` if it reached its target, `degraded` if not, `unknown` if the reading cannot tell, for example because someone else changed the Deployment since. The apply schedules the check in the same write that consumes the plan, and a scheduled verifier runs it through an entry point of the write Lambda that no MCP client can reach. `get_plan_outcome` reports it. See [Verification and revert](../mcp/CONTRACT.md#verification-and-revert).
+
+A scale plan can also pin `revert_on_failure`, with an explicit window, so the human approves the change and its revert together. If the check finds the change `degraded`, the server sets replicas back to the count the plan started from, once, and an alarm tells a human. The revert:
+
+- runs only on `degraded`, never on `unknown`, and only when the Deployment is still exactly as the apply left it: the same object, still marked with the plan, with the spec the apply wrote. The patch carries the resourceVersion of that same reading;
+- is stopped by the global kill switch, the replica bounds and GitOps ownership. A kill switch that is off when the check runs skips the revert for good: by the time it is back on, the approved window has passed;
+- is not stopped by the agent's own kill switch, the blast-radius budget, the oscillation breaker, the budgets or the manual-change check, and takes no budget unit. It is the inverse of one change that already passed them, and refusing it would leave the object in the state the human chose to undo;
+- is verified like any change, and never reverted itself.
+
+The check is one reading at the end of the window, not a comparison with the state before the change. A Deployment that was already short of available pods can be found degraded for a cause the change did not bring; the plan warns about it (`revert_baseline_unhealthy`). The reasons for this design are in [ADR 0004](adr/0004-pre-approved-revert.md).

@@ -19,6 +19,7 @@ locals {
     [for r in aws_iam_role.lambda : r.arn],
     aws_iam_role.sentinel[*].arn,
     aws_iam_role.interceptor[*].arn,
+    aws_iam_role.verifier[*].arn,
     [aws_iam_role.approver.arn, aws_iam_role.gateway.arn],
   )
 

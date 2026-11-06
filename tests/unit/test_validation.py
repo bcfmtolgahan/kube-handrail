@@ -14,6 +14,7 @@ from handrail_common.validation import (
     require_name,
     require_namespace,
     require_plan_id,
+    require_verify_args,
     validate_scale_args,
 )
 
@@ -140,3 +141,51 @@ def test_replica_step_details():
     with pytest.raises(GuardError) as exc:
         check_replica_step(3, 10, 100)
     assert exc.value.details == {"from": 3, "to": 10, "max_step": 3, "max_step_percent": 100}
+
+
+def verify_args(args: dict, enabled: bool = True, revert_allowed: bool = True):
+    return require_verify_args(args, enabled, (60, 1800), revert_allowed)
+
+
+@pytest.mark.parametrize("window", [60, 61, 1799, 1800])
+def test_verify_window_within_bounds(window):
+    assert verify_args({"verify_window_seconds": window}) == (window, False)
+
+
+@pytest.mark.parametrize("window", [59, 1801, 0, -60, "120", 120.0, True])
+def test_verify_window_outside_bounds_or_not_an_integer(window):
+    with pytest.raises(GuardError) as exc:
+        verify_args({"verify_window_seconds": window})
+    assert exc.value.code == INVALID_ARGUMENT
+
+
+def test_verify_arguments_are_optional():
+    assert verify_args({}) == (None, False)
+    assert verify_args({"revert_on_failure": False}) == (None, False)
+    assert verify_args({}, enabled=False) == (None, False)
+
+
+def test_revert_needs_an_explicit_window():
+    assert verify_args({"revert_on_failure": True, "verify_window_seconds": 60}) == (60, True)
+    with pytest.raises(GuardError, match="explicit verify_window_seconds"):
+        verify_args({"revert_on_failure": True})
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_revert_must_be_a_boolean(value):
+    with pytest.raises(GuardError, match="must be a boolean"):
+        verify_args({"revert_on_failure": value, "verify_window_seconds": 60})
+
+
+def test_revert_is_refused_where_it_is_not_supported():
+    with pytest.raises(GuardError, match="not supported"):
+        verify_args({"revert_on_failure": True, "verify_window_seconds": 60}, revert_allowed=False)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [{"verify_window_seconds": 60}, {"revert_on_failure": True, "verify_window_seconds": 60}],
+)
+def test_verify_arguments_need_verification_on_the_server(args):
+    with pytest.raises(GuardError, match="not enabled"):
+        verify_args(args, enabled=False)

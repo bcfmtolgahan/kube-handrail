@@ -16,6 +16,7 @@ SCALE_TO_ZERO = "scale_to_zero"
 RECREATE_STRATEGY = "recreate_strategy"
 ROLLOUT_IN_PROGRESS = "rollout_in_progress"
 NO_PODS = "no_pods"
+REVERT_BASELINE_UNHEALTHY = "revert_baseline_unhealthy"
 RECREATE = "Recreate"
 ROLLING_UPDATE = "RollingUpdate"
 # The API server's defaults for a RollingUpdate Deployment.
@@ -111,6 +112,22 @@ def _pdb_summary(pdb: Obj) -> dict[str, Any]:
     }
 
 
+def revert_warnings(available_now: int, replicas: int) -> list[dict[str, str]]:
+    """For a plan with revert_on_failure: the verification compares with the target, not
+    with the state before the change, so a Deployment that is already short of available
+    pods can be found degraded for a cause the change did not bring, and reverted."""
+    if available_now >= replicas:
+        return []
+    return [
+        {
+            "code": REVERT_BASELINE_UNHEALTHY,
+            "message": f"only {available_now} of {replicas} pods are available now; the "
+            "verification may find the change degraded for a cause it did not bring, and the "
+            "revert would then undo it",
+        }
+    ]
+
+
 def scale_impact(
     labels: Mapping[str, str],
     ready_now: int,
@@ -119,12 +136,14 @@ def scale_impact(
     pdbs: Sequence[Obj],
     services: Sequence[Obj],
     slices: Sequence[Obj],
+    action_warnings: Sequence[Mapping[str, str]] = (),
 ) -> dict[str, Any]:
     """Pods, PodDisruptionBudgets and Services affected by scaling a Deployment whose pod
     template has `labels` and which has `ready_now` ready pods, and warnings for the
-    approver. Warnings never block the plan."""
+    approver. `action_warnings` (revert_warnings) come first, so a cut never drops them.
+    Warnings never block the plan."""
     removed = max(0, replicas_from - replicas_to)
-    warnings: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = [dict(w) for w in action_warnings]
     if replicas_to == 0:
         warnings.append({"code": SCALE_TO_ZERO, "message": "the Deployment would have no pods"})
 

@@ -10,6 +10,7 @@ from handrail_common.impact import (
     SCALE_TO_ZERO,
     SERVICE_WITHOUT_ENDPOINTS,
     ready_endpoints,
+    revert_warnings,
     rollout_impact,
     rollout_strategy,
     scale_impact,
@@ -528,3 +529,15 @@ def test_rollout_of_no_pods_warns():
     result = rollout(deployment(0), ready_now=0)
     assert codes(result) == [NO_PODS]
     assert result["pods"]["replaced"] == 0
+
+
+def test_revert_warnings_flag_a_deployment_already_short_of_available_pods():
+    assert revert_warnings(2, 2) == [] and revert_warnings(3, 2) == []
+    (warning,) = revert_warnings(1, 2)
+    assert warning["code"] == "revert_baseline_unhealthy"
+    assert "1 of 2 pods" in warning["message"]
+
+
+def test_scale_impact_puts_the_action_warnings_first():
+    impact = scale_impact({}, 1, 1, 0, [], [], [], revert_warnings(0, 1))
+    assert [w["code"] for w in impact["warnings"]] == ["revert_baseline_unhealthy", "scale_to_zero"]
