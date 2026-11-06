@@ -8,8 +8,8 @@ change), the blast-radius budget, the impact preview, the correlation id and unt
 
 Environment: GATEWAY_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET, KILL_SWITCH_PARAM,
 PLANS_TABLE (the plans_table_name output), KUBECONFIG, the usual AWS variables,
-APPROVAL_URL with --approval-mode server, and CLIENT_ID_B and CLIENT_SECRET_B with
---with-identity (AGENT_NAME, AGENT_NAME_B and AGENT_BUDGET_B when they differ from
+APPROVAL_URL with --approval-mode server, FREEZES_PARAM with --with-freeze,
+and CLIENT_ID_B and CLIENT_SECRET_B with --with-identity (AGENT_NAME, AGENT_NAME_B and AGENT_BUDGET_B when they differ from
 smoke_test, e2e_peer and 2).
 Pass --with-expiry to also wait out a plan TTL (PLAN_TTL_SECONDS, default 300). APPLY_COOLDOWN_SECONDS (default 60) must
 match the deployment: the test waits it out after each apply. The blast-radius
@@ -98,6 +98,18 @@ window and revert_on_failure (degraded and reverted, as above); show renders bot
 These cases add 5 applies to the smoke_test agent's budget in client mode and 2 in
 server mode; reverts take no budget unit.
 
+With --with-freeze, the change freeze cases also run, against a fixture Deployment
+e2e-freeze created for this run. They write the freezes parameter (FREEZES_PARAM, the
+freezes_parameter output, through the Lambdas' own validator), so the operator's
+credentials need ssm:PutParameter on it, and they always set it back to [] at the end,
+even when a case fails. Every freeze they set names kube-handrail-sandbox or a namespace
+that does not exist. A freeze on another namespace leaves a plan in the sandbox ok; a
+freeze on the sandbox makes a plan change_frozen with its reason and until; a plan made
+before a freeze is refused at apply (client mode) or by the approval's apply (server mode)
+with change_frozen and is not consumed, and once the freeze is removed the same plan
+applies through the gateway (in server mode within the approval's apply window). These
+cases add 1 apply to the smoke_test agent's budget.
+
 The per-object and global hourly budgets and the plan rate limit are covered by
 unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
 scale_to_zero and service_without_endpoints warnings: they need a plan to 0
@@ -142,6 +154,10 @@ VERIFY_KILLSWITCH = {"namespace": NAMESPACE, "name": "e2e-verify-killswitch"}
 VERIFY_NOREVERT = {"namespace": NAMESPACE, "name": "e2e-verify-norevert"}
 VERIFY_BEST_EFFORT = (VERIFY_BAD, VERIFY_KILLSWITCH, VERIFY_NOREVERT)
 QUOTA = "e2e-besteffort"
+FREEZE_TARGET = {"namespace": NAMESPACE, "name": "e2e-freeze"}
+# A namespace no deployment allows: a freeze on it must not touch the sandbox.
+OTHER_NAMESPACE = "e2e-freeze-other"
+FREEZE_REASON = "e2e freeze"
 FIXTURES = (TARGET["name"], FLAP["name"], MANUAL["name"])
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
 RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
@@ -290,6 +306,7 @@ def delete_fixtures() -> None:
         VERIFY_OK["name"],
         VERIFY_MANUAL["name"],
         *(target["name"] for target in VERIFY_BEST_EFFORT),
+        FREEZE_TARGET["name"],
         "--ignore-not-found",
         "--wait=true",
     )
@@ -297,7 +314,10 @@ def delete_fixtures() -> None:
 
 
 def create_fixtures(
-    with_rollout: bool, with_identity: bool = False, with_verify: bool = False
+    with_rollout: bool,
+    with_identity: bool = False,
+    with_verify: bool = False,
+    with_freeze: bool = False,
 ) -> None:
     # Delete leftovers from an aborted run first: a new object (new uid) has no history.
     delete_fixtures()
@@ -306,6 +326,8 @@ def create_fixtures(
         names += [target["name"] for target in IDENTITY]
     if with_verify:
         names += [VERIFY_OK["name"], VERIFY_MANUAL["name"]]
+    if with_freeze:
+        names.append(FREEZE_TARGET["name"])
     for name in names:
         kubectl("create", "-f", "-", stdin=json.dumps(fixture(name)))
     if with_rollout:
@@ -1919,12 +1941,105 @@ async def identity_approval_tests(gw_b: Gateway) -> None:
     )
 
 
+def freezes_module() -> Any:
+    """handrail_common.freezes, so the test writes freezes the way scripts/freeze.py does."""
+    common = str(Path(__file__).parents[2] / "mcp" / "common")
+    if common not in sys.path:
+        sys.path.insert(0, common)
+    import handrail_common.freezes as freezes
+
+    return freezes
+
+
+def set_freezes(*namespaces: str) -> None:
+    """One active window (from a minute ago, for 30 minutes) per namespace, or none."""
+    freezes = freezes_module()
+    now = int(time.time())
+    value = json.dumps(
+        [
+            {
+                "namespaces": [namespace],
+                "start": freezes.format_time(now - 60),
+                "until": freezes.format_time(now + 1800),
+                "reason": FREEZE_REASON,
+            }
+            for namespace in namespaces
+        ]
+    )
+    freezes.parse_freezes(value)
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    boto3.client("ssm", region_name=region).put_parameter(
+        Name=os.environ["FREEZES_PARAM"], Value=value, Type="String", Overwrite=True
+    )
+
+
+async def freeze_tests(gw: Gateway, approval_mode: str) -> None:
+    try:
+        await freeze_cases(gw, approval_mode)
+    finally:
+        set_freezes()
+
+
+async def freeze_cases(gw: Gateway, approval_mode: str) -> None:
+    set_freezes(OTHER_NAMESPACE)
+    envelope = await gw.call(PLAN, {**FREEZE_TARGET, "replicas": 2})
+    report(
+        "freeze: a freeze on another namespace does not refuse a sandbox plan",
+        envelope.get("ok") is True,
+        code(envelope) or "ok",
+    )
+
+    set_freezes(NAMESPACE)
+    envelope = await gw.call(PLAN, {**FREEZE_TARGET, "replicas": 2})
+    found = details(envelope)
+    report(
+        "freeze: a plan in a frozen namespace is change_frozen with its reason and until",
+        code(envelope) == "change_frozen"
+        and found.get("namespace") == NAMESPACE
+        and found.get("reason") == FREEZE_REASON
+        and bool(found.get("until")),
+        code(envelope) or "ok",
+    )
+
+    set_freezes()
+    plan_id = await gw.plan(FREEZE_TARGET, 2)
+    set_freezes(NAMESPACE)
+    if approval_mode == "server":
+        approve = approve_script()
+        url = os.environ["APPROVAL_URL"]
+        region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
+        status, body = approve.decide(url, region, plan_id, "approve", None, True)
+        envelope = (body.get("data") or {}).get("apply") or {}
+        name = "freeze: an approval given before a freeze is refused by its apply, unconsumed"
+    else:
+        status, envelope = 200, await gw.apply(FREEZE_TARGET, plan_id, 2)
+        name = "freeze: a plan made before a freeze is refused at apply, unconsumed"
+    record = plan_record(plan_id)
+    report(
+        name,
+        status == 200
+        and code(envelope) == "change_frozen"
+        and record.get("used") is False
+        and "result" not in record,
+        code(envelope) or status,
+    )
+
+    set_freezes()
+    envelope = await gw.apply(FREEZE_TARGET, plan_id, 2)
+    report(
+        "freeze: once the freeze is removed the same plan applies",
+        envelope.get("ok") is True and last_plan_id(FREEZE_TARGET["name"]) == plan_id,
+        code(envelope) or "ok",
+    )
+
+
 async def run(
     with_expiry: bool,
     approval_mode: str,
     with_rollout: bool,
     with_identity: bool = False,
     with_verify: bool = False,
+    with_freeze: bool = False,
 ) -> None:
     token = fetch_token()
     auth_tests(token)
@@ -1955,6 +2070,8 @@ async def run(
                 await run_identity(gw, approval_mode)
             if with_verify:
                 await verify_tests(gw, approval_mode)
+            if with_freeze:
+                await freeze_tests(gw, approval_mode)
 
 
 async def run_identity(gw_a: Gateway, approval_mode: str) -> None:
@@ -1993,6 +2110,11 @@ def main() -> None:
         help="also run the verification cases (needs verify_enabled, the default)",
     )
     parser.add_argument(
+        "--with-freeze",
+        action="store_true",
+        help="also run the change freeze cases (needs FREEZES_PARAM)",
+    )
+    parser.add_argument(
         "--approval-mode",
         choices=["client", "server"],
         default="client",
@@ -2003,7 +2125,7 @@ def main() -> None:
     web_before = web_spec()
     quotas_before = quota_objects() if args.with_verify else ""
     try:
-        create_fixtures(args.with_rollout, args.with_identity, args.with_verify)
+        create_fixtures(args.with_rollout, args.with_identity, args.with_verify, args.with_freeze)
         asyncio.run(
             run(
                 args.with_expiry,
@@ -2011,6 +2133,7 @@ def main() -> None:
                 args.with_rollout,
                 args.with_identity,
                 args.with_verify,
+                args.with_freeze,
             )
         )
     except Exception as exc:
