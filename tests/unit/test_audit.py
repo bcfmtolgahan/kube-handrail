@@ -227,6 +227,27 @@ def test_existing_object_with_other_bytes_fails_the_record(s3):
     assert s3.get_object(Bucket=BUCKET, Key=key)["Body"].read() == b"{}"
 
 
+def test_redelivery_after_a_summary_change_is_success(s3):
+    # A newer handler version may derive a different summary for a record that is still
+    # being retried; the stream fields and images decide whether it is the same entry.
+    record = stream_record("INSERT", "510", new=PLANNED)
+    key, entry = handler.build_entry(record)
+    s3.put_object(Bucket=BUCKET, Key=key, Body=handler.canonical({**entry, "summary": {}}))
+    response, counts = handler.process([record], s3, BUCKET)
+    assert response == {"batchItemFailures": []}
+    assert counts.duplicates == 1 and counts.mismatches == 0
+
+
+def test_existing_object_with_other_images_fails_the_record(s3):
+    record = stream_record("INSERT", "520", new=PLANNED)
+    key, entry = handler.build_entry(record)
+    forged = {**entry, "new_image": {**entry["new_image"], "replicas_to": 9}}
+    s3.put_object(Bucket=BUCKET, Key=key, Body=handler.canonical(forged))
+    response, counts = handler.process([record], s3, BUCKET)
+    assert response == {"batchItemFailures": [{"itemIdentifier": "520"}]}
+    assert counts.mismatches == 1
+
+
 class FlakyS3:
     """Fails put_object for one key; otherwise delegates."""
 

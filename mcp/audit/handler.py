@@ -4,8 +4,8 @@ record). Not a gateway target.
 Invoked by a DynamoDB stream event source mapping on the plan table. Every stream record of
 a plan becomes one JSON object in a bucket with S3 Object Lock, written with
 If-None-Match: *, so an object is never replaced. The key is derived from the record alone,
-so a redelivered record maps to the same key: a 412 for identical bytes is success, and
-different bytes are a failure that stops the shard and alarms. The tool Lambdas cannot write
+so a redelivered record maps to the same key: a 412 for the same entry (the derived summary
+aside) is success, and any other difference is a failure that stops the shard and alarms. The tool Lambdas cannot write
 to the bucket; the record detects changes after the fact, it does not block them.
 """
 
@@ -65,7 +65,7 @@ _deserializer = TypeDeserializer()
 
 
 class AuditMismatch(Exception):
-    """An object already exists under the record's key with different bytes."""
+    """An object already exists under the record's key with a different entry."""
 
 
 def plain(value: Any) -> Any:
@@ -252,7 +252,7 @@ class Counts:
 
 def write_once(s3: Any, bucket: str, key: str, body: bytes) -> bool:
     """Put `body` at `key` unless an object is there. True if written, False if the same
-    bytes were already there; AuditMismatch if different bytes are."""
+    entry was already there (summary aside); AuditMismatch if a different one is."""
     try:
         s3.put_object(
             Bucket=bucket,
@@ -268,9 +268,21 @@ def write_once(s3: Any, bucket: str, key: str, body: bytes) -> bool:
         if exc.response.get("Error", {}).get("Code") != "PreconditionFailed":
             raise
     existing = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-    if existing != body:
+    if existing != body and recorded(existing) != recorded(body):
         raise AuditMismatch(key)
     return False
+
+
+def recorded(body: bytes) -> Any:
+    """What an entry records: everything but the derived summary, which a newer handler
+    version may build differently for a record that is still being retried."""
+    try:
+        entry = json.loads(body)
+    except ValueError:
+        return body
+    if isinstance(entry, dict):
+        entry.pop("summary", None)
+    return entry
 
 
 def process(records: Sequence[Mapping[str, Any]], s3: Any, bucket: str) -> tuple[dict, Counts]:
