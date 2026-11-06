@@ -105,6 +105,53 @@ def conflict() -> ApiException:
     return ApiException(status=409, reason="Conflict")
 
 
+# Status bodies as a 1.31 API server returned them for a dry-run patch.
+VAP_DENIAL = (
+    "ValidatingAdmissionPolicy 'kube-handrail-writer-bounds' with binding "
+    "'kube-handrail-writer-bounds' denied request: kube-handrail writer: spec.replicas 9 is "
+    "outside [0, 5]"
+)
+VAP_BODY = {
+    "kind": "Status",
+    "apiVersion": "v1",
+    "status": "Failure",
+    "message": f'deployments.apps "web" is forbidden: {VAP_DENIAL}',
+    "reason": "Invalid",
+    "details": {
+        "name": "web",
+        "group": "apps",
+        "kind": "deployments",
+        "causes": [{"message": VAP_DENIAL}],
+    },
+    "code": 422,
+}
+VALIDATION_BODY = {
+    "kind": "Status",
+    "apiVersion": "v1",
+    "status": "Failure",
+    "message": 'Deployment.apps "web" is invalid: spec.replicas: Invalid value: -1: must be '
+    "greater than or equal to 0",
+    "reason": "Invalid",
+    "details": {
+        "name": "web",
+        "group": "apps",
+        "kind": "Deployment",
+        "causes": [{"reason": "FieldValueInvalid", "field": "spec.replicas"}],
+    },
+    "code": 422,
+}
+
+
+def api_error(status: int, body) -> ApiException:
+    exc = ApiException(status=status, reason="Unprocessable Entity")
+    exc.body = body
+    return exc
+
+
+def admission_denied() -> ApiException:
+    return api_error(422, json.dumps(VAP_BODY))
+
+
 def runtime(enabled: str = "true") -> tuple[handler.Runtime, MagicMock]:
     ssm = boto3.client("ssm", region_name=REGION)
     ssm.put_parameter(Name=PARAM, Value=enabled, Type="String", Overwrite=True)
@@ -500,6 +547,62 @@ def test_patch_api_errors(rt, status, code):
     assert error_code(apply(plan.plan_id)) == code
     assert apps.patch_namespaced_deployment.call_count == 1
     assert item(plan.plan_id)["result"] == code
+
+
+def test_a_patch_refused_by_the_admission_policy_is_admission_denied(rt):
+    runtime_, apps = rt
+    apps.patch_namespaced_deployment.side_effect = admission_denied()
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert response["error"]["code"] == "admission_denied"
+    assert response["error"]["details"] == {
+        "policy": "kube-handrail-writer-bounds",
+        "binding": "kube-handrail-writer-bounds",
+    }
+    # The cluster's message is matched, never returned.
+    assert "outside" not in json.dumps(response)
+    # The dry run is refused, so nothing is patched for real and nothing is retried.
+    assert apps.patch_namespaced_deployment.call_count == 1
+    assert apps.patch_namespaced_deployment.call_args.kwargs == {"dry_run": "All"}
+    record = item(plan.plan_id)
+    assert record["used"] is True
+    assert record["result"] == "admission_denied"
+
+
+def test_an_admission_denial_with_a_bytes_body_or_only_in_a_cause_is_recognized(rt):
+    runtime_, apps = rt
+    body = dict(VAP_BODY, message="denied")
+    apps.patch_namespaced_deployment.side_effect = api_error(422, json.dumps(body).encode())
+    plan = create_plan(runtime_.store)
+    assert error_code(apply(plan.plan_id)) == "admission_denied"
+
+
+@pytest.mark.parametrize(
+    "status, body",
+    [
+        # A 422 from validation, not from the policy.
+        (422, json.dumps(VALIDATION_BODY)),
+        # Another policy's denial.
+        (422, json.dumps(VAP_BODY).replace("kube-handrail-writer-bounds", "other-policy")),
+        # The policy's text with another status (for example a reason other than Invalid).
+        (403, json.dumps(VAP_BODY)),
+        (422, None),
+        (422, "not json"),
+        (422, "[1, 2]"),
+        (422, json.dumps({"message": 7, "details": {"causes": ["x", {"message": None}]}})),
+    ],
+)
+def test_other_api_errors_are_not_admission_denied(rt, status, body):
+    runtime_, apps = rt
+    apps.patch_namespaced_deployment.side_effect = api_error(status, body)
+    plan = create_plan(runtime_.store)
+
+    response = apply(plan.plan_id)
+
+    assert error_code(response) == "kubernetes_error"
+    assert item(plan.plan_id)["result"] == "kubernetes_error"
 
 
 def test_a_refused_apply_records_its_correlation_id(rt):
@@ -2324,6 +2427,28 @@ def test_a_spec_change_before_a_retried_revert_is_refused(verify_rt):
     apps.patch_namespaced_deployment.side_effect = [conflict()]
     assert verify(plan.plan_id)["data"]["revert"] == "refused"
     assert item(plan.plan_id)["revert"]["reason"] == "conflict"
+
+
+def test_a_revert_refused_by_the_admission_policy_is_refused(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    apps.patch_namespaced_deployment.reset_mock()
+    apps.patch_namespaced_deployment.side_effect = admission_denied()
+
+    assert verify(plan.plan_id)["data"]["revert"] == "refused"
+
+    revert_id = handler.revert_plan_id(plan.plan_id)
+    assert item(plan.plan_id)["revert"] == {
+        "status": "refused",
+        "reason": "admission_denied",
+        "revert_plan_id": revert_id,
+        "at": NOW + 61,
+    }
+    assert item(revert_id)["result"] == "admission_denied"
+    assert "verify_queue" not in item(plan.plan_id)
+    # Final: a later run does not try again.
+    assert verify(plan.plan_id)["data"]["due"] is False
+    assert apps.patch_namespaced_deployment.call_count == 1
 
 
 def test_a_revert_whose_patch_landed_before_a_crash_is_not_patched_again(verify_rt):

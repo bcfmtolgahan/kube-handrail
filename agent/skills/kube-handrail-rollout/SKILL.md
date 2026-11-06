@@ -51,6 +51,8 @@ For a restart, call `apply_restart_deployment` with the same `plan_id`, `namespa
 
 On `conflict`, read the status first: the Deployment changed since the plan, possibly by a human, or for a rollback the ReplicaSet it pinned was replaced (`details.replica_set`) or edited (`details.template`); re-plan only if the change is still wanted. On `revision_not_found`, the revision's ReplicaSet is gone: read `get_rollout_history` again and choose with the human. On `plan_expired` or `plan_not_found`, re-plan once (the new plan needs its own approval). On `plan_used`, check status instead: the plan was already applied.
 
+On `admission_denied`, the cluster's admission policy refused the change after the server's checks passed. The plan is used. Stop and report it to the human; do not retry or re-plan.
+
 ## Step 5: Verify
 
 After the window, call `get_plan_outcome(plan_id)` until `verification.status` is no longer `pending`, and report it: `healthy` (every pod runs the new template and is available), `degraded` with its reason (the rollout did not complete in the window; read `get_workload_events`), or `unknown` with its reason (the check cannot tell, for example because someone else changed the Deployment since; report it and do not act). Use `get_workload_status` for the live state. After a restart, every new pod carries the annotation `kube-handrail.io/restart-plan-id` with the plan ID. After a rollback, the revision you rolled back to has a new number: the controller reuses its ReplicaSet as the newest revision. If the new pods are not ready, read `get_workload_events` and report; do not restart or roll back again on your own.
