@@ -14,6 +14,7 @@ from moto import mock_aws
 
 from handrail_common.config import load_settings
 from handrail_common.dispatch import caller_signature
+from handrail_common.freezes import FreezeStore, format_time
 from handrail_common.killswitch import KillSwitch
 from handrail_common.plans import (
     RESTART_ANNOTATION,
@@ -2575,3 +2576,138 @@ def test_replanning_the_reverted_change_is_cooldown_then_flapping(verify_rt):
     with pytest.raises(GuardError) as exc:
         history(NOW + 61 + 61)
     assert exc.value.code == "flapping"
+
+
+# --- change freezes -----------------------------------------------------------
+
+FREEZES = "/handrail/freezes"
+FROZEN_UNTIL = NOW + 600
+
+
+def freeze(runtime_, namespaces=("sandbox",), actions=None, start=NOW - 60, until=FROZEN_UNTIL):
+    """Turn freezes on for this runtime and store one window (or none, with namespaces=())."""
+    ssm = runtime_.kill_switch._ssm
+    entries = []
+    if namespaces:
+        entry = {
+            "namespaces": list(namespaces),
+            "start": format_time(start),
+            "until": format_time(until),
+            "reason": "release freeze",
+        }
+        if actions is not None:
+            entry["actions"] = actions
+        entries.append(entry)
+    ssm.put_parameter(Name=FREEZES, Value=json.dumps(entries), Type="String", Overwrite=True)
+    runtime_.freezes = FreezeStore(ssm, FREEZES)
+
+
+def test_a_freeze_refuses_the_apply_without_consuming_the_plan(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    freeze(runtime_)
+    response = apply(plan.plan_id)
+    assert error_code(response) == "change_frozen"
+    assert response["error"]["details"] == {
+        "namespace": "sandbox",
+        "reason": "release freeze",
+        "until": format_time(FROZEN_UNTIL),
+    }
+    record = item(plan.plan_id)
+    assert record["used"] is False and "result" not in record
+    apps.read_namespaced_deployment.assert_not_called()
+    apps.patch_namespaced_deployment.assert_not_called()
+    # Lifted while the plan is still valid: the same plan applies.
+    freeze(runtime_, namespaces=())
+    assert apply(plan.plan_id)["ok"] is True
+
+
+def test_the_freeze_is_checked_with_the_apply_time(rt):
+    runtime_, _ = rt
+    plan = create_plan(runtime_.store)
+    freeze(runtime_, start=NOW + 1)
+    assert apply(plan.plan_id)["ok"] is True
+
+
+def test_a_freeze_on_another_namespace_does_not_refuse(rt):
+    runtime_, _ = rt
+    plan = create_plan(runtime_.store)
+    freeze(runtime_, namespaces=("other",))
+    assert apply(plan.plan_id)["ok"] is True
+
+
+def test_a_freeze_of_other_actions_does_not_refuse_a_scale(rt):
+    runtime_, _ = rt
+    plan = create_plan(runtime_.store)
+    freeze(runtime_, actions=["restart", "rollback"])
+    assert apply(plan.plan_id)["ok"] is True
+
+
+def test_a_freeze_refuses_restarts_and_rollbacks_too(rt):
+    runtime_, _ = rt
+    freeze(runtime_)
+    plan = create_restart_plan(runtime_.store)
+    assert error_code(apply_restart(plan.plan_id)) == "change_frozen"
+    assert item(plan.plan_id)["used"] is False
+
+
+def test_unreadable_freezes_refuse_the_apply_without_consuming(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    runtime_.freezes = FreezeStore(runtime_.kill_switch._ssm, "/handrail/missing")
+    response = apply(plan.plan_id)
+    assert error_code(response) == "remediation_disabled"
+    assert response["error"]["details"] == {"scope": "freezes", "reason": "unreadable"}
+    assert item(plan.plan_id)["used"] is False
+    apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_invalid_freezes_refuse_the_apply(rt):
+    runtime_, _ = rt
+    plan = create_plan(runtime_.store)
+    freeze(runtime_)
+    runtime_.kill_switch._ssm.put_parameter(
+        Name=FREEZES, Value="[{}]", Type="String", Overwrite=True
+    )
+    response = apply(plan.plan_id)
+    assert response["error"]["details"] == {"scope": "freezes", "reason": "invalid"}
+
+
+def test_the_kill_switch_is_checked_before_the_freezes(aws, monkeypatch):
+    runtime_, _ = runtime("false")
+    runtime_.freezes = FreezeStore(runtime_.kill_switch._ssm, "/handrail/missing")
+    monkeypatch.setattr(handler, "get_runtime", lambda: runtime_)
+    plan = create_plan(runtime_.store)
+    assert error_code(apply(plan.plan_id)) == "remediation_disabled"
+    assert "details" not in apply(plan.plan_id)["error"]
+
+
+def test_an_approval_given_before_a_freeze_is_not_applied_during_it(server_rt):
+    runtime_, apps = server_rt
+    plan = create_plan(runtime_.store)
+    runtime_.store.approve(plan.plan_id, HUMAN, NOW, 120)
+    freeze(runtime_)
+    assert error_code(apply(plan.plan_id)) == "change_frozen"
+    record = item(plan.plan_id)
+    assert record["used"] is False and record["status"] == "approved"
+    apps.patch_namespaced_deployment.assert_not_called()
+    # Lifted within the approval's apply window: the approved plan still applies.
+    freeze(runtime_, namespaces=())
+    assert apply(plan.plan_id)["ok"] is True
+
+
+def test_a_freeze_does_not_stop_a_pre_approved_revert(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    freeze(runtime_, until=NOW + 3600)
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    assert item(handler.revert_plan_id(plan.plan_id))["result"] == "applied"
+
+
+def test_a_freeze_does_not_stop_the_verification(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied(runtime_, apps, window=60)
+    freeze(runtime_, until=NOW + 3600)
+    apps.read_namespaced_deployment.return_value = live(plan.plan_id)
+    at(runtime_, NOW + 61)
+    assert verify(plan.plan_id)["data"]["outcome"] == "healthy"

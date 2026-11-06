@@ -39,6 +39,7 @@ from handrail_common.envelope import (
     Envelope,
     ok,
 )
+from handrail_common.freezes import check_not_frozen, freeze_store
 from handrail_common.gitops import is_gitops_managed
 from handrail_common.impact import revert_warnings, rollout_impact, scale_impact
 from handrail_common.observability import current_correlation_id
@@ -570,6 +571,8 @@ def _plan(
 ) -> Envelope:
     namespace, name, request = action.validate(args, settings)
     agent = guard_plan(settings, clients.ssm)
+    # Before the Deployment is read; apply checks again with its own clock.
+    check_not_frozen(freeze_store(clients.ssm, settings.freezes_param), namespace, action.name, now)
     override = request.get("override_manual_change", False) is True
     deployment, raw = _read_deployment_raw(clients.apps, namespace, name)
     if is_gitops_managed(deployment):

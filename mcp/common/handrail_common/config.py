@@ -73,6 +73,9 @@ class Settings:
     verify_window_max_seconds: int = 1800
     # How long after verify_at a verification may still run; later it is unknown (late).
     verify_grace_seconds: int = 300
+    # The SSM parameter holding the change freezes (mcp/CONTRACT.md, Change freezes); unset
+    # means no freezes are checked.
+    freezes_param: str | None = None
 
     @property
     def approval_required(self) -> bool:
@@ -246,4 +249,5 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         verify_window_min_seconds=limits["VERIFY_WINDOW_MIN_SECONDS"],
         verify_window_max_seconds=limits["VERIFY_WINDOW_MAX_SECONDS"],
         verify_grace_seconds=limits["VERIFY_GRACE_SECONDS"],
+        freezes_param=env.get("FREEZES_PARAM", "").strip() or None,
     )

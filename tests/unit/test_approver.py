@@ -14,6 +14,7 @@ from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from handrail_common.config import ConfigError, load_settings
+from handrail_common.freezes import FreezeStore, format_time
 from handrail_common.killswitch import KillSwitch
 from handrail_common.plans import (
     RESTART_ANNOTATION,
@@ -803,3 +804,33 @@ def test_a_record_the_server_made_cannot_be_decided(env, decision):
     record = env.store.get(plan.plan_id)
     assert "approved_by" not in record and "rejected_by" not in record
     assert env.lam.calls == []
+
+
+def test_an_approval_during_a_freeze_is_recorded_and_its_apply_refused(env):
+    freezes = "/handrail/freezes"
+    ssm = boto3.client("ssm", region_name=REGION)
+    ssm.put_parameter(
+        Name=freezes,
+        Type="String",
+        Value=json.dumps(
+            [
+                {
+                    "namespaces": ["sandbox"],
+                    "start": format_time(NOW - 60),
+                    "until": format_time(NOW + 600),
+                    "reason": "release freeze",
+                }
+            ]
+        ),
+    )
+    env.write_rt.freezes = FreezeStore(ssm, freezes)
+    plan = make_plan(env.store)
+    status, body = approve(env, plan)
+    applied = body["data"]["apply"]
+    assert status == 200 and applied["error"]["code"] == "change_frozen"
+    assert applied["error"]["details"]["until"] == format_time(NOW + 600)
+    # Not consumed: the approval stays and expires unless the freeze ends first.
+    record = env.store.get(plan.plan_id)
+    assert record["used"] is False and "result" not in record
+    assert body["data"]["plan"]["status"] == "approved"
+    env.apps.patch_namespaced_deployment.assert_not_called()
