@@ -279,3 +279,34 @@ def test_emit_logs_counts_only(capsys):
     assert line["Records"] == 2 and line["Failures"] == 1
     assert line["failed_sequence_numbers"] == ["9"]
     assert line["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "ns/audit"
+
+
+def test_binary_values_in_the_lambda_event_shape_are_recorded(s3):
+    # Lambda delivers stream binary values as base64 strings, not bytes.
+    record = stream_record("MODIFY", "800", old=APPROVED, new=APPLIED)
+    record["dynamodb"]["OldImage"]["x"] = {"B": "AA=="}
+    record["dynamodb"]["NewImage"]["x"] = {"BS": ["AQ==", "AA=="]}
+    record["dynamodb"]["NewImage"]["m"] = {"M": {"b": {"B": "Ag=="}}}
+    response, counts = handler.process([record], s3, BUCKET)
+    assert response == {"batchItemFailures": []}
+    entry = stored(s3, keys(s3)[0])
+    assert entry["old_image"]["x"] == "AA=="
+    assert entry["new_image"]["x"] == ["AA==", "AQ=="]
+    assert entry["new_image"]["m"] == {"b": "Ag=="}
+    assert entry["summary"]["result"] == {"from": None, "to": "applied"}
+
+
+def test_an_image_that_cannot_be_decoded_is_stored_raw(s3, monkeypatch):
+    def broken(*_args):
+        raise TypeError("cannot decode")
+
+    monkeypatch.setattr(handler, "summarize", broken)
+    record = stream_record("MODIFY", "801", old=APPROVED, new=APPLIED)
+    response, counts = handler.process([record], s3, BUCKET)
+    # Only S3 errors fail a record; the raw images are kept instead.
+    assert response == {"batchItemFailures": []}
+    entry = stored(s3, keys(s3)[0])
+    assert entry["image_format"] == "dynamodb"
+    assert entry["new_image"] == record["dynamodb"]["NewImage"]
+    assert entry["old_image"] == record["dynamodb"]["OldImage"]
+    assert entry["summary"] == {"plan_id": PLAN_ID, "error": "TypeError"}

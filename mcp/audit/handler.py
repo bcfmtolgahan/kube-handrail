@@ -84,10 +84,27 @@ def plain(value: Any) -> Any:
     return value
 
 
+def wire(value: Any) -> Any:
+    """A DynamoDB attribute value as the deserializer expects it. Lambda delivers stream
+    binary values (B, BS) as base64 strings, which TypeDeserializer refuses."""
+    if not isinstance(value, Mapping) or len(value) != 1:
+        return value
+    ((tag, inner),) = value.items()
+    if tag == "B" and isinstance(inner, str):
+        return {"B": base64.b64decode(inner)}
+    if tag == "BS" and isinstance(inner, list):
+        return {"BS": [base64.b64decode(v) if isinstance(v, str) else v for v in inner]}
+    if tag == "M" and isinstance(inner, Mapping):
+        return {"M": {k: wire(v) for k, v in inner.items()}}
+    if tag == "L" and isinstance(inner, list):
+        return {"L": [wire(v) for v in inner]}
+    return value
+
+
 def image(raw: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if raw is None:
         return None
-    return {k: plain(_deserializer.deserialize(v)) for k, v in raw.items()}
+    return {k: plain(_deserializer.deserialize(wire(v))) for k, v in raw.items()}
 
 
 def canonical(entry: Mapping[str, Any]) -> bytes:
@@ -165,7 +182,19 @@ def build_entry(record: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     plan_id = record_plan_id(record)
     approximate_time = int(stream["ApproximateCreationDateTime"])
     sequence_number = str(stream["SequenceNumber"])
-    old, new = image(stream.get("OldImage")), image(stream.get("NewImage"))
+    raw_old, raw_new = stream.get("OldImage"), stream.get("NewImage")
+    try:
+        old, new = image(raw_old), image(raw_new)
+        summary = summarize(plan_id, old, new)
+        image_format = "plain"
+    except Exception as exc:
+        # Whatever the tool roles wrote into the plan record, its change is recorded: an
+        # image that cannot be decoded is kept as the stream delivered it (DynamoDB JSON).
+        # Only S3 errors fail a record.
+        logger.warning("record %s: images kept raw (%s)", sequence_number, type(exc).__name__)
+        old, new = raw_old, raw_new
+        summary = {"plan_id": plan_id, "error": type(exc).__name__}
+        image_format = "dynamodb"
     if name == "REMOVE":
         ttl = ttl_removal(record)
         event = EXPUNGED if ttl else DELETED
@@ -186,9 +215,10 @@ def build_entry(record: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
             "ttl_removal": ttl,
             "user_identity": record.get("userIdentity"),
         },
+        "image_format": image_format,
         "old_image": old,
         "new_image": new,
-        "summary": summarize(plan_id, old, new),
+        "summary": summary,
     }
     return object_key(plan_id, approximate_time, sequence_number), entry
 
