@@ -54,6 +54,15 @@ verify_window_min_seconds     = 60
 verify_window_max_seconds     = 1800
 verify_grace_seconds          = 300
 
+# Audit record (mcp/CONTRACT.md, Audit record). Every change to a plan record is written
+# once to an S3 bucket with Object Lock. GOVERNANCE suits a test deployment; use
+# COMPLIANCE in production (docs/deploy.md). audit_force_destroy lets a test deployment's
+# destroy empty the bucket (GOVERNANCE only, with s3:BypassGovernanceRetention).
+audit_enabled          = true
+audit_object_lock_mode = "GOVERNANCE"
+audit_retention_days   = 30
+audit_force_destroy    = false
+
 # Server-side approval (mcp/CONTRACT.md, Server-side approval). client keeps the
 # DevOps Agent chat approval only; server and both require an approval through the
 # approval URL from one of approver_principals (IAM user or role ARNs).

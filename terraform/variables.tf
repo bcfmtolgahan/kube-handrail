@@ -386,3 +386,37 @@ variable "create_vpc_endpoints" {
   type        = bool
   default     = false
 }
+
+variable "audit_enabled" {
+  description = "Write every change to a plan record, from the plan table's stream, once to an S3 bucket with Object Lock (mcp/CONTRACT.md, Audit record). Enabling it turns the table's stream on in place."
+  type        = bool
+  default     = true
+}
+
+variable "audit_object_lock_mode" {
+  description = "Default Object Lock mode of audit objects. GOVERNANCE: a principal allowed s3:BypassGovernanceRetention can still delete them (test deployments). COMPLIANCE: nobody can delete them, or the bucket, before the retention ends (recommended for production; see docs/deploy.md)."
+  type        = string
+  default     = "GOVERNANCE"
+
+  validation {
+    condition     = contains(["GOVERNANCE", "COMPLIANCE"], var.audit_object_lock_mode)
+    error_message = "audit_object_lock_mode must be GOVERNANCE or COMPLIANCE."
+  }
+}
+
+variable "audit_retention_days" {
+  description = "Default Object Lock retention of each audit object, in days."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.audit_retention_days >= 1 && floor(var.audit_retention_days) == var.audit_retention_days
+    error_message = "audit_retention_days must be a positive integer."
+  }
+}
+
+variable "audit_force_destroy" {
+  description = "Let terraform destroy empty the audit bucket. Objects under GOVERNANCE retention are deleted only if the caller is allowed s3:BypassGovernanceRetention; COMPLIANCE objects cannot be deleted before their retention ends. Test deployments only."
+  type        = bool
+  default     = false
+}

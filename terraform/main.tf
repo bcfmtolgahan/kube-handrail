@@ -82,14 +82,15 @@ locals {
     FREEZES_PARAM = local.freezes_param
   }
 
-  # Every packaged Lambda => its requirements file. The sentinel, the approver and the verifier
-  # are packaged but are not gateway targets.
+  # Every packaged Lambda => its requirements file. The sentinel, the approver, the verifier
+  # and the audit Lambda are packaged but are not gateway targets.
   packages = merge(
     { for fn in keys(local.functions) : fn => "requirements.txt" },
     var.sentinel_enabled ? { sentinel = "mcp/sentinel/requirements.txt" } : {},
     { approver = "mcp/approver/requirements.txt" },
     var.caller_interceptor_enabled ? { interceptor = "mcp/interceptor/requirements.txt" } : {},
     var.verify_enabled ? { verifier = "mcp/verifier/requirements.txt" } : {},
+    var.audit_enabled ? { audit = "mcp/audit/requirements.txt" } : {},
   )
 
   # Tolerates a function directory that has no Python sources yet.
@@ -469,6 +470,11 @@ resource "aws_dynamodb_table" "plans" {
       key_type       = "RANGE"
     }
   }
+
+  # Every change to a record reaches the audit Lambda (terraform/audit.tf). Enabled on an
+  # existing table in place; the view type cannot be changed while the stream is enabled.
+  stream_enabled   = var.audit_enabled
+  stream_view_type = var.audit_enabled ? "NEW_AND_OLD_IMAGES" : null
 
   # Records outlive their plan (expires_at) so they can serve as history.
   ttl {

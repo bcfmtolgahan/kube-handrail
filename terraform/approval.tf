@@ -20,6 +20,9 @@ locals {
     aws_iam_role.sentinel[*].arn,
     aws_iam_role.interceptor[*].arn,
     aws_iam_role.verifier[*].arn,
+    # A string, not aws_iam_role.audit[*].arn: an ARN unknown at plan time in the approver's
+    # existing environment makes the provider fail with an inconsistent final plan.
+    var.audit_enabled ? [local.audit_role_arn] : [],
     [aws_iam_role.approver.arn, aws_iam_role.gateway.arn],
   )
 
