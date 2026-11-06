@@ -101,7 +101,14 @@ def pop_caller(args: dict[str, Any], env: Mapping[str, str] | None = None) -> st
     return caller
 
 
+# Codes whose details.reason is a fixed word set by the server; any other code's reason
+# (change_frozen: the operator's free text) is not logged.
+_LOGGED_REASON_CODES = frozenset({"forbidden", "remediation_disabled"})
+
+
 def _detail(envelope: Envelope, key: str) -> str | None:
+    if key == "reason" and (envelope.get("error") or {}).get("code") not in _LOGGED_REASON_CODES:
+        return None
     details = (envelope.get("error") or {}).get("details")
     value = details.get(key) if isinstance(details, Mapping) else None
     return value if isinstance(value, str) else None

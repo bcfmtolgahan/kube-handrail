@@ -103,7 +103,7 @@ Every tool invocation, including `unknown_tool`, prints exactly one JSON line wh
 - `caller`: the verified caller's `client_id` ([Agent identity](#agent-identity)), otherwise `null`.
 - `plan_id`: the `plan_id` of a successful response's `data`, otherwise the `plan_id` argument, and only if it is a UUID; otherwise `null`.
 - `outcome`: `ok` or the error code.
-- `reason` and `scope`: a rejection's `details.reason` (`forbidden`) and `details.scope` (`remediation_disabled`), otherwise `null`. They are fixed words set by the server, so the metrics keep `Code` as their only rejection dimension.
+- `reason` and `scope`: a rejection's `details.reason` (`forbidden`) and `details.scope` (`remediation_disabled`), otherwise `null`. They are fixed words set by the server, so the metrics keep `Code` as their only rejection dimension. A `remediation_disabled` refused for unreadable freezes logs `reason` `unreadable` or `invalid`; the operator's free-text `reason` of `change_frozen` is never logged.
 - `ToolCalls` is 1. `ToolErrors` is 1 for `internal` and `kubernetes_error` (the tool could not do its job, for example the Kubernetes API refused its credentials or returned a server error). Any other error code is a guard rejection: the record then has `Code` and `GuardRejections = 1` and the second metric entry; an `ok`, `internal` or `kubernetes_error` record has neither. The empty dimension set gives `ToolCalls` and `ToolErrors` across all tools.
 
 The record has only these fields. Argument values, tokens and error messages are never in it. An internal error additionally logs its stack trace through the Lambda logger, in a line that names the correlation ID.

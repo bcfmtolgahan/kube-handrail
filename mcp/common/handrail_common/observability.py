@@ -123,8 +123,9 @@ def tool_record(
 
     Only these fixed fields are logged, never the arguments. `internal` and
     `kubernetes_error` count as errors; every other error code is a guard rejection,
-    counted per code. `reason` and `scope` are the rejection's `details.reason` (forbidden)
-    and `details.scope` (remediation_disabled), fixed words the server set.
+    counted per code. `reason` is the rejection's `details.reason` (forbidden, and
+    remediation_disabled with scope freezes) and `scope` its `details.scope`
+    (remediation_disabled), fixed words the server set; change_frozen's reason is not logged.
     """
     rejected = outcome != OK and outcome not in ERROR_OUTCOMES
     metrics: list[dict[str, Any]] = [
