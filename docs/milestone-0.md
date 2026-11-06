@@ -38,6 +38,7 @@ This creates:
 - `namespace.yaml`: the `kube-handrail-sandbox` namespace (Pod Security `restricted`).
 - `rbac.yaml`: Roles and RoleBindings for the groups `kube-handrail-reader` (get/list Deployments and HPAs; list only on PodDisruptionBudgets, Services and EndpointSlices for the impact preview, on ReplicaSets for `get_workload_events` and the rollout history and rollback plan, and on Events for `get_workload_events`; no Pods) and `kube-handrail-writer` (get/patch Deployments; get on ReplicaSets, for the rollback apply). The groups are mapped to the Lambda roles by the EKS access entries created in step 2; nothing outside this namespace is granted.
 - `web-deployment.yaml`: an unprivileged nginx with 1 replica. Check the image tag against the registry before use, and consider pinning it by digest.
+- `admission-policy.yaml` (Milestone 2): the cluster-scoped ValidatingAdmissionPolicy `kube-handrail-writer-bounds` and its binding, in `[Warn, Audit]`. It needs Kubernetes 1.30 or later; on an older cluster the command exits non-zero for this file only. Re-applying the directory sets a binding switched to `Deny` back to `[Warn, Audit]`. See [Admission policy](deploy.md#admission-policy).
 
 The Deployment deliberately has no `app.kubernetes.io/instance` label, no Argo CD tracking annotation and no HorizontalPodAutoscaler. Any of these makes the plan step refuse it (`gitops_managed`, or the HPA check).
 

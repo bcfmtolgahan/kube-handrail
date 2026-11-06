@@ -64,7 +64,12 @@ Roll it out in three steps:
      --type merge -p '{"spec":{"validationActions":["Deny"]}}'
    ```
 
-   A later `kubectl apply` of the file sets the binding back to `[Warn, Audit]`; patch it again afterwards, or apply a copy with `validationActions: [Deny]`.
+   A later `kubectl apply` of the file, or of `k8s/sandbox/`, sets the binding back to `[Warn, Audit]` without any warning; patch it again afterwards, or apply a copy with `validationActions: [Deny]`. After every such apply, check that enforcement is still on:
+
+   ```sh
+   kubectl get validatingadmissionpolicybinding kube-handrail-writer-bounds \
+     -o jsonpath='{.spec.validationActions}'
+   ```
 
 To go back to audit, patch `validationActions` to `["Warn","Audit"]`. To remove it:
 
@@ -73,7 +78,9 @@ kubectl delete validatingadmissionpolicybinding kube-handrail-writer-bounds
 kubectl delete validatingadmissionpolicy kube-handrail-writer-bounds
 ```
 
-`scripts/cleanup.sh` deletes it with the rest of `k8s/sandbox`.
+`scripts/cleanup.sh` deletes it with the rest of `k8s/sandbox`. On a cluster below 1.30 that delete fails on the unknown kind; delete the other files one by one instead.
+
+The policy and binding names are fixed, so a cluster holds one copy. Two kube-handrail deployments on one cluster share the writer group; if they use different sandbox namespaces, applying the second one's copy replaces the first one's namespace selector and the first namespace loses this check.
 
 ## Agents
 
