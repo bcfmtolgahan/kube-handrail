@@ -17,7 +17,7 @@ Milestone 3: implemented and tested on a test cluster, except the test profile a
 - `e2e_gateway.py` runs the verification cases by default; `--skip-verify` leaves them out, and `--with-verify` is accepted and does nothing.
 - The per-release upgrade notes moved to [Upgrade notes before Milestone 4](docs/history/upgrading.md); [deploy](docs/deploy.md#upgrading) describes `make upgrade`.
 - A correlation ID with a trailing newline is refused like any other value that is not a short token; it would have broken the User-Agent of every Kubernetes request. None of its sources is set by a caller.
-- `audit.py export`: `summary.executed_by` is an object, `{attribution, queries}`, with CloudWatch Logs Insights templates for the Lambda logs (by plan ID and correlation IDs) and the EKS audit log (by User-Agent), instead of a fixed sentence. Milestone 9; implemented, not yet tested on a cluster.
+- `audit.py export`: `summary.executed_by` is an object, `{attribution, queries}`, with CloudWatch Logs Insights templates for the Lambda logs (by plan ID and correlation IDs) and the EKS audit log (by User-Agent), instead of a fixed sentence. Milestone 9; tested on a test cluster.
 - The audit-grade approver is documented as the server approval (`server` or `both` mode); `client` is an evaluation and convenience mode, because CloudTrail records a chat approval without the plan ID ([ADR 0002](docs/adr/0002-server-verified-approval.md#consequences), [deploy](docs/deploy.md#approval-mode)). `COMPLIANCE` is recommended for the audit bucket in production, with what it means for `terraform destroy` ([deploy](docs/deploy.md#audit-record-retention)).
 
 ### Added

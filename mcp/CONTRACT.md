@@ -76,7 +76,7 @@ The ID is carried to:
 - the plan record: `plan_correlation_id` (plan), `approval_request_correlation_id` (the `request_approval` call that notified), `decision_correlation_id` (the approver's request that approved or rejected), `apply_correlation_id` (the apply that recorded its `result`, whether it succeeded or not) and `verification.correlation_id` (the verifier run that checked it). See [Plan record](#plan-record-dynamodb);
 - the Deployment: the apply's patch sets the annotation `kube-handrail.io/correlation-id` to the apply's ID, next to `kube-handrail.io/last-plan-id`. Both are set by the same patch, which bumps `generation` once, as before;
 - `data.correlation_id` in successful `plan_*`, `request_approval` and `apply_*` responses (`null` only outside a Lambda).
-- the Kubernetes API: the User-Agent `kube-handrail/<version> plan/<plan_id> corr/<correlation_id>` (each part when known; `<version>` is `handrail_common.__version__`), for matching EKS audit log entries. The plan is the one being made (a refused plan names an ID never stored), applied, verified or reverted. Implemented, not yet tested on a cluster.
+- the Kubernetes API: the User-Agent `kube-handrail/<version> plan/<plan_id> corr/<correlation_id>` (each part when known; `<version>` is `handrail_common.__version__`), for matching EKS audit log entries. The plan is the one being made (a refused plan names an ID never stored), applied, verified or reverted. Tested on a test cluster.
 
 In `server` mode the approver passes its own request ID to the write Lambda as `kubeHandrailCorrelationId`, so the decision, the apply it runs, `apply_correlation_id` and the annotation share one ID, also when the apply fails.
 
@@ -960,7 +960,7 @@ Under `GOVERNANCE`, a principal allowed `s3:BypassGovernanceRetention` can still
 `scripts/audit.py`, with the operator's credentials (`s3:ListBucket` and `s3:GetObject`; `--bucket`, else `AUDIT_BUCKET`, else `terraform output -raw audit_bucket_name` in `TF_DIR`). Its docstring and `--help` give the fields and finding codes.
 
 - `export <plan_id> [--out FILE] [--no-links]` prints one JSON bundle: every entry in order, `malformed` keys (not read further), a `summary` (the latest image, every approver, `status_history`, verification and revert, `has_creation`) and `linked` (the revert record or reverted plan). For a consumed plan, `executed_by` holds the attribution above and CloudWatch Logs Insights templates: the Lambda logs by plan and correlation IDs, and the EKS audit log by the User-Agent. Exit status 1 without entries.
-- `verify (<plan_id> | --since SECONDS | --all) [--json] [--approval-mode MODE]` exits 1 when a plan's entries show what no writer of the record produces: rewrites before, at or after the consume, an impossible consume, gaps, or a channel or missing server approval wrong for the plan's `approval_mode`. A `client`-mode apply is information, with a time window for CloudTrail. Implemented, not yet tested on a cluster.
+- `verify (<plan_id> | --since SECONDS | --all) [--json] [--approval-mode MODE]` exits 1 when a plan's entries show what no writer of the record produces: rewrites before, at or after the consume, an impossible consume, gaps, or a channel or missing server approval wrong for the plan's `approval_mode`. A `client`-mode apply is information, with a time window for CloudTrail. Tested on a test cluster.
 - `list [--limit N]` lists plans by their latest entry, newest first, reading every key in the bucket.
 
 ### Alarms and metrics
