@@ -140,10 +140,18 @@ it (sent with an If-Match no object matches, so the probe cannot replace the ent
 the policy were missing) the bucket policy denies it (403). The operator needs
 s3:ListBucket, s3:GetObject and s3:PutObject on the bucket; nothing is written.
 
-The per-object and global hourly budgets are covered by unit tests only: reaching
-them here takes 6 or 30 applies. So are the
-scale_to_zero and service_without_endpoints warnings: they need a plan to 0
-replicas, which a sandbox with MIN_REPLICAS=1 refuses as out_of_bounds.
+The per-object and global hourly budgets are not reached here: that takes 6 or 30
+applies. The unit tests cover them at the exact limits, and tests/integration on kind with
+small limits. The scale_to_zero and service_without_endpoints warnings are covered by unit
+tests only: they need a plan to 0 replicas, which a sandbox with MIN_REPLICAS=1 refuses as
+out_of_bounds.
+
+--live-only runs only the cases the kind and moto integration suite (tests/integration)
+cannot cover, listed in LIVE_ONLY_CASES and docs/milestone-0.md: authentication, the
+gateway's schema check, one apply and concurrent applies through the gateway in client mode,
+the approval URL cases in server mode, and, with --with-identity and --with-audit, the
+identity and audit cases. --with-rollout, --with-freeze, --with-expiry and the verification
+cases are ignored with it. Without the flag every case runs as before.
 """
 
 import argparse
@@ -2247,6 +2255,7 @@ async def run(
     with_freeze: bool = False,
     with_audit: bool = False,
     started: int = 0,
+    live_only: bool = False,
 ) -> None:
     token = fetch_token()
     auth_tests(token)
@@ -2256,31 +2265,104 @@ async def run(
         async with ClientSession(read, write) as session:
             await session.initialize()
             gw = Gateway(session)
-            await validation_tests(gw)
-            await ownership_tests(gw)
-            await event_tests(gw)
-            if approval_mode == "server":
-                print(
-                    "server approval mode: skipping the cases that apply through the gateway",
-                    flush=True,
-                )
-                await impact_tests(gw)
-                await approval_tests(gw, token)
+            if live_only:
+                await live_only_tests(gw, token, approval_mode)
+                if with_identity:
+                    await run_identity(gw, approval_mode)
             else:
-                await plan_tests(gw, with_expiry)
-                await impact_tests(gw)
-                await breaker_tests(gw)
-            if with_rollout:
-                await rollout_tests(gw, approval_mode)
-                await rollback_tests(gw, approval_mode)
-            if with_identity:
-                await run_identity(gw, approval_mode)
-            if with_verify:
-                await verify_tests(gw, approval_mode)
-            if with_freeze:
-                await freeze_tests(gw, approval_mode)
+                await guard_tests(
+                    gw,
+                    token,
+                    with_expiry,
+                    approval_mode,
+                    with_rollout,
+                    with_identity,
+                    with_verify,
+                    with_freeze,
+                )
     if with_audit:
         await audit_tests(started)
+
+
+async def guard_tests(
+    gw: Gateway,
+    token: str,
+    with_expiry: bool,
+    approval_mode: str,
+    with_rollout: bool,
+    with_identity: bool,
+    with_verify: bool,
+    with_freeze: bool,
+) -> None:
+    """Every case: the default run."""
+    await validation_tests(gw)
+    await ownership_tests(gw)
+    await event_tests(gw)
+    if approval_mode == "server":
+        print(
+            "server approval mode: skipping the cases that apply through the gateway",
+            flush=True,
+        )
+        await impact_tests(gw)
+        await approval_tests(gw, token)
+    else:
+        await plan_tests(gw, with_expiry)
+        await impact_tests(gw)
+        await breaker_tests(gw)
+    if with_rollout:
+        await rollout_tests(gw, approval_mode)
+        await rollback_tests(gw, approval_mode)
+    if with_identity:
+        await run_identity(gw, approval_mode)
+    if with_verify:
+        await verify_tests(gw, approval_mode)
+    if with_freeze:
+        await freeze_tests(gw, approval_mode)
+
+
+# --live-only: the cases tests/integration cannot cover, because they need a real Cognito
+# user pool, the gateway with its request interceptor, the Lambdas' EKS access entries and
+# network path, the approval Function URL's IAM auth, or real DynamoDB conditional writes
+# (docs/milestone-0.md, Guard tests). Authentication always runs first; --with-identity
+# adds the identity cases (the real interceptor, and the per-agent budget counter on real
+# DynamoDB) and --with-audit the audit cases (the real stream and the bucket policy).
+LIVE_ONLY_CASES = (
+    "authentication (Cognito tokens at the gateway)",
+    "argument types rejected by the gateway's tool schema",
+    "client: a plan and apply through the gateway (interceptor, access entries, network)",
+    "client: concurrent applies of one plan (conditional write on DynamoDB)",
+    "server: the approval URL refuses a Cognito token and an unsigned request, and a SigV4-signed approval applies",
+    "--with-identity: identity cases through the real interceptor and the agent budget counter",
+    "--with-audit: the audit record from the real stream, and the bucket policy",
+)
+
+
+async def live_only_tests(gw: Gateway, token: str, approval_mode: str) -> None:
+    for bad in ("2", 2.5, True):
+        envelope = await gw.call(PLAN, {**WEB, "replicas": bad})
+        report(f"replicas={bad!r} is rejected", not envelope.get("ok"), code(envelope))
+    if approval_mode == "server":
+        await approval_tests(gw, token)
+        return
+    plan_id = await gw.plan(TARGET, 2)
+    envelope = await gw.apply(TARGET, plan_id, 2)
+    report(
+        "live: a plan and apply through the gateway succeed",
+        envelope.get("ok") is True and last_plan_id(TARGET["name"]) == plan_id,
+        code(envelope) or "ok",
+    )
+    reset_target()
+    await cool_down()
+    plan_id = await gw.plan(TARGET, 2)
+    first, second = await asyncio.gather(*(gw.apply(TARGET, plan_id, 2) for _ in range(2)))
+    outcomes = sorted([code(first) or "ok", code(second) or "ok"])
+    report(
+        "concurrent applies of one plan: exactly one succeeds",
+        outcomes == ["ok", "plan_used"],
+        outcomes,
+    )
+    reset_target()
+    await cool_down()
 
 
 def audit_script() -> Any:
@@ -2401,7 +2483,7 @@ def describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}" + (f" stderr: {stderr.strip()}" if stderr else "")
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--with-expiry", action="store_true", help="also wait out a plan TTL")
     parser.add_argument(
@@ -2440,6 +2522,12 @@ def main() -> None:
         "Terraform outputs, else client; both runs as server)",
     )
     parser.add_argument(
+        "--live-only",
+        action="store_true",
+        help="run only the cases tests/integration cannot cover (LIVE_ONLY_CASES); "
+        "--with-identity and --with-audit add theirs, the other --with flags are ignored",
+    )
+    parser.add_argument(
         "--reset-counters",
         action="store_true",
         help="delete this hour's apply counters first; test deployments only",
@@ -2450,9 +2538,16 @@ def main() -> None:
         default=Path(__file__).resolve().parents[2] / "terraform",
         help="Terraform directory whose outputs fill unset variables",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     # Every deployment verifies its applies, so the verification cases run by default.
     args.with_verify = not args.skip_verify
+    if args.live_only:
+        args.with_rollout = args.with_verify = args.with_freeze = args.with_expiry = False
+    return args
+
+
+def main() -> None:
+    args = parse_args()
     outputs, ignored = usable_outputs(terraform_outputs(args.tf_dir))
     if ignored:
         print(ignored, flush=True)
@@ -2486,6 +2581,7 @@ def main() -> None:
                 args.with_freeze,
                 args.with_audit,
                 int(started),
+                args.live_only,
             )
         )
     except Exception as exc:
