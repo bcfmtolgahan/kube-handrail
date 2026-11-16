@@ -317,3 +317,9 @@ def test_outcome_view_of_an_hpa_adjust_names_its_bounds():
     # A Deployment plan has neither.
     plain, _ = outcome_view(with_revert().to_item(), NOW + 60, 300)
     assert "target_kind" not in plain and "hpa" not in plain
+
+
+def test_outcome_view_reports_the_approval_mode():
+    assert outcome_view(with_revert().to_item(), NOW, 300)[0]["approval_mode"] is None
+    record = with_revert(approval_mode="server").to_item()
+    assert outcome_view(record, NOW, 300)[0]["approval_mode"] == "server"

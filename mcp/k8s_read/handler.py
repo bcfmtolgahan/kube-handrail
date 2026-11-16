@@ -50,7 +50,7 @@ from handrail_common.envelope import (
 from handrail_common.freezes import check_not_frozen, freeze_store
 from handrail_common.gitops import is_gitops_managed
 from handrail_common.impact import hpa_warnings, revert_warnings, rollout_impact, scale_impact
-from handrail_common.observability import current_correlation_id
+from handrail_common.observability import bind_plan_id, current_correlation_id
 from handrail_common.plans import (
     ADJUST_HPA,
     GLOBAL_BUDGET_WINDOW_SECONDS,
@@ -634,6 +634,11 @@ def _kind_noun(action: PlanAction) -> str:
 def _plan(
     action: PlanAction, args: Mapping[str, Any], settings: Settings, clients: Clients, now: int
 ) -> Envelope:
+    # Chosen before the first cluster read, so every request of the plan names it in its
+    # User-Agent (handrail_common.eks); a plan refused after a read is never stored.
+    plan_id = str(uuid.uuid4())
+    bind_plan_id(plan_id)
+
     namespace, name, request = action.validate(args, settings)
     agent = guard_plan(settings, clients.ssm)
     # Before the Deployment is read; apply checks again with its own clock.
@@ -674,7 +679,6 @@ def _plan(
         action.impact(target.pods_raw, current, replicas_to, resolved),
     )
     correlation_id = current_correlation_id()
-    plan_id = str(uuid.uuid4())
     template_from = template_hash(template) if template is not None else None
     template_to = (
         template_hash(action.template_to(plan_id, template, resolved))
@@ -708,6 +712,7 @@ def _plan(
         agent=agent.name,
         requested_client_id=agent.client_id,
         status=STATUS_PLANNED,
+        approval_mode=settings.approval_mode,
         override_manual_change=override,
         impact=impact,
         plan_correlation_id=correlation_id,

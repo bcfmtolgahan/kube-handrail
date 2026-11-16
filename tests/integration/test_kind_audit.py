@@ -42,6 +42,12 @@ def test_plan_and_apply_reach_the_bucket_once(kh):
     summary = bundle["summary"]
     assert summary["agent"] == AGENT_A and summary["requested_by"] == f"agent:{AGENT_A}"
     assert summary["result"] == "applied" and summary["has_creation"] is True
+    assert summary["approval_mode"] == "client"
+    # Client mode: the chat approval is not in the record, which verify reports, nothing else.
+    report = audit.verify_plan(kh.s3, BUCKET, plan_id)
+    assert [(f["severity"], f["code"]) for f in report["findings"]] == [
+        ("info", "client_unobserved")
+    ]
 
     # A redelivered batch maps to the same keys: duplicates, no failure, nothing new.
     assert kh.run_audit(records) == {"batchItemFailures": []}
@@ -63,3 +69,18 @@ def test_plan_and_apply_reach_the_bucket_once(kh):
     assert response == {
         "batchItemFailures": [{"itemIdentifier": first["dynamodb"]["SequenceNumber"]}]
     }
+
+
+def test_the_api_server_sees_the_user_agent(kh):
+    """The API server derives a patch's default field manager from the User-Agent's product
+    (before the first `/`), so the Deployment's managed fields show that the header reached
+    it. The full header (plan and correlation id) is only in the API server's audit log,
+    which the kind cluster of this suite does not enable."""
+    target = kh.create(deployment_manifest(unique("it-agent")))
+    plan_id = kh.plan(target, 2)
+    assert kh.apply(target, plan_id, 2)["ok"] is True
+    managers = {
+        (entry.manager, entry.operation)
+        for entry in kh.deployment(target["name"]).metadata.managed_fields or []
+    }
+    assert ("kube-handrail", "Update") in managers

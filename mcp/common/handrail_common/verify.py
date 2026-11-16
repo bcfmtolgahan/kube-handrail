@@ -218,6 +218,7 @@ def outcome_view(record: Mapping[str, Any], now: int, grace: int) -> tuple[dict[
         "kind": plan.kind or "change",
         "reverts_plan_id": plan.reverts_plan_id,
         "replicas": {"from": plan.replicas_from, "to": plan.replicas_to},
+        "approval_mode": plan.approval_mode,
         "plan_status": derived_status(record, now),
         "verification": verification,
         "revert": revert_view(plan, verification["status"]),

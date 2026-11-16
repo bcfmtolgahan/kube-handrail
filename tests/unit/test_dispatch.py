@@ -16,10 +16,13 @@ from handrail_common.envelope import (
     ok,
 )
 from handrail_common.observability import (
+    bind_plan_id,
     correlation_id,
     current_caller,
     current_channel,
     current_correlation_id,
+    current_plan_id,
+    unbind_plan_id,
 )
 from handrail_common.validation import GuardError
 
@@ -136,6 +139,9 @@ def full_ctx(custom: dict | None = None, request_id: str | None = "lambda-req") 
         ({}, None, None),
         # Values that are not short tokens are skipped, never logged or annotated.
         ({"bedrockAgentCoreAwsRequestId": "two\nlines"}, "lambda-req", "lambda-req"),
+        # A trailing newline too: the id goes into the User-Agent header, which must not
+        # break a line.
+        ({"bedrockAgentCoreAwsRequestId": "gw-req\n"}, "lambda-req", "lambda-req"),
         ({"bedrockAgentCoreAwsRequestId": "x" * 129}, "lambda-req", "lambda-req"),
         ({"bedrockAgentCoreAwsRequestId": True}, "lambda-req", "lambda-req"),
     ],
@@ -404,3 +410,31 @@ def test_an_internal_call_is_recorded_under_its_name(capsys):
     )
     (record,) = records(capsys)
     assert (record["tool"], record["outcome"], record["plan_id"]) == ("v", "ok", PLAN_ID)
+
+
+def test_binds_a_valid_plan_id_argument_for_the_invocation_only():
+    plan_id = "00000000-0000-4000-8000-000000000001"
+    handlers = {"echo": lambda args: ok({"plan": current_plan_id()})}
+    token = bind_plan_id(None)
+    try:
+        data = dispatch(handlers, {"plan_id": plan_id}, ctx("t___echo"))["data"]
+        assert data == {"plan": plan_id}
+        assert current_plan_id() is None
+        assert dispatch(handlers, {"plan_id": "x"}, ctx("t___echo"))["data"] == {"plan": None}
+    finally:
+        unbind_plan_id(token)
+
+
+def test_a_plan_id_bound_by_a_handler_ends_with_the_invocation():
+    plan_id = "00000000-0000-4000-8000-000000000002"
+
+    def plan(args):
+        bind_plan_id(plan_id)
+        return ok({"plan_id": plan_id})
+
+    token = bind_plan_id(None)
+    try:
+        dispatch({"plan": plan}, {}, ctx("t___plan"))
+        assert current_plan_id() is None
+    finally:
+        unbind_plan_id(token)

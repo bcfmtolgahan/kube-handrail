@@ -52,6 +52,7 @@ from handrail_common.killswitch import KillSwitch
 from handrail_common.observability import (
     CHANNEL_VERIFIER,
     CORRELATION_ANNOTATION,
+    bind_plan_id,
     current_channel,
     current_correlation_id,
 )
@@ -950,6 +951,7 @@ def _revert_fields(rt: Runtime, plan: Plan, now: int) -> dict[str, Any]:
         "used": True,
         "requested_by": REQUESTER_REVERT,
         "status": STATUS_REVERT,
+        "approval_mode": plan.approval_mode,
         "agent": plan.agent,
         "requested_client_id": plan.requested_client_id,
         "channel": CHANNEL_VERIFIER,
@@ -1045,6 +1047,8 @@ def _patch_revert(
     and not GitOps-managed, with the resourceVersion of that same reading. An object already
     annotated with the revert was patched by an earlier run that stopped before recording
     it."""
+    # Its requests name the revert record, not the plan being verified.
+    bind_plan_id(revert.plan_id)
     ops = ops_for(plan)
     for attempt in range(1, PATCH_ATTEMPTS + 1):
         if obj is None or attempt > 1:

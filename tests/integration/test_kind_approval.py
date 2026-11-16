@@ -6,18 +6,27 @@ from harness import (
     AGENT_B,
     AGENT_SWITCHES,
     APPROVER,
+    BUCKET,
     CLIENT_B,
     LAMBDA_SESSION,
     NOT_APPROVER,
     code,
     deployment_manifest,
     details,
+    load_script,
+    stream_records,
     unique,
 )
 
 REQUEST_APPROVAL = "k8sr___request_approval"
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
 CORRELATION_ANNOTATION = "kube-handrail.io/correlation-id"
+
+
+def audit_findings(kh, plan_id):
+    """audit.py verify of the plan, after the audit Lambda wrote the stream so far."""
+    assert kh.run_audit(stream_records(kh.stream_arn())) == {"batchItemFailures": []}
+    return load_script("audit").verify_plan(kh.s3, BUCKET, plan_id)["findings"]
 
 
 def decide(kh, plan_id, decision, caller=APPROVER, **extra):
@@ -63,6 +72,7 @@ def test_server_approval_applies_the_plan(kh):
 
     status, envelope = decide(kh, plan_id, "approve")
     assert (status, code(envelope)) == (409, "plan_used")
+    assert audit_findings(kh, plan_id) == []
 
 
 def test_rejected_plan_cannot_be_applied(kh):
@@ -86,6 +96,7 @@ def test_both_mode_approval_does_not_apply(kh):
     assert status == 200 and envelope["data"]["apply"] is None
     assert kh.deployment(target["name"]).spec.replicas == 1
     assert kh.apply(target, plan_id, 2)["ok"] is True
+    assert audit_findings(kh, plan_id) == []
 
 
 def test_approval_identity(kh):

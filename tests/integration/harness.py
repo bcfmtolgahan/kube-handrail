@@ -26,6 +26,7 @@ from kubernetes import client as k8s
 from kubernetes import config as k8s_config
 from kubernetes.client.exceptions import ApiException
 
+from handrail_common.eks import HandrailApiClient
 from handrail_common.freezes import Freeze, dump_freezes
 from handrail_common.plans import OBJECT_HISTORY_INDEX, VERIFY_DUE_INDEX
 
@@ -159,8 +160,9 @@ def admin_configuration(kubeconfig: str) -> k8s.Configuration:
 def impersonating_client(configuration: k8s.Configuration, user: str, group: str) -> k8s.ApiClient:
     """A client whose requests the API server authorizes as `user` in `group` only: the
     same identity the EKS access entry gives the Lambda's role. The Python client ignores
-    `as` and `as-groups` in a kubeconfig, so the headers are set here."""
-    api = k8s.ApiClient(configuration)
+    `as` and `as-groups` in a kubeconfig, so the headers are set here. The Lambdas' own
+    client class, so requests carry their User-Agent."""
+    api = HandrailApiClient(configuration)
     api.set_default_header("Impersonate-User", user)
     api.set_default_header("Impersonate-Group", group)
     return api
