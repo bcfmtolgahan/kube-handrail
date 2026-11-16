@@ -25,8 +25,10 @@ MAX_PLAN_TTL_SECONDS = 3600
 # The verifier runs every minute, so a shorter window could not be kept.
 MIN_VERIFY_WINDOW_SECONDS = 60
 # The actions a namespace can allow (Terraform namespaces[*].actions); each is the plan
-# record's action without the _deployment suffix.
-ACTIONS = ("restart", "rollback", "scale")
+# record's action without the _deployment suffix. adjust_hpa is never a default: a namespace
+# lists it to let the writer patch its HorizontalPodAutoscalers.
+ACTIONS = ("adjust_hpa", "restart", "rollback", "scale")
+DEFAULT_ACTIONS = ("restart", "rollback", "scale")
 # The namespace policy Terraform renders into every Lambda package, next to handrail_common
 # (mcp/CONTRACT.md, Namespace policy). NAMESPACE_POLICY_FILE overrides the path (tests).
 POLICY_FILE_NAME = "namespace_policy.json"
@@ -49,7 +51,7 @@ class NamespacePolicy:
 
     min_replicas: int
     max_replicas: int
-    actions: frozenset[str] = frozenset(ACTIONS)
+    actions: frozenset[str] = frozenset(DEFAULT_ACTIONS)
     # IAM user or role ARNs that decide this namespace's plans; empty means the global
     # APPROVER_PRINCIPALS. Checked by the approver only.
     approvers: tuple[str, ...] = ()
@@ -128,9 +130,10 @@ class Settings:
         return policy.min_replicas, policy.max_replicas
 
     def actions_for(self, namespace: str) -> frozenset[str]:
-        """The actions (ACTIONS) an allowed namespace allows; every action without a policy."""
+        """The actions (ACTIONS) an allowed namespace allows; without a policy, the default
+        actions (every action but adjust_hpa)."""
         policy = self.namespace_policy.get(namespace)
-        return frozenset(ACTIONS) if policy is None else policy.actions
+        return frozenset(DEFAULT_ACTIONS) if policy is None else policy.actions
 
     def markers_for(self, namespace: str) -> tuple[str, ...]:
         """GITOPS_MARKERS and the namespace's own marker keys."""

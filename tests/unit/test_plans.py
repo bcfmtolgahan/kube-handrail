@@ -8,12 +8,14 @@ from moto import mock_aws
 
 from handrail_common.envelope import PLAN_EXPIRED, PLAN_MISMATCH, PLAN_NOT_FOUND, PLAN_USED
 from handrail_common.plans import (
+    ADJUST_HPA,
     RESTART_ANNOTATION,
     RESTART_DEPLOYMENT,
     ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
     Plan,
     PlanStore,
+    adjust_hpa_args,
     agent_budget_key,
     args_hash,
     global_budget_key,
@@ -519,6 +521,67 @@ def test_consume_pins_the_revert_target_only_when_asked(store):
     # In the same write that marks it used, from the replicas_from the apply then checks.
     assert (consumed.used, consumed.revert_to) == (True, plan.replicas_from)
     assert store.get(plan.plan_id)["revert_to"] == plan.replicas_from
+
+
+def hpa_plan() -> Plan:
+    args = adjust_hpa_args(
+        "sandbox", "web", 2, None, revert_on_failure=True, verify_window_seconds=120
+    )
+    return dataclasses.replace(
+        make_plan(),
+        action=ADJUST_HPA,
+        args=args,
+        args_hash=plan_args_hash(ADJUST_HPA, args),
+        generation=-1,
+        target_kind="HorizontalPodAutoscaler",
+        hpa_target="web",
+        min_from=1,
+        min_to=2,
+        max_from=4,
+        max_to=4,
+        spec_from="sha256:a",
+        spec_to="sha256:b",
+    )
+
+
+def test_adjust_hpa_args_carry_only_the_given_bounds():
+    assert adjust_hpa_args("ns", "web", None, 5) == {
+        "namespace": "ns",
+        "name": "web",
+        "max_replicas": 5,
+    }
+    assert adjust_hpa_args("ns", "web", 2, 5, True, True, 120) == {
+        "namespace": "ns",
+        "name": "web",
+        "min_replicas": 2,
+        "max_replicas": 5,
+        "override_manual_change": True,
+        "revert_on_failure": True,
+        "verify_window_seconds": 120,
+    }
+
+
+def test_hpa_fields_round_trip(store):
+    plan = hpa_plan()
+    store.create(plan)
+    assert Plan.from_item(store.get(plan.plan_id)) == plan
+    # A Deployment plan has none of them.
+    assert "target_kind" not in make_plan().to_item()
+
+
+def test_consume_pins_the_hpa_revert_bounds(store):
+    plan = hpa_plan()
+    store.create(plan)
+    consumed = store.consume(
+        plan.plan_id,
+        plan.args_hash,
+        ADJUST_HPA,
+        NOW,
+        pin_revert=True,
+        revert_pins=(("revert_min_to", "min_from"), ("revert_max_to", "max_from")),
+    )
+    assert (consumed.revert_min_to, consumed.revert_max_to) == (1, 4)
+    assert consumed.revert_to is None
 
 
 def test_due_plans_reads_the_index_longest_due_first(store):
