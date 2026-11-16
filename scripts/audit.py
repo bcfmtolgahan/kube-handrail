@@ -120,7 +120,10 @@ AFTER_CONSUME = frozenset(
     }
 )
 # What the consume itself writes, in the one conditional update (PlanStore.consume).
-CONSUME = frozenset({"used", "channel", "verify_at", "verify_queue", "revert_to"})
+# An HPA adjust pins revert_min_to and revert_max_to instead of revert_to.
+CONSUME = frozenset(
+    {"used", "channel", "verify_at", "verify_queue", "revert_to", "revert_min_to", "revert_max_to"}
+)
 WRITE_ONCE = ("verification", "revert")
 # record_result writes these together, once per plan; a revert record's second run may
 # record `applied` over the error code of the first.
@@ -163,6 +166,14 @@ PINNED = frozenset(
         "plan_correlation_id",
         "kind",
         "reverts_plan_id",
+        "target_kind",
+        "hpa_target",
+        "min_from",
+        "min_to",
+        "max_from",
+        "max_to",
+        "spec_from",
+        "spec_to",
     }
 )
 DECIDED = ("approved", "rejected")
@@ -539,7 +550,7 @@ def check_rewrites(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
                     finding(
                         "executor_rewrite",
                         "the consume changed more than it writes (used, channel, verify_at, "
-                        "verify_queue, revert_to)",
+                        "verify_queue, revert_to or the HPA revert bounds)",
                         key=key,
                         changed=sorted(names - CONSUME),
                         rewritten=[],
