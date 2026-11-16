@@ -26,7 +26,8 @@ Steps, in order (docs/deploy.md, Upgrading):
 10. smoke       scripts/smoke_test.py; --read-only in server and both mode.
 
 Progress is kept in .upgrade-state.json at the repository root (not committed); after a
-failure, fix the cause and run again with --resume. The state file is removed when the
+failure, fix the cause and run again with --resume. Until the apply is done, a resume runs
+the plan, the kill switch step and the migration again. The state file is removed when the
 upgrade finishes.
 
 The DevOps Agent IDs come from --agent-space-id / --association-id, AGENT_SPACE_ID /
@@ -53,6 +54,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STATE_FILE = REPO_ROOT / ".upgrade-state.json"
 PLAN_FILE = "upgrade.tfplan"
 STATE_VERSION = 1
+
+# Re-run on resume until "apply" is done.
+BEFORE_APPLY = ("plan", "disable_kill_switch", "migrate")
 
 STEPS = (
     "preflight",
@@ -508,9 +512,11 @@ class Upgrade:
             "smoke": self.smoke,
         }
         for step in STEPS:
-            # The preflight always runs; the plan runs again on resume until the apply is
-            # done, because a saved plan may be stale.
-            again = step == "preflight" or (step == "plan" and "apply" not in self.state.done)
+            # The preflight always runs. Until the apply is done, the plan and the steps
+            # that depend on it run again on resume: a saved plan may be stale, a new one
+            # may change the tool set or need a migration, and the kill switch may have
+            # been turned on by hand in between. Each of them is idempotent.
+            again = step == "preflight" or (step in BEFORE_APPLY and "apply" not in self.state.done)
             if step in self.state.done and not again:
                 continue
             say(f"step {step}")
@@ -559,18 +565,34 @@ class Upgrade:
         ours = self.state.kill_switch_marker
         if value == "true":
             if self.state.kill_switch_disabled:
-                # Someone turned it back on by hand; nothing for this script to restore.
+                # Turned back on by hand; nothing for this script to restore. Before the
+                # apply, disable_kill_switch turns it off again if the tool set changes.
                 self.state.kill_switch_disabled = False
                 self.state.notes.append("the kill switch was turned on by someone else")
+                if "apply" not in self.state.done:
+                    say("the kill switch was turned on by hand; it goes off again for the apply")
             return
         if ours is not None and value == ours:
             say("the kill switch is off with this run's marker; continuing")
             return
-        message = (
-            f"the kill switch {self.kill_switch_param()} is {value!r}, and this script did not "
-            "turn it off. Find out why (a drift alert, an operator) and turn it on by hand "
-            "before upgrading."
-        )
+        if ours is not None and self.state.kill_switch_disabled:
+            message = (
+                f"the kill switch {self.kill_switch_param()} is {value!r}: something overwrote "
+                "this run's marker after this script turned it off (the drift sentinel writes "
+                "false on drift; so may an operator). Find out why, turn it on by hand, and "
+                "run with --resume"
+                + (
+                    "; this script turns it off again for the apply."
+                    if "apply" not in self.state.done
+                    else "."
+                )
+            )
+        else:
+            message = (
+                f"the kill switch {self.kill_switch_param()} is {value!r}, and this script did "
+                "not turn it off. Find out why (a drift alert, an operator) and turn it on by "
+                "hand before upgrading."
+            )
         if self.options.dry_run:
             say(f"WARNING: {message}")
             return
@@ -648,8 +670,9 @@ class Upgrade:
         result = self.tf.apply_targets(self.state.targets)
         if result.returncode != 0:
             raise UpgradeError("the targeted apply failed; fix the cause and run with --resume")
-        # The saved plan is stale now.
+        # The saved plan is stale now, and the new one may change the tool set.
         self.plan()
+        self.disable_kill_switch()
         if self.state.targets:
             raise UpgradeError(
                 f"still to create after the targeted apply: {', '.join(self.state.targets)}"
@@ -663,6 +686,7 @@ class Upgrade:
             raise UpgradeError("terraform apply failed; fix the cause and run with --resume")
         say("inconsistent final plan: planning again and applying once more")
         self.plan()
+        self.disable_kill_switch()
         if self.tf.apply_plan().returncode != 0:
             raise UpgradeError("terraform apply failed twice; fix the cause and run with --resume")
 
@@ -718,8 +742,10 @@ class Upgrade:
         value = self.kill_switch_value()
         if value != self.state.kill_switch_marker:
             raise UpgradeError(
-                f"the kill switch is now {value!r}: something else wrote it after this script "
-                "turned it off (the sentinel writes false on drift). It stays as it is."
+                f"the kill switch is now {value!r}: something overwrote this run's marker after "
+                "this script turned it off (a drift sentinel of an earlier release writes false "
+                "on drift; so may an operator). It stays as it is: find out why and turn it on "
+                "by hand."
             )
         self.clients.ssm.put_parameter(
             Name=self.kill_switch_param(), Value="true", Type="String", Overwrite=True

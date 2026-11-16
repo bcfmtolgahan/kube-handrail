@@ -416,7 +416,7 @@ def test_drift_found_by_the_sentinel_keeps_remediation_off(world):
         "enable_write",
     ]
     # The switch is no longer this run's: a resume refuses rather than turning it on.
-    with pytest.raises(upgrade.UpgradeError, match="did not turn it off"):
+    with pytest.raises(upgrade.UpgradeError, match="overwrote this run.s marker"):
         world.make(resume=True).run()
     assert world.state_path.exists()
 
@@ -428,7 +428,7 @@ def test_a_kill_switch_changed_after_the_sentinel_is_left_alone(world):
         world.ssm.values[PARAM] = "false"
 
     world.lam = FakeLambda(log=world.log, on_invoke=operator_writes)
-    with pytest.raises(upgrade.UpgradeError, match="something else wrote it"):
+    with pytest.raises(upgrade.UpgradeError, match="overwrote this run.s marker"):
         world.make().run()
     assert world.ssm.values[PARAM] == "false"
 
@@ -682,3 +682,67 @@ def test_changed_or_missing_guidance_is_reported():
     assert upgrade.guidance_differs(register, client, "space-1", "GENERIC") == ["AGENTS.md"] + [
         f"skill {n}" for n in sorted(skills)
     ]
+
+
+# --- The kill switch is checked again before every apply --------------------------------
+
+
+def ssm_writes_before_apply(world) -> list:
+    """The kill switch writes logged before the last apply."""
+    last_apply = max(i for i, e in enumerate(world.log) if e == ("apply",))
+    return [e for e in world.log[:last_apply] if e[0] == "ssm"]
+
+
+def test_a_tool_change_that_appears_on_resume_turns_the_kill_switch_off(world):
+    world.tf.applies = [upgrade.Result(1, "Error: AccessDenied"), upgrade.Result(0, "")]
+    with pytest.raises(upgrade.UpgradeError, match="apply failed"):
+        world.make().run()
+    assert world.ssm.values[PARAM] == "true"
+
+    # The operator changes a tools.json while fixing the cause, then resumes.
+    tool_set_changed(world)
+    world.log.clear()
+    assert world.make(resume=True).run() == 0
+    [(_, marker)] = ssm_writes_before_apply(world)
+    assert marker.startswith(upgrade.MARKER_PREFIX)
+    assert ("enable_write", "space-1", "assoc-1") in world.log
+    assert world.ssm.values[PARAM] == "true"
+
+
+def test_a_switch_turned_on_by_hand_is_turned_off_again_for_the_apply(world):
+    tool_set_changed(world)
+    world.tf.applies = [upgrade.Result(1, "Error: timeout"), upgrade.Result(0, "")]
+    with pytest.raises(upgrade.UpgradeError):
+        world.make().run()
+    marker = world.state()["kill_switch_marker"]
+
+    # Something overwrote the marker with false while the run was stopped.
+    world.ssm.values[PARAM] = "false"
+    with pytest.raises(upgrade.UpgradeError, match="overwrote this run's marker"):
+        world.make(resume=True).run()
+
+    # The operator turns it on by hand and resumes: the apply still runs with it off.
+    world.ssm.values[PARAM] = "true"
+    world.log.clear()
+    assert world.make(resume=True).run() == 0
+    assert ssm_writes_before_apply(world) == [("ssm", marker)]
+    assert world.ssm.values[PARAM] == "true"
+
+
+def test_a_tool_change_seen_only_after_the_migration_turns_the_kill_switch_off(world):
+    world.tf._outputs.pop("tool_set_hash")
+    world.tf.plans = [fixture("plan_legacy_migration"), fixture("plan_tool_set_change")]
+    assert world.make().run() == 0
+    [(_, marker)] = ssm_writes_before_apply(world)
+    assert marker.startswith(upgrade.MARKER_PREFIX)
+    assert world.ssm.values[PARAM] == "true"
+
+
+def test_a_tool_change_seen_only_by_the_retry_plan_turns_the_kill_switch_off(world):
+    world.tf._outputs.pop("tool_set_hash")
+    world.tf.plans = [fixture("plan_switch_removal"), fixture("plan_tool_set_change")]
+    world.tf.applies = [upgrade.Result(1, INCONSISTENT), upgrade.Result(0, "Apply complete!")]
+    assert world.make().run() == 0
+    [(_, marker)] = ssm_writes_before_apply(world)
+    assert marker.startswith(upgrade.MARKER_PREFIX)
+    assert world.ssm.values[PARAM] == "true"
