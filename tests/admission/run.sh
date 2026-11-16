@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Server-side dry-run cases for the admission policy rendered to build/k8s
-# (terraform/modules/namespace-policy; mcp/CONTRACT.md, Admission policy). Every request is
-# a dry run: nothing in the cluster changes, except the binding's validationActions, which
-# the script switches to Deny and back, and the other namespace, which it creates and
-# deletes only with OTHER_NAMESPACE set.
+# Server-side dry-run cases for the admission policies rendered to build/k8s
+# (terraform/modules/namespace-policy; mcp/CONTRACT.md, Admission policy, and
+# mcp/contract/adjust-hpa.md). Every request is a dry run: nothing in the cluster changes,
+# except the bindings' validationActions, which the script switches to Deny and back, a
+# HorizontalPodAutoscaler per namespace (kube-handrail-admission-hpa, scaling a Deployment
+# that does not exist, so the HPA controller changes nothing), which it creates and deletes,
+# and the other namespace, which it creates and deletes only with OTHER_NAMESPACE set.
 #
 # Needs kubectl 1.30 or later and a kubeconfig whose user may impersonate users and groups
 # (cluster-admin). The rendered manifests (build/k8s) and the Deployments must already exist.
@@ -14,7 +16,8 @@
 #   MIN_REPLICAS     the policy's minimum there (default 0)
 #   MAX_REPLICAS     the policy's maximum there (default 5)
 #   ACTIONS          the actions the policy allows there, comma-separated, for the writer's
-#                    RBAC cases (default restart,rollback,scale; empty for none)
+#                    RBAC cases (default restart,rollback,scale; empty for none; adjust_hpa
+#                    for the HPA patch)
 #   NAMESPACE_2      if set, a second namespace of the policy with other bounds; the bound
 #                    cases run there too, and a count allowed in one is checked in the other
 #   DEPLOYMENT_2     Deployment in it, below its maximum (default web)
@@ -37,6 +40,8 @@ MAX_REPLICAS_2=${MAX_REPLICAS_2:-5}
 ACTIONS=${ACTIONS-restart,rollback,scale}
 ACTIONS_2=${ACTIONS_2-restart,rollback,scale}
 POLICY=kube-handrail-writer-bounds
+HPA_POLICY=kube-handrail-writer-hpa-bounds
+HPA=kube-handrail-admission-hpa
 READER=(--as kube-handrail-admission-reader --as-group kube-handrail-reader)
 WRITER=(--as kube-handrail-admission-test --as-group kube-handrail-writer)
 # system:masters passes RBAC, so the only thing that can stop these requests is the policy.
@@ -44,6 +49,7 @@ WRITER_ADMIN=(--as kube-handrail-admission-test --as-group kube-handrail-writer 
 OTHER_ADMIN=(--as kube-handrail-admission-other --as-group system:masters)
 DENIAL="ValidatingAdmissionPolicy '$POLICY' with binding '$POLICY' denied request"
 WARNING="Validation failed for ValidatingAdmissionPolicy '$POLICY' with binding '$POLICY'"
+HPA_DENIAL="ValidatingAdmissionPolicy '$HPA_POLICY' with binding '$HPA_POLICY' denied request"
 
 failures=0
 pass() { echo "PASS  $1"; }
@@ -133,6 +139,52 @@ expect_denied() {
   fi
 }
 
+expect_hpa_denied() {
+  local name=$1 out
+  shift
+  if out=$("$@"); then
+    fail "$name" "admitted:" "$out"
+  elif grep -q "$HPA_DENIAL" <<<"$out"; then
+    pass "$name"
+  else
+    fail "$name" "refused, but not by $HPA_POLICY:" "$out"
+  fi
+}
+
+# patch_hpa <namespace> <spec JSON> <identity...>: a dry-run merge patch of the test HPA.
+patch_hpa() {
+  local ns=$1 spec=$2
+  shift 2
+  kubectl patch horizontalpodautoscaler.v2.autoscaling "$HPA" -n "$ns" --dry-run=server \
+    --type merge -p "{\"spec\":$spec}" "$@" 2>&1
+}
+
+# patch_hpa_v1 <namespace> <spec JSON> <identity...>: the same through autoscaling/v1.
+patch_hpa_v1() {
+  local ns=$1 spec=$2
+  shift 2
+  kubectl patch horizontalpodautoscaler.v1.autoscaling "$HPA" -n "$ns" --dry-run=server \
+    --type merge -p "{\"spec\":$spec}" "$@" 2>&1
+}
+
+# create_hpa <namespace> <min> <max>: the test HPA, within the namespace's bounds.
+create_hpa() {
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: $HPA
+  namespace: $1
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: kube-handrail-admission-none}
+  minReplicas: $2
+  maxReplicas: $3
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 80}}
+YAML
+}
+
 # replicas_of <namespace> <deployment> <maximum>: the current count, which must be below
 # the maximum so that one more is a change within the bounds.
 replicas_of() {
@@ -151,11 +203,18 @@ if [[ -n "${NAMESPACE_2:-}" ]]; then
   current_2=$(replicas_of "$NAMESPACE_2" "$DEPLOYMENT_2" "$MAX_REPLICAS_2")
 fi
 actions=$(kubectl get validatingadmissionpolicybinding "$POLICY" -o jsonpath='{.spec.validationActions}')
+hpa_actions=$(kubectl get validatingadmissionpolicybinding "$HPA_POLICY" -o jsonpath='{.spec.validationActions}')
 
 restore() {
   if [[ "${KEEP_DENY:-0}" != 1 ]]; then
     kubectl patch validatingadmissionpolicybinding "$POLICY" --type merge \
       -p "{\"spec\":{\"validationActions\":$actions}}" >/dev/null
+    kubectl patch validatingadmissionpolicybinding "$HPA_POLICY" --type merge \
+      -p "{\"spec\":{\"validationActions\":$hpa_actions}}" >/dev/null
+  fi
+  kubectl delete horizontalpodautoscaler "$HPA" -n "$NAMESPACE" --ignore-not-found >/dev/null
+  if [[ -n "${NAMESPACE_2:-}" ]]; then
+    kubectl delete horizontalpodautoscaler "$HPA" -n "$NAMESPACE_2" --ignore-not-found >/dev/null
   fi
   if [[ -n "${OTHER_NAMESPACE:-}" ]]; then
     kubectl delete namespace "$OTHER_NAMESPACE" --ignore-not-found --wait=false >/dev/null
@@ -163,12 +222,14 @@ restore() {
 }
 trap restore EXIT
 
-warnings=$(kubectl get validatingadmissionpolicy "$POLICY" -o jsonpath='{.status.typeChecking.expressionWarnings}')
-if [[ -z "$warnings" ]]; then
-  pass "policy type-checks without warnings"
-else
-  fail "policy type-checks without warnings" "$warnings"
-fi
+for policy in "$POLICY" "$HPA_POLICY"; do
+  warnings=$(kubectl get validatingadmissionpolicy "$policy" -o jsonpath='{.status.typeChecking.expressionWarnings}')
+  if [[ -z "$warnings" ]]; then
+    pass "$policy type-checks without warnings"
+  else
+    fail "$policy type-checks without warnings" "$warnings"
+  fi
+done
 
 if [[ -n "${OTHER_NAMESPACE:-}" ]]; then
   kubectl create namespace "$OTHER_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
@@ -193,6 +254,8 @@ else
 fi
 
 kubectl patch validatingadmissionpolicybinding "$POLICY" --type merge \
+  -p '{"spec":{"validationActions":["Deny"]}}' >/dev/null
+kubectl patch validatingadmissionpolicybinding "$HPA_POLICY" --type merge \
   -p '{"spec":{"validationActions":["Deny"]}}' >/dev/null
 for _ in $(seq 1 30); do
   if patch_replicas "$NAMESPACE" "$DEPLOYMENT" "$over" "${WRITER[@]}" | grep -q "$DENIAL"; then
@@ -228,6 +291,44 @@ bound_cases() {
     patch_replicas "$ns" "$name" "$above" "${OTHER_ADMIN[@]}"
 }
 
+# hpa_cases <namespace> <min> <max>: the HPA policy's Deny cases. The test HPA starts at
+# [max(1, min), max]; within the bounds means its minimum raised by one (when it fits).
+hpa_cases() {
+  local ns=$1 min=$2 max=$3
+  local low=$((min > 1 ? min : 1))
+  create_hpa "$ns" "$low" "$max"
+  for _ in $(seq 1 30); do
+    if patch_hpa "$ns" "{\"maxReplicas\":$((max + 1))}" "${WRITER_ADMIN[@]}" | grep -q "$HPA_DENIAL"; then
+      break
+    fi
+    sleep 1
+  done
+  if ((low < max)); then
+    expect_allowed "hpa: $ns: writer raises minReplicas within bounds ($low -> $((low + 1)))" \
+      patch_hpa "$ns" "{\"minReplicas\":$((low + 1))}" "${WRITER_ADMIN[@]}"
+  fi
+  expect_hpa_denied "hpa: $ns: writer maxReplicas over the maximum ($((max + 1)))" \
+    patch_hpa "$ns" "{\"maxReplicas\":$((max + 1))}" "${WRITER_ADMIN[@]}"
+  if ((min > 1)); then
+    expect_hpa_denied "hpa: $ns: writer minReplicas below the minimum ($((min - 1)))" \
+      patch_hpa "$ns" "{\"minReplicas\":$((min - 1))}" "${WRITER_ADMIN[@]}"
+  fi
+  expect_hpa_denied "hpa: $ns: writer changes scaleTargetRef" \
+    patch_hpa "$ns" '{"scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"other"}}' "${WRITER_ADMIN[@]}"
+  expect_hpa_denied "hpa: $ns: writer changes metrics" \
+    patch_hpa "$ns" '{"metrics":[{"type":"Resource","resource":{"name":"cpu","target":{"type":"Utilization","averageUtilization":10}}}]}' "${WRITER_ADMIN[@]}"
+  expect_hpa_denied "hpa: $ns: writer adds behavior" \
+    patch_hpa "$ns" '{"behavior":{"scaleDown":{"stabilizationWindowSeconds":0}}}' "${WRITER_ADMIN[@]}"
+  expect_hpa_denied "hpa: $ns: writer over the maximum through autoscaling/v1" \
+    patch_hpa_v1 "$ns" "{\"maxReplicas\":$((max + 1))}" "${WRITER_ADMIN[@]}"
+  expect_allowed "hpa: $ns: another user changes metrics and bounds" \
+    patch_hpa "$ns" "{\"maxReplicas\":$((max + 1)),\"metrics\":[]}" "${OTHER_ADMIN[@]}"
+}
+hpa_cases "$NAMESPACE" "$MIN_REPLICAS" "$MAX_REPLICAS"
+if [[ -n "${NAMESPACE_2:-}" ]]; then
+  hpa_cases "$NAMESPACE_2" "$MIN_REPLICAS_2" "$MAX_REPLICAS_2"
+fi
+
 # The writer's own RBAC (no system:masters) in the first namespace.
 expect_allowed "deny mode: writer scale within bounds through its own RBAC" \
   patch_replicas "$NAMESPACE" "$DEPLOYMENT" "$((current + 1 > MIN_REPLICAS ? current + 1 : MIN_REPLICAS))" "${WRITER[@]}"
@@ -250,11 +351,13 @@ else
   echo "SKIP  second namespace: NAMESPACE_2 is not set"
 fi
 
-# The read Lambda's ClusterRole: get on the two objects, nothing else.
-expect_answer "policy reader: get the policy" yes \
-  get "validatingadmissionpolicies.admissionregistration.k8s.io/$POLICY" "${READER[@]}"
-expect_answer "policy reader: get the binding" yes \
-  get "validatingadmissionpolicybindings.admissionregistration.k8s.io/$POLICY" "${READER[@]}"
+# The read Lambda's ClusterRole: get on the two policies and their bindings, nothing else.
+for policy in "$POLICY" "$HPA_POLICY"; do
+  expect_answer "policy reader: get $policy" yes \
+    get "validatingadmissionpolicies.admissionregistration.k8s.io/$policy" "${READER[@]}"
+  expect_answer "policy reader: get the binding $policy" yes \
+    get "validatingadmissionpolicybindings.admissionregistration.k8s.io/$policy" "${READER[@]}"
+done
 expect_answer "policy reader: no other policy" no \
   get "validatingadmissionpolicies.admissionregistration.k8s.io/another-policy" "${READER[@]}"
 expect_answer "policy reader: no list" no \
@@ -262,16 +365,25 @@ expect_answer "policy reader: no list" no \
 expect_answer "policy reader: no patch" no \
   patch "validatingadmissionpolicybindings.admissionregistration.k8s.io/$POLICY" "${READER[@]}"
 
-# The writer's Role per namespace: get and patch on Deployments where any action is
-# allowed, get on ReplicaSets only where rollback is; never the scale subresource or delete.
+# The writer's Role per namespace: get on Deployments where any action is allowed, patch
+# where scale, restart or rollback is, get on ReplicaSets only where rollback is, get and
+# patch on HPAs only where adjust_hpa is; never the scale subresource or delete.
 rbac_cases() {
-  local ns=$1 actions=$2 any=no rollback=no
+  local ns=$1 actions=$2 any=no rollback=no hpa=no deployment=no
   [[ -n "$actions" ]] && any=yes
   [[ ",$actions," == *,rollback,* ]] && rollback=yes
+  [[ ",$actions," == *,adjust_hpa,* ]] && hpa=yes
+  [[ ",$actions," =~ ,(restart|rollback|scale), ]] && deployment=yes
   expect_answer "rbac: $ns: writer get deployments ($any)" "$any" \
     get deployments -n "$ns" "${WRITER[@]}"
-  expect_answer "rbac: $ns: writer patch deployments ($any)" "$any" \
+  expect_answer "rbac: $ns: writer patch deployments ($deployment)" "$deployment" \
     patch deployments -n "$ns" "${WRITER[@]}"
+  expect_answer "rbac: $ns: writer get horizontalpodautoscalers ($hpa, adjust_hpa)" "$hpa" \
+    get horizontalpodautoscalers.autoscaling -n "$ns" "${WRITER[@]}"
+  expect_answer "rbac: $ns: writer patch horizontalpodautoscalers ($hpa, adjust_hpa)" "$hpa" \
+    patch horizontalpodautoscalers.autoscaling -n "$ns" "${WRITER[@]}"
+  expect_answer "rbac: $ns: writer no delete horizontalpodautoscalers" no \
+    delete horizontalpodautoscalers.autoscaling -n "$ns" "${WRITER[@]}"
   expect_answer "rbac: $ns: writer get replicasets ($rollback, rollback)" "$rollback" \
     get replicasets -n "$ns" "${WRITER[@]}"
   expect_answer "rbac: $ns: writer no patch deployments/scale" no \
