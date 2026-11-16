@@ -351,6 +351,32 @@ def deployment_manifest(
     }
 
 
+def hpa_manifest(
+    name: str, target: str, minimum: int = 1, maximum: int = 3, namespace: str = NAMESPACE
+) -> dict[str, Any]:
+    """An HPA on CPU utilization. A fixture without CPU requests (best_effort) leaves its
+    metrics unavailable; the controller still keeps the count within the bounds."""
+    return {
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": target},
+            "minReplicas": minimum,
+            "maxReplicas": maximum,
+            "metrics": [
+                {
+                    "type": "Resource",
+                    "resource": {
+                        "name": "cpu",
+                        "target": {"type": "Utilization", "averageUtilization": 80},
+                    },
+                }
+            ],
+        },
+    }
+
+
 def best_effort_quota() -> dict[str, Any]:
     """Admits one BestEffort pod in the namespace: scaling a BestEffort fixture from 1 to 2
     leaves the second pod refused (ReplicaFailure), as in the live end-to-end test."""
@@ -540,6 +566,7 @@ class Harness:
         self.writer = writer
         self.apps = k8s.AppsV1Api(admin)
         self.core = k8s.CoreV1Api(admin)
+        self.autoscaling = k8s.AutoscalingV2Api(admin)
         self._set_env = set_env
         # The session's render: namespace_policy.json for the Lambdas, the YAML for the cluster.
         self.rendered = rendered
@@ -570,10 +597,11 @@ class Harness:
         self.audit_handler._settings = None
         self.audit_handler._s3 = None
         runtime = self.write.get_runtime()
-        # The two seams of the write Lambda's runtime: its Kubernetes client, here the
+        # The seams of the write Lambda's runtime: its Kubernetes clients, here the
         # impersonated writer (the read Lambda gets the reader through eks.ClientCache),
         # and its clock.
         runtime.apps = lambda: k8s.AppsV1Api(self.writer)
+        runtime.autoscaling = lambda: k8s.AutoscalingV2Api(self.writer)
         runtime.clock = lambda: time.time() + self.write_offset
 
     def write_now(self) -> int:
@@ -718,6 +746,18 @@ class Harness:
         self.created.append(("deployment", name, namespace))
         self.apps.create_namespaced_deployment(namespace, manifest)
         return {"namespace": namespace, "name": name}
+
+    def create_hpa(self, manifest: dict[str, Any]) -> dict[str, str]:
+        """An autoscaling/v2 HorizontalPodAutoscaler, deleted at cleanup before the
+        Deployments (cleanup runs in reverse order)."""
+        name = manifest["metadata"]["name"]
+        namespace = manifest["metadata"]["namespace"]
+        self.created.append(("horizontalpodautoscaler", name, namespace))
+        self.autoscaling.create_namespaced_horizontal_pod_autoscaler(namespace, manifest)
+        return {"namespace": namespace, "name": name}
+
+    def hpa(self, name: str, namespace: str = NAMESPACE) -> Any:
+        return self.autoscaling.read_namespaced_horizontal_pod_autoscaler(name, namespace)
 
     def deployment(self, name: str, namespace: str = NAMESPACE) -> Any:
         return self.apps.read_namespaced_deployment(name, namespace)

@@ -108,6 +108,9 @@ jobs:
           version: v0.31.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           cluster_name: kube-handrail-integration
+      # The HPA adjust cases run with metrics-server, pinned by version and checksum.
+      - name: metrics-server
+        run: tests/integration/metrics-server.sh
       - name: Integration tests
         env:
           KH_INTEGRATION: "1"

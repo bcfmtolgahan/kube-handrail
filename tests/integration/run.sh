@@ -3,7 +3,8 @@
 #
 # The cluster gets its own kubeconfig file in a temporary directory: the default kubeconfig
 # is never read or written. The node image is the one the CI jobs pin. AWS is moto only.
-# Needs Docker, kind, kubectl and terraform (the harness renders the namespace policy).
+# Needs Docker, kind, kubectl and terraform (the harness renders the namespace policy), and
+# network access for the pinned metrics-server manifest (metrics-server.sh).
 #
 # Environment:
 #   PYTHON        interpreter with requirements-dev.txt (default .venv/bin/python)
@@ -40,5 +41,6 @@ started=$(date +%s)
 # is ours, so a name taken meanwhile by someone else is never deleted.
 kind create cluster --name "$NAME" --image "$NODE_IMAGE" --kubeconfig "$KUBECONFIG" --wait 120s
 trap cleanup EXIT
+tests/integration/metrics-server.sh
 KH_INTEGRATION=1 "$PYTHON" -m pytest -q tests/integration "$@"
 echo "integration suite: $(($(date +%s) - started))s including the cluster"
