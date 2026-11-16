@@ -139,6 +139,9 @@ def full_ctx(custom: dict | None = None, request_id: str | None = "lambda-req") 
         ({}, None, None),
         # Values that are not short tokens are skipped, never logged or annotated.
         ({"bedrockAgentCoreAwsRequestId": "two\nlines"}, "lambda-req", "lambda-req"),
+        # A trailing newline too: the id goes into the User-Agent header, which must not
+        # break a line.
+        ({"bedrockAgentCoreAwsRequestId": "gw-req\n"}, "lambda-req", "lambda-req"),
         ({"bedrockAgentCoreAwsRequestId": "x" * 129}, "lambda-req", "lambda-req"),
         ({"bedrockAgentCoreAwsRequestId": True}, "lambda-req", "lambda-req"),
     ],

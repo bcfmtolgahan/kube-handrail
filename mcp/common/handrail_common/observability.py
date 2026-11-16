@@ -35,8 +35,8 @@ OK = "ok"
 ERROR_OUTCOMES = (INTERNAL, KUBERNETES_ERROR, ADMISSION_DENIED)
 
 # Only a short token is accepted: the value goes into logs, the plan record and a
-# Kubernetes annotation.
-_CORRELATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+# Kubernetes annotation and User-Agent; fullmatch, so a trailing newline is refused too.
+_CORRELATION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 _correlation_id: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 _caller: ContextVar[str | None] = ContextVar("caller", default=None)
@@ -49,7 +49,7 @@ _plan_id: ContextVar[str | None] = ContextVar("plan_id", default=None)
 def _valid(value: Any) -> str | None:
     if isinstance(value, int) and not isinstance(value, bool):
         value = str(value)
-    if isinstance(value, str) and _CORRELATION_ID.match(value):
+    if isinstance(value, str) and _CORRELATION_ID.fullmatch(value):
         return value
     return None
 
