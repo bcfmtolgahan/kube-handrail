@@ -48,7 +48,6 @@ output "guard_settings" {
     min_replicas               = var.min_replicas
     max_replicas               = var.max_replicas
     max_replica_step_percent   = var.max_replica_step_percent
-    verify_enabled             = var.verify_enabled
     verify_window_min_seconds  = var.verify_window_min_seconds
     gitops_markers             = var.gitops_markers
   }
@@ -80,8 +79,8 @@ output "sentinel_function_name" {
 }
 
 output "verifier_function_name" {
-  description = "Name of the verifier Lambda, or null when verification is disabled."
-  value       = one(aws_lambda_function.verifier[*].function_name)
+  description = "Name of the verifier Lambda."
+  value       = aws_lambda_function.verifier.function_name
 }
 
 output "alert_topic_arn" {

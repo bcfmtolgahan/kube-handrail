@@ -38,7 +38,6 @@ agents = {
 }
 
 # The verify cases use windows of 60 and 90 seconds.
-verify_enabled            = true
 verify_window_min_seconds = 60
 
 # Run the suite once per approval mode: client, then server.

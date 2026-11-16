@@ -51,9 +51,9 @@ AGENT_BUDGET_PREFIX = "budget#agent#"
 APPROVAL_REQUEST_PREFIX = "approval#global#"
 APPROVAL_REQUEST_WINDOW_SECONDS = 600
 
-# Without the caller interceptor (legacy mode) every plan is requested by the gateway's
-# machine principal class; with it, by agent:<name> (handrail_common.agents). Approvals come
-# only from human IAM principals.
+# Plans are requested by agent:<name> (handrail_common.agents). Records made before agent
+# identity name the gateway's machine principal class instead, and cannot be applied.
+# Approvals come only from human IAM principals.
 REQUESTER_GATEWAY = "mcp-gateway"
 # details.reason of the forbidden code when an agent names another agent's plan.
 NOT_REQUESTER = "not_requester"

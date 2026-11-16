@@ -143,8 +143,8 @@ def test_replica_step_details():
     assert exc.value.details == {"from": 3, "to": 10, "max_step": 3, "max_step_percent": 100}
 
 
-def verify_args(args: dict, enabled: bool = True, revert_allowed: bool = True):
-    return require_verify_args(args, enabled, (60, 1800), revert_allowed)
+def verify_args(args: dict, revert_allowed: bool = True):
+    return require_verify_args(args, (60, 1800), revert_allowed)
 
 
 @pytest.mark.parametrize("window", [60, 61, 1799, 1800])
@@ -162,7 +162,6 @@ def test_verify_window_outside_bounds_or_not_an_integer(window):
 def test_verify_arguments_are_optional():
     assert verify_args({}) == (None, False)
     assert verify_args({"revert_on_failure": False}) == (None, False)
-    assert verify_args({}, enabled=False) == (None, False)
 
 
 def test_revert_needs_an_explicit_window():
@@ -180,12 +179,3 @@ def test_revert_must_be_a_boolean(value):
 def test_revert_is_refused_where_it_is_not_supported():
     with pytest.raises(GuardError, match="not supported"):
         verify_args({"revert_on_failure": True, "verify_window_seconds": 60}, revert_allowed=False)
-
-
-@pytest.mark.parametrize(
-    "args",
-    [{"verify_window_seconds": 60}, {"revert_on_failure": True, "verify_window_seconds": 60}],
-)
-def test_verify_arguments_need_verification_on_the_server(args):
-    with pytest.raises(GuardError, match="not enabled"):
-        verify_args(args, enabled=False)

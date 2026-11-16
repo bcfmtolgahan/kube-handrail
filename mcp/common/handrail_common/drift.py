@@ -137,13 +137,13 @@ def allowed_clients(response: Mapping[str, Any]) -> list[str] | None:
 
 
 def compare_gateway_configuration(
-    expected_interceptor: str | None, expected_clients: Iterable[str], response: Mapping[str, Any]
+    expected_interceptor: str, expected_clients: Iterable[str], response: Mapping[str, Any]
 ) -> list[Finding]:
-    """The gateway must keep the interceptor that identifies agents (when one is deployed)
-    and allow only the agents' clients. A client missing from the list only locks that agent
-    out, so it is not drift."""
+    """The gateway must keep the interceptor that identifies agents and allow only the
+    agents' clients. A client missing from the list only locks that agent out, so it is not
+    drift."""
     findings = []
-    if expected_interceptor and not has_interceptor(response, expected_interceptor):
+    if not has_interceptor(response, expected_interceptor):
         findings.append(finding("gateway_config", "missing_interceptor", INTERCEPTOR_SUBJECT))
     clients = allowed_clients(response)
     if clients is None:

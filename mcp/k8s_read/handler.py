@@ -599,7 +599,7 @@ def _plan(
     template_from = template_hash(template)
     template_to = template_hash(action.template_to(plan_id, template, resolved))
     window = request.get("verify_window_seconds")
-    if window is None and settings.verify_enabled:
+    if window is None:
         # The default is recorded, not hashed: the consume schedules the check with it.
         window = settings.verify_window_default_seconds
 
@@ -618,8 +618,8 @@ def _plan(
         expires_at=now + settings.plan_ttl_seconds,
         retain_until=now + retention_seconds(settings),
         requested_by=requester(agent),
-        agent=agent.name if agent else None,
-        requested_client_id=agent.client_id if agent else None,
+        agent=agent.name,
+        requested_client_id=agent.client_id,
         status=STATUS_PLANNED,
         override_manual_change=override,
         impact=impact,
@@ -644,12 +644,10 @@ def _plan(
         # The plan rate limit was removed; the entry stays one release for clients that read it.
         if check == "plan_rate":
             preflight[-1]["skipped"] = True
-        # The per-agent checks, after the checks they follow; skipped in legacy mode.
+        # The per-agent checks, after the checks they follow.
         follows = {"arguments": "agent_enabled", "global_budget": "agent_budget"}.get(check)
         if follows is not None:
             preflight.append({"check": follows, "passed": True})
-            if agent is None:
-                preflight[-1]["skipped"] = True
     data: dict[str, Any] = {
         "plan_id": plan.plan_id,
         "diff": action.diff(plan),
@@ -659,9 +657,8 @@ def _plan(
         "expires_at": plan.expires_at,
         "requested_by": plan.requested_by,
         "correlation_id": correlation_id,
+        "verification": _verification(plan),
     }
-    if settings.verify_enabled:
-        data["verification"] = _verification(plan)
     return ok(data, truncated=impact["truncated"] or resolved.truncated)
 
 
@@ -680,9 +677,7 @@ def _verification(plan: Plan) -> dict[str, Any]:
 def _verify_request(
     args: Mapping[str, Any], settings: Settings, revert_allowed: bool = False
 ) -> tuple[int | None, bool]:
-    return require_verify_args(
-        args, settings.verify_enabled, settings.verify_window_bounds, revert_allowed
-    )
+    return require_verify_args(args, settings.verify_window_bounds, revert_allowed)
 
 
 # --- scale_deployment ---------------------------------------------------------
@@ -1008,8 +1003,7 @@ def request_approval(
     if settings.approval_topic_arn is None:
         # Fail before the plan changes state: an approval nobody hears about cannot come.
         raise GuardError(INTERNAL, "no approval destination is configured")
-    # Only the plan's own agent may ask, while its kill switch is on; in legacy mode every
-    # plan is the gateway's.
+    # Only the plan's own agent may ask, while its kill switch is on.
     agent = guard_plan(settings, clients.ssm)
     correlation_id = current_correlation_id()
     item, retry_after = clients.store.request_approval(
@@ -1019,7 +1013,7 @@ def request_approval(
         settings.approval_request_cooldown_seconds,
         settings.approval_request_limit,
         correlation_id,
-        requester(agent) if agent else None,
+        requester(agent),
     )
     data: dict[str, Any] = {
         "plan_id": plan_id,

@@ -3,6 +3,10 @@ import pytest
 from handrail_common.config import ConfigError, load_settings
 from handrail_common.killswitch import KillSwitch
 
+AGENTS = (
+    '{"client-a": {"name": "smoke_test", "hourly_apply_budget": 2},'
+    ' "client-b": {"name": "devops_agent"}}'
+)
 BASE = {
     "CLUSTER_NAME": "demo",
     "PLANS_TABLE": "plans",
@@ -10,6 +14,8 @@ BASE = {
     "MIN_REPLICAS": "0",
     "MAX_REPLICAS": "5",
     "PLAN_TTL_SECONDS": "300",
+    "AGENTS": AGENTS,
+    "AGENT_KILL_SWITCH_PREFIX": "/kh/agents/",
 }
 
 
@@ -28,21 +34,20 @@ def test_settings_parse():
     assert s.approval_topic_arn is None and s.approval_url is None
 
 
-IDENTITY = {"CALLER_INTERCEPTOR": "true", "AGENT_KILL_SWITCH_PREFIX": "/kh/agents/"}
-AGENTS = (
-    '{"client-a": {"name": "smoke_test", "hourly_apply_budget": 2},'
-    ' "client-b": {"name": "devops_agent"}}'
-)
+@pytest.mark.parametrize("key", ["AGENTS", "AGENT_KILL_SWITCH_PREFIX"])
+def test_agents_and_their_switch_prefix_are_required(key):
+    """Every caller must be an agent, so the Lambda does not start without them, whatever
+    a removed CALLER_INTERCEPTOR says."""
+    env = BASE | {"CALLER_INTERCEPTOR": "false"}
+    del env[key]
+    with pytest.raises(ConfigError):
+        load_settings(env)
+    with pytest.raises(ConfigError):
+        load_settings(env | {key: " "})
 
 
-def test_legacy_mode_ignores_agents():
-    s = load_settings(BASE | {"AGENTS": "not json"})
-    assert s.identity_required is False and s.agents == {}
-
-
-def test_identity_mode_parses_agents_by_client_id():
-    s = load_settings(BASE | IDENTITY | {"AGENTS": AGENTS})
-    assert s.identity_required is True
+def test_agents_are_parsed_by_client_id():
+    s = load_settings(BASE | {"AGENTS": AGENTS})
     assert {cid: a.name for cid, a in s.agents.items()} == {
         "client-a": "smoke_test",
         "client-b": "devops_agent",
@@ -54,7 +59,7 @@ def test_identity_mode_parses_agents_by_client_id():
         2,
         10,
     )
-    s = load_settings(BASE | IDENTITY | {"AGENTS": AGENTS, "AGENT_HOURLY_APPLY_BUDGET": "4"})
+    s = load_settings(BASE | {"AGENTS": AGENTS, "AGENT_HOURLY_APPLY_BUDGET": "4"})
     assert s.agents["client-b"].hourly_apply_budget == s.agent_budget("devops_agent") == 4
 
 
@@ -62,13 +67,6 @@ def test_identity_mode_parses_agents_by_client_id():
 def test_the_default_agent_budget_must_be_positive(budget):
     with pytest.raises(ConfigError):
         load_settings(BASE | {"AGENT_HOURLY_APPLY_BUDGET": budget})
-
-
-def test_identity_mode_needs_the_switch_prefix():
-    env = BASE | IDENTITY | {"AGENTS": AGENTS}
-    del env["AGENT_KILL_SWITCH_PREFIX"]
-    with pytest.raises(ConfigError):
-        load_settings(env)
 
 
 @pytest.mark.parametrize(
@@ -93,8 +91,10 @@ def test_identity_mode_needs_the_switch_prefix():
         '{"client-a": {"name": "x", "hourly_apply_budget": 1.5}}',
     ],
 )
-def test_identity_mode_refuses_bad_agents(agents):
-    env = BASE | IDENTITY | ({} if agents is None else {"AGENTS": agents})
+def test_bad_agents_are_refused(agents):
+    env = BASE | {"AGENTS": agents}
+    if agents is None:
+        del env["AGENTS"]
     with pytest.raises(ConfigError):
         load_settings(env)
 
@@ -232,23 +232,19 @@ def test_killswitch_state_tells_unreadable_from_off():
 
 def test_verify_settings_parse():
     s = load_settings(BASE)
-    assert s.verify_enabled is False
     assert (s.verify_window_default_seconds, s.verify_window_bounds) == (120, (60, 1800))
     assert s.verify_grace_seconds == 300
     s = load_settings(
         BASE
         | {
-            "VERIFY_ENABLED": "true",
             "VERIFY_WINDOW_DEFAULT_SECONDS": "90",
             "VERIFY_WINDOW_MIN_SECONDS": "90",
             "VERIFY_WINDOW_MAX_SECONDS": "600",
             "VERIFY_GRACE_SECONDS": "120",
         }
     )
-    assert s.verify_enabled is True
     assert (s.verify_window_default_seconds, s.verify_window_bounds) == (90, (90, 600))
     assert s.verify_grace_seconds == 120
-    assert load_settings(BASE | {"VERIFY_ENABLED": "yes"}).verify_enabled is False
 
 
 @pytest.mark.parametrize(

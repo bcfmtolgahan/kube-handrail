@@ -83,7 +83,7 @@ def test_other_methods_pass_through_unchanged():
 
 
 KEY = "test-caller-key"
-IDENTITY = {"CALLER_INTERCEPTOR": "true", "CALLER_KEY": KEY}
+IDENTITY = {"CALLER_KEY": KEY}
 
 
 def test_with_a_key_the_caller_is_signed(monkeypatch):
@@ -111,11 +111,13 @@ def test_interceptor_output_round_trips_through_pop_caller(monkeypatch):
     assert arguments == {"a": 1}
 
 
-def test_pop_caller_trusts_only_a_signed_argument_with_the_interceptor_enabled():
+def test_pop_caller_trusts_only_a_signed_argument():
     args = {"replicas": 2, CALLER_ARGUMENT: f"abc.{caller_signature(KEY, 'abc')}"}
     assert pop_caller(dict(args), IDENTITY) == "abc"
+    # A removed CALLER_INTERCEPTOR switch changes nothing; without the key nothing is trusted.
+    assert pop_caller(dict(args), {**IDENTITY, "CALLER_INTERCEPTOR": "false"}) == "abc"
     assert pop_caller(dict(args), {"CALLER_INTERCEPTOR": "true"}) is None
-    assert pop_caller(dict(args), {**IDENTITY, "CALLER_INTERCEPTOR": "false"}) is None
+    assert pop_caller(dict(args), {"CALLER_KEY": ""}) is None
     assert pop_caller(dict(args), {}) is None
     stripped = dict(args)
     pop_caller(stripped, {})

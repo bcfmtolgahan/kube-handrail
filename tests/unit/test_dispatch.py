@@ -163,7 +163,7 @@ def test_handler_sees_the_correlation_id(capsys):
 
 def test_one_record_per_successful_call(capsys):
     handlers = {"x": lambda args: ok({"plan_id": PLAN_ID})}
-    env = {"CALLER_INTERCEPTOR": "true", "CALLER_KEY": KEY, "METRIC_NAMESPACE": "kh/tools"}
+    env = {"CALLER_KEY": KEY, "METRIC_NAMESPACE": "kh/tools"}
     event = {"_kube_handrail_caller": signed("client-1")}
     dispatch(handlers, event, full_ctx({"bedrockAgentCoreAwsRequestId": "gw-req"}), env)
 
@@ -266,7 +266,7 @@ def test_unverified_caller_is_null(capsys):
 def test_caller_and_channel_are_bound_only_during_the_call(capsys):
     seen = []
     handlers = {"x": lambda args: seen.append((current_caller(), current_channel())) or ok({})}
-    env = {"CALLER_INTERCEPTOR": "true", "CALLER_KEY": KEY}
+    env = {"CALLER_KEY": KEY}
     dispatch(handlers, {"_kube_handrail_caller": signed("client-1")}, full_ctx(), env)
     custom = {"kubeHandrailChannel": "approval-api"}
     dispatch(handlers, {}, full_ctx(custom), env)
@@ -274,7 +274,7 @@ def test_caller_and_channel_are_bound_only_during_the_call(capsys):
     assert (current_caller(), current_channel()) == (None, "gateway")
 
 
-def test_a_forged_caller_is_ignored_in_legacy_mode(capsys):
+def test_without_a_key_a_signed_caller_is_ignored(capsys):
     seen = []
     handlers = {"x": lambda args: seen.append((current_caller(), args)) or ok({})}
     dispatch(handlers, {"_kube_handrail_caller": signed("forged"), "a": 1}, full_ctx(), {})
@@ -296,10 +296,10 @@ def test_a_forged_caller_is_ignored_in_legacy_mode(capsys):
         ["client-1"],
     ],
 )
-def test_an_unsigned_or_forged_caller_is_not_trusted_in_identity_mode(capsys, value):
+def test_an_unsigned_or_forged_caller_is_not_trusted(capsys, value):
     seen = []
     handlers = {"x": lambda args: seen.append((current_caller(), args)) or ok({})}
-    env = {"CALLER_INTERCEPTOR": "true", "CALLER_KEY": KEY}
+    env = {"CALLER_KEY": KEY}
     dispatch(handlers, {"_kube_handrail_caller": value, "a": 1}, full_ctx(), env)
     assert seen == [(None, {"a": 1})]
     (record,) = records(capsys)
@@ -309,7 +309,7 @@ def test_an_unsigned_or_forged_caller_is_not_trusted_in_identity_mode(capsys, va
 def test_without_a_key_no_caller_is_trusted(capsys):
     seen = []
     handlers = {"x": lambda args: seen.append(current_caller()) or ok({})}
-    env = {"CALLER_INTERCEPTOR": "true"}
+    env = {"CALLER_KEY": ""}
     dispatch(handlers, {"_kube_handrail_caller": signed("client-1")}, full_ctx(), env)
     dispatch(handlers, {"_kube_handrail_caller": "client-1"}, full_ctx(), env)
     assert seen == [None, None]

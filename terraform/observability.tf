@@ -52,8 +52,7 @@ resource "aws_cloudwatch_metric_alarm" "tool_lambda_errors" {
 # One dashboard over the metrics the Lambdas already emit: tool calls per plan and apply
 # tool, guard rejections by code, tool errors, the sentinel's drift and unknown results,
 # the verifier's runs, backlog and reverts, and the audit record's dead letters and lag.
-# It follows sentinel_enabled like the alarms; the verifier and audit widgets follow
-# verify_enabled and audit_enabled.
+# It follows sentinel_enabled like the alarms; the audit widgets follow audit_enabled.
 
 locals {
   dashboard_tools = flatten([for fn in values(local.functions) : [for tool in fn.tools : tool.name]])
@@ -90,7 +89,7 @@ locals {
         ]
       }),
     ],
-    var.verify_enabled ? [
+    [
       jsonencode({
         title = "Verifier: runs and backlog (Due stays above Processed while it falls behind)"
         metrics = [
@@ -107,7 +106,7 @@ locals {
           [local.verifier_metric_namespace, "Reverts"],
         ]
       }),
-    ] : [],
+    ],
     var.audit_enabled ? [
       jsonencode({
         title   = "Audit record: dead letters (records given up on)"

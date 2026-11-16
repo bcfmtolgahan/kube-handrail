@@ -34,10 +34,9 @@ expect_elevated_actions     = true
 alert_email                 = ""
 
 # Agent identity (mcp/CONTRACT.md, Agent identity). One OAuth client per agent; an
-# entry without client_id gets a Cognito app client. The interceptor identifies the
-# caller; false is the legacy mode without per-agent attribution or limits. Per-agent
-# kill switches are /<name_prefix>/agents/<agent>/enabled (agent_kill_switch_parameters).
-caller_interceptor_enabled = true
+# entry without client_id gets a Cognito app client. The gateway interceptor identifies
+# the caller. Per-agent kill switches are /<name_prefix>/agents/<agent>/enabled
+# (agent_kill_switch_parameters).
 agents = {
   devops_agent = {}
   smoke_test   = { hourly_apply_budget = 30 } # the smoke and end-to-end tests
@@ -47,7 +46,6 @@ agent_hourly_apply_budget = 10
 # Verification (mcp/CONTRACT.md, Verification and revert). Each apply is checked once
 # its window has passed, by a verifier Lambda that runs every minute; plans may pin
 # verify_window_seconds within the bounds below.
-verify_enabled                = true
 verify_window_default_seconds = 120
 verify_window_min_seconds     = 60
 verify_window_max_seconds     = 1800

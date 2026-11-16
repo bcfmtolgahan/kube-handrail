@@ -13,7 +13,6 @@ from handrail_common.killswitch import KillSwitch
 from handrail_common.observability import CHANNEL_GATEWAY, current_caller, current_channel
 from handrail_common.plans import (
     GLOBAL_BUDGET_WINDOW_SECONDS,
-    REQUESTER_GATEWAY,
     Plan,
     PlanStore,
     agent_budget_error,
@@ -21,13 +20,13 @@ from handrail_common.plans import (
 from handrail_common.validation import GuardError
 
 REQUESTER_PREFIX = "agent:"
-# details.reason of the forbidden code when identity mode finds no configured agent.
+# details.reason of the forbidden code when the caller is no configured agent.
 AGENT_UNKNOWN = "agent_unknown"
 
 
-def requester(agent: Agent | None) -> str:
-    """The plan record's requested_by: agent:<name>, or the gateway class in legacy mode."""
-    return REQUESTER_GATEWAY if agent is None else f"{REQUESTER_PREFIX}{agent.name}"
+def requester(agent: Agent) -> str:
+    """The plan record's requested_by: agent:<name>."""
+    return f"{REQUESTER_PREFIX}{agent.name}"
 
 
 def agent_unknown_error(message: str) -> GuardError:
@@ -35,11 +34,9 @@ def agent_unknown_error(message: str) -> GuardError:
     return GuardError(FORBIDDEN, message, {"reason": AGENT_UNKNOWN})
 
 
-def resolve_caller(settings: Settings) -> Agent | None:
-    """The verified caller's agent; None in legacy mode. In identity mode a caller that is
-    missing, `unknown` or not in AGENTS is refused."""
-    if not settings.identity_required:
-        return None
+def resolve_caller(settings: Settings) -> Agent:
+    """The verified caller's agent. A caller that is missing, `unknown` or not in AGENTS is
+    refused."""
     agent = settings.agents.get(current_caller() or "")
     if agent is None:
         raise agent_unknown_error("the caller is not a configured agent")
@@ -58,40 +55,36 @@ def check_agent_enabled(ssm: Any, settings: Settings, name: str) -> None:
         )
 
 
-def guard_plan(settings: Settings, ssm: Any) -> Agent | None:
+def guard_plan(settings: Settings, ssm: Any) -> Agent:
     """Plan and request_approval: the agent the plan is for, whose kill switch must be on,
     before any cluster read."""
     agent = resolve_caller(settings)
-    if agent is not None:
-        check_agent_enabled(ssm, settings, agent.name)
+    check_agent_enabled(ssm, settings, agent.name)
     return agent
 
 
-def check_agent_budget(store: PlanStore, agent: Agent | None, now: int) -> None:
+def check_agent_budget(store: PlanStore, agent: Agent, now: int) -> None:
     """Plan only: the agent's counter for this clock hour, read; apply takes the unit."""
-    if agent is not None and store.agent_applies(agent.name, now) >= agent.hourly_apply_budget:
+    if store.agent_applies(agent.name, now) >= agent.hourly_apply_budget:
         raise agent_budget_error(
             agent.name, now - now % GLOBAL_BUDGET_WINDOW_SECONDS, agent.hourly_apply_budget
         )
 
 
 def guard_apply(settings: Settings) -> str | None:
-    """The requester the plan must have, for the consume condition. A gateway apply in
-    identity mode must come from the plan's own agent. The approval channel carries no
-    caller: the approval condition applies there, and the plan's agent is charged."""
+    """The requester the plan must have, for the consume condition. A gateway apply must
+    come from the plan's own agent. The approval channel carries no caller: the approval
+    condition applies there, and the plan's agent is charged."""
     if current_channel() != CHANNEL_GATEWAY:
         return None
-    agent = resolve_caller(settings)
-    return None if agent is None else requester(agent)
+    return requester(resolve_caller(settings))
 
 
 def check_plan_agent(settings: Settings, ssm: Any, plan: Plan) -> None:
-    """After the consume, on every channel: in identity mode the plan must name its agent,
-    and that agent's kill switch must be on. Checked here because on the approval channel
-    the agent is known only from the record. A plan made before identity mode (requested by
-    the gateway class) cannot be applied; plan again."""
-    if not settings.identity_required:
-        return
+    """After the consume, on every channel: the plan must name its agent, and that agent's
+    kill switch must be on. Checked here because on the approval channel the agent is known
+    only from the record. A plan made before agent identity (requested by the gateway
+    class) cannot be applied; plan again."""
     if plan.agent is None:
         raise agent_unknown_error("the plan names no agent; plan again")
     check_agent_enabled(ssm, settings, plan.agent)
@@ -100,5 +93,5 @@ def check_plan_agent(settings: Settings, ssm: Any, plan: Plan) -> None:
 def take_agent_budget(store: PlanStore, settings: Settings, plan: Plan, now: int) -> None:
     """Apply only, before the global unit: one unit of the plan's agent's hourly budget,
     whichever channel applies it."""
-    if settings.identity_required and plan.agent is not None:
+    if plan.agent is not None:
         store.take_agent_budget(plan.agent, now, settings.agent_budget(plan.agent))

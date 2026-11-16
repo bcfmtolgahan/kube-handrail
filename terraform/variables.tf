@@ -183,12 +183,6 @@ variable "alert_email" {
   default     = ""
 }
 
-variable "caller_interceptor_enabled" {
-  description = "Attach the gateway request interceptor that passes the verified OAuth client_id to the tool Lambdas, which then identify each agent by it and refuse writes from unknown callers (mcp/CONTRACT.md, Agent identity). false is the legacy mode: no per-agent attribution or limits."
-  type        = bool
-  default     = true
-}
-
 variable "agents" {
   description = "Agents by name, one OAuth client each. An entry without client_id gets a Cognito app client created here; with client_id, that existing client of the user pool is allowed instead. hourly_apply_budget overrides agent_hourly_apply_budget for that agent. The default keys are the app clients earlier versions created, so they are kept on upgrade."
   type = map(object({
@@ -226,12 +220,6 @@ variable "agent_hourly_apply_budget" {
     condition     = var.agent_hourly_apply_budget > 0 && floor(var.agent_hourly_apply_budget) == var.agent_hourly_apply_budget
     error_message = "agent_hourly_apply_budget must be a positive integer."
   }
-}
-
-variable "verify_enabled" {
-  description = "Verify every applied plan once its verification window has passed (mcp/CONTRACT.md, Verification and revert): applies schedule the check, a scheduled verifier Lambda runs it, and get_plan_outcome reports it. false: plans refuse verify_window_seconds and revert_on_failure, and nothing is verified."
-  type        = bool
-  default     = true
 }
 
 variable "verify_window_default_seconds" {
@@ -422,4 +410,19 @@ variable "audit_force_destroy" {
   description = "Let terraform destroy empty the audit bucket. Objects under GOVERNANCE retention are deleted only if the caller is allowed s3:BypassGovernanceRetention; COMPLIANCE objects cannot be deleted before their retention ends. Test deployments only."
   type        = bool
   default     = false
+}
+
+# Deprecated and ignored: the interceptor and the verifier are always deployed. Kept one
+# release so existing tfvars still plan; the check "deprecated_switches" in main.tf warns
+# while either is set.
+variable "caller_interceptor_enabled" {
+  description = "Deprecated, ignored: the gateway request interceptor is always deployed (legacy mode was removed). Remove it from your tfvars."
+  type        = bool
+  default     = null
+}
+
+variable "verify_enabled" {
+  description = "Deprecated, ignored: every applied plan is verified. Remove it from your tfvars."
+  type        = bool
+  default     = null
 }

@@ -43,6 +43,15 @@ NOW = 1_700_000_000
 REGION = "us-east-1"
 TABLE = "plans-test"
 PARAM = "/handrail/remediation-enabled"
+AGENTS = '{"client-a": {"name": "smoke_test"}, "client-b": {"name": "devops_agent"}}'
+SWITCHES = "/handrail/agents/"
+CALLER_KEY = "test-caller-key"
+# The record fields of a plan made by agent smoke_test (client-a), the default caller.
+AGENT_FIELDS = {
+    "requested_by": "agent:smoke_test",
+    "agent": "smoke_test",
+    "requested_client_id": "client-a",
+}
 ENV = {
     "CLUSTER_NAME": "test-cluster",
     "PLANS_TABLE": TABLE,
@@ -55,6 +64,8 @@ ENV = {
     "MAX_REPLICA_STEP_PERCENT": "200",
     # The guard cases below are the same in every mode; server approval has its own tests.
     "APPROVAL_MODE": "client",
+    "AGENTS": AGENTS,
+    "AGENT_KILL_SWITCH_PREFIX": SWITCHES,
 }
 GATEWAY_REQUEST_ID = "6c1f9a52-1f0e-4d7e-9a0b-3d1c2b4a5e6f"
 CONTEXT = SimpleNamespace(
@@ -73,6 +84,8 @@ def aws(monkeypatch, plans_table):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
+    # dispatch trusts the caller argument only when signed with the key, as in the Lambda.
+    monkeypatch.setenv("CALLER_KEY", CALLER_KEY)
     with mock_aws():
         plans_table(TABLE, REGION)
         yield
@@ -160,12 +173,17 @@ def runtime(enabled: str = "true") -> tuple[handler.Runtime, MagicMock]:
     apps.patch_namespaced_deployment.return_value = SimpleNamespace(
         metadata=SimpleNamespace(resource_version="12346")
     )
+    for name in ("smoke_test", "devops_agent"):
+        ssm.put_parameter(
+            Name=f"{SWITCHES}{name}/enabled", Value="true", Type="String", Overwrite=True
+        )
     rt = handler.Runtime(
         settings=load_settings(ENV, write=True),
         kill_switch=KillSwitch(ssm, PARAM),
         store=PlanStore.from_name(TABLE, REGION),
         apps=lambda: apps,
         clock=lambda: NOW,
+        ssm=ssm,
     )
     return rt, apps
 
@@ -195,14 +213,20 @@ def create_plan(
         uid=UID,
         created_at=NOW,
         expires_at=expires_at,
+        **AGENT_FIELDS,
     )
     store.create(plan)
     return plan
 
 
+def signed(client: str = "client-a") -> dict:
+    """The reserved caller argument as the gateway interceptor sets it."""
+    return {"_kube_handrail_caller": f"{client}.{caller_signature(CALLER_KEY, client)}"}
+
+
 def apply(plan_id: str, replicas: int = 3, **overrides) -> dict:
     event = {"plan_id": plan_id, "namespace": "sandbox", "name": "web", "replicas": replicas}
-    return handler.lambda_handler({**event, **overrides}, CONTEXT)
+    return handler.lambda_handler({**event, **signed(), **overrides}, CONTEXT)
 
 
 def item(plan_id: str) -> dict:
@@ -245,10 +269,11 @@ def test_apply_success_dry_run_then_real(rt):
     assert dry.args == real.args == ("web", "sandbox", body)
     assert body["spec"] == {"replicas": 3}
     assert body["metadata"]["resourceVersion"] == "12345"
-    # Both annotations change in the one patch, so the apply bumps generation once.
+    # The annotations change in the one patch, so the apply bumps generation once.
     assert body["metadata"]["annotations"] == {
         handler.LAST_PLAN_ANNOTATION: plan.plan_id,
         "kube-handrail.io/correlation-id": GATEWAY_REQUEST_ID,
+        handler.REQUESTED_BY_ANNOTATION: "agent:smoke_test",
     }
 
     record = item(plan.plan_id)
@@ -1156,6 +1181,7 @@ def create_restart_plan(store: PlanStore, **overrides) -> Plan:
         expires_at=NOW + 300,
         template_from="sha256:from",
         template_to="sha256:to",
+        **AGENT_FIELDS,
     )
     plan = dataclasses.replace(plan, **overrides)
     store.create(plan)
@@ -1164,7 +1190,7 @@ def create_restart_plan(store: PlanStore, **overrides) -> Plan:
 
 def apply_restart(plan_id: str, **overrides) -> dict:
     event = {"plan_id": plan_id, "namespace": "sandbox", "name": "web"}
-    return handler.lambda_handler({**event, **overrides}, RESTART_CONTEXT)
+    return handler.lambda_handler({**event, **signed(), **overrides}, RESTART_CONTEXT)
 
 
 def test_restart_sets_only_the_plan_annotations(rt):
@@ -1196,6 +1222,7 @@ def test_restart_sets_only_the_plan_annotations(rt):
                 "annotations": {
                     handler.LAST_PLAN_ANNOTATION: plan.plan_id,
                     "kube-handrail.io/correlation-id": GATEWAY_REQUEST_ID,
+                    handler.REQUESTED_BY_ANNOTATION: "agent:smoke_test",
                 },
             },
             "spec": {"template": {"metadata": {"annotations": {RESTART_ANNOTATION: plan.plan_id}}}},
@@ -1366,6 +1393,7 @@ def create_rollback_plan(store: PlanStore, override: bool = False, **overrides) 
         target_rs_uid=RS_UID,
         images=[{"container": "nginx", "init": False, "from": "a", "to": "b", "changed": True}],
         fields_changed=["spec.containers[nginx].image"],
+        **AGENT_FIELDS,
     )
     plan = dataclasses.replace(plan, **overrides)
     store.create(plan)
@@ -1374,7 +1402,7 @@ def create_rollback_plan(store: PlanStore, override: bool = False, **overrides) 
 
 def apply_rollback(plan_id: str, **overrides) -> dict:
     event = {"plan_id": plan_id, "namespace": "sandbox", "name": "web", "revision": 3}
-    return handler.lambda_handler({**event, **overrides}, ROLLBACK_CONTEXT)
+    return handler.lambda_handler({**event, **signed(), **overrides}, ROLLBACK_CONTEXT)
 
 
 @pytest.fixture
@@ -1427,6 +1455,11 @@ def test_rollback_writes_exactly_the_checked_template_as_a_json_patch(rollback_r
                 "op": "add",
                 "path": "/metadata/annotations/kube-handrail.io~1correlation-id",
                 "value": GATEWAY_REQUEST_ID,
+            },
+            {
+                "op": "add",
+                "path": "/metadata/annotations/kube-handrail.io~1requested-by",
+                "value": "agent:smoke_test",
             },
         ],
     )
@@ -1673,14 +1706,7 @@ def test_server_mode_rollback_after_approval(server_rt):
 
 # --- Agent identity -----------------------------------------------------------
 
-AGENTS = '{"client-a": {"name": "smoke_test"}, "client-b": {"name": "devops_agent"}}'
-SWITCHES = "/handrail/agents/"
-CALLER_KEY = "test-caller-key"
-IDENTITY_ENV = ENV | {
-    "CALLER_INTERCEPTOR": "true",
-    "AGENTS": AGENTS,
-    "AGENT_KILL_SWITCH_PREFIX": SWITCHES,
-}
+IDENTITY_ENV = ENV
 APPROVAL_CONTEXT = SimpleNamespace(
     client_context=SimpleNamespace(
         custom={
@@ -1693,17 +1719,8 @@ APPROVAL_CONTEXT = SimpleNamespace(
 
 
 @pytest.fixture
-def identity_rt(aws, monkeypatch):
-    # dispatch trusts the caller argument only with the interceptor and its key, as in the Lambda.
-    monkeypatch.setenv("CALLER_INTERCEPTOR", "true")
-    monkeypatch.setenv("CALLER_KEY", CALLER_KEY)
-    rt, apps = runtime()
-    rt.settings = load_settings(IDENTITY_ENV, write=True)
-    rt.ssm = boto3.client("ssm", region_name=REGION)
-    for name in ("smoke_test", "devops_agent"):
-        set_agent_switch(rt, name, "true")
-    monkeypatch.setattr(handler, "get_runtime", lambda: rt)
-    return rt, apps
+def identity_rt(rt):
+    return rt
 
 
 def set_agent_switch(rt, name: str, value: str) -> None:
@@ -1723,6 +1740,11 @@ def create_agent_plan(store: PlanStore, agent: str | None = "smoke_test") -> Pla
     )
     store.create(plan)
     return plan
+
+
+def create_pre_identity_plan(store: PlanStore) -> Plan:
+    """A record made before agent identity: requested by the gateway class, no agent."""
+    return create_agent_plan(store, None)
 
 
 def apply_as(plan_id: str, client: str | None, context=CONTEXT) -> dict:
@@ -1781,10 +1803,10 @@ def test_identity_apply_with_an_unsigned_caller_is_forbidden(identity_rt):
     apps.patch_namespaced_deployment.assert_not_called()
 
 
-def test_identity_apply_of_a_legacy_plan_is_forbidden(identity_rt):
-    """A plan made before identity mode names the gateway class; it must be planned again."""
+def test_identity_apply_of_a_pre_identity_plan_is_forbidden(identity_rt):
+    """A plan made before agent identity names the gateway class; it must be planned again."""
     runtime_, _ = identity_rt
-    plan = create_plan(runtime_.store)
+    plan = create_pre_identity_plan(runtime_.store)
     response = apply_as(plan.plan_id, "client-a")
     assert response["error"]["details"] == {"reason": "not_requester"}
     assert item(plan.plan_id)["used"] is False
@@ -1801,21 +1823,12 @@ def test_identity_apply_on_the_approval_channel_needs_no_caller(identity_rt):
 
 def test_identity_approval_channel_refuses_a_plan_without_an_agent(identity_rt):
     runtime_, apps = identity_rt
-    plan = create_plan(runtime_.store)
+    plan = create_pre_identity_plan(runtime_.store)
     response = apply_as(plan.plan_id, None, APPROVAL_CONTEXT)
     assert response["error"]["details"] == {"reason": "agent_unknown"}
     record = item(plan.plan_id)
     assert (record["used"], record["result"]) == (True, "forbidden")
     apps.patch_namespaced_deployment.assert_not_called()
-
-
-def test_legacy_apply_records_the_channel_and_no_agent_annotation(rt):
-    runtime_, apps = rt
-    plan = create_plan(runtime_.store)
-    assert apply(plan.plan_id, _kube_handrail_caller="client-a")["ok"] is True
-    assert item(plan.plan_id)["channel"] == "gateway"
-    annotations = apps.patch_namespaced_deployment.call_args.args[2]["metadata"]["annotations"]
-    assert handler.REQUESTED_BY_ANNOTATION not in annotations
 
 
 def test_rollback_patch_sets_the_requested_by_annotation():
@@ -1905,7 +1918,7 @@ def test_identity_apply_refused_by_another_check_takes_no_agent_unit(identity_rt
 
 # --- Verification -------------------------------------------------------------
 
-VERIFY_ENV = ENV | {"VERIFY_ENABLED": "true"}
+VERIFY_ENV = ENV
 VERIFIER_CONTEXT = SimpleNamespace(
     client_context=SimpleNamespace(
         custom={
@@ -2008,11 +2021,13 @@ def test_apply_with_the_default_window_schedules_it(verify_rt):
     assert item(plan.plan_id)["verify_at"] == NOW + 120
 
 
-def test_apply_without_verification_schedules_nothing(rt):
+def test_apply_of_a_plan_without_a_window_schedules_the_default(rt):
+    """A record made before every plan recorded a window gets the default one."""
     runtime_, _ = rt
     plan = create_plan(runtime_.store)
     assert apply(plan.plan_id)["ok"] is True
-    assert "verify_at" not in item(plan.plan_id)
+    record = item(plan.plan_id)
+    assert (record["verify_at"], record["verify_queue"]) == (NOW + 120, "due")
 
 
 def test_apply_with_another_window_is_plan_mismatch(verify_rt):
@@ -2032,14 +2047,6 @@ def test_a_record_with_another_window_is_plan_mismatch(verify_rt):
         ExpressionAttributeValues={":w": 1800},
     )
     assert error_code(apply(plan.plan_id, verify_window_seconds=60)) == "plan_mismatch"
-
-
-def test_apply_with_a_window_needs_verification_on_the_server(rt):
-    runtime_, _ = rt
-    plan = create_plan(runtime_.store)
-    response = apply(plan.plan_id, verify_window_seconds=60)
-    assert error_code(response) == "invalid_argument"
-    assert item(plan.plan_id)["used"] is False
 
 
 def test_verification_before_verify_at_does_nothing(verify_rt):
@@ -2316,15 +2323,7 @@ def test_a_revert_takes_no_budget_and_skips_the_history_checks(verify_rt):
 
 def test_a_revert_is_not_stopped_by_the_agents_own_switch(identity_rt):
     runtime_, apps = identity_rt
-    runtime_.settings = load_settings(IDENTITY_ENV | {"VERIFY_ENABLED": "true"}, write=True)
-    plan = dataclasses.replace(
-        create_reverting_plan(runtime_.store),
-        plan_id=str(uuid.uuid4()),
-        requested_by="agent:smoke_test",
-        agent="smoke_test",
-        requested_client_id="client-a",
-    )
-    runtime_.store.create(plan)
+    plan = create_reverting_plan(runtime_.store)
     event = {
         "plan_id": plan.plan_id,
         "namespace": "sandbox",

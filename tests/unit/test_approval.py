@@ -147,7 +147,7 @@ def test_consume_by_another_agent_is_forbidden_and_leaves_the_plan_usable(store)
 
 
 def test_a_plan_of_the_gateway_class_is_forbidden_to_an_agent(store):
-    """A plan made in legacy mode, open across the upgrade, must be planned again."""
+    """A plan made before agent identity, open across the upgrade, must be planned again."""
     plan = make_plan(store)
     assert code_of(
         store.consume, plan.plan_id, plan.args_hash, SCALE_DEPLOYMENT, NOW, requester=AGENT_A
