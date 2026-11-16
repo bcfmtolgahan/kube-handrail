@@ -6,10 +6,10 @@ Single source of truth for handlers, infrastructure code and tests. Change this 
 
 | Gateway target | Lambda | Classification | Tools (schema file) |
 |---|---|---|---|
-| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `get_workload_events`, `get_rollout_history`, `plan_scale_deployment`, `plan_restart_deployment`, `plan_rollback_deployment`, `request_approval`, `get_plan_outcome` (`mcp/k8s_read/tools.json`) |
-| `k8sw` | `k8s_write` | `MUTATIVE` | `apply_scale_deployment`, `apply_restart_deployment`, `apply_rollback_deployment` (`mcp/k8s_write/tools.json`) |
+| `k8sr` | `k8s_read` | `READ_ONLY` | `get_workload_status`, `get_workload_events`, `get_rollout_history`, `plan_scale_deployment`, `plan_restart_deployment`, `plan_rollback_deployment`, `plan_adjust_hpa`, `request_approval`, `get_plan_outcome` (`mcp/k8s_read/tools.json`) |
+| `k8sw` | `k8s_write` | `MUTATIVE` | `apply_scale_deployment`, `apply_restart_deployment`, `apply_rollback_deployment`, `apply_adjust_hpa` (`mcp/k8s_write/tools.json`) |
 
-Each action has one `plan_<action>` tool and one `apply_<action>` tool; apply takes the plan's arguments plus `plan_id`. `plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`). See [History checks](#history-checks-oscillation-breaker). `plan_restart_deployment` and `apply_restart_deployment` take `namespace` and `name`; see [Restart](#restart). `plan_rollback_deployment` and `apply_rollback_deployment` take `namespace`, `name`, `revision` (an integer from 1 to 999999999999999999) and an optional boolean `override_manual_change`; see [Rollback](#rollback). Every `plan_*` and `apply_*` tool also takes an optional integer `verify_window_seconds`, and the scale tools an optional boolean `revert_on_failure`; see [Verification and revert](#verification-and-revert). `request_approval` takes only `plan_id`; see [Server-side approval](#server-side-approval). `get_plan_outcome` takes only `plan_id`; see [Verification and revert](#verification-and-revert). `get_workload_status` takes `namespace` and `name`; `get_workload_events` also takes an optional `limit`; see [Workload events](#workload-events). `get_rollout_history` takes `namespace` and `name`; see [Rollout history](#rollout-history).
+Each action has one `plan_<action>` tool and one `apply_<action>` tool; apply takes the plan's arguments plus `plan_id`. `plan_scale_deployment` and `apply_scale_deployment` take `namespace`, `name`, `replicas` and an optional boolean `override_manual_change` (default `false`; any other type is `invalid_argument`). See [History checks](#history-checks-oscillation-breaker). `plan_restart_deployment` and `apply_restart_deployment` take `namespace` and `name`; see [Restart](#restart). `plan_rollback_deployment` and `apply_rollback_deployment` take `namespace`, `name`, `revision` (an integer from 1 to 999999999999999999) and an optional boolean `override_manual_change`; see [Rollback](#rollback). `plan_adjust_hpa` and `apply_adjust_hpa` take `namespace`, `name` (a HorizontalPodAutoscaler), integers `min_replicas` and `max_replicas` (at least one) and an optional boolean `override_manual_change`; see [Adjust HPA](#adjust-hpa). Every `plan_*` and `apply_*` tool also takes an optional integer `verify_window_seconds`, and the scale and HPA adjust tools an optional boolean `revert_on_failure`; see [Verification and revert](#verification-and-revert). `request_approval` takes only `plan_id`; see [Server-side approval](#server-side-approval). `get_plan_outcome` takes only `plan_id`; see [Verification and revert](#verification-and-revert). `get_workload_status` takes `namespace` and `name`; `get_workload_events` also takes an optional `limit`; see [Workload events](#workload-events). `get_rollout_history` takes `namespace` and `name`; see [Rollout history](#rollout-history).
 
 Clients see `<target>___<tool>`, for example `k8sw___apply_scale_deployment`. Full names must be at most 64 characters and match `^[a-z0-9_]+$`.
 
@@ -261,7 +261,7 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | Attribute | Type | Notes |
 |---|---|---|
 | `plan_id` | S | partition key, random UUID |
-| `action` | S | `scale_deployment`, `restart_deployment` or `rollback_deployment` |
+| `action` | S | `scale_deployment`, `restart_deployment`, `rollback_deployment` or `adjust_hpa` |
 | `namespace`, `name` | S | target |
 | `replicas_from`, `replicas_to` | N | for a restart or a rollback both are the current `spec.replicas` (unset counts as 1) |
 | `args_hash` | S | SHA-256 of `json.dumps({"action": action, **args}, sort_keys=True, separators=(",", ":"))`. For a scale that is `{action, namespace, name, replicas}`, for a restart `{action, namespace, name}`, for a rollback `{action, namespace, name, revision}`; the scale and rollback objects gain `"override_manual_change": true` only when the override is true, every object gains `"verify_window_seconds": N` only when the window was given, and the scale object `"revert_on_failure": true` only when it is true, so a hash without them is the same as before they existed |
@@ -288,6 +288,7 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `applied_generation` | N | written with `result` after a successful patch: the Deployment's `metadata.generation` from the patch response. Evidence only |
 | `verification` | M | written once by the verifier channel: `{outcome, reason, checked_at, observed, correlation_id}` ([Verification and revert](#verification-and-revert)) |
 | `revert` | M | written once by the verifier channel, only for a plan with `revert_on_failure` whose verification is `degraded`: `{status, reason, revert_plan_id, at}` ([Revert](#revert)) |
+| `target_kind`, `hpa_target`, `min_from`, `min_to`, `max_from`, `max_to`, `spec_from`, `spec_to`, `revert_min_to`, `revert_max_to` | S, S, N, N, N, N, S, S, N, N | HPA adjust only (`target_kind` `HorizontalPodAutoscaler`; absent means Deployment): the HPA's scale target, its bounds before and after, the hash of its spec before and after, and the bounds a revert restores, pinned by the consume like `revert_to` ([Adjust HPA](#adjust-hpa)) |
 | `kind`, `reverts_plan_id` | S, S | revert records only: `revert`, and the `plan_id` of the plan whose apply the record undoes |
 | `cluster` | S | the cluster the plan is for: the read Lambda's `CLUSTER_NAME`; a revert record copies it from its plan. The approval channel shows it. Records made before it have none |
 | `status` | S | `planned`, `awaiting_approval`, `approved` or `rejected`, and `revert` on a revert record, which can never be requested, approved or applied. `applied` (`used = true`) and `expired` (`expires_at <= now`) are derived, never stored. Records made before server approval have no `status` and `requested_by`; they can be applied in `client` mode until they expire but never requested or approved |
@@ -315,7 +316,7 @@ Plan (`k8s_read`):
 3. The namespace's bounds: `min_replicas <= replicas <= max_replicas` of its policy (`MIN_REPLICAS` and `MAX_REPLICAS` without a policy file).
 3a. Admission policy: the cluster's ValidatingAdmissionPolicy and binding back the namespace's bounds in `Deny`; otherwise `conflict` with `details.check = "admission_policy_match"` ([Admission policy](#admission-policy)). Read after the agent and freeze checks, before the Deployment. Skipped only with `ADMISSION_CHECK=false`.
 4. Deployment exists and is not GitOps-managed: it has none of the Argo CD annotation `argocd.argoproj.io/tracking-id` (annotation tracking), the Flux labels `kustomize.toolkit.fluxcd.io/name`, `kustomize.toolkit.fluxcd.io/namespace`, `helm.toolkit.fluxcd.io/name` and `helm.toolkit.fluxcd.io/namespace`, and no label or annotation named in `GITOPS_MARKERS`. Malformed labels or annotations count as managed. `app.kubernetes.io/instance` alone is not a marker, because Helm sets it on every release; a deployment whose Argo CD uses label tracking, which writes only that label, lists it in `GITOPS_MARKERS` (Terraform `gitops_markers`). Until this release that label was a default marker, so every Helm release was refused (tested on a test cluster).
-5. Deployment has no HorizontalPodAutoscaler targeting it; otherwise `conflict` without `details`.
+5. Deployment has no HorizontalPodAutoscaler targeting it; otherwise `conflict` with `details` `{"hpa": [<names>], "hint": "use plan_adjust_hpa on <first name>"}`, and the message ends with the hint ([Adjust HPA](#adjust-hpa)).
 6. Blast-radius budget: `|replicas - current| <= max(1, ceil(current * MAX_REPLICA_STEP_PERCENT / 100))`, where `current` is `spec.replicas` (unset counts as 1); otherwise `blast_radius_exceeded`. It is enforced whatever the approval says.
 7. History checks: manual change, cooldown, flapping, object budget (below).
 8. Global budget: the current hour's counter, read consistently, must be below `GLOBAL_HOURLY_APPLY_BUDGET`. Planning only reads it.
@@ -361,7 +362,7 @@ Terraform `namespaces` maps each namespace the tools may act in to its policy:
 | Field | Default | Meaning |
 |---|---|---|
 | `min_replicas`, `max_replicas` | 0, 5 | the replica bounds of [guard check 3](#guard-checks) and of the [admission policy](#admission-policy) |
-| `actions` | `restart`, `rollback`, `scale` | the actions plans and applies may take there; an empty set leaves the namespace read-only |
+| `actions` | `restart`, `rollback`, `scale` | the actions plans and applies may take there; `adjust_hpa` only when listed ([Adjust HPA](#adjust-hpa)); an empty set leaves the namespace read-only |
 | `approvers` | none | IAM user or role ARNs that decide the namespace's plans; when set, only they, not `approver_principals` ([Approval API](#approval-api)); unused in `client` mode, where Terraform warns |
 | `gitops_markers` | none | label or annotation keys that mark GitOps ownership there, in addition to `GITOPS_MARKERS` ([guard check 4](#guard-checks)) |
 
@@ -370,7 +371,7 @@ An empty map (the default) derives one entry from the deprecated `sandbox_namesp
 - **Where it lives.** Terraform renders `namespace_policy.json` into the packages of the tool Lambdas and the approver, next to `handrail_common`: `{"namespaces": {"<ns>": {"min_replicas": N, "max_replicas": M, "actions": [...], "approvers": [...], "gitops_markers": [...]}}}`. Its content is in the packages' source hashes, so a change redeploys them. Not an environment variable (the 4 KB limit) and not an SSM parameter: it widens access, so only a reviewed deploy changes it.
 - **Loading.** An invalid file (an unknown action, bounds out of order, a bad namespace name or marker) fails the Lambda's start. `ALLOWED_NAMESPACES` must list exactly the file's namespaces, so a package and an environment from different applies cannot run together (an apply that changes them can briefly fail cold starts this way). `NAMESPACE_POLICY_FILE` names another path (tests); it must then exist. A package without the file falls back to `ALLOWED_NAMESPACES`, `MIN_REPLICAS` and `MAX_REPLICAS` with every action.
 - **Checks.** Plan and apply refuse an action the namespace does not allow with `forbidden_namespace` and `details` `{"action": "<action>", "allowed_actions": [...]}`, before the replica bounds; a namespace not allowed at all has no `details`. The read tools (`get_workload_status`, `get_workload_events`, `get_rollout_history`) work in every allowed namespace whatever its actions.
-- **Reverts.** A pre-approved revert into a namespace that no longer allows `scale`, or is no longer allowed, is refused (`revert = {status: refused, reason: forbidden_namespace}`).
+- **Reverts.** A pre-approved revert into a namespace that no longer allows the plan's action (`scale` or `adjust_hpa`), or is no longer allowed, is refused (`revert = {status: refused, reason: forbidden_namespace}`).
 - **Global guards stay global.** The blast-radius and other budgets and the breaker apply alike in every namespace; there is no per-namespace budget. Change freezes already name namespaces.
 
 ## Restart
@@ -470,6 +471,12 @@ Apply, differences from the scale steps above:
 A successful apply's `data` is `plan_id`, `namespace`, `name`, `revision_requested`, `template` (`template_to`), `images` (as in the plan), `resource_version`, `approved` and `correlation_id`. The Deployment's new revision number is not reported: the controller assigns it afterwards, reusing the target ReplicaSet with the next number. Follow the rollout with `get_workload_status`.
 
 A revision is only as trustworthy as the namespace's RBAC ([Guards](../docs/guards.md#rollback)). A ConfigMap or Secret the template reads keeps its current content, and an image tag can have been moved since the revision ran.
+
+## Adjust HPA
+
+Status: implemented, not yet tested on a cluster (unit tests, and on kind the admission cases and the integration suite).
+
+`plan_adjust_hpa` and `apply_adjust_hpa` change a HorizontalPodAutoscaler's `minReplicas` and `maxReplicas`, nothing else of it, within the namespace's bounds, in namespaces whose `actions` list `adjust_hpa`. The plan record's `target_kind` (`HorizontalPodAutoscaler`) selects the operations for apply and verification (`handrail_common/resources.py`). The blast radius applies to the pods the new bounds move (the target's replicas clamped to them), the verification checks that the HPA keeps its target within them, and `revert_on_failure` patches both bounds back. A second admission policy, `kube-handrail-writer-hpa-bounds`, bounds the writer and freezes `scaleTargetRef`, `metrics` and `behavior`. The full definition, as differences from a scale, and what was observed on kind are in [the appendix](contract/adjust-hpa.md).
 
 ## Impact preview
 
@@ -1019,7 +1026,7 @@ A denial is HTTP 422 (the validation's `reason` is left at its default, `Invalid
 
 ### Plan-time check
 
-Every plan (scale, restart and rollback; [guard check 3a](#guard-checks)) reads the policy and the binding through the ClusterRole `kube-handrail-policy-reader` and is refused with `conflict` unless all of these hold:
+Every plan (scale, restart and rollback; [guard check 3a](#guard-checks); `plan_adjust_hpa` reads the HPA policy the same way, [Adjust HPA](#adjust-hpa)) reads the policy and the binding through the ClusterRole `kube-handrail-policy-reader` and is refused with `conflict` unless all of these hold:
 
 1. the policy exists, and its namespace selector selects the plan's namespace;
 2. the binding exists, refers to the policy, selects the namespace, and its `validationActions` include `Deny`;
