@@ -266,7 +266,7 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `namespace`, `name` | S | target |
 | `replicas_from`, `replicas_to` | N | for a restart or a rollback both are the current `spec.replicas` (unset counts as 1) |
 | `args_hash` | S | SHA-256 of `json.dumps({"action": action, **args}, sort_keys=True, separators=(",", ":"))`. For a scale that is `{action, namespace, name, replicas}`, for a restart `{action, namespace, name}`, for a rollback `{action, namespace, name, revision}`; the scale and rollback objects gain `"override_manual_change": true` only when the override is true, every object gains `"verify_window_seconds": N` only when the window was given, and the scale object `"revert_on_failure": true` only when it is true, so a hash without them is the same as before they existed |
-| `args` | M | the argument payload `args_hash` covers, without `action`: the apply arguments without `plan_id`, optional arguments only when given (scale: `namespace`, `name`, `replicas`, and `override_manual_change: true` only when the override is true; restart: `namespace`, `name`; rollback: `namespace`, `name`, `revision`, and the override as for a scale; each also `verify_window_seconds` when given, and a scale `revert_on_failure: true` when it is true). The approval channel forwards it unchanged as the apply arguments, and apply compares the request's arguments with it. Records made before it have none; they can be neither approved nor applied and must be planned again |
+| `args` | M | the argument payload `args_hash` covers, without `action`: the apply arguments without `plan_id`, optional arguments only when given (scale: `namespace`, `name`, `replicas`, and `override_manual_change: true` only when the override is true; restart: `namespace`, `name`; rollback: `namespace`, `name`, `revision`, and the override as for a scale; each also `verify_window_seconds` when given, a scale `revert_on_failure: true` when it is true, and any action [`change_ref`](contract/change-ref.md) when given). The approval channel forwards it unchanged as the apply arguments, and apply compares the request's arguments with it. Records made before it have none; they can be neither approved nor applied and must be planned again |
 | `template_from`, `template_to` | S | `sha256:` and the hex SHA-256 of `json.dumps(template, sort_keys=True, separators=(",", ":"))`, where `template` is the Deployment's `spec.template` as the API server returned it at plan time (raw JSON, not client models, which drop fields the client does not know), and the template the change leaves. A scale does not change the template, so both are the current hash. A restart's `template_to` is the hash of the current template with the pod-template annotation `kube-handrail.io/restart-plan-id` set to the plan's own `plan_id` ([Restart](#restart)), so the template it leaves is pinned when the plan is made. A rollback's `template_to` is the hash of the target ReplicaSet's template ([Rollback](#rollback)). Recorded for every action; the template manual-change rule reads them back ([History checks](#history-checks-oscillation-breaker)). Records made before them have neither |
 | `revision_from` | N | the Deployment's `deployment.kubernetes.io/revision` annotation at plan time, only for an action that changes the template (restart, rollback) and only when the annotation is an integer. Information only |
 | `revision_to`, `target_rs_name`, `target_rs_uid` | N, S, S | rollback only: the requested revision (the approved argument), and the name and `uid` of the ReplicaSet it resolved to, which apply re-reads |
@@ -478,7 +478,7 @@ A revision is only as trustworthy as the namespace's RBAC ([Guards](../docs/guar
 
 Status: implemented, not yet tested on a cluster (unit tests, and on kind the admission cases and the integration suite).
 
-`plan_adjust_hpa` and `apply_adjust_hpa` change a HorizontalPodAutoscaler's `minReplicas` and `maxReplicas`, nothing else of it, within the namespace's bounds, in namespaces whose `actions` list `adjust_hpa`. The plan record's `target_kind` (`HorizontalPodAutoscaler`) selects the operations for apply and verification (`handrail_common/resources.py`). The blast radius applies to the pods the new bounds move (the target's replicas clamped to them), the verification checks that the HPA keeps its target within them, and `revert_on_failure` patches both bounds back. A second admission policy, `kube-handrail-writer-hpa-bounds`, bounds the writer and freezes `scaleTargetRef`, `metrics` and `behavior`. The full definition, as differences from a scale, and what was observed on kind are in [the appendix](contract/adjust-hpa.md).
+`plan_adjust_hpa` and `apply_adjust_hpa` change only a HorizontalPodAutoscaler's `minReplicas` and `maxReplicas`, within the namespace's bounds, where `actions` list `adjust_hpa`; the record's `target_kind` selects the object for apply, verification and revert. The blast radius applies to the pods the new bounds move. The admission policy `kube-handrail-writer-hpa-bounds` also freezes `scaleTargetRef`, `metrics` and `behavior`. Defined, as differences from a scale, with the kind findings, in [the appendix](contract/adjust-hpa.md).
 
 ## Impact preview
 
@@ -684,6 +684,7 @@ The revert record is verified one window later like any applied plan and reports
   "kind": "change", "reverts_plan_id": null,
   "replicas": { "from": 1, "to": 2 },
   "approval_mode": "server",
+  "approval": { "status": "approved", "approved_at": 1700000010 },
   "plan_status": "applied",
   "verification": {
     "window_seconds": 120, "verify_at": 1700000120,
@@ -703,6 +704,7 @@ The revert record is verified one window later like any applied plan and reports
 - `cluster` is the record's `cluster` (`null` on a record made before it).
 - `kind` is `change`, or `revert` for a revert record, with `reverts_plan_id`.
 - `approval_mode` is the record's, or `null`.
+- `approval` is the record's `status` and `approved_at` (`null` when absent); in `both` mode the agent waits here for `approved`. It never names the approver.
 - `revert` is `{"requested": false, "status": "not_requested"}` without `revert_on_failure` and on a revert record. With it, `{"requested": true, "status"}`: `pending` (no verdict yet, or `degraded` and not yet acted on), `not_needed` (the outcome is not `degraded`), or the recorded `reverted`, `skipped` or `refused` with its `reason` and `revert_plan_id`.
 - `correlation_ids` holds those recorded, by step: `plan`, `apply`, `verification`.
 - Condition reasons in `observed` are returned as [untrusted text](#untrusted-output): anyone who can write the Deployment's status sets them. A reason cut at its limit sets the envelope's `truncated`. Every other value was set by the server.
@@ -852,7 +854,7 @@ After the consume, the record's `args` must equal the request's arguments withou
 
 ### `request_approval(plan_id)`
 
-`READ_ONLY` tool on `k8sr`. It approves nothing and only `plan_id` is read from the arguments, so no agent text reaches the approvers.
+`READ_ONLY` tool on `k8sr`. It approves nothing and only `plan_id` is read from the arguments; the only agent text approvers see is the plan's `change_ref`, as untrusted text.
 
 1. `plan_id` must be a UUID, and the mode must be `server` or `both` (`invalid_argument` otherwise, so a plan's life is never extended in `client` mode). Without a configured `APPROVAL_TOPIC_ARN` the call fails with `internal` before the plan changes.
 2. The caller must be a configured agent (`forbidden`, `agent_unknown`).
@@ -941,7 +943,7 @@ The object is `json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_a
 | `stream` | `event_name`, `event_id`, `sequence_number`, `approximate_creation_time`, `ttl_removal` (bool), `user_identity` (as in the record, or `null`) |
 | `image_format` | `plain`, or `dynamodb` when an image could not be decoded |
 | `old_image`, `new_image` | the item before and after, as plain JSON (`null` when absent): integral numbers as integers, other numbers as their exact decimal string, sets as sorted lists, binary as base64. The source of truth. With `image_format` `dynamodb`, the images are kept exactly as the stream delivered them (DynamoDB JSON) and `summary` is only `{plan_id, error}`, the exception class: a value written into the plan record never keeps its change out of the record |
-| `summary` | derived for humans: `plan_id`; `cluster`, `kind`, `action`, `namespace`, `name`, `requested_by`, `agent`, `requested_client_id`, `approved_by`, `approval_channel`, `approval_mode`, `rejected_by`, `channel`, `applied_at`, `reverts_plan_id` when present; `status`, `used` and `result` as a value, or as `{"from": ..., "to": ...}` when the record changed it; `verification` (its `outcome`) and `revert` (`status`, `revert_plan_id`) when present; `changed`, the sorted names of the attributes the record changed |
+| `summary` | derived for humans: `plan_id`; `change_ref` as untrusted text; `cluster`, `kind`, `action`, `target_kind`, `hpa_target`, `namespace`, `name`, `requested_by`, `agent`, `requested_client_id`, `approved_by`, `approval_channel`, `approval_mode`, `rejected_by`, `channel`, `applied_at`, `reverts_plan_id` when present; `status`, `used` and `result` as a value, or as `{"from": ..., "to": ...}` when the record changed it; `verification` (its `outcome`) and `revert` (`status`, `revert_plan_id`) when present; `changed`, the sorted names of the attributes the record changed |
 
 Each object is written with `PutObject` and `If-None-Match: *` (and `Content-MD5`; Object Lock requires an integrity header). A `412 PreconditionFailed` means the key exists: the Lambda reads the object, and an entry that is identical except for `summary` counts as written (a redelivery; a newer handler version may derive the summary differently). Any other difference is a failure of that record (`Mismatches`), which stops the shard, raises the failures alarm and, once the retries are spent, the dead-letter alarm. The put never sets a retention: the bucket's default applies.
 

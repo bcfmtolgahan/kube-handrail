@@ -52,7 +52,7 @@ The verifier reads the HPA and its target Deployment (the writer may `get` Deplo
 
 A degraded change with `revert_on_failure` is reverted like a scale ([Revert](../CONTRACT.md#revert)), with these differences: the pinned targets are `revert_min_to` and `revert_max_to` (a record without both is `refused`, `plan_mismatch`); both must lie within the namespace's bounds and the namespace must still allow `adjust_hpa`; the revert record is an `adjust_hpa` plan with `target_kind`, `min_from`/`max_from` and `spec_from` equal to the parent's `min_to`/`max_to` and `spec_to`, and `min_to`/`max_to` the pinned bounds; the patch writes both bounds, only on the spec the parent's apply left. The revert restores the bounds, not the pods: the HPA controller decides the count within them.
 
-`get_plan_outcome` adds `target_kind` and `hpa` (the bounds and `scale_target`, as in the diff) for an HPA adjust; `replicas` are the target's pods. The approval view's `change` is the diff; the notification names the HPA and its Deployment, both bounds and the pod change. The audit summary copies `target_kind`.
+`get_plan_outcome` adds `target_kind` and `hpa` (the bounds and `scale_target`, as in the diff) for an HPA adjust; `replicas` are the target's pods. The approval view's `change` is the diff; the notification names the HPA and its Deployment, both bounds and the pod change. The audit summary copies `target_kind` and `hpa_target`; `scripts/audit.py verify` accepts `revert_min_to` and `revert_max_to` in the consume and treats the HPA fields set at plan time as pinned.
 
 ## RBAC and admission
 

@@ -44,7 +44,7 @@ On an error, follow the AGENTS.md error table. In short: `blast_radius_exceeded`
 Call `request_approval(plan_id)`:
 
 - `approval_mode: server`: approvers were notified. Their approval applies the change; do not call apply. Report the `plan_id` and expiry and end the procedure here, then verify in Step 6 if asked later.
-- `approval_mode: both`: wait for a human to say the plan was approved, then go to Step 5.
+- `approval_mode: both`: call `get_plan_outcome(plan_id)` until `approval.status` is `approved`, then go to Step 5.
 - `invalid_argument` ("client mode: apply directly, your client asks the human"): go to Step 5; your client asks the human for approval of the apply call.
 - `notified: false`: approvers already have the request; do not ask again before `retry_after`.
 - `conflict` ("plan changed concurrently"): call `request_approval` once more.
