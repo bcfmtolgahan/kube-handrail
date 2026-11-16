@@ -1939,6 +1939,40 @@ def test_identity_plan_records_the_agent_and_its_client(clients, table, caller):
     assert item["args_hash"] == scale_args_hash("sandbox", "web", 3)
 
 
+@pytest.mark.parametrize("mode", ["client", "server", "both"])
+def test_plan_records_the_approval_mode(clients, table, caller, mode):
+    caller("client-a")
+    settings = dataclasses.replace(IDENTITY_SETTINGS, approval_mode=mode)
+    data = handler.plan_scale_deployment(
+        {"namespace": "sandbox", "name": "web", "replicas": 3}, settings, clients, NOW
+    )["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["approval_mode"] == mode
+
+
+def test_plan_binds_its_plan_id_before_reading_the_cluster(clients, table, caller, monkeypatch):
+    caller("client-a")
+    seen = []
+    read = handler._read_deployment_raw
+
+    def spy(*args, **kwargs):
+        seen.append(current_plan_id())
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(handler, "_read_deployment_raw", spy)
+    token = bind_plan_id(None)
+    try:
+        data = handler.plan_scale_deployment(
+            {"namespace": "sandbox", "name": "web", "replicas": 3},
+            IDENTITY_SETTINGS,
+            clients,
+            NOW,
+        )["data"]
+    finally:
+        unbind_plan_id(token)
+    assert seen == [data["plan_id"]]
+
+
 @pytest.mark.parametrize("value", [None, "unknown", "client-z"])
 def test_identity_plan_refuses_an_unknown_caller_before_any_cluster_read(
     clients, table, caller, value
@@ -2353,37 +2387,3 @@ def test_argument_checks_come_before_the_freezes(clients):
             {"namespace": "elsewhere", "name": "web", "replicas": 3}, FROZEN, clients, NOW
         )
     assert exc.value.code == "forbidden_namespace"
-
-
-@pytest.mark.parametrize("mode", ["client", "server", "both"])
-def test_plan_records_the_approval_mode(clients, table, caller, mode):
-    caller("client-a")
-    settings = dataclasses.replace(IDENTITY_SETTINGS, approval_mode=mode)
-    data = handler.plan_scale_deployment(
-        {"namespace": "sandbox", "name": "web", "replicas": 3}, settings, clients, NOW
-    )["data"]
-    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
-    assert item["approval_mode"] == mode
-
-
-def test_plan_binds_its_plan_id_before_reading_the_cluster(clients, table, caller, monkeypatch):
-    caller("client-a")
-    seen = []
-    read = handler._read_deployment_raw
-
-    def spy(*args, **kwargs):
-        seen.append(current_plan_id())
-        return read(*args, **kwargs)
-
-    monkeypatch.setattr(handler, "_read_deployment_raw", spy)
-    token = bind_plan_id(None)
-    try:
-        data = handler.plan_scale_deployment(
-            {"namespace": "sandbox", "name": "web", "replicas": 3},
-            IDENTITY_SETTINGS,
-            clients,
-            NOW,
-        )["data"]
-    finally:
-        unbind_plan_id(token)
-    assert seen == [data["plan_id"]]

@@ -2492,6 +2492,48 @@ def test_a_revert_whose_patch_landed_before_a_crash_is_not_patched_again(verify_
     assert item(revert_id)["created_at"] == NOW + 61
 
 
+def test_a_revert_record_keeps_the_approval_mode_of_its_plan(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps, approval_mode="both")
+    assert handler.revert_record(runtime_, plan, NOW + 61).approval_mode == "both"
+
+
+def test_a_revert_patch_names_the_revert_record_in_its_user_agent(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    runtime_.store.record_once(
+        plan.plan_id, "verification", {"outcome": "degraded", "reason": "target_not_reached"}
+    )
+    seen = []
+    apps.patch_namespaced_deployment.side_effect = lambda *a, **k: (
+        seen.append(current_plan_id())
+        or SimpleNamespace(metadata=SimpleNamespace(resource_version="20002", generation=6))
+    )
+    at(runtime_, NOW + 100)
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    assert seen and set(seen) == {handler.revert_plan_id(plan.plan_id)}
+
+
+def test_an_apply_names_its_plan_while_patching_and_not_afterwards(verify_rt):
+    runtime_, apps = verify_rt
+    plan = create_verified_plan(runtime_.store, 60)
+    patch = apps.patch_namespaced_deployment.side_effect
+    seen = []
+
+    def spy(*args, **kwargs):
+        seen.append(current_plan_id())
+        return patch(*args, **kwargs) if patch else apps.patch_namespaced_deployment.return_value
+
+    apps.patch_namespaced_deployment.side_effect = spy
+    token = bind_plan_id(None)
+    try:
+        assert apply(plan.plan_id, verify_window_seconds=60)["ok"] is True
+        assert current_plan_id() is None
+    finally:
+        unbind_plan_id(token)
+    assert seen and set(seen) == {plan.plan_id}
+
+
 def landed_revert(runtime_, apps, plan: Plan) -> str:
     """An earlier run created the revert record and patched, then stopped before recording
     anything else; returns the revert record's id."""
@@ -2859,45 +2901,3 @@ def test_a_freeze_does_not_stop_the_verification(verify_rt):
     apps.read_namespaced_deployment.return_value = live(plan.plan_id)
     at(runtime_, NOW + 61)
     assert verify(plan.plan_id)["data"]["outcome"] == "healthy"
-
-
-def test_a_revert_record_keeps_the_approval_mode_of_its_plan(verify_rt):
-    runtime_, apps = verify_rt
-    plan = applied_with_revert(runtime_, apps, approval_mode="both")
-    assert handler.revert_record(runtime_, plan, NOW + 61).approval_mode == "both"
-
-
-def test_a_revert_patch_names_the_revert_record_in_its_user_agent(verify_rt):
-    runtime_, apps = verify_rt
-    plan = applied_with_revert(runtime_, apps)
-    runtime_.store.record_once(
-        plan.plan_id, "verification", {"outcome": "degraded", "reason": "target_not_reached"}
-    )
-    seen = []
-    apps.patch_namespaced_deployment.side_effect = lambda *a, **k: (
-        seen.append(current_plan_id())
-        or SimpleNamespace(metadata=SimpleNamespace(resource_version="20002", generation=6))
-    )
-    at(runtime_, NOW + 100)
-    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
-    assert seen and set(seen) == {handler.revert_plan_id(plan.plan_id)}
-
-
-def test_an_apply_names_its_plan_while_patching_and_not_afterwards(verify_rt):
-    runtime_, apps = verify_rt
-    plan = create_verified_plan(runtime_.store, 60)
-    patch = apps.patch_namespaced_deployment.side_effect
-    seen = []
-
-    def spy(*args, **kwargs):
-        seen.append(current_plan_id())
-        return patch(*args, **kwargs) if patch else apps.patch_namespaced_deployment.return_value
-
-    apps.patch_namespaced_deployment.side_effect = spy
-    token = bind_plan_id(None)
-    try:
-        assert apply(plan.plan_id, verify_window_seconds=60)["ok"] is True
-        assert current_plan_id() is None
-    finally:
-        unbind_plan_id(token)
-    assert seen and set(seen) == {plan.plan_id}
