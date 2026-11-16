@@ -418,6 +418,7 @@ def test_drift_found_by_the_sentinel_keeps_remediation_off(world):
         "disable_kill_switch",
         "migrate",
         "apply",
+        "k8s",
         "enable_write",
     ]
     # The switch is no longer this run's: a resume refuses rather than turning it on.
@@ -596,6 +597,8 @@ def test_the_terraform_commands(tmp_path):
     chdir = f"-chdir={tmp_path}"
     assert calls == [
         ["terraform", chdir, "output", "-json"],
+        # A module the release added is installed before the plan.
+        ["terraform", chdir, "get", "-no-color"],
         [
             "terraform",
             chdir,
@@ -628,6 +631,9 @@ def test_a_failed_terraform_command_is_an_upgrade_error(tmp_path):
     tf = upgrade.Terraform(tmp_path, [], stream=fail, quiet=fail)
     with pytest.raises(upgrade.UpgradeError, match="terraform output failed"):
         tf.outputs()
+    with pytest.raises(upgrade.UpgradeError, match="terraform get failed"):
+        tf.plan()
+    tf = upgrade.Terraform(tmp_path, [], stream=fail, quiet=lambda command: upgrade.Result(0, ""))
     with pytest.raises(upgrade.UpgradeError, match="terraform plan failed"):
         tf.plan()
 
@@ -834,3 +840,157 @@ def test_terraform_removes_its_saved_plan(tmp_path):
     tf.remove_plan()
     tf.remove_plan()
     assert not (tmp_path / upgrade.PLAN_FILE).exists()
+
+
+# --- Cluster manifests (--with-k8s) -------------------------------------------------------
+
+MANIFESTS = {
+    "rbac.yaml": (
+        "kind: Role\nmetadata:\n  name: kube-handrail-reader\n  namespace: team-a\n---\n"
+        "kind: RoleBinding\nmetadata:\n  name: kube-handrail-reader\n  namespace: team-a\n"
+    ),
+    "admission-policy.yaml": "kind: ValidatingAdmissionPolicy\nmetadata:\n  name: x\n",
+}
+
+
+class FakeKubectl:
+    def __init__(self, log, actions=("Deny",), labeled=None, fail=None) -> None:
+        self.log = log
+        self.actions = list(actions)
+        self.labeled = labeled
+        self.fail = fail
+        self.applied: list = []
+
+    def current_context(self):
+        return "test-context"
+
+    def apply(self, directory, dry_run):
+        self.log.append(("kubectl", "dry-run" if dry_run else "apply"))
+        self.applied.append(sorted(p.name for p in directory.glob("*.yaml")))
+        failed = self.fail == ("dry-run" if dry_run else "apply")
+        return upgrade.Result(1 if failed else 0, "")
+
+    def binding_actions(self):
+        return self.actions
+
+    def labeled_roles(self):
+        return self.labeled
+
+
+def k8s_world(world, tmp_path, manifests_before=None, **kubectl):
+    world.tf._outputs["k8s_manifests"] = MANIFESTS
+    world.tf._outputs["guard_settings"] = {"admission_mode": "Deny", "approval_mode": "server"}
+    world.kubectl = FakeKubectl(world.log, **kubectl)
+    before = dict(world.tf._outputs, k8s_manifests=manifests_before or MANIFESTS)
+    outputs = [before]
+
+    def outputs_fn():
+        return dict(outputs.pop(0)) if outputs else dict(world.tf._outputs)
+
+    world.tf.outputs = outputs_fn
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def make(**options):
+        options.setdefault("yes", True)
+        upgrade_ = world.make(**options)
+        upgrade_.kubectl = world.kubectl
+        upgrade_.k8s_dir = root / "build/k8s"
+        return upgrade_
+
+    return make, root
+
+
+def test_with_k8s_writes_and_applies_the_manifests_after_a_dry_run(world, tmp_path):
+    make, root = k8s_world(
+        world,
+        tmp_path,
+        labeled=["team-a/Role/kube-handrail-reader", "team-a/RoleBinding/kube-handrail-reader"],
+    )
+    assert make(with_k8s=True).run() == 0
+    assert world.log[:4] == [("plan",), ("apply",), ("kubectl", "dry-run"), ("kubectl", "apply")]
+    assert sorted(p.name for p in (root / "build/k8s").glob("*.yaml")) == sorted(MANIFESTS)
+    assert (root / "build/k8s/rbac.yaml").read_text() == MANIFESTS["rbac.yaml"]
+
+
+def test_a_failed_dry_run_applies_nothing(world, tmp_path):
+    make, _ = k8s_world(world, tmp_path, fail="dry-run")
+    with pytest.raises(upgrade.UpgradeError, match="nothing was applied"):
+        make(with_k8s=True).run()
+    assert ("kubectl", "apply") not in world.log
+    assert world.state()["done"][-1] == "apply"
+
+
+def test_a_binding_left_in_warn_fails_the_step(world, tmp_path):
+    make, _ = k8s_world(world, tmp_path, actions=("Warn", "Audit"))
+    with pytest.raises(upgrade.UpgradeError, match="validationActions"):
+        make(with_k8s=True).run()
+
+
+def test_stale_roles_are_listed_not_deleted(world, tmp_path, capsys):
+    make, _ = k8s_world(
+        world,
+        tmp_path,
+        labeled=[
+            "team-a/Role/kube-handrail-reader",
+            "team-a/RoleBinding/kube-handrail-reader",
+            "old-team/Role/kube-handrail-writer",
+        ],
+    )
+    assert make(with_k8s=True).run() == 0
+    out = capsys.readouterr().out
+    assert "kubectl delete role kube-handrail-writer -n old-team" in out
+    assert "1 stale kube-handrail Role(s) or binding(s)" in out
+
+
+def test_without_with_k8s_a_manifest_change_is_only_reported(world, tmp_path, capsys):
+    make, root = k8s_world(world, tmp_path, manifests_before={"rbac.yaml": "older"})
+    assert make().run() == 0
+    assert not any(entry[0] == "kubectl" for entry in world.log)
+    assert not (root / "build/k8s").exists()
+    assert "the cluster manifests changed and were not applied" in capsys.readouterr().out
+
+
+def test_without_with_k8s_unchanged_manifests_say_nothing(world, tmp_path, capsys):
+    make, _ = k8s_world(world, tmp_path)
+    assert make().run() == 0
+    assert "cluster manifests" not in capsys.readouterr().out
+
+
+def test_the_rendered_roles_are_read_from_the_template_layout():
+    golden = ROOT / "tests/k8s_render/golden/two-namespaces"
+    manifests = {p.name: p.read_text() for p in golden.glob("*.yaml")}
+    assert upgrade.rendered_roles(manifests) == {
+        f"{ns}/{kind}/kube-handrail-{who}"
+        for ns in ("kube-handrail-sandbox", "kube-handrail-sandbox-2")
+        for kind in ("Role", "RoleBinding")
+        for who in ("reader", "writer")
+    }
+
+
+def test_manifest_names_must_be_plain_yaml_files(tmp_path):
+    with pytest.raises(upgrade.UpgradeError, match="unexpected manifest name"):
+        upgrade.write_manifests({"../x.yaml": ""}, tmp_path)
+
+
+def test_kubectl_commands_use_the_given_context():
+    calls = []
+
+    def run(command):
+        calls.append(command)
+        return upgrade.Result(0, '["Deny"]')
+
+    kubectl = upgrade.Kubectl("ctx", stream=run, quiet=run)
+    assert kubectl.current_context() == "ctx"
+    kubectl.apply(Path("build/k8s"), dry_run=True)
+    assert kubectl.binding_actions() == ["Deny"]
+    assert calls[0] == [
+        "kubectl",
+        "--context",
+        "ctx",
+        "apply",
+        "--dry-run=server",
+        "-f",
+        "build/k8s",
+    ]
+    assert calls[1][:3] == ["kubectl", "--context", "ctx"]

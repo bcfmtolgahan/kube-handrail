@@ -8,8 +8,12 @@
 #   4. empty the audit bucket, bypassing GOVERNANCE retention  (AUDIT_BUCKET, else the
 #      audit_bucket_name output in TF_DIR; needs s3:BypassGovernanceRetention; COMPLIANCE
 #      objects cannot be deleted before they expire)
-#   5. terraform destroy in TF_DIR                       (default: terraform)
-#   6. kubectl delete -f k8s/sandbox                     (KUBECONFIG must be set)
+#   5. terraform destroy in TF_DIR                       (default: terraform); first, if
+#      build/k8s is missing, it is written from the k8s_manifests output
+#   6. kubectl delete -f build/k8s, the rendered RBAC, ClusterRole and admission policy
+#      (KUBECONFIG must be set), and the kube-handrail.io/managed label from the namespaces;
+#      the namespaces themselves stay
+#   7. kubectl delete -f k8s/sandbox: the sandbox namespace and its web Deployment
 # Steps whose IDs are unset are skipped. Every step asks for confirmation unless --yes.
 set -euo pipefail
 
@@ -127,6 +131,18 @@ else
   echo "skip: empty the audit bucket (AUDIT_BUCKET not set and no audit_bucket_name output)"
 fi
 
+k8s_dir="$repo_root/build/k8s"
+if ! $skip_k8s && ! $skip_terraform && [[ -d "$tf_dir" ]] && ! compgen -G "$k8s_dir/*.yaml" >/dev/null; then
+  # The destroy removes the output; keep the manifests so step 6 can delete them.
+  if manifests="$(terraform -chdir="$tf_dir" output -json k8s_manifests 2>/dev/null)" && [[ "$manifests" == "{"* ]]; then
+    mkdir -p "$k8s_dir"
+    "$python" -c 'import json, pathlib, sys
+for name, text in json.loads(sys.argv[1]).items():
+    pathlib.Path(sys.argv[2], name).write_text(text)' "$manifests" "$k8s_dir"
+    echo "wrote build/k8s from the k8s_manifests output"
+  fi
+fi
+
 if $skip_terraform; then
   echo "skip: terraform destroy (--skip-terraform)"
 elif [[ ! -d "$tf_dir" ]]; then
@@ -141,14 +157,21 @@ elif confirm "Run terraform destroy in ${tf_dir}?"; then
 fi
 
 if $skip_k8s; then
-  echo "skip: sandbox manifests (--skip-k8s)"
+  echo "skip: cluster manifests and sandbox (--skip-k8s)"
 else
   if [[ -z "${KUBECONFIG:-}" ]]; then
-    echo "KUBECONFIG must be set to delete the sandbox manifests (or pass --skip-k8s)" >&2
+    echo "KUBECONFIG must be set to delete the cluster manifests (or pass --skip-k8s)" >&2
     exit 1
   fi
   context="$(kubectl config current-context)"
-  if confirm "Delete k8s/sandbox (namespace kube-handrail-sandbox) from context ${context}?"; then
+  if ! compgen -G "$k8s_dir/*.yaml" >/dev/null; then
+    echo "skip: rendered manifests (no build/k8s; delete the kube-handrail Roles, the ClusterRole kube-handrail-policy-reader and the policy kube-handrail-writer-bounds by hand)"
+  elif confirm "Delete the rendered manifests in build/k8s (RBAC in every policy namespace, ClusterRole kube-handrail-policy-reader, admission policy) from context ${context}?"; then
+    kubectl delete -f "$k8s_dir" --ignore-not-found
+    kubectl label namespace -l kube-handrail.io/managed=true kube-handrail.io/managed- || true
+    rm -rf "$k8s_dir"
+  fi
+  if confirm "Delete k8s/sandbox (namespace kube-handrail-sandbox and its web Deployment) from context ${context}?"; then
     kubectl delete -f "$repo_root/k8s/sandbox" --ignore-not-found
   fi
 fi
