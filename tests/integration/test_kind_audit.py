@@ -33,6 +33,12 @@ def test_plan_and_apply_reach_the_bucket_once(kh):
     summary = bundle["summary"]
     assert summary["agent"] == AGENT_A and summary["requested_by"] == f"agent:{AGENT_A}"
     assert summary["result"] == "applied" and summary["has_creation"] is True
+    assert summary["approval_mode"] == "client"
+    # Client mode: the chat approval is not in the record, which verify reports, nothing else.
+    report = audit.verify_plan(kh.s3, BUCKET, plan_id)
+    assert [(f["severity"], f["code"]) for f in report["findings"]] == [
+        ("info", "client_unobserved")
+    ]
 
     # A redelivered batch maps to the same keys: duplicates, no failure, nothing new.
     assert kh.run_audit(records) == {"batchItemFailures": []}

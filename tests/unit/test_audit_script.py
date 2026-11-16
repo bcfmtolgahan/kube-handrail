@@ -106,7 +106,7 @@ def test_export_summary_names_the_chain(s3):
     assert summary["revert"]["revert_plan_id"] == REVERT_ID
     assert summary["has_creation"] is True
     assert summary["removed"] is None
-    assert "k8s_write" in summary["executed_by"]
+    assert "k8s_write" in summary["executed_by"]["attribution"]
     seqs = [e["stream"]["sequence_number"] for e in bundle["entries"]]
     assert seqs == ["100", "101", "102", "103", "104", "106"]
 
@@ -194,3 +194,34 @@ def test_undecoded_entries_do_not_feed_the_summary(s3, monkeypatch):
     assert summary["entries"] == 7
     assert summary["undecoded"] == 1
     assert summary["approved_by"] == ["approver-a"]
+
+
+def test_export_gives_query_templates_for_the_executor(s3):
+    executed = audit.export(s3, BUCKET, PLAN_ID)["summary"]["executed_by"]
+    lambda_logs = executed["queries"]["lambda_logs"]
+    # The bucket name does not follow <name_prefix>-audit-<account id>: a placeholder.
+    assert "/aws/lambda/<name_prefix>-k8s-write" in lambda_logs["log_groups"]
+    assert f'@message like "{PLAN_ID}"' in lambda_logs["query"]
+    assert (lambda_logs["start"], lambda_logs["end"]) == (1_700_000_000 - 300, 1_700_000_101 + 300)
+    eks = executed["queries"]["eks_audit_log"]
+    assert eks["log_groups"] == ["/aws/eks/<cluster_name>/cluster"]
+    assert f'userAgent like "plan/{PLAN_ID}"' in eks["query"]
+
+
+def test_queries_use_the_correlation_ids_name_prefix_and_cluster():
+    image = {
+        "plan_correlation_id": "plan-1",
+        "decision_correlation_id": "dec-1",
+        "apply_correlation_id": "dec-1",
+        "verification": {"correlation_id": "ver-1"},
+        "cluster": "demo",
+    }
+    found = audit.queries(PLAN_ID, "kh-test-audit-000000000000", {}, image)
+    assert found["lambda_logs"]["log_groups"][1] == "/aws/lambda/kh-test-k8s-write"
+    assert 'correlation_id in ["plan-1", "dec-1", "ver-1"]' in found["lambda_logs"]["query"]
+    assert "start" not in found["lambda_logs"]
+    assert found["eks_audit_log"]["log_groups"] == ["/aws/eks/demo/cluster"]
+
+
+def test_an_unconsumed_plan_has_no_executor(s3):
+    assert "executed_by" not in audit.export(s3, BUCKET, OTHER_ID)["summary"]

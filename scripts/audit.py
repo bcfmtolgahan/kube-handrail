@@ -8,7 +8,15 @@ agent, the approver, the channel the apply ran under, the result, and the verifi
 revert outcome. A plan's revert record, or the plan a revert record undid, is included under
 `linked`.
 
+`verify` checks a plan's entries for what the record should never show: a change after the
+consume to anything but the result, verification and revert (the executor-rewrite pattern),
+an apply on the wrong channel for the plan's approval mode, an apply without a server
+approval in server or both mode, a missing creation, gaps and deletions. In client mode the
+approval is the client's, which the record cannot see: such applies are reported as
+client-unobserved, for information. Exit status 1 when anything but information is found.
+
   audit.py export <plan_id> [--out FILE] [--no-links]
+  audit.py verify (<plan_id> | --since SECONDS | --all) [--json] [--approval-mode MODE]
   audit.py list [--limit N]
 
 --bucket defaults to AUDIT_BUCKET, then to `terraform output -raw audit_bucket_name` in TF_DIR
@@ -18,6 +26,7 @@ revert outcome. A plan's revert record, or the plan a revert record undid, is in
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -48,8 +57,50 @@ LATEST_ATTRIBUTES = (
     "reverts_plan_id",
 )
 # The executing role is not in the record: only the write Lambda's role can consume a plan
-# through the guard, so it is attributed by construction, not observed.
-EXECUTOR_NOTE = "the k8s_write Lambda role, by construction; the record does not observe it"
+# through the guard, so it is attributed by construction, not observed. The export adds query
+# templates for the logs that do observe it.
+EXECUTOR_ATTRIBUTION = (
+    "the k8s_write Lambda role, by construction; the record does not observe it. Run the "
+    "queries to see the invocations and the Kubernetes requests"
+)
+# Seconds added before the first and after the last entry for the query time range.
+QUERY_MARGIN_SECONDS = 300
+# The bucket is <name_prefix>-audit-<account id> (terraform/audit.tf).
+BUCKET_NAME = re.compile(r"^(?P<prefix>.+)-audit-\d{12}$")
+
+# Approval modes (APPROVAL_MODE) and the channels an apply may run under in each
+# (mcp/CONTRACT.md, Server-side approval): only in server mode does the approval channel
+# apply; a revert runs on the verifier channel whatever the mode.
+CLIENT, SERVER, BOTH = "client", "server", "both"
+CHANNELS_BY_MODE = {
+    CLIENT: ("gateway",),
+    SERVER: ("approval-api", "gateway"),
+    BOTH: ("gateway",),
+}
+REVERT_CHANNEL = "verifier"
+APPROVAL_CHANNEL = "api"
+# What may change in a plan record once it is consumed: the result (record_result), the
+# verification and revert (each written once) and the verify-due marker. Anything else is
+# the executor-rewrite pattern: after the consume only the write role writes the record.
+AFTER_CONSUME = frozenset(
+    {
+        "result",
+        "applied_at",
+        "apply_correlation_id",
+        "applied_generation",
+        "verification",
+        "revert",
+        "verify_queue",
+    }
+)
+WRITE_ONCE = ("verification", "revert")
+# Written by the approval channel, in the one update that decides.
+APPROVAL_ATTRIBUTES = frozenset(
+    {"approved_by", "approved_at", "approved_args_hash", "approval_channel", "approval_expires_at"}
+)
+DECIDABLE = ("planned", "awaiting_approval")
+# Severities: a finding fails verify; information does not.
+FINDING, INFO = "finding", "info"
 
 
 def bucket_name(explicit: str | None) -> str:
@@ -151,8 +202,6 @@ def summarize(
             statuses.append(status)
     summary["approved_by"] = approvers
     summary["status_history"] = statuses
-    if image.get("used"):
-        summary["executed_by"] = EXECUTOR_NOTE
     verification = image.get("verification")
     if isinstance(verification, Mapping):
         summary["verification"] = {
@@ -179,6 +228,86 @@ def summarize(
     return summary
 
 
+def correlation_ids(image: Mapping[str, Any]) -> list[str]:
+    """The correlation ids the record holds, by step, without repeats."""
+    found = [
+        image.get(name)
+        for name in (
+            "plan_correlation_id",
+            "approval_request_correlation_id",
+            "decision_correlation_id",
+            "apply_correlation_id",
+        )
+    ]
+    verification = image.get("verification")
+    if isinstance(verification, Mapping):
+        found.append(verification.get("correlation_id"))
+    out: list[str] = []
+    for value in found:
+        if isinstance(value, str) and value and value not in out:
+            out.append(value)
+    return out
+
+
+def name_prefix(bucket: str) -> str:
+    match = BUCKET_NAME.match(bucket)
+    return match.group("prefix") if match else "<name_prefix>"
+
+
+def queries(
+    plan_id: str, bucket: str, summary: Mapping[str, Any], image: Mapping[str, Any]
+) -> dict[str, Any]:
+    """CloudWatch Logs Insights query templates for the logs that observe the executor: the
+    Lambdas' structured records (by plan id and the record's correlation ids) and, when the
+    cluster's audit log goes to CloudWatch Logs, the Kubernetes requests the Lambdas made for
+    the plan (by the User-Agent plan/<plan_id>)."""
+    prefix = name_prefix(bucket)
+    ids = correlation_ids(image)
+    condition = f'@message like "{plan_id}"'
+    if ids:
+        condition += " or correlation_id in [" + ", ".join(f'"{i}"' for i in ids) + "]"
+    time_range: dict[str, Any] = {}
+    if "first_seen" in summary:
+        time_range = {
+            "start": summary["first_seen"] - QUERY_MARGIN_SECONDS,
+            "end": summary["last_seen"] + QUERY_MARGIN_SECONDS,
+        }
+    cluster = image.get("cluster") or "<cluster_name>"
+    return {
+        "lambda_logs": {
+            "log_groups": [
+                f"/aws/lambda/{prefix}-{name}"
+                for name in ("k8s-read", "k8s-write", "approver", "verifier")
+            ],
+            "query": (
+                "fields @timestamp, @log, tool, event, outcome, caller, approver, "
+                f"correlation_id, plan_id\n| filter {condition}\n| sort @timestamp asc"
+            ),
+            **time_range,
+        },
+        "eks_audit_log": {
+            "log_groups": [f"/aws/eks/{cluster}/cluster"],
+            "query": (
+                "fields @timestamp, verb, objectRef.namespace, objectRef.name, user.username, "
+                "user.groups.0, responseStatus.code, userAgent\n"
+                "| filter @logStream like /^kube-apiserver-audit/\n"
+                f'| filter userAgent like "plan/{plan_id}"\n| sort @timestamp asc'
+            ),
+            **time_range,
+            "note": "needs the cluster's audit log type enabled (EKS control plane logging)",
+        },
+    }
+
+
+def executed_by(
+    plan_id: str, bucket: str, summary: Mapping[str, Any], image: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "attribution": EXECUTOR_ATTRIBUTION,
+        "queries": queries(plan_id, bucket, summary, image),
+    }
+
+
 def links(summary: Mapping[str, Any]) -> list[tuple[str, str]]:
     """(relation, plan_id) of the linked revert records, one level only: a revert is never
     reverted."""
@@ -194,6 +323,9 @@ def links(summary: Mapping[str, Any]) -> list[tuple[str, str]]:
 def export(s3: Any, bucket: str, plan_id: str, follow_links: bool = True) -> dict[str, Any]:
     entries, malformed = read_entries(s3, bucket, plan_id)
     summary = summarize(plan_id, entries, malformed)
+    image = latest_image(decoded(entries))
+    if image.get("used"):
+        summary["executed_by"] = executed_by(plan_id, bucket, summary, image)
     bundle: dict[str, Any] = {
         "plan_id": plan_id,
         "bucket": bucket,
@@ -220,7 +352,270 @@ def export(s3: Any, bucket: str, plan_id: str, follow_links: bool = True) -> dic
     return bundle
 
 
-def list_plans(s3: Any, bucket: str, limit: int) -> list[dict[str, Any]]:
+def finding(code: str, message: str, severity: str = FINDING, **details: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {"code": code, "severity": severity, "message": message}
+    if details:
+        out["details"] = details
+    return out
+
+
+def changed(old: Mapping[str, Any] | None, new: Mapping[str, Any] | None) -> set[str]:
+    """Attributes an entry added, removed or changed, from its images."""
+    old, new = old or {}, new or {}
+    return {k for k in set(old) | set(new) if k not in old or k not in new or old[k] != new[k]}
+
+
+def consume_index(entries: list[Mapping[str, Any]]) -> int | None:
+    """The entry that consumed the plan (`used` from false to true), or the creation of a
+    record created consumed (a revert record)."""
+    for index, entry in enumerate(entries):
+        old, new = entry.get("old_image") or {}, entry.get("new_image") or {}
+        if new.get("used") is True and old.get("used") is not True:
+            return index
+    return None
+
+
+def is_decision(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
+    """The approval channel's update: an undecided plan becomes approved or rejected."""
+    return old.get("status") in DECIDABLE and new.get("status") in ("approved", "rejected")
+
+
+def check_sequence(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Missing creation, gaps between consecutive entries, and deletions."""
+    found = []
+    if not any(e.get("event") == "created" for e in entries):
+        found.append(
+            finding(
+                "missing_creation",
+                "no creation entry: created before the stream was enabled, or a record went "
+                "to the dead-letter queue",
+            )
+        )
+    previous = None
+    for entry in entries:
+        old = entry.get("old_image")
+        if previous is not None and old is not None and old != previous.get("new_image"):
+            found.append(
+                finding(
+                    "gap",
+                    "the entry does not start where the previous one ended: a change is "
+                    "missing from the record",
+                    key=entry.get("key"),
+                    after=previous.get("key"),
+                )
+            )
+        if entry.get("event") == "deleted":
+            found.append(
+                finding("deleted", "the plan record was deleted, not expired", key=entry.get("key"))
+            )
+        previous = entry
+    return found
+
+
+def check_rewrites(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The executor-rewrite pattern: after the consume, a change to anything but the result,
+    a second result, a verification or revert written twice; at any time, approval
+    attributes written outside the decision, or a changed approval mode."""
+    found = []
+    consumed = consume_index(entries)
+    for index, entry in enumerate(entries):
+        if entry.get("event") != "modified":
+            continue
+        old, new = entry.get("old_image") or {}, entry.get("new_image") or {}
+        names = changed(old, new)
+        if consumed is not None and index > consumed:
+            unexpected = sorted(names - AFTER_CONSUME)
+            again = sorted(n for n in WRITE_ONCE if n in names and old.get(n) is not None)
+            if old.get("result") is not None and "result" in names:
+                again.append("result")
+            if unexpected or again:
+                found.append(
+                    finding(
+                        "executor_rewrite",
+                        "the record changed after the consume beyond the result, "
+                        "verification and revert; only the write role writes it then",
+                        key=entry.get("key"),
+                        changed=unexpected,
+                        rewritten=again,
+                    )
+                )
+                continue
+        approval = sorted(names & APPROVAL_ATTRIBUTES)
+        if approval and not (is_decision(old, new) and old.get("approved_by") is None):
+            found.append(
+                finding(
+                    "approval_rewrite",
+                    "approval attributes were written outside the approval channel's decision",
+                    key=entry.get("key"),
+                    changed=approval,
+                )
+            )
+        if "approval_mode" in names:
+            found.append(
+                finding(
+                    "approval_mode_changed",
+                    "the plan's approval mode changed after it was planned",
+                    key=entry.get("key"),
+                    before=old.get("approval_mode"),
+                    after=new.get("approval_mode"),
+                )
+            )
+    return found
+
+
+def check_apply(entries: list[Mapping[str, Any]], default_mode: str | None) -> list[dict[str, Any]]:
+    """Channel and approval of the consume, against the plan's approval mode."""
+    consumed = consume_index(entries)
+    if consumed is None:
+        return []
+    entry = entries[consumed]
+    record = entry.get("new_image") or {}
+    key = entry.get("key")
+    channel = record.get("channel")
+    if record.get("kind") == "revert" or record.get("status") == "revert":
+        if channel != REVERT_CHANNEL:
+            return [
+                finding(
+                    "wrong_channel",
+                    f"a revert record must run on the {REVERT_CHANNEL} channel",
+                    key=key,
+                    channel=channel,
+                )
+            ]
+        return []
+    mode = record.get("approval_mode") or default_mode
+    if mode not in CHANNELS_BY_MODE:
+        return [
+            finding(
+                "approval_mode_unknown",
+                "the record has no approval mode (planned before it was recorded); pass "
+                "--approval-mode to check the channel and the approval",
+                INFO,
+                key=key,
+            )
+        ]
+    found = []
+    if channel not in CHANNELS_BY_MODE[mode]:
+        found.append(
+            finding(
+                "wrong_channel",
+                f"applied on channel {channel!r}; {mode} mode allows "
+                + " or ".join(CHANNELS_BY_MODE[mode]),
+                key=key,
+                channel=channel,
+                approval_mode=mode,
+            )
+        )
+    approved_by = record.get("approved_by")
+    if mode in (SERVER, BOTH):
+        problems = []
+        if not approved_by:
+            problems.append("no approved_by")
+        elif approved_by == record.get("requested_by"):
+            problems.append("approved by the requester")
+        if record.get("status") != "approved":
+            problems.append(f"status {record.get('status')!r}")
+        if record.get("approved_args_hash") != record.get("args_hash"):
+            problems.append("approval of other arguments")
+        if approved_by and record.get("approval_channel") != APPROVAL_CHANNEL:
+            problems.append(f"approval channel {record.get('approval_channel')!r}")
+        if problems:
+            found.append(
+                finding(
+                    "applied_without_approval",
+                    f"consumed in {mode} mode without a valid server approval: "
+                    + ", ".join(problems),
+                    key=key,
+                    approval_mode=mode,
+                )
+            )
+    elif not approved_by:
+        times = [e["stream"]["approximate_creation_time"] for e in entries[: consumed + 1]]
+        found.append(
+            finding(
+                "client_unobserved",
+                "client mode: the approval was given in the client (the DevOps Agent chat), "
+                "which the record cannot see; CloudTrail logs it (UpdateApprovalAction) with "
+                "the approver but without the plan id, so it can only be matched by time",
+                INFO,
+                key=key,
+                approval_window={"from": min(times), "to": max(times)},
+            )
+        )
+    return found
+
+
+def verify_plan(
+    s3: Any, bucket: str, plan_id: str, default_mode: str | None = None
+) -> dict[str, Any]:
+    """The findings for one plan, worst first: findings, then information."""
+    entries, malformed = read_entries(s3, bucket, plan_id)
+    found: list[dict[str, Any]] = []
+    if not entries:
+        found.append(finding("no_entries", "the bucket holds no entries for this plan"))
+    for key in malformed:
+        found.append(finding("malformed", "an object that is not an audit entry", key=key))
+    readable = decoded(entries)
+    for entry in entries:
+        if entry not in readable:
+            found.append(
+                finding(
+                    "undecoded",
+                    "an entry whose images could not be decoded; read it by hand",
+                    key=entry.get("key"),
+                )
+            )
+    if entries:
+        found += check_sequence(readable)
+        found += check_rewrites(readable)
+        found += check_apply(readable, default_mode)
+    found.sort(key=lambda f: f["severity"] != FINDING)
+    return {
+        "plan_id": plan_id,
+        "entries": len(entries),
+        "ok": not any(f["severity"] == FINDING for f in found),
+        "findings": found,
+    }
+
+
+def verify(
+    s3: Any,
+    bucket: str,
+    plan_ids: Iterable[str],
+    default_mode: str | None = None,
+) -> dict[str, Any]:
+    plans = [verify_plan(s3, bucket, plan_id, default_mode) for plan_id in plan_ids]
+    return {
+        "bucket": bucket,
+        "verified_at": int(time.time()),
+        "plans": plans,
+        "findings": sum(1 for plan in plans for f in plan["findings"] if f["severity"] == FINDING),
+        "ok": all(plan["ok"] for plan in plans),
+    }
+
+
+def plans_since(s3: Any, bucket: str, since: int | None) -> list[str]:
+    """Plan ids with an entry at or after `since` (every plan when None), oldest first."""
+    plans = list_plans(s3, bucket, limit=None)
+    return [
+        plan["plan_id"]
+        for plan in reversed(plans)
+        if is_plan_id(plan["plan_id"]) and (since is None or plan["last_seen"] >= since)
+    ]
+
+
+def verify_text(report: Mapping[str, Any]) -> str:
+    lines = []
+    for plan in report["plans"]:
+        lines.append(f"{plan['plan_id']}: {'ok' if plan['ok'] else 'FINDINGS'}")
+        for f in plan["findings"]:
+            where = f" ({f['details']['key']})" if f.get("details", {}).get("key") else ""
+            lines.append(f"  {f['severity']}: {f['code']}: {f['message']}{where}")
+    lines.append(f"{len(report['plans'])} plan(s), {report['findings']} finding(s)")
+    return "\n".join(lines)
+
+
+def list_plans(s3: Any, bucket: str, limit: int | None) -> list[dict[str, Any]]:
     """Plans by their last entry, newest first. Lists every key in the bucket."""
     plans: dict[str, dict[str, Any]] = {}
     for key in list_keys(s3, bucket, PLAN_PREFIX):
@@ -248,6 +643,19 @@ def main(argv: list[str] | None = None, s3: Any = None) -> int:
     exp.add_argument("plan_id", type=check_plan_id)
     exp.add_argument("--out", help="write the bundle to this file instead of stdout")
     exp.add_argument("--no-links", action="store_true", help="do not include linked reverts")
+    ver = sub.add_parser("verify", help="check plans' audit entries for anomalies")
+    which = ver.add_mutually_exclusive_group(required=True)
+    which.add_argument("plan_id", nargs="?", type=check_plan_id)
+    which.add_argument(
+        "--since", type=int, metavar="SECONDS", help="every plan with an entry in the last SECONDS"
+    )
+    which.add_argument("--all", action="store_true", help="every plan in the bucket")
+    ver.add_argument("--json", action="store_true", help="print the report as JSON")
+    ver.add_argument(
+        "--approval-mode",
+        choices=sorted(CHANNELS_BY_MODE),
+        help="the mode to assume for records made before approval_mode was recorded",
+    )
     lst = sub.add_parser("list", help="list plans with audit entries, newest first")
     lst.add_argument("--limit", type=int, default=20)
     args = parser.parse_args(argv)
@@ -260,6 +668,15 @@ def main(argv: list[str] | None = None, s3: Any = None) -> int:
     if args.command == "list":
         print(json.dumps(list_plans(s3, bucket, args.limit), indent=2))
         return 0
+    if args.command == "verify":
+        if args.plan_id:
+            plan_ids = [args.plan_id]
+        else:
+            since = None if args.all else int(time.time()) - args.since
+            plan_ids = plans_since(s3, bucket, since)
+        report = verify(s3, bucket, plan_ids, args.approval_mode)
+        print(json.dumps(report, indent=2, sort_keys=True) if args.json else verify_text(report))
+        return 0 if report["ok"] else 1
     bundle = export(s3, bucket, args.plan_id, follow_links=not args.no_links)
     text = json.dumps(bundle, indent=2, sort_keys=True)
     if args.out:
