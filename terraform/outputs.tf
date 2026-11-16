@@ -118,3 +118,8 @@ output "audit_dlq_url" {
   description = "SQS queue that receives plan stream records the audit Lambda gave up on, or null when audit_enabled is false."
   value       = one(aws_sqs_queue.audit_dlq[*].url)
 }
+
+output "dashboard_name" {
+  description = "CloudWatch dashboard of the tools, the sentinel, the verifier and the audit record, or null when the sentinel is disabled."
+  value       = one(aws_cloudwatch_dashboard.this[*].dashboard_name)
+}
