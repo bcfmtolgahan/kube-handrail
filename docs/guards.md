@@ -12,6 +12,12 @@ Three independent checks stand between an agent and a Deployment; each assumes t
 
 The policy checks only the replica bounds. It does not check the pod template, the approval or the history, which need state that only the guard has.
 
+## Plan lifetime
+
+A plan is valid for `PLAN_TTL_SECONDS`. When `plan_ttl_seconds` is not set, Terraform picks 900 seconds in `client` mode, where the human reads the plan and approves it in the DevOps Agent chat with nothing to extend it, and 300 seconds in `server` and `both` mode, where `request_approval` extends it to `approval_wait_ttl_seconds`. The TTL is capped at 3600 (implemented, not yet tested on a cluster).
+
+The TTL is not a guard, and a longer one does not mean 15 minutes in which anything goes. It only bounds how long an approval can refer to a plan. Apply checks the live object again whatever the plan's age: the same `uid` and `generation` and the planned replica count (`conflict` otherwise), the per-object and global budgets, the cooldown and flapping rules, the change freezes and the kill switches. A plan that has gone stale is refused at apply, not applied.
+
 ## GitOps ownership
 
 An object a GitOps controller owns is changed in Git, not here: plan and apply refuse it with `gitops_managed`. The markers are the ones the controllers set: the Argo CD annotation `argocd.argoproj.io/tracking-id`, and the Flux labels `kustomize.toolkit.fluxcd.io/name|namespace` and `helm.toolkit.fluxcd.io/name|namespace`. Malformed metadata counts as managed.

@@ -28,6 +28,11 @@ output "agent_kill_switch_parameters" {
   value       = { for name, p in aws_ssm_parameter.agent_enabled : name => p.name }
 }
 
+output "plan_ttl_seconds" {
+  description = "Seconds a plan stays valid (PLAN_TTL_SECONDS): plan_ttl_seconds, or the approval_mode default when it is null."
+  value       = local.plan_ttl
+}
+
 output "plans_table_name" {
   description = "DynamoDB table holding plans."
   value       = aws_dynamodb_table.plans.name

@@ -45,13 +45,13 @@ variable "max_replicas" {
 }
 
 variable "plan_ttl_seconds" {
-  description = "Seconds a plan stays valid."
+  description = "Seconds a plan stays valid, at most 3600. null (the default) picks by approval_mode: 900 in client mode, where the human approves in the chat after reading the plan, and 300 in server and both mode, where request_approval extends it to approval_wait_ttl_seconds."
   type        = number
-  default     = 300
+  default     = null
 
   validation {
-    condition     = var.plan_ttl_seconds > 0
-    error_message = "plan_ttl_seconds must be positive."
+    condition     = var.plan_ttl_seconds == null || try(var.plan_ttl_seconds > 0 && var.plan_ttl_seconds <= 3600 && floor(var.plan_ttl_seconds) == var.plan_ttl_seconds, false)
+    error_message = "plan_ttl_seconds must be null or an integer from 1 to 3600."
   }
 }
 

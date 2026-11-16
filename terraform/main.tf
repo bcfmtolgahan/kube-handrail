@@ -43,13 +43,17 @@ locals {
     }
   }
 
+  # Client mode has no request_approval to extend a plan, so the human reads and approves
+  # it in the chat within this TTL alone. Not a guard: apply re-checks everything.
+  plan_ttl = coalesce(var.plan_ttl_seconds, var.approval_mode == "client" ? 900 : 300)
+
   common_env = {
     CLUSTER_NAME       = var.cluster_name
     PLANS_TABLE        = aws_dynamodb_table.plans.name
     ALLOWED_NAMESPACES = var.sandbox_namespace
     MIN_REPLICAS       = tostring(var.min_replicas)
     MAX_REPLICAS       = tostring(var.max_replicas)
-    PLAN_TTL_SECONDS   = tostring(var.plan_ttl_seconds)
+    PLAN_TTL_SECONDS   = tostring(local.plan_ttl)
     # From a variable, so it is known when the existing Lambdas are planned.
     GITOPS_MARKERS = jsonencode(var.gitops_markers)
 

@@ -129,6 +129,17 @@ def test_approval_settings_parse():
     assert s.approval_topic_arn.endswith(":approvals") and s.approval_url.startswith("https://")
 
 
+def test_client_mode_plan_ttl_fits_the_default_approval_wait():
+    # Terraform's client-mode default is 900 s, the longest TTL the default wait allows.
+    s = load_settings(BASE | {"APPROVAL_MODE": "client", "PLAN_TTL_SECONDS": "900"})
+    assert (s.plan_ttl_seconds, s.approval_wait_ttl_seconds) == (900, 900)
+
+
+def test_plan_ttl_at_most_an_hour():
+    env = BASE | {"PLAN_TTL_SECONDS": "3600", "APPROVAL_WAIT_TTL_SECONDS": "3600"}
+    assert load_settings(env).plan_ttl_seconds == 3600
+
+
 def test_breaker_settings_parse():
     s = load_settings(
         BASE
@@ -157,6 +168,7 @@ def test_breaker_settings_parse():
         {"MAX_REPLICAS": "x"},
         {"MIN_REPLICAS": "6"},
         {"PLAN_TTL_SECONDS": "0"},
+        {"PLAN_TTL_SECONDS": "3601"},
         {"MAX_REPLICAS": ""},
         {"FLAP_WINDOW_SECONDS": "0"},
         {"OBJECT_HOURLY_APPLY_BUDGET": "-1"},
