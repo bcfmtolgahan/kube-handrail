@@ -63,7 +63,7 @@ The check is one reading at the end of the window, not a comparison with the sta
 
 ## Change freezes
 
-Status: implemented, not yet tested on a cluster.
+Status: implemented and tested on a test cluster.
 
 An operator can freeze changes in one or more namespaces, or all of them, for a window: over a release, a migration or a holiday. The windows live in one SSM parameter, `/<name_prefix>/freezes`, which `scripts/freeze.py` lists and edits; each window names its namespaces, a start, an end (`until`, excluded), a reason and optionally the actions it covers (`scale`, `restart`, `rollback`). See [Change freezes](../mcp/CONTRACT.md#change-freezes).
 

@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-06
 
-Implemented in [Milestone 2](../roadmap.md#milestone-2-verified-changes-more-actions-accountable-agents) (item 5, freezes only), not yet tested on a cluster; see [Change freezes](../../mcp/CONTRACT.md#change-freezes) for the exact rules.
+Implemented in [Milestone 2](../roadmap.md#milestone-2-verified-changes-more-actions-accountable-agents) (item 5, freezes only) and tested on a test cluster; see [Change freezes](../../mcp/CONTRACT.md#change-freezes) for the exact rules.
 
 ## Context
 
