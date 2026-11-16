@@ -2,7 +2,9 @@
 # edit. Bound to the kubernetes_groups of the two EKS access entries (mcp/CONTRACT.md,
 # Identity). Every namespace gets the reader Role; the writer Role only where the policy
 # allows an action. The Lambdas tell scale, restart and rollback apart (all three patch
-# the Deployment); RBAC only drops the ReplicaSet read where rollback is not allowed.
+# the Deployment); RBAC only drops the ReplicaSet read where rollback is not allowed, the
+# Deployment patch where none of the three is, and grants the HPA patch only where
+# adjust_hpa is.
 %{ for name in names ~}
 %{ if name != names[0] ~}
 ---
@@ -66,9 +68,22 @@ metadata:
   labels:
     app.kubernetes.io/part-of: kube-handrail
 rules:
+%{ if length(setsubtract(namespaces[name].actions, ["adjust_hpa"])) > 0 ~}
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "patch"]
+%{ else ~}
+  # The verification of an HPA adjust reads the Deployment the HPA scales.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+%{ endif ~}
+%{ if contains(namespaces[name].actions, "adjust_hpa") ~}
+  # apply_adjust_hpa: minReplicas and maxReplicas only (the admission policy).
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "patch"]
+%{ endif ~}
 %{ if contains(namespaces[name].actions, "rollback") ~}
   # apply_rollback_deployment re-reads the ReplicaSet the plan pinned.
   - apiGroups: ["apps"]

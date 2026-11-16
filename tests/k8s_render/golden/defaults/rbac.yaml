@@ -2,7 +2,9 @@
 # edit. Bound to the kubernetes_groups of the two EKS access entries (mcp/CONTRACT.md,
 # Identity). Every namespace gets the reader Role; the writer Role only where the policy
 # allows an action. The Lambdas tell scale, restart and rollback apart (all three patch
-# the Deployment); RBAC only drops the ReplicaSet read where rollback is not allowed.
+# the Deployment); RBAC only drops the ReplicaSet read where rollback is not allowed, the
+# Deployment patch where none of the three is, and grants the HPA patch only where
+# adjust_hpa is.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

@@ -18,10 +18,15 @@ edit the policy: anyone with that right is trusted as much as the policy itself.
 It fails closed: a policy or binding that cannot be read (no RBAC, an API error, a network
 error) refuses the plan too, so a cluster without the backstop is never planned against
 silently. Only ADMISSION_CHECK=false (Terraform admission_check = false) turns it off.
+
+plan_adjust_hpa checks the second policy and binding, kube-handrail-writer-hpa-bounds
+(HPA_POLICY), the same way: the same bounds variables, its own validations and
+resourceRules covering UPDATE of autoscaling/v2 horizontalpodautoscalers.
 """
 
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from handrail_common.envelope import CONFLICT
@@ -61,6 +66,55 @@ FIXED_VARIABLES = {
 }
 RESOURCES = ("deployments", "deployments/scale")
 
+
+@dataclass(frozen=True)
+class PolicyShape:
+    """One rendered policy and binding: their name, the validation expressions that must all
+    be present, the variables besides the bounds, and the (group, version, resource) rules
+    the resourceRules must cover for UPDATE."""
+
+    name: str
+    validations: tuple[str, ...]
+    fixed_variables: Mapping[str, str]
+    resources: tuple[tuple[str, str, str], ...]
+    # For messages: what the resourceRules must cover.
+    covers: str
+
+
+DEPLOYMENT_POLICY = PolicyShape(
+    name=POLICY_NAME,
+    validations=(VALIDATION,),
+    fixed_variables=FIXED_VARIABLES,
+    resources=tuple(("apps", "v1", resource) for resource in RESOURCES),
+    covers="UPDATE of deployments and deployments/scale",
+)
+# The HPA policy (terraform/modules/namespace-policy/templates/admission-policy.yaml.tftpl).
+HPA_POLICY_NAME = "kube-handrail-writer-hpa-bounds"
+HPA_BOUNDS_VALIDATION = (
+    "(variables.hpaMin == variables.oldHpaMin && "
+    "object.spec.maxReplicas == oldObject.spec.maxReplicas) || (variables.bounded && "
+    "variables.hpaMin >= variables.minReplicas[request.namespace] && "
+    "object.spec.maxReplicas <= variables.maxReplicas[request.namespace])"
+)
+HPA_FROZEN_VALIDATION = (
+    "object.spec.scaleTargetRef == oldObject.spec.scaleTargetRef && "
+    "has(object.spec.metrics) == has(oldObject.spec.metrics) && "
+    "(!has(object.spec.metrics) || object.spec.metrics == oldObject.spec.metrics) && "
+    "has(object.spec.behavior) == has(oldObject.spec.behavior) && "
+    "(!has(object.spec.behavior) || object.spec.behavior == oldObject.spec.behavior)"
+)
+HPA_POLICY = PolicyShape(
+    name=HPA_POLICY_NAME,
+    validations=(HPA_BOUNDS_VALIDATION, HPA_FROZEN_VALIDATION),
+    fixed_variables={
+        "bounded": FIXED_VARIABLES["bounded"],
+        "hpaMin": "has(object.spec.minReplicas) ? object.spec.minReplicas : 1",
+        "oldHpaMin": "has(oldObject.spec.minReplicas) ? oldObject.spec.minReplicas : 1",
+    },
+    resources=(("autoscaling", "v2", "horizontalpodautoscalers"),),
+    covers="UPDATE of autoscaling/v2 horizontalpodautoscalers",
+)
+
 POLICY_MISSING = "policy_missing"
 BINDING_MISSING = "binding_missing"
 BINDING_OTHER_POLICY = "binding_other_policy"
@@ -75,16 +129,17 @@ UNREADABLE = "unreadable"
 _HINT = "an operator must apply the rendered manifests (make upgrade UPGRADE_FLAGS=--with-k8s)"
 
 
-def _refuse(reason: str, message: str, **details: Any) -> GuardError:
+def _refuse(reason: str, message: str, policy: str = POLICY_NAME, **details: Any) -> GuardError:
     return GuardError(
         CONFLICT,
-        f"the cluster's admission policy {POLICY_NAME} does not back this plan: {message}; "
-        + _HINT,
-        {"check": CHECK, "reason": reason, "policy": POLICY_NAME, **details},
+        f"the cluster's admission policy {policy} does not back this plan: {message}; " + _HINT,
+        {"check": CHECK, "reason": reason, "policy": policy, **details},
     )
 
 
-def _read(call: Callable[..., Any], name: str, what: str) -> dict[str, Any] | None:
+def _read(
+    call: Callable[..., Any], name: str, what: str, policy: str = POLICY_NAME
+) -> dict[str, Any] | None:
     """The object as raw JSON, or None when it does not exist. Anything else that keeps it
     from being read refuses the plan (fail closed)."""
     try:
@@ -95,13 +150,15 @@ def _read(call: Callable[..., Any], name: str, what: str) -> dict[str, Any] | No
             return None
         # Status only: the response body can echo cluster internals.
         cause = f"HTTP {status}" if isinstance(status, int) else type(exc).__name__
-        raise _refuse(UNREADABLE, f"cannot read the {what} ({cause})", status=status) from None
+        raise _refuse(
+            UNREADABLE, f"cannot read the {what} ({cause})", policy, status=status
+        ) from None
     try:
         value = json.loads(response.data)
     except (ValueError, AttributeError, TypeError):
-        raise _refuse(UNREADABLE, f"the {what} is not JSON") from None
+        raise _refuse(UNREADABLE, f"the {what} is not JSON", policy) from None
     if not isinstance(value, dict):
-        raise _refuse(UNREADABLE, f"the {what} is not an object")
+        raise _refuse(UNREADABLE, f"the {what} is not an object", policy)
     return value
 
 
@@ -154,8 +211,8 @@ def _normal(expression: Any) -> str:
     return " ".join(str(expression).split())
 
 
-def _covers(rule: Any, resource: str) -> bool:
-    """Whether one resourceRules entry matches UPDATE of apps/v1 `resource` in a
+def _covers(rule: Any, resource: str, group: str = "apps", version: str = "v1") -> bool:
+    """Whether one resourceRules entry matches UPDATE of `group`/`version` `resource` in a
     namespace, for every object name."""
     if not isinstance(rule, Mapping):
         return False
@@ -167,8 +224,8 @@ def _covers(rule: Any, resource: str) -> bool:
     parent, _, sub = resource.partition("/")
     names = [resource, f"{parent}/*"] + ([f"*/{sub}"] if sub else [])
     return (
-        has("apiGroups", "apps")
-        and has("apiVersions", "v1")
+        has("apiGroups", group)
+        and has("apiVersions", version)
         and has("operations", "UPDATE")
         and has("resources", *names)
         and not rule.get("resourceNames")
@@ -176,16 +233,19 @@ def _covers(rule: Any, resource: str) -> bool:
     )
 
 
-def _covers_all(rules: Any) -> bool:
+def _covers_all(rules: Any, shape: PolicyShape = DEPLOYMENT_POLICY) -> bool:
     rules = rules if isinstance(rules, list) else []
-    return all(any(_covers(rule, resource) for rule in rules) for resource in RESOURCES)
+    return all(
+        any(_covers(rule, resource, group, version) for rule in rules)
+        for group, version, resource in shape.resources
+    )
 
 
 def _empty(value: Any) -> bool:
     return value is None or value == {} or value == []
 
 
-def _policy_modified(spec: Mapping[str, Any]) -> str | None:
+def _policy_modified(spec: Mapping[str, Any], shape: PolicyShape = DEPLOYMENT_POLICY) -> str | None:
     """What makes the policy's enforcing parts differ from the rendered ones, or None."""
     if spec.get("failurePolicy", "Fail") != "Fail":
         return "failurePolicy is not Fail"
@@ -198,8 +258,8 @@ def _policy_modified(spec: Mapping[str, Any]) -> str | None:
         return "matchConstraints has an objectSelector"
     if not _empty(constraints.get("excludeResourceRules")):
         return "matchConstraints has excludeResourceRules"
-    if not _covers_all(constraints.get("resourceRules")):
-        return "resourceRules do not cover UPDATE of deployments and deployments/scale"
+    if not _covers_all(constraints.get("resourceRules"), shape):
+        return f"resourceRules do not cover {shape.covers}"
     conditions = spec.get("matchConditions") or []
     if not isinstance(conditions, list) or [
         _normal(c.get("expression")) if isinstance(c, Mapping) else None for c in conditions
@@ -210,18 +270,23 @@ def _policy_modified(spec: Mapping[str, Any]) -> str | None:
         for v in spec.get("variables") or []
         if isinstance(v, Mapping)
     }
-    for name, expression in FIXED_VARIABLES.items():
+    for name, expression in shape.fixed_variables.items():
         if variables.get(name) != expression:
             return f"variable {name} differs from the rendered one"
     validations = spec.get("validations") or []
-    if not isinstance(validations, list) or not any(
-        isinstance(v, Mapping) and _normal(v.get("expression")) == VALIDATION for v in validations
-    ):
-        return "no validation has the rendered expression"
+    present = {
+        _normal(v.get("expression"))
+        for v in (validations if isinstance(validations, list) else [])
+        if isinstance(v, Mapping)
+    }
+    if not all(expression in present for expression in shape.validations):
+        return "a rendered validation expression is missing"
     return None
 
 
-def _binding_modified(spec: Mapping[str, Any]) -> str | None:
+def _binding_modified(
+    spec: Mapping[str, Any], shape: PolicyShape = DEPLOYMENT_POLICY
+) -> str | None:
     resources = spec.get("matchResources") or {}
     if not isinstance(resources, Mapping):
         return "matchResources is not an object"
@@ -230,43 +295,51 @@ def _binding_modified(spec: Mapping[str, Any]) -> str | None:
     if not _empty(resources.get("excludeResourceRules")):
         return "matchResources has excludeResourceRules"
     rules = resources.get("resourceRules")
-    if not _empty(rules) and not _covers_all(rules):
-        return "resourceRules do not cover UPDATE of deployments and deployments/scale"
+    if not _empty(rules) and not _covers_all(rules, shape):
+        return f"resourceRules do not cover {shape.covers}"
     return None
 
 
-def check_admission_policy(api: Any, namespace: str, bounds: tuple[int, int]) -> None:
+def check_admission_policy(
+    api: Any, namespace: str, bounds: tuple[int, int], shape: PolicyShape = DEPLOYMENT_POLICY
+) -> None:
     """Raise conflict unless the cluster's policy and binding back the bounds in the
-    namespace. `api` is an AdmissionregistrationV1Api."""
-    policy = _read(api.read_validating_admission_policy, POLICY_NAME, "policy")
+    namespace. `api` is an AdmissionregistrationV1Api; `shape` names the policy (the
+    Deployment one, or HPA_POLICY for plan_adjust_hpa)."""
+    name = shape.name
+
+    def refuse(reason: str, message: str, **details: Any) -> GuardError:
+        return _refuse(reason, message, name, **details)
+
+    policy = _read(api.read_validating_admission_policy, name, "policy", name)
     if policy is None:
-        raise _refuse(POLICY_MISSING, "the policy does not exist")
-    binding = _read(api.read_validating_admission_policy_binding, BINDING_NAME, "binding")
+        raise refuse(POLICY_MISSING, "the policy does not exist")
+    binding = _read(api.read_validating_admission_policy_binding, name, "binding", name)
     if binding is None:
-        raise _refuse(BINDING_MISSING, "the binding does not exist")
+        raise refuse(BINDING_MISSING, "the binding does not exist")
 
     policy_spec = policy.get("spec") or {}
     binding_spec = binding.get("spec") or {}
-    if binding_spec.get("policyName") != POLICY_NAME:
-        raise _refuse(BINDING_OTHER_POLICY, "the binding refers to another policy")
+    if binding_spec.get("policyName") != name:
+        raise refuse(BINDING_OTHER_POLICY, "the binding refers to another policy")
     actions = binding_spec.get("validationActions") or []
     if not isinstance(actions, list) or DENY not in actions:
-        raise _refuse(
+        raise refuse(
             BINDING_NOT_DENY,
             "the binding does not deny (validationActions has no Deny)",
             validation_actions=actions if isinstance(actions, list) else None,
         )
     if not selects((policy_spec.get("matchConstraints") or {}).get("namespaceSelector"), namespace):
-        raise _refuse(POLICY_NOT_SELECTING, f"the policy does not select namespace {namespace}")
+        raise refuse(POLICY_NOT_SELECTING, f"the policy does not select namespace {namespace}")
     if not selects((binding_spec.get("matchResources") or {}).get("namespaceSelector"), namespace):
-        raise _refuse(BINDING_NOT_SELECTING, f"the binding does not select namespace {namespace}")
+        raise refuse(BINDING_NOT_SELECTING, f"the binding does not select namespace {namespace}")
 
-    modified = _policy_modified(policy_spec)
+    modified = _policy_modified(policy_spec, shape)
     if modified:
-        raise _refuse(POLICY_MODIFIED, f"the policy was changed: {modified}")
-    modified = _binding_modified(binding_spec)
+        raise refuse(POLICY_MODIFIED, f"the policy was changed: {modified}")
+    modified = _binding_modified(binding_spec, shape)
     if modified:
-        raise _refuse(BINDING_MODIFIED, f"the binding was changed: {modified}")
+        raise refuse(BINDING_MODIFIED, f"the binding was changed: {modified}")
 
     variables = policy_spec.get("variables")
     found = (
@@ -275,7 +348,7 @@ def check_admission_policy(api: Any, namespace: str, bounds: tuple[int, int]) ->
     )
     if found != tuple(bounds):
         minimum, maximum = bounds
-        raise _refuse(
+        raise refuse(
             BOUNDS_MISMATCH,
             f"its bounds for namespace {namespace} are {list(found)}, the server's "
             f"[{minimum}, {maximum}]",
