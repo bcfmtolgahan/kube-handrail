@@ -16,6 +16,8 @@ Milestone 3: implemented and tested on a test cluster, except the test profile a
 - The drift sentinel leaves the kill switch as it is when it already holds any value other than `true` (which is already off), instead of overwriting it with `false`; this keeps the marker `make upgrade` writes while the tool set changes.
 - `e2e_gateway.py` runs the verification cases by default; `--skip-verify` leaves them out, and `--with-verify` is accepted and does nothing.
 - The per-release upgrade notes moved to [Upgrade notes before Milestone 4](docs/history/upgrading.md); [deploy](docs/deploy.md#upgrading) describes `make upgrade`.
+- `audit.py export`: `summary.executed_by` is an object, `{attribution, queries}`, with CloudWatch Logs Insights templates for the Lambda logs (by plan ID and correlation IDs) and the EKS audit log (by User-Agent), instead of a fixed sentence. Milestone 9; implemented, not yet tested on a cluster.
+- The audit-grade approver is documented as the server approval (`server` or `both` mode); `client` is an evaluation and convenience mode, because CloudTrail records a chat approval without the plan ID ([ADR 0002](docs/adr/0002-server-verified-approval.md#consequences), [deploy](docs/deploy.md#approval-mode)). `COMPLIANCE` is recommended for the audit bucket in production, with what it means for `terraform destroy` ([deploy](docs/deploy.md#audit-record-retention)).
 
 ### Added
 
@@ -34,6 +36,10 @@ Milestone 3: implemented and tested on a test cluster, except the test profile a
 - `terraform/test.tfvars.example`, a test profile from the normal variables, and `e2e_gateway.py --reset-counters`, which deletes the current hour's apply counters on a test deployment only (a `name_prefix` with `test`, `e2e` or `ci` as a word).
 - Guidance sync tests (`tests/unit/test_guidance_sync.py`, `scripts/check_contract.py`): the `AGENTS.md` tool and error tables and the `CONTRACT.md` error code line against `tools.json` and the error codes, tool and argument names in the skills, contract links, and word-count ceilings.
 - `docs/releasing.md` and this changelog. Approval mode guidance and a shadow-mode recipe in [deploy](docs/deploy.md#approval-mode).
+- **Milestone 9 (approver and executor identity, audit quality):** implemented, not yet tested on a cluster. Tool schemas: unchanged, so no `enable-write`. Agent guidance: unchanged. No Terraform change: `terraform plan` shows only package rebuilds (`terraform_data.build`) and in-place code updates of the Lambdas.
+  - `approval_mode` on every plan record (the read Lambda's `APPROVAL_MODE`; a revert record copies its plan's), in the audit summary, `audit.py export` and `get_plan_outcome`.
+  - `scripts/audit.py verify (<plan_id> | --since SECONDS | --all) [--json]`: flags the executor-rewrite pattern, approval attributes written outside the decision, an apply on the wrong channel for the plan's approval mode, an apply without a server approval in `server` or `both` mode, missing creations, gaps and deletions, and exits 1 on any; `client`-mode applies are reported as `client_unobserved`, for information ([Export](mcp/CONTRACT.md#export)).
+  - Kubernetes API requests carry the User-Agent `kube-handrail/<version> plan/<plan_id> corr/<correlation_id>`, for matching against the EKS audit log. The version comes from `handrail_common.__version__`, which a unit test ties to `pyproject.toml` and the newest release here ([Releasing](docs/releasing.md#release-checklist)).
 
 ### Deprecated
 
