@@ -1,0 +1,90 @@
+# Rendered by Terraform (terraform/modules/namespace-policy) from var.namespaces and
+# var.admission_mode; do not edit. Cluster-side replica bounds for the kube-handrail writer
+# (mcp/CONTRACT.md, Admission policy). Needs admissionregistration.k8s.io/v1
+# ValidatingAdmissionPolicy (Kubernetes 1.30 or later).
+#
+# It applies only to requests whose user is in the group kube-handrail-writer (the write
+# Lambda's access entry), and only in the namespaces of the policy: matchConstraints and
+# the binding select them by kubernetes.io/metadata.name, which the API server sets and
+# nobody can change, so no other namespace is affected, whatever the CEL says. Within
+# them, a validation that fails only refuses the writer; a matchCondition that cannot be
+# evaluated falls to failurePolicy and, in Deny, would refuse Deployment updates by every
+# user there.
+#
+# The bounds are one CEL map per side, keyed by namespace. The read Lambda reads them on
+# every plan and refuses the plan (conflict) unless they equal its own bounds and the
+# binding denies. Change them, and the mode, through Terraform (namespaces,
+# admission_mode); a kubectl patch is undone by the next apply of build/k8s.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-handrail-writer-bounds
+  labels:
+    app.kubernetes.io/part-of: kube-handrail
+spec:
+  # An expression that cannot be evaluated rejects the request (fail closed). For the
+  # validations that is only the writer's; for the matchCondition it is anyone's Deployment
+  # update in these namespaces. The namespace match keeps both to them.
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["kube-handrail-sandbox"]
+    resourceRules:
+      # A PATCH arrives as UPDATE. deployments/scale is not granted to the writer by RBAC;
+      # it is covered so a wider Role cannot bypass the bounds.
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["deployments", "deployments/scale"]
+  matchConditions:
+    - name: kube-handrail-writer
+      expression: "has(request.userInfo.groups) && 'kube-handrail-writer' in request.userInfo.groups"
+  variables:
+    # Namespace => bound; JSON objects, which are CEL map literals.
+    - name: minReplicas
+      expression: '{"kube-handrail-sandbox":1}'
+    - name: maxReplicas
+      expression: '{"kube-handrail-sandbox":3}'
+    # Every selected namespace has bounds; anything else is refused rather than unbounded.
+    - name: bounded
+      expression: "request.namespace in variables.minReplicas && request.namespace in variables.maxReplicas"
+    # A Deployment is defaulted before admission; a Scale omits a count of 0.
+    - name: replicas
+      expression: "has(object.spec.replicas) ? object.spec.replicas : 0"
+    - name: oldReplicas
+      expression: "has(oldObject.spec.replicas) ? oldObject.spec.replicas : 0"
+  validations:
+    # Only a change of the count is bounded: a restart or rollback of a Deployment that a
+    # human scaled outside the bounds keeps its count and is admitted. reason is left at its
+    # default (Invalid, HTTP 422), which the write guard maps to admission_denied.
+    - expression: >-
+        variables.replicas == variables.oldReplicas ||
+        (variables.bounded &&
+        variables.replicas >= variables.minReplicas[request.namespace] &&
+        variables.replicas <= variables.maxReplicas[request.namespace])
+      messageExpression: >-
+        'kube-handrail writer: spec.replicas ' + string(variables.replicas) +
+        (variables.bounded ?
+        ' is outside [' + string(variables.minReplicas[request.namespace]) + ', ' +
+        string(variables.maxReplicas[request.namespace]) + ']' :
+        ' has no bounds') + ' in namespace ' + request.namespace
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-handrail-writer-bounds
+  labels:
+    app.kubernetes.io/part-of: kube-handrail
+spec:
+  policyName: kube-handrail-writer-bounds
+  # Terraform admission_mode. Deny is what the read Lambda requires before it plans.
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["kube-handrail-sandbox"]

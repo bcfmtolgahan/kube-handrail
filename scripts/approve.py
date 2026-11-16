@@ -101,6 +101,8 @@ def summary(view: dict[str, Any]) -> str:
 def change_summary(view: dict[str, Any]) -> str:
     change = view.get("change") or {}
     target = f"{view.get('action')} {view.get('namespace')}/{view.get('name')}"
+    if view.get("cluster"):
+        target += f" on cluster {view['cluster']}"
     if "restart" in change:
         return (
             f"{target}: replace {change['restart'].get('pods_replaced')} pod(s), replicas unchanged"

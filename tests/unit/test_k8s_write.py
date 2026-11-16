@@ -12,7 +12,7 @@ from kubernetes import client as k8s_models
 from kubernetes.client.exceptions import ApiException
 from moto import mock_aws
 
-from handrail_common.config import load_settings
+from handrail_common.config import NamespacePolicy, load_settings
 from handrail_common.dispatch import caller_signature
 from handrail_common.freezes import FreezeStore, format_time
 from handrail_common.killswitch import KillSwitch
@@ -2901,3 +2901,56 @@ def test_a_freeze_does_not_stop_the_verification(verify_rt):
     apps.read_namespaced_deployment.return_value = live(plan.plan_id)
     at(runtime_, NOW + 61)
     assert verify(plan.plan_id)["data"]["outcome"] == "healthy"
+
+
+# --- Namespace policy ------------------------------------------------------------------
+
+
+def restrict(runtime_, actions: set[str], bounds: tuple[int, int] = (0, 5)) -> None:
+    """The sandbox's policy changed after the plan was made (a later deploy)."""
+    runtime_.settings = dataclasses.replace(
+        runtime_.settings,
+        namespace_policy={"sandbox": NamespacePolicy(*bounds, frozenset(actions))},
+    )
+
+
+def test_an_apply_the_namespace_no_longer_allows_is_refused_and_not_consumed(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    restrict(runtime_, {"restart"})
+    response = apply(plan.plan_id)
+    assert error_code(response) == "forbidden_namespace"
+    assert response["error"]["details"] == {"action": "scale", "allowed_actions": ["restart"]}
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert item(plan.plan_id)["used"] is False
+
+
+def test_an_apply_uses_the_namespaces_own_bounds(rt):
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store, replicas=3)
+    restrict(runtime_, {"scale"}, bounds=(0, 2))
+    assert error_code(apply(plan.plan_id)) == "out_of_bounds"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_a_revert_where_scale_was_withdrawn_is_refused(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    restrict(runtime_, {"restart"})
+    assert verify(plan.plan_id)["data"]["revert"] == "refused"
+    assert item(plan.plan_id)["revert"]["reason"] == "forbidden_namespace"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_a_revert_record_keeps_the_cluster_of_its_plan(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps)
+    table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+    table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET #c = :c",
+        ExpressionAttributeNames={"#c": "cluster"},
+        ExpressionAttributeValues={":c": "test-cluster"},
+    )
+    assert verify(plan.plan_id)["data"]["revert"] == "reverted"
+    assert item(handler.revert_plan_id(plan.plan_id))["cluster"] == "test-cluster"

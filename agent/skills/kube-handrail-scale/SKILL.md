@@ -31,6 +31,8 @@ Call `plan_scale_deployment(namespace, name, replicas)`, with `verify_window_sec
 4. `verification`: the window and, with revert, `revert_to`, the count a degraded change is set back to;
 5. `plan_id` and `expires_at` (epoch seconds; plans last minutes).
 
+`forbidden_namespace` with `details.action` `scale`: the namespace does not allow scaling (`details.allowed_actions`); stop and tell the human, and do not restart instead. `conflict` with `details.check` `admission_policy_match`: the cluster's admission policy does not back this namespace; stop and report it.
+
 Warnings do not block the plan. Never omit them. If a warning makes the change unsafe, say so and do not continue without the human.
 
 On an error, follow the AGENTS.md error table. In short: `blast_radius_exceeded` means plan a smaller step; `cooldown` means wait until `details.retry_after`; `manual_change`, `flapping`, budgets, `gitops_managed` and `remediation_disabled` (also when it names only your agent) mean stop and report.

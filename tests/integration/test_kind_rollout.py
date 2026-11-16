@@ -1,6 +1,7 @@
 """Restart and rollback, and the cluster's admission policy behind the write Lambda
 (tests/e2e/e2e_gateway.py: rollout_tests, rollback_refusal_tests, rollback_tests; the
-admission policy's own cases are tests/admission/run.sh)."""
+admission policy's own cases are tests/admission/run.sh, the plan-time check of the binding
+test_kind_namespaces.py)."""
 
 import json
 
@@ -22,6 +23,7 @@ from harness import (
 from kubernetes import client as k8s
 from kubernetes.client.exceptions import ApiException
 
+PLAN_SCALE = "k8sr___plan_scale_deployment"
 PLAN_RESTART = "k8sr___plan_restart_deployment"
 APPLY_RESTART = "k8sw___apply_restart_deployment"
 HISTORY = "k8sr___get_rollout_history"
@@ -209,20 +211,6 @@ def test_rollback_and_manual_change(kh, rollback_target):
     assert envelope["ok"] is True, envelope
 
 
-def _apply_policy(min_replicas, max_replicas):
-    """The deploy sed, then the binding back in Deny (the file commits Warn and Audit)."""
-    kubectl("apply", "-f", "-", stdin=harness.admission_policy(min_replicas, max_replicas))
-    kubectl(
-        "patch",
-        "validatingadmissionpolicybinding",
-        "kube-handrail-writer-bounds",
-        "--type",
-        "merge",
-        "-p",
-        '{"spec":{"validationActions":["Deny"]}}',
-    )
-
-
 def _writer_dry_run_denied(kh, name, replicas):
     try:
         k8s.AppsV1Api(kh.writer).patch_namespaced_deployment(
@@ -233,24 +221,36 @@ def _writer_dry_run_denied(kh, name, replicas):
     return False
 
 
-def test_admission_policy_refuses_what_the_server_bounds_allow(kh):
-    """The policy's bounds drifted below the Lambdas' (MAX_REPLICAS 5, the policy 3): the
-    server's checks pass, the API server refuses the writer's patch, and the plan is used."""
+def test_policy_edited_after_the_plan_refuses_the_apply(kh):
+    """The plan was made against a policy with the Lambdas' bounds; someone then narrows it
+    in the cluster (the sandbox's maximum 5 to 3). The write Lambda does not re-read the
+    policy: its checks pass, the API server refuses the writer's patch (admission_denied)
+    and the plan is used. The next plan sees the edit and is refused (bounds_mismatch)."""
     target = kh.create(deployment_manifest(unique("it-admission"), 2))
-    _apply_policy(MIN_REPLICAS, 3)
+    plan_id = kh.plan(target, 4)
+    kubectl("apply", "-f", "-", stdin=harness.edited_policy(kh.rendered, NAMESPACE, 0, 3))
     try:
         wait_until("the narrower policy", lambda: _writer_dry_run_denied(kh, target["name"], 4))
-        plan_id = kh.plan(target, 4)
         envelope = kh.apply(target, plan_id, 4)
         assert code(envelope) == "admission_denied"
         assert details(envelope)["policy"] == "kube-handrail-writer-bounds"
         assert kh.record(plan_id)["used"] is True
         assert kh.deployment(target["name"]).spec.replicas == 2
-        # Within the policy's bounds the writer is admitted.
-        assert kh.apply(target, kh.plan(target, 3), 3)["ok"] is True
+
+        envelope = kh.call(PLAN_SCALE, {**target, "replicas": 3})
+        assert code(envelope) == "conflict"
+        assert details(envelope)["check"] == "admission_policy_match"
+        assert details(envelope)["reason"] == "bounds_mismatch"
+        assert details(envelope)["expected"] == {
+            "min_replicas": MIN_REPLICAS,
+            "max_replicas": MAX_REPLICAS,
+        }
+        assert details(envelope)["found"] == {"min_replicas": 0, "max_replicas": 3}
     finally:
-        _apply_policy(MIN_REPLICAS, MAX_REPLICAS)
+        kh.restore_policy()
         wait_until(
             "the policy with the Lambdas' bounds",
             lambda: not _writer_dry_run_denied(kh, target["name"], 4),
         )
+    # Restored: planned and admitted again.
+    assert kh.apply(target, kh.plan(target, 4), 4)["ok"] is True

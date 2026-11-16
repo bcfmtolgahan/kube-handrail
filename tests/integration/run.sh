@@ -3,6 +3,7 @@
 #
 # The cluster gets its own kubeconfig file in a temporary directory: the default kubeconfig
 # is never read or written. The node image is the one the CI jobs pin. AWS is moto only.
+# Needs Docker, kind, kubectl and terraform (the harness renders the namespace policy).
 #
 # Environment:
 #   PYTHON        interpreter with requirements-dev.txt (default .venv/bin/python)
@@ -16,6 +17,9 @@ PYTHON=${PYTHON:-.venv/bin/python}
 NAME=${KIND_CLUSTER:-kh-int-$RANDOM}
 NODE_IMAGE=$(sed -n 's/^ *node_image: *//p' .github/workflows/ci.yml | head -n 1)
 [ -n "$NODE_IMAGE" ] || { echo "no node_image in .github/workflows/ci.yml" >&2; exit 2; }
+for tool in kind kubectl terraform; do
+  command -v "$tool" >/dev/null || { echo "$tool not found" >&2; exit 2; }
+done
 
 # Never adopt (and later delete) a cluster that another run or session created.
 if kind get clusters 2>/dev/null | grep -qx "$NAME"; then

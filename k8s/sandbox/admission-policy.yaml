@@ -1,3 +1,9 @@
+# SUPERSEDED: Terraform renders the RBAC and the admission policy for every namespace of
+# var.namespaces to build/k8s (terraform/k8s.tf; docs/deploy.md, Namespaces, RBAC and
+# admission policy). Do not apply this file to a deployment: the read Lambda refuses every
+# plan (conflict) against this policy's format. It stays until the test harnesses that
+# still read it move to the rendered manifests, and will then be deleted.
+#
 # Cluster-side replica bounds for the kube-handrail writer (mcp/CONTRACT.md, Admission policy).
 # Needs admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy (Kubernetes 1.30 or later).
 #

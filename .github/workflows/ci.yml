@@ -39,28 +39,56 @@ jobs:
         run: terraform -chdir=terraform init -backend=false -input=false
       - name: Validate
         run: terraform -chdir=terraform validate
+      # The namespace policy and the cluster manifests rendered for fixture tfvars, offline,
+      # against tests/k8s_render/golden (render.sh --update after a reviewed change).
+      - name: Golden manifests
+        run: tests/k8s_render/render.sh --check
 
-  # The admission policy against a real API server (tests/admission/run.sh). Kubernetes 1.31,
+  # The rendered admission policy and RBAC against a real API server
+  # (tests/admission/run.sh), for two namespaces with different bounds. Kubernetes 1.31,
   # pinned by digest; ValidatingAdmissionPolicy v1 needs 1.30 or later.
   admission:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
       - uses: helm/kind-action@v1
         with:
           version: v0.31.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           cluster_name: kube-handrail-admission
-      - name: Apply the sandbox manifests and the policy
-        run: kubectl apply -f k8s/sandbox/
+      - name: Render the two-namespace fixture
+        run: tests/k8s_render/render.sh tests/k8s_render/fixtures/two-namespaces.tfvars "$RUNNER_TEMP/k8s"
+      - name: Namespaces, web Deployments and the rendered manifests
+        run: |
+          kubectl apply -f k8s/sandbox/namespace.yaml -f k8s/sandbox/web-deployment.yaml
+          kubectl create namespace kube-handrail-sandbox-2
+          sed 's/namespace: kube-handrail-sandbox$/namespace: kube-handrail-sandbox-2/' \
+            k8s/sandbox/web-deployment.yaml | kubectl apply -f -
+          kubectl apply -f "$RUNNER_TEMP/k8s/rbac.yaml" -f "$RUNNER_TEMP/k8s/policy-reader.yaml" \
+            -f "$RUNNER_TEMP/k8s/admission-policy.yaml"
+          # Rendered in Deny; start in Warn so the warn case runs too.
+          kubectl patch validatingadmissionpolicybinding kube-handrail-writer-bounds \
+            --type merge -p '{"spec":{"validationActions":["Warn","Audit"]}}'
       - name: Admission cases
         env:
+          NAMESPACE: kube-handrail-sandbox
+          MIN_REPLICAS: "1"
+          MAX_REPLICAS: "3"
+          ACTIONS: restart
+          NAMESPACE_2: kube-handrail-sandbox-2
+          MIN_REPLICAS_2: "0"
+          MAX_REPLICAS_2: "6"
           OTHER_NAMESPACE: kube-handrail-admission-other
         run: tests/admission/run.sh
 
   # The guard scenarios end to end (tests/integration): the Lambda handlers in process against
   # kind, impersonating the reader and writer groups, with moto for DynamoDB, SSM, SNS and S3.
-  # Same node image as the admission job; tests/integration/run.sh reads the first pin.
+  # The harness renders tests/integration/namespaces.tfvars with tests/k8s_render/render.sh
+  # (terraform, no AWS) and applies those manifests. Same node image as the admission job;
+  # tests/integration/run.sh reads the first pin.
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -69,6 +97,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
       - uses: helm/kind-action@v1

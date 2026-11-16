@@ -17,6 +17,7 @@ help:
 	@echo "make register    register the gateway with DevOps Agent, read tools only"
 	@echo "                 (AGENT_SPACE_ID, CLIENT_ID, CLIENT_SECRET of devops_agent)"
 	@echo "make upgrade     scripts/upgrade.py \$$(UPGRADE_FLAGS), e.g. UPGRADE_FLAGS=--dry-run"
+	@echo "                 UPGRADE_FLAGS=--with-k8s also applies build/k8s with kubectl"
 	@echo "make smoke       the smoke test (--read-only in server and both mode)"
 	@echo "make destroy     scripts/cleanup.sh \$$(CLEANUP_FLAGS)"
 	@echo "make integration the kind and moto integration suite on a throwaway kind cluster"
@@ -52,6 +53,7 @@ smoke:
 destroy:
 	TF_DIR=$(TF_DIR) PYTHON=$(PYTHON) scripts/cleanup.sh $(CLEANUP_FLAGS)
 
-# Needs docker and kind; never touches AWS or the default kubeconfig (tests/integration/README.md).
+# Needs docker, kind and terraform; never touches AWS or the default kubeconfig
+# (tests/integration/README.md).
 integration:
 	PYTHON=$(PYTHON) tests/integration/run.sh

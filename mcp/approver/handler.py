@@ -2,7 +2,9 @@
 
 Served through a Lambda Function URL with AWS_IAM auth, never through the gateway, so no MCP
 client can reach it. The caller is the IAM principal that signed the request; only listed
-human principals may decide, and machine identities are refused even when listed.
+human principals may decide, and machine identities are refused even when listed. A
+namespace whose policy lists its own approvers (namespace_policy.json) is decided only by
+them; every other namespace by APPROVER_PRINCIPALS.
 """
 
 import base64
@@ -12,14 +14,21 @@ import os
 import re
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
 
 from handrail_common.approval import plain, plan_view, sanitize_reason
-from handrail_common.config import SERVER, ConfigError, approval_mode, int_env, required_env
+from handrail_common.config import (
+    SERVER,
+    ConfigError,
+    approval_mode,
+    int_env,
+    load_namespace_policy,
+    required_env,
+)
 from handrail_common.envelope import (
     CONFLICT,
     FORBIDDEN,
@@ -59,6 +68,8 @@ APPLY_TOOLS = {
 }
 APPROVE = "approve"
 REJECT = "reject"
+# details.reason of forbidden when the caller approves for another namespace only.
+NOT_NAMESPACE_APPROVER = "not_namespace_approver"
 BODY_FIELDS = frozenset({"plan_id", "decision", "reason", "apply"})
 MAX_BODY_BYTES = 4096
 
@@ -89,6 +100,24 @@ class ApproverSettings:
     approval_mode: str
     apply_after_approval_ttl_seconds: int
     region: str | None
+    # Namespace => its own approvers, for the namespaces whose policy lists any.
+    namespace_approvers: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    # Every namespace of the packaged policy; empty without a policy file.
+    policy_namespaces: frozenset[str] = frozenset()
+
+    def approvers_for(self, namespace: Any) -> tuple[str, ...]:
+        """Who decides a plan in this namespace: its own approvers when its policy lists
+        any (the global ones then cannot), otherwise APPROVER_PRINCIPALS. Nobody, for a
+        namespace that a packaged policy no longer has."""
+        if self.policy_namespaces and namespace not in self.policy_namespaces:
+            return ()
+        return self.namespace_approvers.get(namespace) or self.approvers
+
+    @property
+    def all_approvers(self) -> tuple[str, ...]:
+        """Everyone who may decide in some namespace."""
+        listed = [*self.approvers, *(a for v in self.namespace_approvers.values() for a in v)]
+        return tuple(dict.fromkeys(listed))
 
     @property
     def applies_after_approval(self) -> bool:
@@ -110,6 +139,16 @@ def load_approver_settings(env: Mapping[str, str] | None = None) -> ApproverSett
     ttl = int_env(env, "APPLY_AFTER_APPROVAL_TTL_SECONDS", 120)
     if ttl <= 0:
         raise ConfigError("APPLY_AFTER_APPROVAL_TTL_SECONDS must be positive")
+    namespace_approvers = {}
+    namespace_policy = load_namespace_policy(env)
+    for namespace, policy in namespace_policy.items():
+        for value in policy.approvers:
+            if not _IAM_ARN.match(value):
+                raise ConfigError(
+                    f"approvers of {namespace}: {value!r} is not an IAM user or role ARN"
+                )
+        if policy.approvers:
+            namespace_approvers[namespace] = policy.approvers
     return ApproverSettings(
         plans_table=required_env(env, "PLANS_TABLE"),
         write_function=required_env(env, "WRITE_FUNCTION_NAME"),
@@ -118,6 +157,8 @@ def load_approver_settings(env: Mapping[str, str] | None = None) -> ApproverSett
         approval_mode=approval_mode(env),
         apply_after_approval_ttl_seconds=ttl,
         region=env.get("AWS_REGION") or None,
+        namespace_approvers=namespace_approvers,
+        policy_namespaces=frozenset(namespace_policy),
     )
 
 
@@ -134,13 +175,28 @@ def principal_matches(entry: str, caller: str) -> bool:
 
 
 def check_approver(settings: ApproverSettings, caller: str | None) -> str:
+    """The caller may decide in at least one namespace; check_namespace_approver then
+    checks the plan's namespace."""
     if not caller:
         raise GuardError(FORBIDDEN, "the request carries no IAM identity")
     if any(principal_matches(entry, caller) for entry in settings.denied):
         raise GuardError(FORBIDDEN, "machine identities cannot approve")
-    if not any(principal_matches(entry, caller) for entry in settings.approvers):
+    if not any(principal_matches(entry, caller) for entry in settings.all_approvers):
         raise GuardError(FORBIDDEN, "the caller is not an approver")
     return caller
+
+
+def check_namespace_approver(
+    settings: ApproverSettings, caller: str, item: Mapping[str, Any]
+) -> None:
+    """The caller must be an approver of the plan's own namespace."""
+    namespace = item.get("namespace")
+    if not any(principal_matches(e, caller) for e in settings.approvers_for(namespace)):
+        raise GuardError(
+            FORBIDDEN,
+            f"the caller is not an approver of namespace {namespace}",
+            {"reason": NOT_NAMESPACE_APPROVER, "namespace": namespace},
+        )
 
 
 def caller_arn(event: Mapping[str, Any]) -> str | None:
@@ -240,12 +296,13 @@ def trigger_apply(
     return envelope if isinstance(envelope, dict) else err(INTERNAL, "unexpected apply response")
 
 
-def show(rt: Runtime, event: Mapping[str, Any]) -> Envelope:
+def show(rt: Runtime, event: Mapping[str, Any], approver: str) -> Envelope:
     params = event.get("queryStringParameters") or {}
     plan_id = require_plan_id(params.get("plan_id"))
     item = rt.store.get(plan_id)
     if item is None:
         raise GuardError(PLAN_NOT_FOUND, "plan not found")
+    check_namespace_approver(rt.settings, approver, item)
     return ok(plan_view(item, int(rt.clock())))
 
 
@@ -268,6 +325,7 @@ def decide(
     # A missing plan is left to the decision itself, which says why it cannot be made.
     if current is not None:
         check_decidable(current)
+        check_namespace_approver(s, approver, current)
     if decision == APPROVE:
         if current is not None:
             check_appliable(current)
@@ -317,7 +375,7 @@ def handle(rt: Runtime, event: Mapping[str, Any], correlation_id: str | None = N
     approver = check_approver(rt.settings, caller_arn(event))
     method = ((event.get("requestContext") or {}).get("http") or {}).get("method")
     if method == "GET":
-        return show(rt, event)
+        return show(rt, event, approver)
     if method == "POST":
         return decide(rt, event, approver, correlation_id)
     raise GuardError(INVALID_ARGUMENT, "use GET to show a plan or POST to decide")

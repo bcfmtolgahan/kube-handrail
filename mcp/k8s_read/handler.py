@@ -14,6 +14,8 @@ import boto3
 from kubernetes import client as k8s
 from kubernetes.client.rest import ApiException
 
+from handrail_common.admission import CHECK as ADMISSION_POLICY_MATCH
+from handrail_common.admission import check_admission_policy
 from handrail_common.agents import check_agent_budget, guard_plan, requester
 from handrail_common.approval import notification, plain, plan_view
 from handrail_common.breaker import (
@@ -24,7 +26,7 @@ from handrail_common.breaker import (
     replica_baseline,
     retention_seconds,
 )
-from handrail_common.config import Settings, load_settings
+from handrail_common.config import Settings, action_name, load_settings
 from handrail_common.dispatch import dispatch
 from handrail_common.eks import api_client
 from handrail_common.envelope import (
@@ -400,6 +402,10 @@ class Clients:
         return k8s.DiscoveryV1Api(api_client(self._settings.cluster_name))
 
     @property
+    def admission(self) -> k8s.AdmissionregistrationV1Api:
+        return k8s.AdmissionregistrationV1Api(api_client(self._settings.cluster_name))
+
+    @property
     def store(self) -> PlanStore:
         return _store(self._settings.plans_table, self._settings.region)
 
@@ -432,7 +438,7 @@ def get_workload_status(args: dict[str, Any], settings: Settings, clients: Clien
     name = require_name(args.get("name"))
     check_namespace_allowed(namespace, settings.allowed_namespaces)
     deployment = _read_deployment(clients.apps, namespace, name)
-    summary, truncated = _summary(deployment, settings.gitops_markers)
+    summary, truncated = _summary(deployment, settings.markers_for(namespace))
     return ok(summary, truncated=truncated)
 
 
@@ -579,9 +585,12 @@ def _plan(
     agent = guard_plan(settings, clients.ssm)
     # Before the Deployment is read; apply checks again with its own clock.
     check_not_frozen(freeze_store(clients.ssm, settings.freezes_param), namespace, action.name, now)
+    # The cluster's backstop must hold the same bounds before anything is planned against it.
+    if settings.admission_check:
+        check_admission_policy(clients.admission, namespace, settings.bounds_for(namespace))
     override = request.get("override_manual_change", False) is True
     deployment, raw = _read_deployment_raw(clients.apps, namespace, name)
-    if is_gitops_managed(deployment, settings.gitops_markers):
+    if is_gitops_managed(deployment, settings.markers_for(namespace)):
         raise GuardError(GITOPS_MANAGED, "deployment is managed by GitOps; change it in Git")
     current = _desired_replicas(deployment)
     template = (raw.get("spec") or {}).get("template") or {}
@@ -609,6 +618,7 @@ def _plan(
 
     plan = Plan(
         plan_id=plan_id,
+        cluster=settings.cluster_name,
         action=action.name,
         namespace=namespace,
         name=name,
@@ -648,6 +658,8 @@ def _plan(
             preflight[-1]["overridden"] = True
         # The plan rate limit was removed; the entry stays one release for clients that read it.
         if check == "plan_rate":
+            preflight[-1]["skipped"] = True
+        if check == ADMISSION_POLICY_MATCH and not settings.admission_check:
             preflight[-1]["skipped"] = True
         # The per-agent checks, after the checks they follow.
         follows = {"arguments": "agent_enabled", "global_budget": "agent_budget"}.get(check)
@@ -690,7 +702,7 @@ def _verify_request(
 
 def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, str, dict[str, Any]]:
     namespace, name, replicas = validate_scale_args(
-        args, settings.allowed_namespaces, settings.bounds_for
+        args, settings.allowed_namespaces, settings.bounds_for, settings.actions_for
     )
     override = require_override_flag(args)
     window, revert = _verify_request(args, settings, revert_allowed=True)
@@ -761,7 +773,9 @@ SCALE = PlanAction(
     preflight=(
         "arguments",
         "namespace_allowed",
+        "action_allowed",
         "replica_bounds",
+        ADMISSION_POLICY_MATCH,
         "not_gitops_managed",
         "no_hpa",
         "blast_radius",
@@ -795,7 +809,9 @@ def plan_scale_deployment(
 def _validate_restart(
     args: Mapping[str, Any], settings: Settings
 ) -> tuple[str, str, dict[str, Any]]:
-    namespace, name = validate_target_args(args, settings.allowed_namespaces)
+    namespace, name = validate_target_args(
+        args, settings.allowed_namespaces, action_name(RESTART_DEPLOYMENT), settings.actions_for
+    )
     window, _ = _verify_request(args, settings)
     return namespace, name, restart_args(namespace, name, window)
 
@@ -846,6 +862,8 @@ RESTART = PlanAction(
     preflight=(
         "arguments",
         "namespace_allowed",
+        "action_allowed",
+        ADMISSION_POLICY_MATCH,
         "not_gitops_managed",
         "not_paused",
         "cooldown",
@@ -878,7 +896,9 @@ def plan_restart_deployment(
 def _validate_rollback(
     args: Mapping[str, Any], settings: Settings
 ) -> tuple[str, str, dict[str, Any]]:
-    namespace, name = validate_target_args(args, settings.allowed_namespaces)
+    namespace, name = validate_target_args(
+        args, settings.allowed_namespaces, action_name(ROLLBACK_DEPLOYMENT), settings.actions_for
+    )
     revision = require_revision(args.get("revision"))
     override = require_override_flag(args)
     window, _ = _verify_request(args, settings)
@@ -957,6 +977,8 @@ ROLLBACK = PlanAction(
     preflight=(
         "arguments",
         "namespace_allowed",
+        "action_allowed",
+        ADMISSION_POLICY_MATCH,
         "not_gitops_managed",
         "not_paused",
         "revision_found",

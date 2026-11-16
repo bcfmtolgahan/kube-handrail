@@ -26,22 +26,78 @@ variable "name_prefix" {
   }
 }
 
+variable "namespaces" {
+  description = "Namespaces the tools may plan and apply changes in, each with its replica bounds, the actions it allows (restart, rollback, scale), its own approvers (IAM user or role ARNs; when set, only they decide its plans, otherwise approver_principals) and GitOps marker keys checked in addition to gitops_markers. Empty (the default) derives one namespace from the deprecated sandbox_namespace, min_replicas and max_replicas, which is what earlier releases did."
+  type = map(object({
+    min_replicas   = optional(number, 0)
+    max_replicas   = optional(number, 5)
+    actions        = optional(set(string), ["restart", "rollback", "scale"])
+    approvers      = optional(list(string), [])
+    gitops_markers = optional(list(string), [])
+  }))
+  default = {}
+
+  validation {
+    condition     = alltrue([for name in keys(var.namespaces) : length(name) <= 63 && can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", name))])
+    error_message = "namespaces keys must be Kubernetes namespace names (DNS-1123 labels)."
+  }
+
+  validation {
+    condition     = alltrue([for ns in values(var.namespaces) : try(ns.min_replicas >= 0 && ns.min_replicas <= ns.max_replicas && floor(ns.min_replicas) == ns.min_replicas && floor(ns.max_replicas) == ns.max_replicas, false)])
+    error_message = "Each namespace needs integers 0 <= min_replicas <= max_replicas."
+  }
+
+  validation {
+    condition     = alltrue([for ns in values(var.namespaces) : length(setsubtract(ns.actions, ["restart", "rollback", "scale"])) == 0])
+    error_message = "A namespace's actions must be restart, rollback or scale."
+  }
+
+  validation {
+    condition     = alltrue(flatten([for ns in values(var.namespaces) : [for arn in ns.approvers : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(user|role)/.+$", arn))]]))
+    error_message = "A namespace's approvers must be IAM user or role ARNs."
+  }
+
+  validation {
+    condition     = alltrue(flatten([for ns in values(var.namespaces) : [for key in ns.gitops_markers : can(regex("^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$", key))]]))
+    error_message = "A namespace's gitops_markers must be Kubernetes label or annotation keys."
+  }
+}
+
+# Deprecated: namespaces replaces them. null means not set; the check
+# "deprecated_namespace_variables" in k8s.tf warns while any is set.
 variable "sandbox_namespace" {
-  description = "The only namespace the tools may plan or apply changes in."
+  description = "Deprecated, use namespaces. The only namespace when namespaces is empty (null: kube-handrail-sandbox)."
   type        = string
-  default     = "kube-handrail-sandbox"
+  default     = null
 }
 
 variable "min_replicas" {
-  description = "Lowest replica count a plan may request."
+  description = "Deprecated, use namespaces. Lowest replica count a plan may request when namespaces is empty (null: 0)."
   type        = number
-  default     = 0
+  default     = null
 }
 
 variable "max_replicas" {
-  description = "Highest replica count a plan may request."
+  description = "Deprecated, use namespaces. Highest replica count a plan may request when namespaces is empty (null: 5)."
   type        = number
-  default     = 5
+  default     = null
+}
+
+variable "admission_mode" {
+  description = "validationActions of the admission policy binding in build/k8s: Deny refuses the writer's out-of-bounds changes, Warn admits them with a warning and an audit annotation (a trial; plans need admission_check = false then, because the read Lambda requires Deny)."
+  type        = string
+  default     = "Deny"
+
+  validation {
+    condition     = contains(["Warn", "Deny"], var.admission_mode)
+    error_message = "admission_mode must be Warn or Deny."
+  }
+}
+
+variable "admission_check" {
+  description = "Whether the read Lambda compares the cluster's admission policy with its own bounds on every plan and refuses the plan (conflict) when they differ or the policy cannot be read. Turn it off only for a cluster that does not run the policy (Kubernetes below 1.30)."
+  type        = bool
+  default     = true
 }
 
 variable "plan_ttl_seconds" {

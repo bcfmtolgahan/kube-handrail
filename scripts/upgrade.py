@@ -17,6 +17,12 @@ Steps, in order (docs/deploy.md, Upgrading):
  4. migrate     The targeted apply of a known two-step migration, then a new plan.
  5. apply       The saved plan; once more, after a new plan and check, when Terraform fails
                 with "inconsistent final plan".
+ 5b. k8s        With --with-k8s: the cluster manifests (the k8s_manifests output) written to
+                build/k8s and applied with kubectl, after a server-side dry run of all of
+                them; then the admission policy binding is checked against admission_mode,
+                and kube-handrail Roles the manifests no longer contain are listed (never
+                deleted). Without it, a warning when the manifests changed. --k8s-only runs
+                just this step against the deployed state (after a confirmation).
  6. enable-write  Only when the tool set changed and the DevOps Agent IDs are known.
  7. sentinel    Invoked at once; its result must be ok.
  8. kill switch Turned back on only if this script turned it off and nothing else wrote it
@@ -24,6 +30,9 @@ Steps, in order (docs/deploy.md, Upgrading):
  9. guidance    install-guidance when AGENTS.md or a skill differs from what is installed;
                 prints the asset versions and the stale-skill warning.
 10. smoke       scripts/smoke_test.py; --read-only in server and both mode.
+
+terraform get runs before every plan, so a module added by the release is installed (it
+touches neither the backend nor the providers).
 
 Progress is kept in .upgrade-state.json at the repository root (not committed); after a
 failure, fix the cause and run again with --resume. Until the apply is done, a resume runs
@@ -64,6 +73,7 @@ STEPS = (
     "disable_kill_switch",
     "migrate",
     "apply",
+    "k8s",
     "enable_write",
     "sentinel",
     "enable_kill_switch",
@@ -97,6 +107,11 @@ SENTINEL_RETRY_SECONDS = 20
 # The kill switch value this script writes: anything but "true" turns remediation off, and
 # the run ID shows whose it is.
 MARKER_PREFIX = "false:upgrade:"
+# The cluster manifests (terraform/k8s.tf): where --with-k8s writes them, the binding it
+# checks, and the label of the objects it rendered (and of the earlier static manifests).
+K8S_DIR = Path("build") / "k8s"
+BINDING = "kube-handrail-writer-bounds"
+PART_OF_SELECTOR = "app.kubernetes.io/part-of in (kube-handrail,kube-handrail-sandbox)"
 # DevOps Agent may keep serving the previous skill text to running sessions for a while.
 STALE_SKILL_MINUTES = 35
 GENERIC = "GENERIC"
@@ -225,6 +240,13 @@ class State:
     kill_switch_disabled: bool = False
     sentinel: str | None = None
     notes: list[str] = field(default_factory=list)
+    # --with-k8s and the kubectl context it resolved to, kept so a --resume applies the
+    # cluster manifests to the same context even without the flag.
+    with_k8s: bool = False
+    kube_context: str | None = None
+    # Hash of the k8s_manifests output before the apply, so a resume after the apply can
+    # still tell that the manifests changed.
+    k8s_manifests_before: str | None = None
 
     @classmethod
     def new(cls) -> "State":
@@ -320,7 +342,14 @@ class Terraform:
             raise UpgradeError("terraform output did not return JSON") from None
         return {name: entry.get("value") for name, entry in raw.items()}
 
+    def get(self) -> None:
+        """Install the modules the configuration uses; no backend or provider change."""
+        result = self.quiet(self._base("get", "-no-color"))
+        if result.returncode != 0:
+            raise UpgradeError(f"terraform get failed: {result.text().strip()[-500:]}")
+
     def plan(self) -> dict[str, Any]:
+        self.get()
         result = self.stream(
             self._base("plan", "-input=false", "-lock-timeout=60s", f"-out={PLAN_FILE}")
             + self._vars()
@@ -351,6 +380,124 @@ class Terraform:
             + [f"-target={t}" for t in targets]
             + self._vars()
         )
+
+
+# --- Kubernetes -------------------------------------------------------------------------
+
+
+class Kubectl:
+    """kubectl with the operator's kubeconfig, on --kube-context or the current context."""
+
+    def __init__(
+        self,
+        context: str | None = None,
+        stream: Runner = run_streaming,
+        quiet: Runner = run_quiet,
+    ) -> None:
+        self.context = context
+        self.stream = stream
+        self.quiet = quiet
+
+    def _base(self, *args: str) -> list[str]:
+        return ["kubectl", *(["--context", self.context] if self.context else []), *args]
+
+    def current_context(self) -> str:
+        if self.context:
+            return self.context
+        result = self.quiet(["kubectl", "config", "current-context"])
+        if result.returncode != 0 or not result.output.strip():
+            raise UpgradeError(
+                "--with-k8s: kubectl has no current context; set KUBECONFIG or --kube-context"
+            )
+        return result.output.strip()
+
+    def pin(self) -> str:
+        """Resolve the context once, so every later command names it with --context even
+        if the kubeconfig's current context changes during the run."""
+        self.context = self.current_context()
+        return self.context
+
+    def apply(self, files: list[Path], dry_run: bool) -> Result:
+        """Apply the named files only, so nothing else in the directory is applied."""
+        extra = ["--dry-run=server"] if dry_run else []
+        names = [arg for path in files for arg in ("-f", str(path))]
+        return self.stream(self._base("apply", *extra, *names))
+
+    def binding_actions(self) -> list[str] | None:
+        result = self.quiet(
+            self._base(
+                "get",
+                "validatingadmissionpolicybinding",
+                BINDING,
+                "-o",
+                "jsonpath={.spec.validationActions}",
+            )
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            value = json.loads(result.output or "null")
+        except ValueError:
+            return None
+        return value if isinstance(value, list) else None
+
+    def labeled_roles(self) -> list[str] | None:
+        """namespace/kind/name of every Role and RoleBinding with a kube-handrail part-of
+        label, or None when they cannot be listed (no cluster-wide list right)."""
+        result = self.quiet(
+            self._base(
+                "get",
+                "roles.rbac.authorization.k8s.io,rolebindings.rbac.authorization.k8s.io",
+                "--all-namespaces",
+                "-l",
+                PART_OF_SELECTOR,
+                "-o",
+                "json",
+            )
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            items = json.loads(result.output).get("items") or []
+        except (ValueError, AttributeError):
+            return None
+        return sorted(
+            f"{i['metadata']['namespace']}/{i['kind']}/{i['metadata']['name']}" for i in items
+        )
+
+
+def rendered_roles(manifests: Mapping[str, str]) -> set[str]:
+    """namespace/kind/name of the Roles and RoleBindings in the rendered manifests, read
+    from their fixed layout (terraform/modules/namespace-policy/templates/rbac.yaml.tftpl)."""
+    found: set[str] = set()
+    for text in manifests.values():
+        for document in text.split("\n---\n"):
+            kind = re.search(r"^kind: (Role|RoleBinding)$", document, re.MULTILINE)
+            name = re.search(r"^  name: (\S+)$", document, re.MULTILINE)
+            namespace = re.search(r"^  namespace: (\S+)$", document, re.MULTILINE)
+            if kind and name and namespace:
+                found.add(f"{namespace.group(1)}/{kind.group(1)}/{name.group(1)}")
+    return found
+
+
+def write_manifests(manifests: Mapping[str, str], directory: Path) -> list[Path]:
+    """Replace the YAML files in `directory` with the rendered manifests; return their
+    paths, which are what gets applied."""
+    for name in manifests:
+        if "/" in name or not name.endswith(".yaml"):
+            raise UpgradeError(f"unexpected manifest name {name!r} in the k8s_manifests output")
+    directory.mkdir(parents=True, exist_ok=True)
+    for old in directory.glob("*.yaml"):
+        old.unlink()
+    written = []
+    for name, text in sorted(manifests.items()):
+        (directory / name).write_text(text)
+        written.append(directory / name)
+    return written
+
+
+def manifests_hash(manifests: Any) -> str:
+    return hashlib.sha256(json.dumps(manifests, sort_keys=True).encode()).hexdigest()
 
 
 # --- Guidance ---------------------------------------------------------------------------
@@ -418,6 +565,7 @@ class Options:
     smoke_namespace: str | None = None
     smoke_name: str | None = None
     yes: bool = False
+    with_k8s: bool = False
     python: str = sys.executable
 
 
@@ -443,8 +591,11 @@ class Upgrade:
         smoke: Callable[[list[str], dict[str, str]], int] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         confirm: Callable[[str], bool] | None = None,
+        kubectl: Kubectl | None = None,
     ) -> None:
         self.tf = terraform
+        self.kubectl = kubectl or Kubectl()
+        self.k8s_dir = repo_root / K8S_DIR
         self.clients = clients
         self.options = options
         self.state_path = state_path
@@ -535,6 +686,7 @@ class Upgrade:
             "disable_kill_switch": self.disable_kill_switch,
             "migrate": self.migrate,
             "apply": self.apply,
+            "k8s": self.k8s,
             "enable_write": self.enable_write,
             "sentinel": self.sentinel,
             "enable_kill_switch": self.enable_kill_switch,
@@ -577,6 +729,10 @@ class Upgrade:
                 raise UpgradeError(f"--resume: no {self.state_path.name}; run without --resume")
             state = State.load(self.state_path)
             say(f"resuming run {state.run_id} after {', '.join(state.done) or 'nothing'}")
+            if state.with_k8s and not self.options.with_k8s:
+                say("--with-k8s from the run being resumed")
+                self.options.with_k8s = True
+            state.with_k8s = self.options.with_k8s
             return state
         if exists:
             raise UpgradeError(
@@ -584,6 +740,7 @@ class Upgrade:
                 "--resume to continue it, or delete the file if you finished it by hand."
             )
         state = State.new()
+        state.with_k8s = self.options.with_k8s
         state.save(self.state_path)
         return state
 
@@ -598,6 +755,12 @@ class Upgrade:
     def preflight(self) -> None:
         assert self.state is not None
         self.outputs = self.tf.outputs()
+        if "apply" not in self.state.done and self.state.k8s_manifests_before is None:
+            self.state.k8s_manifests_before = manifests_hash(self.outputs.get("k8s_manifests"))
+        if self.options.with_k8s:
+            self.pin_context()
+            # Shown before the confirmation, so the operator sees which cluster it is.
+            say(f"--with-k8s: build/k8s goes to kubectl context {self.kubectl.context}")
         value = self.kill_switch_value()
         ours = self.state.kill_switch_marker
         if value == "true":
@@ -671,6 +834,8 @@ class Upgrade:
         if self.state.targets:
             steps.append(f"apply -target {' '.join(self.state.targets)}")
         steps.append("apply")
+        if self.options.with_k8s:
+            steps.append("kubectl apply build/k8s (a server-side dry run first)")
         if self.state.tool_set_changed:
             steps.append(
                 "enable-write"
@@ -732,6 +897,86 @@ class Upgrade:
         self.disable_kill_switch()
         if self.tf.apply_plan().returncode != 0:
             raise UpgradeError("terraform apply failed twice; fix the cause and run with --resume")
+
+    def k8s_only(self, outputs: dict[str, Any]) -> int:
+        """--k8s-only: the manifests of the deployed state, without a Terraform run."""
+        self.state = State.new()
+        self.outputs = outputs
+        say(f"build/k8s goes to kubectl context {self.kubectl.pin()}")
+        if not self.options.yes and not self.confirmed("Apply build/k8s to this context?"):
+            raise UpgradeError("not confirmed; nothing was applied")
+        self.k8s()
+        for note in self.state.notes:
+            say(f"note: {note}")
+        return 0
+
+    def pin_context(self) -> None:
+        """The kubectl context of the run: the one a resumed run used, unless
+        --kube-context names another, which is refused."""
+        assert self.state is not None
+        saved = self.state.kube_context
+        if saved and self.kubectl.context and self.kubectl.context != saved:
+            raise UpgradeError(
+                f"--kube-context {self.kubectl.context}: the run being resumed applies to "
+                f"context {saved}; resume without --kube-context or with that one"
+            )
+        if saved:
+            self.kubectl.context = saved
+        self.state.kube_context = self.kubectl.pin()
+
+    def k8s(self) -> None:
+        """The cluster manifests of this release, after the apply that rendered them."""
+        assert self.state is not None
+        before = self.state.k8s_manifests_before or manifests_hash(self.output("k8s_manifests"))
+        self.outputs = self.tf.outputs()
+        manifests = self.output("k8s_manifests")
+        if not isinstance(manifests, dict) or not manifests:
+            say("WARNING: no k8s_manifests output; the cluster manifests were not checked")
+            return
+        if not self.options.with_k8s:
+            if manifests_hash(manifests) != before:
+                say(
+                    "WARNING: the cluster manifests changed and were not applied: plans are "
+                    "refused (conflict) until they are. Run make upgrade UPGRADE_FLAGS="
+                    "--k8s-only now, or kubectl apply -f build/k8s/ yourself"
+                )
+                self.state.notes.append("cluster manifests changed: apply build/k8s")
+            return
+        files = write_manifests(manifests, self.k8s_dir)
+        say(f"kubectl apply --dry-run=server of {', '.join(p.name for p in files)} in {K8S_DIR}")
+        if self.kubectl.apply(files, dry_run=True).returncode != 0:
+            raise UpgradeError(
+                "the server-side dry run of build/k8s failed, nothing was applied to the "
+                "cluster: fix the cause (a missing namespace, RBAC) and run with --resume "
+                "(it keeps --with-k8s)"
+            )
+        if self.kubectl.apply(files, dry_run=False).returncode != 0:
+            raise UpgradeError(
+                "kubectl apply of build/k8s failed; fix the cause and run with --resume "
+                "(it keeps --with-k8s)"
+            )
+        mode = (self.output("guard_settings") or {}).get("admission_mode", "Deny")
+        expected = ["Deny"] if mode == "Deny" else ["Warn", "Audit"]
+        actions = self.kubectl.binding_actions()
+        if actions != expected:
+            raise UpgradeError(
+                f"the admission policy binding has validationActions {actions}, not {expected} "
+                "after the apply; check it with kubectl and run with --resume"
+            )
+        say(f"admission policy binding: {actions}")
+        labeled = self.kubectl.labeled_roles()
+        if labeled is None:
+            say("note: could not list kube-handrail Roles cluster-wide; stale ones not checked")
+            return
+        stale = sorted(set(labeled) - rendered_roles(manifests))
+        for entry in stale:
+            namespace, kind, name = entry.split("/")
+            say(
+                f"WARNING: {kind} {namespace}/{name} is no longer rendered (a namespace removed, "
+                f"or its actions narrowed); delete it: kubectl delete {kind.lower()} {name} -n {namespace}"
+            )
+        if stale:
+            self.state.notes.append(f"{len(stale)} stale kube-handrail Role(s) or binding(s)")
 
     def enable_write(self) -> None:
         assert self.state is not None
@@ -917,6 +1162,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--smoke-only", action="store_true", help="run only the smoke test (make smoke)"
     )
+    parser.add_argument(
+        "--with-k8s",
+        action="store_true",
+        help="after the apply, kubectl apply the cluster manifests (build/k8s), dry run first",
+    )
+    parser.add_argument(
+        "--k8s-only",
+        action="store_true",
+        help="only write and apply the cluster manifests of the deployed state (dry run first)",
+    )
+    parser.add_argument(
+        "--kube-context", help="kubectl context for --with-k8s (default: the current one)"
+    )
     return parser
 
 
@@ -947,13 +1205,16 @@ def main(argv: list[str] | None = None) -> int:
         smoke_namespace=args.smoke_namespace,
         smoke_name=args.smoke_name,
         yes=args.yes,
+        with_k8s=args.with_k8s or args.k8s_only,
     )
-    upgrade = Upgrade(terraform, clients, options)
+    upgrade = Upgrade(terraform, clients, options, kubectl=Kubectl(args.kube_context))
     try:
         if args.smoke_only:
             upgrade.outputs = outputs
             upgrade.smoke()
             return 0
+        if args.k8s_only:
+            return upgrade.k8s_only(outputs)
         return upgrade.run()
     except UpgradeError as exc:
         print(f"upgrade: {exc}", file=sys.stderr)

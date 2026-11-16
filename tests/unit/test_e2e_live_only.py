@@ -21,7 +21,14 @@ def test_default_arguments_are_unchanged():
 
 def test_live_only_drops_the_cases_the_integration_suite_covers():
     args = e2e_gateway.parse_args(
-        ["--live-only", "--with-rollout", "--with-freeze", "--with-expiry", "--with-identity"]
+        [
+            "--live-only",
+            "--with-rollout",
+            "--with-freeze",
+            "--with-expiry",
+            "--with-identity",
+            "--with-namespaces",
+        ]
     )
     assert args.live_only is True
     assert (args.with_rollout, args.with_freeze, args.with_expiry, args.with_verify) == (
@@ -31,6 +38,7 @@ def test_live_only_drops_the_cases_the_integration_suite_covers():
         False,
     )
     assert args.with_identity is True
+    assert args.with_namespaces is False
 
 
 def _run(monkeypatch, live_only, with_identity=False, with_audit=False):

@@ -285,6 +285,9 @@ class Plan:
     # Revert records only: KIND_REVERT and the plan whose apply the record undoes.
     kind: str | None = None
     reverts_plan_id: str | None = None
+    # The cluster the plan is for (CLUSTER_NAME of the read Lambda), so an approver sees
+    # where the change goes. Absent on plans made before it was recorded.
+    cluster: str | None = None
 
     @property
     def object_key(self) -> str:
@@ -387,6 +390,7 @@ _OPTIONAL_INTS = (
     "revert_to",
 )
 _OPTIONAL_STRS = (
+    "cluster",
     "result",
     "approved_by",
     "approved_args_hash",
