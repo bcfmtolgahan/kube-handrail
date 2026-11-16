@@ -991,6 +991,15 @@ def plan_rollback_deployment(
     return _plan(ROLLBACK, args, settings, clients, now)
 
 
+# request_approval in client mode: what to do first, then the earlier message, which the
+# guidance of earlier releases looks for (DevOps Agent can serve it for a while after an
+# upgrade). The code stays invalid_argument: an ok here could read as an approval.
+CLIENT_MODE_MESSAGE = (
+    "client mode: apply directly, your client asks the human; "
+    "approval is handled by the client in client mode"
+)
+
+
 def request_approval(
     args: dict[str, Any], settings: Settings, clients: Clients, now: int
 ) -> Envelope:
@@ -999,7 +1008,7 @@ def request_approval(
     plan_id = require_plan_id(args.get("plan_id"))
     if not settings.approval_required:
         # A server approval would change nothing, and the wait would only keep the plan alive.
-        raise GuardError(INVALID_ARGUMENT, "approval is handled by the client in client mode")
+        raise GuardError(INVALID_ARGUMENT, CLIENT_MODE_MESSAGE)
     if settings.approval_topic_arn is None:
         # Fail before the plan changes state: an approval nobody hears about cannot come.
         raise GuardError(INTERNAL, "no approval destination is configured")

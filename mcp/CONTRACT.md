@@ -776,7 +776,7 @@ Implements [ADR 0002](../docs/adr/0002-server-verified-approval.md). A human app
 | `server` | Yes. | Every other client, and DevOps Agent autonomous investigations (plan and `request_approval`, then a human approves through the approval channel, which also runs the apply). |
 | `both` | Yes. The server cannot see the client's approval, so the apply condition is the one of `server`. The approval channel never runs the apply in this mode: the client applies, after its own approval. | DevOps Agent chat with a server approval too: the agent plans and calls `request_approval`, a human approves through the approval channel, then the agent applies in chat and the chat approval is asked as usual. |
 
-Only in `server` mode does the approval channel run the apply. `request_approval` is refused with `invalid_argument` in `client` mode, where the client approves and a server approval would change nothing. The approval API works in every mode; in `client` mode an approval is recorded but not required.
+Only in `server` mode does the approval channel run the apply. `request_approval` is refused with `invalid_argument` in `client` mode, where the client approves and a server approval would change nothing; the message is "client mode: apply directly, your client asks the human; approval is handled by the client in client mode" (the second part is the earlier message, for guidance of earlier releases). The approval API works in every mode; in `client` mode an approval is recorded but not required.
 
 ### Lifecycle
 

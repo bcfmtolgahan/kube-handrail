@@ -997,6 +997,9 @@ def test_request_approval_is_refused_in_client_mode(approvals, table):
     with pytest.raises(GuardError) as exc:
         request(approvals, plan_id, settings=settings)
     assert exc.value.code == "invalid_argument"
+    # What to do, then the earlier message that guidance of earlier releases looks for.
+    assert exc.value.message.startswith("client mode: apply directly, your client asks the human")
+    assert "approval is handled by the client in client mode" in exc.value.message
     record = table.get_item(Key={"plan_id": plan_id})["Item"]
     assert (record["status"], record["expires_at"]) == ("planned", NOW + 300)
     assert approvals.sns.messages == []

@@ -4,7 +4,7 @@ All notable changes to kube-handrail are listed here. The format follows [Keep a
 
 ## [Unreleased]
 
-Milestones 3 and 4. Implemented, not yet tested on a cluster. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md`), so re-run `install-guidance` (`make upgrade` does).
+Milestones 3 and 4. Implemented, not yet tested on a cluster. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md` and both skills), so re-run `install-guidance` (`make upgrade` does).
 
 ### Changed
 
@@ -12,6 +12,7 @@ Milestones 3 and 4. Implemented, not yet tested on a cluster. Tool schemas: unch
 - **Plan TTL by approval mode.** `plan_ttl_seconds` defaults to `null`: 900 seconds in `client` mode, where the human approves in the chat within the plan's own TTL, and 300 seconds in `server` and `both` mode. A value set in tfvars still wins. The TTL is not a guard; apply checks the live object again ([Guards](docs/guards.md#plan-lifetime)).
 - `e2e_gateway.py` reads the values Terraform knows from `terraform output` of a test deployment (other states are ignored); set variables still win. Its `--approval-mode` defaults to the deployment's mode.
 - **The gateway request interceptor and the verifier are always deployed.** Legacy mode (`caller_interceptor_enabled = false`) and the `verify_enabled` switch are gone: every plan names its agent, every caller of a write path must be a configured agent, and every apply is verified. The tool Lambdas require `AGENTS` and `AGENT_KILL_SWITCH_PREFIX` and do not start without them; a plan response always has `verification`; preflight no longer reports `agent_enabled` and `agent_budget` as skipped. The sentinel requires `EXPECT_INTERCEPTOR_ARN` and always checks the gateway's interceptor. On a deployment that had both enabled (the default) the upgrade is moves only for these resources; a deployment that had either off gets them in a two-step apply ([deploy](docs/deploy.md#upgrading)).
+- `request_approval` in `client` mode still returns `invalid_argument`, with a clearer message: "client mode: apply directly, your client asks the human", followed by the previous message, so agents with the previous guidance still recognize it.
 - `e2e_gateway.py` runs the verification cases by default; `--skip-verify` leaves them out, and `--with-verify` is accepted and does nothing.
 - The per-release upgrade notes moved to [Upgrade notes before Milestone 4](docs/history/upgrading.md); [deploy](docs/deploy.md#upgrading) describes `make upgrade`.
 
