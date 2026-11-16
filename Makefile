@@ -9,7 +9,7 @@ CLEANUP_FLAGS ?=
 MCP_NAME ?= kube-handrail
 TF := terraform -chdir=$(TF_DIR)
 
-.PHONY: help bootstrap deploy register upgrade smoke destroy
+.PHONY: help bootstrap deploy register upgrade smoke destroy integration
 
 help:
 	@echo "make bootstrap   create .venv, install the requirements, terraform init"
@@ -20,6 +20,7 @@ help:
 	@echo "                 UPGRADE_FLAGS=--with-k8s also applies build/k8s with kubectl"
 	@echo "make smoke       the smoke test (--read-only in server and both mode)"
 	@echo "make destroy     scripts/cleanup.sh \$$(CLEANUP_FLAGS)"
+	@echo "make integration the kind and moto integration suite on a throwaway kind cluster"
 
 bootstrap:
 	test -x $(PYTHON) || python3 -m venv .venv
@@ -51,3 +52,7 @@ smoke:
 
 destroy:
 	TF_DIR=$(TF_DIR) PYTHON=$(PYTHON) scripts/cleanup.sh $(CLEANUP_FLAGS)
+
+# Needs docker and kind; never touches AWS or the default kubeconfig (tests/integration/README.md).
+integration:
+	PYTHON=$(PYTHON) tests/integration/run.sh
