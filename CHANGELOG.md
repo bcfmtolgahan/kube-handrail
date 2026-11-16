@@ -10,7 +10,7 @@ Milestone 3. Implemented, not yet tested on a cluster. Tool schemas: unchanged, 
 
 - **GitOps ownership is detected by controller markers.** A Deployment is `gitops_managed` when it has the Argo CD annotation `argocd.argoproj.io/tracking-id` or a Flux kustomize-controller or helm-controller label (`kustomize.toolkit.fluxcd.io/name|namespace`, `helm.toolkit.fluxcd.io/name|namespace`). `app.kubernetes.io/instance` alone no longer counts: Helm sets it on every release, so every Helm-installed Deployment used to be refused. **Behaviour change:** if your Argo CD uses label tracking, set `gitops_markers = ["app.kubernetes.io/instance"]` before upgrading, or those objects become changeable through kube-handrail. Flux-managed objects, which were not detected before, are now refused.
 - **Plan TTL by approval mode.** `plan_ttl_seconds` defaults to `null`: 900 seconds in `client` mode, where the human approves in the chat within the plan's own TTL, and 300 seconds in `server` and `both` mode. A value set in tfvars still wins. The TTL is not a guard; apply checks the live object again ([Guards](docs/guards.md#plan-lifetime)).
-- `e2e_gateway.py` reads the values Terraform knows from `terraform output`; set variables still win. Its `--approval-mode` defaults to the deployment's mode.
+- `e2e_gateway.py` reads the values Terraform knows from `terraform output` of a test deployment (other states are ignored); set variables still win. Its `--approval-mode` defaults to the deployment's mode.
 
 ### Added
 

@@ -123,3 +123,19 @@ def test_gitops_markers_from_the_environment(monkeypatch, raw, markers):
     else:
         monkeypatch.setenv("GITOPS_MARKERS", raw)
     assert e2e_gateway.gitops_markers() == markers
+
+
+def test_outputs_of_a_test_deployment_are_used():
+    assert e2e_gateway.usable_outputs(OUTPUTS) == (OUTPUTS, "")
+
+
+@pytest.mark.parametrize("table", ["kube-handrail-plans", None, "", 7])
+def test_outputs_of_any_other_deployment_are_ignored(table):
+    outputs = OUTPUTS | {"plans_table_name": table}
+    used, reason = e2e_gateway.usable_outputs(outputs)
+    assert used == {}
+    assert reason
+
+
+def test_no_outputs_are_not_reported():
+    assert e2e_gateway.usable_outputs({}) == ({}, "")

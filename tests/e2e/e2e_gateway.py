@@ -16,7 +16,9 @@ match the deployment: the test waits it out after each apply. The blast-radius
 case expects MAX_REPLICA_STEP_PERCENT=100 (the default) and MAX_REPLICAS >= 3.
 
 Values the deployment knows are read from `terraform output -json` in --tf-dir (default:
-the repository's terraform/ directory) when that works, so they need not be exported:
+the repository's terraform/ directory) when that works and the outputs are a test
+deployment's (the --reset-counters rule below, applied to plans_table_name; any other
+state is ignored, so a run without exports never targets it), so they need not be exported:
 GATEWAY_URL, TOKEN_URL, KILL_SWITCH_PARAM, PLANS_TABLE, APPROVAL_URL, FREEZES_PARAM,
 AUDIT_BUCKET, CLIENT_ID and CLIENT_ID_B (by agent name), PLAN_TTL_SECONDS,
 APPLY_COOLDOWN_SECONDS, AGENT_BUDGET_B, GITOPS_MARKERS (a JSON array, default none) and
@@ -900,6 +902,21 @@ def terraform_outputs(tf_dir: Path) -> dict[str, Any]:
         return {name: entry.get("value") for name, entry in json.loads(result.stdout).items()}
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return {}
+
+
+def usable_outputs(outputs: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """The outputs, when they belong to a test deployment (the --reset-counters rule on
+    plans_table_name), else none and why: a run without exports must never pick up the
+    gateway, kill switch and freezes of whatever state the checkout points at."""
+    if not outputs:
+        return {}, ""
+    table = outputs.get("plans_table_name")
+    if isinstance(table, str) and is_test_table(table):
+        return outputs, ""
+    return {}, (
+        f"terraform output ignored: plans table {table!r} is not a test deployment's "
+        "(<name_prefix>-plans with test, e2e or ci in name_prefix); export the variables"
+    )
 
 
 def env_from_outputs(outputs: dict[str, Any], env: dict[str, str]) -> dict[str, str]:
@@ -2429,7 +2446,9 @@ def main() -> None:
         help="Terraform directory whose outputs fill unset variables",
     )
     args = parser.parse_args()
-    outputs = terraform_outputs(args.tf_dir)
+    outputs, ignored = usable_outputs(terraform_outputs(args.tf_dir))
+    if ignored:
+        print(ignored, flush=True)
     filled = env_from_outputs(outputs, dict(os.environ))
     os.environ.update(filled)
     if filled:
