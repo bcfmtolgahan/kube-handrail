@@ -32,6 +32,7 @@ NOW = 1_800_001_234
         ("kh-e2e-plans-backup", False),
         ("kh-contest-plans", False),
         ("kh-e2e", False),
+        ("kh-test-plans\n", False),
     ],
 )
 def test_only_a_test_table_is_reset(table, test):

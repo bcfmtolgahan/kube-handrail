@@ -144,6 +144,7 @@ def test_markers_are_parsed_in_order_without_duplicates():
         '["a/b/c"]',
         '["' + "x" * 64 + '"]',
         "[null]",
+        '["example.com/x\\n"]',
     ],
 )
 def test_malformed_markers_fail_the_load(raw):
@@ -162,6 +163,8 @@ def test_malformed_markers_fail_the_load(raw):
         ("/name", False),
         ("prefix/", False),
         (7, False),
+        ("managed\n", False),
+        ("example.com/key\n", False),
     ],
 )
 def test_valid_marker(key, valid):

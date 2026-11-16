@@ -819,7 +819,7 @@ def injection_event(name: str, uid: str) -> dict[str, Any]:
 
 
 def is_test_table(name: str) -> bool:
-    return bool(TEST_TABLE.match(name))
+    return bool(TEST_TABLE.fullmatch(name))
 
 
 def counter_keys(agents: tuple[str, ...], now: int) -> list[str]:

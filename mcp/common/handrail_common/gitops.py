@@ -41,7 +41,7 @@ MAX_PREFIX_LENGTH = 253
 
 
 def valid_marker(key: Any) -> bool:
-    if not isinstance(key, str) or not MARKER_KEY.match(key):
+    if not isinstance(key, str) or not MARKER_KEY.fullmatch(key):
         return False
     prefix, _, _ = key.rpartition("/")
     return len(prefix) <= MAX_PREFIX_LENGTH
