@@ -37,6 +37,7 @@ LATEST_ATTRIBUTES = (
     "agent",
     "requested_client_id",
     "approval_channel",
+    "approval_mode",
     "rejected_by",
     "reject_reason",
     "channel",

@@ -228,6 +228,9 @@ class Plan:
     approved_args_hash: str | None = None
     approval_channel: str | None = None
     approval_expires_at: int | None = None
+    # APPROVAL_MODE of the read Lambda when the plan was made, so the audit record shows
+    # which approval the apply needed (scripts/audit.py verify). Absent on older records.
+    approval_mode: str | None = None
     rejected_by: str | None = None
     rejected_at: int | None = None
     reject_reason: str | None = None
@@ -388,6 +391,7 @@ _OPTIONAL_STRS = (
     "approved_by",
     "approved_args_hash",
     "approval_channel",
+    "approval_mode",
     "rejected_by",
     "reject_reason",
     "plan_correlation_id",

@@ -621,6 +621,7 @@ def _plan(
         agent=agent.name,
         requested_client_id=agent.client_id,
         status=STATUS_PLANNED,
+        approval_mode=settings.approval_mode,
         override_manual_change=override,
         impact=impact,
         plan_correlation_id=correlation_id,

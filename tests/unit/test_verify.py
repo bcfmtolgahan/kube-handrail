@@ -295,3 +295,9 @@ def test_outcome_view_of_a_record():
     assert view["verification"]["status"] == HEALTHY
     assert view["revert"] == {"requested": True, "status": "not_needed"}
     assert view["correlation_ids"] == {"plan": "plan-1", "apply": "apply-1", "verification": "v-1"}
+
+
+def test_outcome_view_reports_the_approval_mode():
+    assert outcome_view(with_revert().to_item(), NOW, 300)[0]["approval_mode"] is None
+    record = with_revert(approval_mode="server").to_item()
+    assert outcome_view(record, NOW, 300)[0]["approval_mode"] == "server"

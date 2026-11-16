@@ -2858,3 +2858,9 @@ def test_a_freeze_does_not_stop_the_verification(verify_rt):
     apps.read_namespaced_deployment.return_value = live(plan.plan_id)
     at(runtime_, NOW + 61)
     assert verify(plan.plan_id)["data"]["outcome"] == "healthy"
+
+
+def test_a_revert_record_keeps_the_approval_mode_of_its_plan(verify_rt):
+    runtime_, apps = verify_rt
+    plan = applied_with_revert(runtime_, apps, approval_mode="both")
+    assert handler.revert_record(runtime_, plan, NOW + 61).approval_mode == "both"

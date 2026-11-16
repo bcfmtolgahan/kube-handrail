@@ -776,6 +776,7 @@ def revert_record(rt: Runtime, plan: Plan, now: int) -> Plan:
         used=True,
         requested_by=REQUESTER_REVERT,
         status=STATUS_REVERT,
+        approval_mode=plan.approval_mode,
         agent=plan.agent,
         requested_client_id=plan.requested_client_id,
         channel=CHANNEL_VERIFIER,

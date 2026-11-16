@@ -2347,3 +2347,14 @@ def test_argument_checks_come_before_the_freezes(clients):
             {"namespace": "elsewhere", "name": "web", "replicas": 3}, FROZEN, clients, NOW
         )
     assert exc.value.code == "forbidden_namespace"
+
+
+@pytest.mark.parametrize("mode", ["client", "server", "both"])
+def test_plan_records_the_approval_mode(clients, table, caller, mode):
+    caller("client-a")
+    settings = dataclasses.replace(IDENTITY_SETTINGS, approval_mode=mode)
+    data = handler.plan_scale_deployment(
+        {"namespace": "sandbox", "name": "web", "replicas": 3}, settings, clients, NOW
+    )["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["approval_mode"] == mode
