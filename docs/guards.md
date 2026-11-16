@@ -12,6 +12,10 @@ Three independent checks stand between an agent and a Deployment; each assumes t
 
 The policy checks only the replica bounds. It does not check the pod template, the approval or the history, which need state that only the guard has.
 
+## Approval modes
+
+The approval is a guard only when the server checks it. In `server` (the default) and `both` mode the write Lambda refuses an apply without an unexpired approval, by a listed human other than the requester, of exactly the planned arguments, and records that human on the plan. In `client` mode the only approval is the client's (the DevOps Agent chat): the server requires none and cannot bind it to a plan, because CloudTrail records the chat approval with every argument, the plan ID included, redacted. Use `server`, or `both` with DevOps Agent in production; `client` is for evaluation ([deploy](deploy.md#approval-mode)).
+
 ## Plan lifetime
 
 A plan is valid for `PLAN_TTL_SECONDS`. When `plan_ttl_seconds` is not set, Terraform picks 900 seconds in `client` mode, where the human reads the plan and approves it in the DevOps Agent chat with nothing to extend it, and 300 seconds in `server` and `both` mode, where `request_approval` extends it to `approval_wait_ttl_seconds`. The TTL is capped at 3600 (implemented, not yet tested on a cluster).

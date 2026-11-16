@@ -113,6 +113,12 @@ Milestone 2, item 4 (verify and revert): plans take a verification window and, f
 
 Milestone 2, item 6 (durable audit record): every change to a plan record is written once, from the plan table's stream, to an S3 bucket with Object Lock that the tool Lambdas cannot write to, and `scripts/audit.py export` shows a plan's requesting agent, approver, channel, result, verification and revert. Implemented and tested on a test cluster. See [Audit record](mcp/CONTRACT.md#audit-record).
 
+Milestone 3 (quick wins and guard rails): GitOps ownership by controller markers (Helm releases are no longer refused, Flux-managed objects are), the plan TTL by approval mode, the plan rate limit removed, faster end-to-end runs, guidance sync tests, a release process and a dashboard. Implemented, not yet tested on a cluster. See [CHANGELOG.md](CHANGELOG.md).
+
+**Which approval mode.** `server` is the default and the mode for an audit-grade record of who approved. With DevOps Agent in production, use `both`: the chat approval stays the agent's flow and the server approval is the record. `client` is an evaluation and convenience mode: the chat approval cannot be bound to a plan (CloudTrail records the approver but redacts the plan ID), so the approver is best-effort. See [Approval mode](docs/deploy.md#approval-mode).
+
+**Supported versions** and the release rules are in [Releasing](docs/releasing.md): Kubernetes 1.30 or later for the admission policy, Terraform 1.5 or later with the AWS provider pinned in `terraform/versions.tf`.
+
 ## Planned layout
 
 Subject to change as the design is validated.
@@ -148,12 +154,13 @@ AGENTS.md        tool contract for MCP clients
 - [ADR 0007: Durable audit record](docs/adr/0007-durable-audit-record.md) - a write-once record of every plan change, outside the executor's reach
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
 - [Deploying to a new account](docs/deploy.md) - prerequisites, names, RBAC, networking for clusters with a private endpoint, and the order of steps
-- [Guards](docs/guards.md) - blast-radius budget, impact preview, what a rollback trusts, the oscillation breaker (flapping, cooldown, per-object and global budgets and manual-change checks), the per-agent budget and kill switch, and verify and revert
+- [Guards](docs/guards.md) - plan lifetime, GitOps ownership, blast-radius budget, impact preview, what a rollback trusts, the oscillation breaker (flapping, cooldown, per-object and global budgets and manual-change checks), the per-agent budget and kill switch, and verify and revert
 - [Drift sentinel](mcp/CONTRACT.md#drift-sentinel) - what it checks, outcomes, and how to restore remediation after drift
 - [Server-side approval](mcp/CONTRACT.md#server-side-approval) - approval modes, `request_approval`, the approval API and who can approve
 - [Observability](mcp/CONTRACT.md#observability) - correlation IDs, the per-call tool record and its metrics, and the internal error alarm
 - [Untrusted output](mcp/CONTRACT.md#untrusted-output) - how text from the cluster is cleaned and wrapped before an agent sees it, and why that is a hint rather than a boundary
 - [Roadmap](docs/roadmap.md) - milestones and open questions
+- [CHANGELOG.md](CHANGELOG.md) and [Releasing](docs/releasing.md) - what changed in each release, semver policy, supported versions and the one-schema-batch-per-release rule
 
 ## Contributing
 
