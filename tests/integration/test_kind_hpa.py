@@ -4,6 +4,8 @@ with revert_on_failure; the writer refused by the HPA admission policy when it c
 scaleTargetRef; and a scale plan on an HPA-targeted Deployment pointing at plan_adjust_hpa.
 As in test_kind_verify.py, a case moves verify_at into the past instead of waiting."""
 
+import json
+
 import pytest
 from harness import (
     NAMESPACE,
@@ -13,6 +15,7 @@ from harness import (
     deployment_manifest,
     details,
     hpa_manifest,
+    kubectl,
     unique,
     wait_until,
 )
@@ -210,3 +213,32 @@ def test_adjust_hpa_refusals(kh):
     assert code(refused) == "forbidden_namespace"
     assert details(refused)["action"] == "adjust_hpa"
     assert code(kh.call(PLAN, {**hpa, "name": "kh-int-none", "min_replicas": 2})) == "not_found"
+
+
+def test_an_exact_match_policy_refuses_hpa_plans(kh):
+    """matchPolicy Exact would let the writer change an HPA through autoscaling/v1 unchecked,
+    so the plan-time check refuses it like any other edit of the policy."""
+    target, hpa = autoscaled(kh, "it-hpa-exact")
+
+    def match_policy(value):
+        kubectl(
+            "patch",
+            "validatingadmissionpolicy",
+            HPA_POLICY,
+            "--type",
+            "merge",
+            "-p",
+            json.dumps({"spec": {"matchConstraints": {"matchPolicy": value}}}),
+        )
+
+    match_policy("Exact")
+    try:
+        envelope = kh.call(PLAN, {**hpa, "min_replicas": 2})
+        assert code(envelope) == "conflict", envelope
+        assert details(envelope)["reason"] == "policy_modified"
+        assert details(envelope)["policy"] == HPA_POLICY
+    finally:
+        # The rendered policy leaves matchPolicy to its default, so applying it again would
+        # keep Exact.
+        match_policy("Equivalent")
+    assert kh.call(PLAN, {**hpa, "min_replicas": 2})["ok"] is True

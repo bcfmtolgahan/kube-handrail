@@ -241,6 +241,10 @@ def _covers_all(rules: Any, shape: PolicyShape = DEPLOYMENT_POLICY) -> bool:
     )
 
 
+# Exact would stop requests through another version (autoscaling/v1) reaching the policy.
+EQUIVALENT = "Equivalent"
+
+
 def _empty(value: Any) -> bool:
     return value is None or value == {} or value == []
 
@@ -258,6 +262,8 @@ def _policy_modified(spec: Mapping[str, Any], shape: PolicyShape = DEPLOYMENT_PO
         return "matchConstraints has an objectSelector"
     if not _empty(constraints.get("excludeResourceRules")):
         return "matchConstraints has excludeResourceRules"
+    if constraints.get("matchPolicy", EQUIVALENT) != EQUIVALENT:
+        return "matchConstraints.matchPolicy is not Equivalent"
     if not _covers_all(constraints.get("resourceRules"), shape):
         return f"resourceRules do not cover {shape.covers}"
     conditions = spec.get("matchConditions") or []
@@ -294,6 +300,8 @@ def _binding_modified(
         return "matchResources has an objectSelector"
     if not _empty(resources.get("excludeResourceRules")):
         return "matchResources has excludeResourceRules"
+    if resources.get("matchPolicy", EQUIVALENT) != EQUIVALENT:
+        return "matchResources.matchPolicy is not Equivalent"
     rules = resources.get("resourceRules")
     if not _empty(rules) and not _covers_all(rules, shape):
         return f"resourceRules do not cover {shape.covers}"

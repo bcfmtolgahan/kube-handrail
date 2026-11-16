@@ -1041,7 +1041,7 @@ Every plan (scale, restart and rollback; [guard check 3a](#guard-checks); `plan_
 1. the policy exists, and its namespace selector selects the plan's namespace;
 2. the binding exists, refers to the policy, selects the namespace, and its `validationActions` include `Deny`;
 3. the policy's `minReplicas` and `maxReplicas` hold exactly the namespace's bounds (`bounds_for`);
-4. its enforcing parts are as rendered: `failurePolicy: Fail`, the matchCondition, variables and validation expression, resourceRules covering `UPDATE` of `deployments` and `deployments/scale`, and no `paramKind`, `objectSelector` or `excludeResourceRules` on policy or binding.
+4. its enforcing parts are as rendered: `failurePolicy: Fail`, the matchCondition, variables and validation expression, resourceRules covering `UPDATE` of `deployments` and `deployments/scale`, no `paramKind`, `objectSelector` or `excludeResourceRules` on policy or binding, and no `matchPolicy` other than `Equivalent` on either.
 
 It catches drift and these switch-offs, not every administrator edit.
 

@@ -3,6 +3,7 @@ admission policy check (mcp/CONTRACT.md, Namespace policy and Admission policy).
 
 import copy
 import json
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -636,3 +637,35 @@ def test_an_hpa_policy_switched_off_is_a_conflict(change):
             hpa_api(vap, vapb), "kube-handrail-sandbox-2", (0, 6), admission.HPA_POLICY
         )
     assert exc.value.details["reason"] == "policy_modified"
+
+
+@pytest.mark.parametrize(
+    ("target", "match_policy", "reason"),
+    [
+        # Exact stops autoscaling/v1 requests reaching a policy that names only v2.
+        ("policy", "Exact", "policy_modified"),
+        ("binding", "Exact", "binding_modified"),
+        ("policy", "Equivalent", None),
+        ("binding", "Equivalent", None),
+    ],
+)
+def test_a_match_policy_other_than_equivalent_is_a_conflict(target, match_policy, reason):
+    vap, vapb = rendered_hpa()
+    vapb["spec"]["validationActions"] = ["Deny"]
+    if target == "policy":
+        vap["spec"]["matchConstraints"]["matchPolicy"] = match_policy
+    else:
+        vapb["spec"].setdefault("matchResources", {})["matchPolicy"] = match_policy
+    check = partial(
+        admission.check_admission_policy,
+        hpa_api(vap, vapb),
+        "kube-handrail-sandbox-2",
+        (0, 6),
+        admission.HPA_POLICY,
+    )
+    if reason is None:
+        check()
+        return
+    with pytest.raises(GuardError) as exc:
+        check()
+    assert exc.value.details["reason"] == reason
