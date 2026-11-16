@@ -8,9 +8,16 @@ target's tools.json under that target name, a target has the reserved name of th
 internal handlers or a tools.json names one of them, or AGENTS.md does not name
 every error code listed in mcp/CONTRACT.md except the deprecated ones, which it must
 not name.
+
+The guidance checks (check_guidance) keep the agent guidance in sync with the code: the
+AGENTS.md tool table lists exactly the served tools, its error table exactly the error
+codes minus the deprecated ones, every tool the skills name exists and every argument
+they pass in a call exists for that tool, every impact warning code appears in a skill,
+and every relative Markdown link with an anchor resolves to a heading.
 Standard library only, so it runs before any dependency is installed.
 """
 
+import difflib
 import importlib.util
 import json
 import re
@@ -168,8 +175,168 @@ def check(root: Path) -> list[str]:
     return errors + check_pairs(names) + check_agents_md(root)
 
 
+# --- Guidance ----------------------------------------------------------------
+
+TABLE_ROW = re.compile(r"^\|\s*([^|]*?)\s*\|", re.MULTILINE)
+SECTION = re.compile(r"^## (.+)$", re.MULTILINE)
+# A tool named in prose, with or without its target prefix: plan_/apply_ actions on a
+# Deployment, get_ reads and request_ calls.
+TOOL_MENTION = re.compile(
+    r"\b(?:k8s[rw]___)?((?:plan|apply)_[a-z]+(?:_[a-z]+)*_deployment|get_[a-z]+(?:_[a-z]+)*"
+    r"|request_[a-z]+(?:_[a-z]+)*)\b"
+)
+# A call written as tool(arg, arg, ...).
+TOOL_CALL = re.compile(r"\b(?:k8s[rw]___)?([a-z_]+)\(([a-z_, ]*)\)")
+# Python modules whose "code": CONSTANT entries are the impact warnings.
+WARNING_MODULES = ("impact.py", "rollout.py")
+WARNING_CODE = re.compile(r"[\"']code[\"']:\s*([A-Z_]+)")
+LINK = re.compile(r"\]\(([^)\s]*?)#([^)\s]+)\)")
+HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
+GUIDANCE_DOCS = ("AGENTS.md", "README.md", "CHANGELOG.md")
+CODE_OR_TOOL = re.compile(r"`([a-z0-9_]+)`")
+
+
+def section(text: str, title: str) -> str:
+    """The body of the `## title` section, up to the next `## ` heading."""
+    matches = list(SECTION.finditer(text))
+    for i, match in enumerate(matches):
+        if match.group(1).strip() == title:
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            return text[match.end() : end]
+    return ""
+
+
+def table_codes(body: str) -> list[str]:
+    """Backticked names in the first cell of each table row, header and rule excluded."""
+    names: list[str] = []
+    for cell in TABLE_ROW.findall(body):
+        names.extend(CODE_OR_TOOL.findall(cell))
+    return names
+
+
+def served_tools(root: Path) -> dict[str, dict]:
+    """Full tool name => tool schema, for every target terraform/main.tf loads."""
+    targets = terraform_targets((root / "terraform/main.tf").read_text())
+    tools: dict[str, dict] = {}
+    for target, directory in targets.items():
+        for tool in json.loads((root / "mcp" / directory / "tools.json").read_text()):
+            tools[f"{target}{DELIMITER}{tool['name']}"] = tool
+    return tools
+
+
+def check_agents_tables(root: Path) -> list[str]:
+    agents_md = (root / "AGENTS.md").read_text()
+    errors: list[str] = []
+    listed = table_codes(section(agents_md, "Tools"))
+    served = set(served_tools(root))
+    errors += [f"AGENTS.md tool table does not list {n}" for n in sorted(served - set(listed))]
+    errors += [f"AGENTS.md tool table lists unknown {n}" for n in sorted(set(listed) - served)]
+    errors += [f"AGENTS.md tool table lists {n} twice" for n in sorted(_twice(listed))]
+    module = envelope_module(root)
+    expected = set(module.ERROR_CODES) - set(module.DEPRECATED_ERROR_CODES)
+    codes = table_codes(section(agents_md, "Errors"))
+    errors += [f"AGENTS.md error table does not list {c}" for c in sorted(expected - set(codes))]
+    errors += [
+        f"AGENTS.md error table lists {c}, which is deprecated or unknown"
+        for c in sorted(set(codes) - expected)
+    ]
+    errors += [f"AGENTS.md error table lists {c} twice" for c in sorted(_twice(codes))]
+    return errors
+
+
+def _twice(names: list[str]) -> set[str]:
+    return {n for n in names if names.count(n) > 1}
+
+
+def warning_codes(root: Path) -> set[str]:
+    codes: set[str] = set()
+    for name in WARNING_MODULES:
+        source = (root / "mcp/common/handrail_common" / name).read_text()
+        constants = dict(re.findall(r"^([A-Z_]+) = \"([a-z_]+)\"$", source, re.MULTILINE))
+        codes |= {constants[c] for c in WARNING_CODE.findall(source) if c in constants}
+    return codes
+
+
+def check_skills(root: Path) -> list[str]:
+    tools = {full.split(DELIMITER, 1)[1]: schema for full, schema in served_tools(root).items()}
+    errors: list[str] = []
+    skills = sorted((root / "agent/skills").glob("*/SKILL.md"))
+    texts = {path.relative_to(root).as_posix(): path.read_text() for path in skills}
+    for rel, text in texts.items():
+        for name in sorted(set(TOOL_MENTION.findall(text)) - set(tools)):
+            errors.append(f"{rel}: names unknown tool {name}")
+        for name, raw in TOOL_CALL.findall(text):
+            if name not in tools:
+                continue
+            properties = tools[name].get("inputSchema", {}).get("properties", {})
+            for arg in (a.strip() for a in raw.split(",") if a.strip()):
+                if arg not in properties:
+                    errors.append(f"{rel}: {name} has no argument {arg}")
+    named = set(re.findall(r"`([a-z_]+)`", "\n".join(texts.values())))
+    errors += [f"no skill names warning {c}" for c in sorted(warning_codes(root) - named)]
+    # An argument named outside a call (`revert_on_failure: true`) cannot be told apart from
+    # a response field, so only near misses of an argument name are reported, as typos.
+    arguments = {a for s in tools.values() for a in s.get("inputSchema", {}).get("properties", {})}
+    texts["AGENTS.md"] = (root / "AGENTS.md").read_text()
+    for rel, text in texts.items():
+        for token in sorted(set(re.findall(r"`([a-z]+(?:_[a-z]+)+)\b", text)) - arguments):
+            close = difflib.get_close_matches(token, arguments, n=1, cutoff=0.85)
+            if close:
+                errors.append(f"{rel}: {token} looks like the argument {close[0]}")
+    return errors
+
+
+def slug(heading: str) -> str:
+    """GitHub's anchor for a heading: lower case, punctuation removed, spaces to hyphens."""
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading).lower()
+    return re.sub(r"[^\w\- ]", "", text).replace(" ", "-")
+
+
+def anchors(text: str) -> set[str]:
+    seen: dict[str, int] = {}
+    result: set[str] = set()
+    for heading in HEADING.findall(FENCE.sub("", text)):
+        base = slug(heading)
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        result.add(base if count == 0 else f"{base}-{count}")
+    return result
+
+
+def guidance_files(root: Path) -> list[Path]:
+    files = [root / name for name in GUIDANCE_DOCS if (root / name).is_file()]
+    files += sorted((root / "docs").rglob("*.md")) + sorted((root / "agent/skills").glob("*/*.md"))
+    return files + [root / "mcp/CONTRACT.md"]
+
+
+def check_links(root: Path) -> list[str]:
+    """Every relative Markdown link with an anchor, including same-file ones, resolves."""
+    errors: list[str] = []
+    cache: dict[Path, set[str]] = {}
+    for path in guidance_files(root):
+        text = FENCE.sub("", path.read_text())
+        for target, anchor in LINK.findall(text):
+            if "://" in target or target.startswith("mailto:"):
+                continue
+            file = (path.parent / target).resolve() if target else path
+            rel = path.relative_to(root).as_posix()
+            if not file.is_file():
+                errors.append(f"{rel}: link to missing {target}#{anchor}")
+                continue
+            if file not in cache:
+                cache[file] = anchors(file.read_text())
+            if anchor not in cache[file]:
+                errors.append(f"{rel}: no heading for {target}#{anchor}")
+    return errors
+
+
+def check_guidance(root: Path) -> list[str]:
+    return check_agents_tables(root) + check_skills(root) + check_links(root)
+
+
 def main() -> None:
-    errors = check(REPO_ROOT)
+    errors = check(REPO_ROOT) + check_guidance(REPO_ROOT)
     for error in errors:
         print(f"error: {error}", file=sys.stderr)
     if errors:
