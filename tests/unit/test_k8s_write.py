@@ -3316,6 +3316,11 @@ def test_a_degraded_hpa_adjust_with_revert_restores_both_bounds(hpa_rt):
     plan = applied_hpa(runtime_, revert=True)
     fake.patches.clear()
     revert_id = handler.revert_plan_id(plan.plan_id)
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET approval_mode = :m",
+        ExpressionAttributeValues={":m": "both"},
+    )
     data = verify(plan.plan_id)["data"]
     assert (data["outcome"], data["revert"]) == ("degraded", "reverted")
     (dry, _), (real, _) = fake.patches
@@ -3329,6 +3334,7 @@ def test_a_degraded_hpa_adjust_with_revert_restores_both_bounds(hpa_rt):
         "revert",
     )
     assert (record.min_from, record.min_to, record.max_from, record.max_to) == (3, 1, 5, 5)
+    assert record.approval_mode == "both"
     assert record.spec_from == plan.spec_to and record.spec_to == plan.spec_from
     assert record.args == {
         "namespace": "sandbox",
