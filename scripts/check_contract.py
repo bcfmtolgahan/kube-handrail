@@ -288,12 +288,14 @@ def check_skills(root: Path) -> list[str]:
     arguments = {a for s in tools.values() for a in s.get("inputSchema", {}).get("properties", {})}
     texts["AGENTS.md"] = (root / "AGENTS.md").read_text()
     for rel, text in texts.items():
+        typos = set()
         for token in sorted(set(re.findall(r"`([a-z]+(?:_[a-z]+)+)\b", text)) - arguments):
             close = difflib.get_close_matches(token, arguments, n=1, cutoff=0.85)
             if close:
+                typos.add(token)
                 errors.append(f"{rel}: {token} looks like the argument {close[0]}")
-            elif token in SETTING.findall(text) and token not in RESPONSE_FIELDS:
-                errors.append(f"{rel}: sets {token}, which no tool takes")
+        for token in sorted(set(SETTING.findall(text)) - arguments - RESPONSE_FIELDS - typos):
+            errors.append(f"{rel}: sets {token}, which no tool takes")
     return errors
 
 

@@ -178,9 +178,11 @@ def test_skill_sets_an_argument_the_tools_dropped(repo):
     assert f"{AGENTS}: sets revert_on_failure, which no tool takes" in errors
 
 
-def test_a_response_field_set_in_prose_is_not_an_argument(repo):
+def test_a_response_field_set_in_prose_is_not_an_argument(repo, monkeypatch):
     assert "`notified: false`" in (repo / SCALE_SKILL).read_text()
     assert check_contract.check_skills(repo) == []
+    monkeypatch.setattr(check_contract, "RESPONSE_FIELDS", frozenset())
+    assert f"{SCALE_SKILL}: sets notified, which no tool takes" in check_contract.check_skills(repo)
 
 
 def test_contract_error_codes_line_matches_the_envelope(repo):
