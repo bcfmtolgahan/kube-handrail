@@ -19,7 +19,7 @@ Releases before the changelog were not tagged; the changelog summarizes them by 
 
 | Component | Supported | Where it is set |
 |---|---|---|
-| Kubernetes (EKS) | 1.30 or later for the admission policy (ValidatingAdmissionPolicy v1); the tools themselves use only `apps/v1` and `v1`. CI tests the policy on 1.31. | `k8s/sandbox/admission-policy.yaml`, `.github/workflows/ci.yml` |
+| Kubernetes (EKS) | 1.30 or later for the admission policies (ValidatingAdmissionPolicy v1); the tools use `apps/v1`, `v1` and `autoscaling/v2`. CI tests on 1.31, with metrics-server v0.7.2. | `terraform/modules/namespace-policy`, `.github/workflows/ci.yml` |
 | EKS authentication mode | `API` or `API_AND_CONFIG_MAP` | checked at plan time |
 | Terraform | 1.5.0 or later | `terraform/versions.tf` |
 | AWS provider | `~> 6.70` (lock file: 6.70.0) | `terraform/versions.tf`, `terraform/.terraform.lock.hcl` |
@@ -45,7 +45,7 @@ Why: every schema change costs the operator a sequence that takes effect only in
 
 ## Release checklist
 
-1. CI is green: `scripts/check_contract.py`, `ruff check`, `ruff format --check`, `pytest tests/unit` (including the guidance sync tests), `terraform fmt -check -recursive`, `terraform validate`, the admission job and the integration job (`tests/integration`).
+1. CI is green: `scripts/check_contract.py`, `ruff check`, `ruff format --check`, `pytest tests/unit`, `terraform fmt -check -recursive`, `terraform validate`, the admission job and the integration job.
 2. The changelog's Unreleased section lists every change, says whether `enable-write` and `install-guidance` are needed, and points to the upgrade notes in [deploy](deploy.md#upgrading).
-3. Behaviour changes have run on a test deployment (`terraform/test.tfvars.example`, `tests/e2e/e2e_gateway.py`); until then the docs say "implemented, not yet tested on a cluster".
+3. Behaviour changes have run on a test deployment (`terraform/test.tfvars.example`, `tests/e2e/e2e_gateway.py`, and a chat in `both` mode); until then the docs say "implemented, not yet tested on a cluster".
 4. Rename Unreleased to the version and date, set `__version__` and `pyproject.toml` to it, tag `vX.Y.Z`, and reopen Unreleased.
