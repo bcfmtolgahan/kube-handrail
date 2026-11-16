@@ -625,3 +625,60 @@ def test_a_failed_terraform_command_is_an_upgrade_error(tmp_path):
         tf.outputs()
     with pytest.raises(upgrade.UpgradeError, match="terraform plan failed"):
         tf.plan()
+
+
+# --- Guidance comparison ----------------------------------------------------------------
+
+
+class NotFound(Exception):
+    pass
+
+
+class FakeAssets:
+    """DevOps Agent assets holding the given AGENTS.md and skill texts."""
+
+    exceptions = type("Exceptions", (), {"ResourceNotFoundException": NotFound})
+
+    def __init__(self, agents_md: str | None, skills: dict[str, str]) -> None:
+        self.files = {}
+        self.items = {"agents_md": [], "skill": []}
+        if agents_md is not None:
+            self.items["agents_md"].append({"assetId": "a1", "metadata": {"agent_type": "GENERIC"}})
+            self.files["a1"] = agents_md
+        for i, (name, text) in enumerate(skills.items()):
+            self.items["skill"].append({"assetId": f"s{i}", "metadata": {"name": name}})
+            self.files[f"s{i}"] = text
+
+    def list_assets(self, agentSpaceId, assetType, **_):
+        return {"items": self.items[assetType]}
+
+    def get_asset_file(self, agentSpaceId, assetId, path):
+        if assetId not in self.files:
+            raise NotFound(assetId)
+        return {"file": {"content": {"text": self.files[assetId]}}}
+
+
+def repo_guidance():
+    register = upgrade.register_module()
+    skills = {s.name: s.text for s in register.load_skills(register.SKILLS_DIR)}
+    return register, register.load_agents_md(register.AGENTS_MD), skills
+
+
+def test_installed_guidance_that_matches_the_repository_is_current():
+    register, agents_md, skills = repo_guidance()
+    client = FakeAssets(agents_md, skills)
+    assert upgrade.guidance_differs(register, client, "space-1", "GENERIC") == []
+
+
+def test_changed_or_missing_guidance_is_reported():
+    register, agents_md, skills = repo_guidance()
+    name = sorted(skills)[0]
+    client = FakeAssets(agents_md + "\nold line\n", {**skills, name: "old"})
+    assert upgrade.guidance_differs(register, client, "space-1", "GENERIC") == [
+        "AGENTS.md",
+        f"skill {name}",
+    ]
+    client = FakeAssets(None, {})
+    assert upgrade.guidance_differs(register, client, "space-1", "GENERIC") == ["AGENTS.md"] + [
+        f"skill {n}" for n in sorted(skills)
+    ]
