@@ -304,7 +304,7 @@ These move to "Later ideas":
 
 **Done when:** `audit.py verify` reports nothing after an end-to-end run.
 
-**Status:** implemented, not yet tested on a cluster. `approval_mode` is on every plan record; `audit.py verify` checks a plan or a time window; export gives Logs Insights queries for the Lambda logs and the EKS audit log; every Kubernetes request names its plan and correlation ID in the User-Agent (seen in a kind API server audit log); [deploy](deploy.md#audit-record-retention) recommends `COMPLIANCE` for production.
+**Status:** implemented, not yet tested on a cluster: `approval_mode` on plan records, `audit.py verify` (a plan or a time window), Logs Insights query templates in the export, the User-Agent with plan and correlation ID (the kind suite checks only the field manager derived from it), and `COMPLIANCE` recommended for production ([deploy](deploy.md#audit-record-retention)).
 
 ## Later ideas
 
@@ -335,7 +335,7 @@ These are unverified and may change the design.
 - **DevOps Agent tool limits.** The per-call timeout and response size limit for custom MCP tools, which determine output and time budgets.
 - **CloudTrail data events as executor identity.** Whether CloudTrail DynamoDB data events on the plan table can show the principal that consumed a plan, so that the executor identity of a change is observed rather than attributed by construction (Milestone 2, item 6).
 
-Answered by the identity spike for Milestone 9 (S0): CloudTrail records a DevOps Agent chat approval (`UpdateApprovalAction`) as a management event with the approver's IAM identity, but redacts every tool argument, the plan ID included, and the request carries no approval ID. A `client`-mode approval can therefore be matched to a plan only by time, not bound to it; the audit-grade approver is the server approval (`server` or `both`), and `client` is an evaluation and convenience mode ([deploy](deploy.md#approval-mode)). This also closes the question of the DevOps Agent approval reference: CloudTrail carries no approval ID that a recorded reference could be joined to, so it is not pursued, and Milestone 9 builds no correlation ([ADR 0002](adr/0002-server-verified-approval.md)).
+Answered by the identity spike for Milestone 9 (S0): CloudTrail records a DevOps Agent chat approval (`UpdateApprovalAction`) as a management event with the approver's IAM identity, but redacts every tool argument, the plan ID included, and its request parameters hold no approval ID. A `client`-mode approval can therefore be matched to a plan only by time, not bound to it; the audit-grade approver is the server approval (`server` or `both`), and `client` is an evaluation and convenience mode ([deploy](deploy.md#approval-mode)). This also closes the DevOps Agent approval reference question: there is no approval ID to join, so Milestone 9 builds no correlation ([ADR 0002](adr/0002-server-verified-approval.md)).
 
 Answered by Milestone 3: Flux-managed objects carry the kustomize-controller labels `kustomize.toolkit.fluxcd.io/name` and `/namespace`, or the helm-controller labels `helm.toolkit.fluxcd.io/name` and `/namespace`; they are refused like Argo CD-managed ones (implemented from the Flux documentation and tested on a test cluster with the labels set by hand, not with a running Flux).
 
