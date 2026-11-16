@@ -77,6 +77,7 @@ from handrail_common.plans import (
     rollback_args,
     scale_args,
     template_hash,
+    with_change_ref,
 )
 from handrail_common.resources import (
     DEPLOYMENT_OPS,
@@ -100,6 +101,7 @@ from handrail_common.validation import (
     GuardError,
     check_not_paused,
     check_replica_step,
+    require_change_ref,
     require_int,
     require_override_flag,
     require_plan_id,
@@ -479,6 +481,7 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
     # Who is applying: in identity mode a gateway apply must come from the plan's agent.
     expected_requester = guard_apply(s)
     namespace, name, request = action.validate(args, s)
+    request = with_change_ref(request, require_change_ref(args))
     override = request.get("override_manual_change", False) is True
     plan_id = require_plan_id(args.get("plan_id"))
 

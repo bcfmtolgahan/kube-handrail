@@ -1,6 +1,7 @@
 """Argument guards. Each check raises GuardError carrying a contract error code."""
 
 import re
+import unicodedata
 import uuid
 from collections.abc import Callable, Collection, Mapping
 from typing import Any
@@ -200,4 +201,28 @@ def require_plan_id(value: Any) -> str:
         canonical = None
     if canonical is None or canonical != value:
         raise GuardError(INVALID_ARGUMENT, "plan_id must be a UUID")
+    return value
+
+
+CHANGE_REF_MAX_CHARS = 128
+
+
+def require_change_ref(args: Mapping[str, Any]) -> str | None:
+    """Optional `change_ref`: a ticket or incident reference, untrusted and display-only. At
+    most 128 characters, with no control or format characters, so the value pinned in
+    args_hash is the one an approver is shown (wrapped as untrusted text)."""
+    value = args.get("change_ref")
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > CHANGE_REF_MAX_CHARS
+        or any(unicodedata.category(ch) in ("Cc", "Cf", "Cs") for ch in value)
+    ):
+        raise GuardError(
+            INVALID_ARGUMENT,
+            f"change_ref must be a non-blank string of at most {CHANGE_REF_MAX_CHARS} "
+            "characters without control characters",
+        )
     return value

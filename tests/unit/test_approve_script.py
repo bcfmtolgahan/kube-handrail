@@ -182,3 +182,14 @@ def test_summaries_of_an_hpa_adjust():
     assert approve.verification_summary(verification) == (
         "; verified 60 s after the apply, reverted to bounds 1-5 if degraded"
     )
+
+
+def test_summary_ends_with_the_change_ref():
+    view = {
+        "action": "scale_deployment",
+        "namespace": "sandbox",
+        "name": "web",
+        "replicas": {"from": 1, "to": 3},
+        "change_ref": "<untrusted>INC-7</untrusted>",
+    }
+    assert approve.summary(view).endswith("; change reference <untrusted>INC-7</untrusted>")

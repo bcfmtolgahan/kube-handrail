@@ -95,7 +95,11 @@ def emit(envelope: dict[str, Any]) -> None:
 def summary(view: dict[str, Any]) -> str:
     """One line naming the action, the Deployment and what changes, from the server's view,
     and the verification the apply schedules."""
-    return change_summary(view) + verification_summary(view.get("verification"))
+    text = change_summary(view) + verification_summary(view.get("verification"))
+    if view.get("change_ref"):
+        # Agent-supplied and untrusted; the server sends it already wrapped.
+        text += f"; change reference {view['change_ref']}"
+    return text
 
 
 def change_summary(view: dict[str, Any]) -> str:

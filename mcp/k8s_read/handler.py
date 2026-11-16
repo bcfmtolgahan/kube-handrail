@@ -71,6 +71,7 @@ from handrail_common.plans import (
     rollback_args,
     scale_args,
     template_hash,
+    with_change_ref,
 )
 from handrail_common.resources import (
     HORIZONTAL_POD_AUTOSCALER,
@@ -103,6 +104,7 @@ from handrail_common.validation import (
     check_namespace_allowed,
     check_not_paused,
     check_replica_step,
+    require_change_ref,
     require_int,
     require_name,
     require_namespace,
@@ -640,6 +642,7 @@ def _plan(
     bind_plan_id(plan_id)
 
     namespace, name, request = action.validate(args, settings)
+    request = with_change_ref(request, require_change_ref(args))
     agent = guard_plan(settings, clients.ssm)
     # Before the Deployment is read; apply checks again with its own clock.
     check_not_frozen(freeze_store(clients.ssm, settings.freezes_param), namespace, action.name, now)
@@ -1305,7 +1308,8 @@ def request_approval(
     args: dict[str, Any], settings: Settings, clients: Clients, now: int
 ) -> Envelope:
     """Ask the configured approvers to decide on a plan. Approves nothing; only the plan_id
-    is read from the arguments, so no agent text reaches the approvers."""
+    is read from the arguments; the only agent text approvers see is the plan's change_ref,
+    as untrusted text."""
     plan_id = require_plan_id(args.get("plan_id"))
     if not settings.approval_required:
         # A server approval would change nothing, and the wait would only keep the plan alive.

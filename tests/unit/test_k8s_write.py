@@ -30,6 +30,7 @@ from handrail_common.plans import (
     scale_args,
     scale_args_hash,
     template_hash,
+    with_change_ref,
 )
 from handrail_common.validation import GuardError
 
@@ -3387,3 +3388,35 @@ def test_a_scale_record_given_another_target_kind_is_plan_mismatch(rt):
     )
     assert error_code(apply(plan.plan_id)) == "plan_mismatch"
     apps.patch_namespaced_deployment.assert_not_called()
+
+
+def create_plan_with_ref(store: PlanStore, change_ref: str) -> Plan:
+    args = with_change_ref(scale_args("sandbox", "web", 3), change_ref)
+    plan = dataclasses.replace(
+        create_plan(store),
+        plan_id=str(uuid.uuid4()),
+        args=args,
+        args_hash=plan_args_hash(SCALE_DEPLOYMENT, args),
+    )
+    store.create(plan)
+    return plan
+
+
+def test_change_ref_is_pinned_like_any_argument(rt):
+    runtime_, apps = rt
+    plan = create_plan_with_ref(runtime_.store, "INC-42")
+    assert error_code(apply(plan.plan_id)) == "plan_mismatch"
+    assert error_code(apply(plan.plan_id, change_ref="INC-43")) == "plan_mismatch"
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert apply(plan.plan_id, change_ref="INC-42")["ok"] is True
+    # A plan without one refuses an apply that adds one.
+    other = create_plan(runtime_.store)
+    assert error_code(apply(other.plan_id, change_ref="INC-42")) == "plan_mismatch"
+
+
+@pytest.mark.parametrize("value", ["", "  ", "x" * 129, "INC\n42", "INC‮42", 42])
+def test_a_bad_change_ref_is_refused_before_the_consume(rt, value):
+    runtime_, apps = rt
+    plan = create_plan_with_ref(runtime_.store, "INC-42")
+    assert error_code(apply(plan.plan_id, change_ref=value)) == "invalid_argument"
+    assert item(plan.plan_id)["used"] is False

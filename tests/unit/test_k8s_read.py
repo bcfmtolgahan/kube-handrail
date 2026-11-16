@@ -2890,3 +2890,38 @@ def test_adjust_hpa_flapping_follows_the_bounds(clients, table):
     serve_hpa(clients, hpa_object(1, 5))
     # Up, down, and now up again: the pods (2) never moved, the bounds did.
     assert adjust_error(clients, min_replicas=2).code == "flapping"
+
+
+def test_change_ref_enters_the_payload_only_when_given(clients, table):
+    data = plan(clients, change_ref="INC-42 (ticket)")["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3, "change_ref": "INC-42 (ticket)"}
+    assert item["args"] == args
+    assert item["args_hash"] == plan_args_hash("scale_deployment", args)
+    data = plan(clients)["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert "change_ref" not in item["args"]
+    assert item["args_hash"] == scale_args_hash("sandbox", "web", 3)
+
+
+def test_every_plan_takes_a_change_ref(clients, table):
+    data = handler.plan_restart_deployment(
+        {"namespace": "sandbox", "name": "web", "change_ref": "CHG-7"}, SETTINGS, clients, NOW
+    )["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["args"]["change_ref"] == "CHG-7"
+    serve_hpa(clients, hpa_object(1, 5))
+    data = adjust(clients, min_replicas=2, change_ref="CHG-8")["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["args"]["change_ref"] == "CHG-8"
+
+
+@pytest.mark.parametrize("value", ["", " ", "x" * 129, "a\tb", "zero​width", 7, ["x"]])
+def test_a_bad_change_ref_is_refused_before_any_api_call(clients, table, value):
+    assert plan_error(clients, change_ref=value) == "invalid_argument"
+    assert table.scan()["Count"] == 0
+    clients.apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_a_change_ref_of_128_characters_is_accepted(clients):
+    assert plan(clients, change_ref="x" * 128)["ok"] is True

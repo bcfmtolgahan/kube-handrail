@@ -1,5 +1,6 @@
 """What an approver sees: a plan rendered from the server's own record (mcp/CONTRACT.md,
-Server-side approval). Nothing here comes from text an agent supplied.
+Server-side approval). The only text an agent supplied is `change_ref`, shown as untrusted
+text.
 """
 
 import unicodedata
@@ -16,6 +17,7 @@ from handrail_common.plans import (
     STATUS_PLANNED,
     STATUS_REJECTED,
 )
+from handrail_common.untrusted import untrusted_text
 from handrail_common.validation import GuardError
 
 STATUS_APPLIED = "applied"
@@ -93,6 +95,13 @@ def verification_view(record: Mapping[str, Any]) -> dict[str, Any] | None:
     return view
 
 
+def change_ref_view(record: Mapping[str, Any]) -> str | None:
+    """The plan's `change_ref` argument as untrusted text, None when it has none. The agent
+    chose it, so it is cleaned and wrapped like event text."""
+    value = (record.get("args") or {}).get("change_ref")
+    return untrusted_text(value)[0] if isinstance(value, str) else None
+
+
 def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
     record = plain(item)
     view: dict[str, Any] = {
@@ -114,6 +123,9 @@ def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
     verification = verification_view(record)
     if verification is not None:
         view["verification"] = verification
+    change_ref = change_ref_view(record)
+    if change_ref is not None:
+        view["change_ref"] = change_ref
     if "approved_by" in record:
         view["approval"] = {
             key: record.get(key)
@@ -255,6 +267,11 @@ def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
             f"Cluster: {view.get('cluster') or 'not recorded'}",
             target,
             *change,
+            *(
+                [f"Change reference (from the agent): {view['change_ref']}"]
+                if "change_ref" in view
+                else []
+            ),
             f"Override manual change: {'yes' if view['override_manual_change'] else 'no'}",
             *_verification_lines(view.get("verification")),
             f"Requested by: {view['requested_by']}",

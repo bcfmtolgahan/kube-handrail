@@ -116,6 +116,14 @@ def _verify_args(
     return args
 
 
+def with_change_ref(args: dict[str, Any], change_ref: str | None) -> dict[str, Any]:
+    """Every action's payload gains `change_ref` only when given, so hashes without it are
+    unchanged; args_hash then pins it like any other argument."""
+    if change_ref is not None:
+        args["change_ref"] = change_ref
+    return args
+
+
 def scale_args(
     namespace: str,
     name: str,

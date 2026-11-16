@@ -26,6 +26,7 @@ from boto3.dynamodb.types import Binary, TypeDeserializer
 from botocore.exceptions import ClientError
 
 from handrail_common.config import required_env
+from handrail_common.untrusted import untrusted_text
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -48,6 +49,7 @@ SUMMARY_ATTRIBUTES = (
     "kind",
     "action",
     "target_kind",
+    "hpa_target",
     "namespace",
     "name",
     "requested_by",
@@ -152,6 +154,10 @@ def summarize(
     for name in SUMMARY_ATTRIBUTES:
         if current.get(name) is not None:
             summary[name] = current[name]
+    args = current.get("args")
+    if isinstance(args, Mapping) and isinstance(args.get("change_ref"), str):
+        # Agent-supplied: cleaned and wrapped like event text. The image keeps it as given.
+        summary["change_ref"] = untrusted_text(args["change_ref"])[0]
     for name in TRANSITIONS:
         before = (old or {}).get(name)
         after = (new or {}).get(name)
