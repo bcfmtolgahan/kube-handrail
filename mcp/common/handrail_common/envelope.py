@@ -27,6 +27,7 @@ APPROVAL_RATE_LIMITED = "approval_rate_limited"
 PLAN_DECIDED = "plan_decided"
 REVISION_NOT_FOUND = "revision_not_found"
 FORBIDDEN = "forbidden"
+CHANGE_FROZEN = "change_frozen"
 KUBERNETES_ERROR = "kubernetes_error"
 INTERNAL = "internal"
 
@@ -57,6 +58,7 @@ ERROR_CODES = frozenset(
         PLAN_DECIDED,
         REVISION_NOT_FOUND,
         FORBIDDEN,
+        CHANGE_FROZEN,
         KUBERNETES_ERROR,
         INTERNAL,
     }

@@ -103,7 +103,7 @@ Every tool invocation, including `unknown_tool`, prints exactly one JSON line wh
 - `caller`: the verified caller's `client_id` ([Agent identity](#agent-identity)), otherwise `null`.
 - `plan_id`: the `plan_id` of a successful response's `data`, otherwise the `plan_id` argument, and only if it is a UUID; otherwise `null`.
 - `outcome`: `ok` or the error code.
-- `reason` and `scope`: a rejection's `details.reason` (`forbidden`) and `details.scope` (`remediation_disabled`), otherwise `null`. They are fixed words set by the server, so the metrics keep `Code` as their only rejection dimension.
+- `reason` and `scope`: a rejection's `details.reason` (`forbidden`) and `details.scope` (`remediation_disabled`), otherwise `null`. They are fixed words set by the server, so the metrics keep `Code` as their only rejection dimension. A `remediation_disabled` refused for unreadable freezes logs `reason` `unreadable` or `invalid`; the operator's free-text `reason` of `change_frozen` is never logged.
 - `ToolCalls` is 1. `ToolErrors` is 1 for `internal` and `kubernetes_error` (the tool could not do its job, for example the Kubernetes API refused its credentials or returned a server error). Any other error code is a guard rejection: the record then has `Code` and `GuardRejections = 1` and the second metric entry; an `ok`, `internal` or `kubernetes_error` record has neither. The empty dimension set gives `ToolCalls` and `ToolErrors` across all tools.
 
 The record has only these fields. Argument values, tokens and error messages are never in it. An internal error additionally logs its stack trace through the Lambda logger, in a line that names the correlation ID.
@@ -140,7 +140,7 @@ Every handler returns a JSON object (not wrapped in `statusCode`/`body`):
 
 `replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. For `conflict` because the Deployment's rollout is paused (restart and rollback, on plan and apply), `details` is `{ "paused": true }`. For `conflict` because the ReplicaSet a rollback plan pinned was replaced, `details` is `{ "replica_set": { "planned": "<uid>", "current": "<uid>" } }`, and because its template changed, `{ "template": { "planned": "sha256:...", "current": "sha256:..." } }`. `revision_not_found` has `details` `{ "revision": 3, "available": [5, 4, 2] }` on a plan and `{ "revision": 3, "replica_set": "<name>" }` on an apply ([Rollback](#rollback)). A `conflict` from a 409 that persists after all patch attempts has no `details`. `forbidden` from an agent check has `details` `{"reason": "agent_unknown" | "not_requester"}`, and `remediation_disabled` from an agent's own kill switch `{"scope": "agent", "agent": "<name>"}` (the global kill switch adds no `details`); see [Agent identity](#agent-identity). The history checks below also return `details`; every value in them is an integer or a string.
 
-Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `agent_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `revision_not_found`, `forbidden`, `kubernetes_error`, `internal`.
+Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `agent_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `revision_not_found`, `forbidden`, `change_frozen`, `kubernetes_error`, `internal`.
 
 ## Untrusted output
 
@@ -347,6 +347,8 @@ With `VERIFY_ENABLED`, step 3's conditional update also schedules the verificati
 In identity mode, a gateway apply resolves its caller to an agent between steps 1 and 2 (`forbidden`, `agent_unknown`), and step 3's conditional update also requires the plan's `requested_by` to be that agent's ([Apply condition](#apply-condition)). Step 3 records the apply's `channel` in the same update. Right after it, on every channel, a plan without `agent` is refused in identity mode (`forbidden`, `agent_unknown`; only the approval channel can get that far with one), and the kill switch of the plan's agent must be on (`remediation_disabled`, `details.scope = "agent"`); either refusal leaves the plan consumed with its code as `result`, like a blast-radius refusal. In step 7, one conditional update adds 1 to the plan's agent's counter for the current hour, only while it is below the agent's budget (`agent_budget_exceeded`), right before the global unit is taken, whichever channel applies the plan.
 
 The kill switch is read on every apply (no caching), so turning it off takes effect immediately.
+
+A [change freeze](#change-freezes) is checked when planning, after checks 1-3 and the agent checks, and when applying, between steps 2 and 3, before the consume; a refusal there leaves the plan unconsumed.
 
 ## Restart
 
@@ -676,6 +678,53 @@ Known limits:
 - If the verifier cannot run within `VERIFY_GRACE_SECONDS` of `verify_at`, the outcome is `unknown` with reason `late`, and nothing is reverted.
 - A revert of a restart or rollback is not supported: `revert_on_failure` is a scale argument only.
 
+## Change freezes
+
+Status: implemented and tested on a test cluster.
+
+A change freeze is a window in which no change is planned or applied in the namespaces it names, for example over a release or a holiday. Operators set freezes; nothing in the tool surface can. There is no break-glass path: to make a change during a freeze, an operator removes or shortens it ([ADR 0005](../docs/adr/0005-change-freezes.md)).
+
+### Configuration
+
+One SSM `String` parameter, `FREEZES_PARAM` (Terraform: `/<name_prefix>/freezes`, created as `[]`, later applies ignore its value; output `freezes_parameter`), holds a JSON list of at most 50 entries:
+
+```json
+[
+  { "namespaces": ["kube-handrail-sandbox"], "start": "2026-12-23T00:00:00Z",
+    "until": "2027-01-02T00:00:00Z", "reason": "year-end freeze" },
+  { "namespaces": ["*"], "start": "2026-12-01T18:00:00Z", "until": "2026-12-01T20:00:00Z",
+    "reason": "database migration", "actions": ["scale", "restart"] }
+]
+```
+
+- `namespaces`: a non-empty list of distinct DNS-1123 labels, or `"*"` for every namespace. They are not checked against `ALLOWED_NAMESPACES`.
+- `start`, `until`: RFC 3339 in UTC to the second (`YYYY-MM-DDTHH:MM:SSZ`, no other offset, no fraction); `until` later than `start`. The window includes `start` and excludes `until`. An entry whose window has passed is valid and simply inactive.
+- `reason`: printable text, 1 to 200 characters, returned to agents as is.
+- `actions` (optional): a non-empty list of distinct `scale`, `restart`, `rollback`; without it the freeze covers every action.
+- No other fields.
+
+`scripts/freeze.py` (`list`, `add`, `remove INDEX...`, `remove --expired`, `remove --all`) reads and writes the parameter and validates every write with the Lambdas' own parser (`handrail_common.freezes`). Without `FREEZES_PARAM` no freeze is checked; Terraform always sets it.
+
+### Reading
+
+The parameter is read on every check, without caching, like the kill switch, so a freeze takes effect on the next call. It fails closed the way the kill switch does: a parameter that cannot be read (missing, denied, throttled) or that does not validate refuses the write with `remediation_disabled`, `details` `{"scope": "freezes", "reason": "unreadable" | "invalid"}`, in every namespace. `scripts/freeze.py remove --all` resets an invalid value to `[]`.
+
+### Where it is checked
+
+- **Plan** (every `plan_*` tool, `k8s_read`): after argument checks 1-3 and the caller's agent and its kill switch, before the Deployment is read. Nothing is read from the cluster and no plan is stored.
+- **Apply** (every `apply_*` tool, `k8s_write`): between [apply](#guard-checks) step 2 and step 3, with the time of the apply, before the plan is consumed. A plan approved before a freeze is therefore not applied during it. The refusal leaves the plan unconsumed, with no `result`: it can be applied once the freeze ends, if it has not expired by then (a server approval keeps a plan valid for `APPLY_AFTER_APPROVAL_TTL_SECONDS`), and otherwise it expires. The namespace checked is the request's, which the consume condition (`args_hash`) ties to the plan's.
+- **Approval channel:** the approver runs the same apply, so an approval during a freeze is recorded and its apply refused (`data.apply.error.code = "change_frozen"`, HTTP 200). The approval API itself does not read freezes.
+- **Not checked:** `request_approval` (its apply is), the read tools, the verification, and a pre-approved revert ([Revert](#revert)): a revert never enters the apply path, so a freeze does not stop it (ADR 0004 and 0005).
+
+A freeze covers a request when the request's namespace is in `namespaces` (or `namespaces` has `"*"`), its action is in `actions` (or there is none), and `start <= now < until`. The refusal is `change_frozen`:
+
+```json
+{ "code": "change_frozen", "message": "changes in namespace sandbox are frozen until 2027-01-02T00:00:00Z",
+  "details": { "namespace": "sandbox", "reason": "year-end freeze", "until": "2027-01-02T00:00:00Z" } }
+```
+
+`details.until` is the first moment a change is allowed again: windows covering the same namespace and action that overlap or touch the current one extend it. `details.reason` is the reason of the current window that ends last.
+
 ## Drift sentinel
 
 A write tool that loses its `MUTATIVE` classification runs without approval in DevOps Agent (an unclassified tool counts as `READ_ONLY`). The sentinel is a scheduled Lambda (`mcp/sentinel/`, every 5 minutes by default) that turns remediation off when that happens, or when the gateway no longer identifies agents as deployed. It is not a gateway target and has no MCP tools.
@@ -842,6 +891,7 @@ Existing assets are found with `ListAssets` and checked before the first write; 
 ## Identity
 
 - Two IAM roles, one per tool Lambda. On the plan table: read role `dynamodb:PutItem`, `dynamodb:GetItem` and `dynamodb:UpdateItem` (for `request_approval` and its counter); write role `dynamodb:GetItem` and `dynamodb:UpdateItem`; both `dynamodb:Query` on the `object-history` index ARN only. Both roles have `ssm:GetParameter` on the per-agent kill switches (`parameter/<name_prefix>/agents/*`); only the write role reads the global kill switch. The read role also has `sns:Publish` on the approval topic, and an explicit deny of `PutItem` and `UpdateItem` that name any approval attribute (`approved_*`, `approval_channel`, `approval_expires_at`, `rejected_*`, `reject_reason`, `decision_correlation_id`, through `dynamodb:Attributes`), and of the attributes that schedule, record and target a verification or revert (`verify_at`, `verify_queue`, `verification`, `revert`, `revert_to`, `kind`, `reverts_plan_id`), which it never writes. The write role has no such deny, because its consume condition reads those attributes; nothing in IAM keeps it from writing them. What is guaranteed: the read role cannot write an approval, the approver refuses the Lambda and gateway roles, and the write guard re-validates the consumed record against the request's arguments before it touches the cluster.
+- Both tool roles also have `ssm:GetParameter` on the change freezes parameter (`parameter/<name_prefix>/freezes`); nothing in the deployment can write it.
 - Approver role: `dynamodb:GetItem` and `dynamodb:UpdateItem` on the plan table, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS access: the apply it triggers runs as the write Lambda.
 - Verifier role (with `verify_enabled`): `dynamodb:Query` on the `verify-due` index ARN only, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS, SSM or table item access: the verification runs as the write Lambda, whose role needs nothing new. The approver refuses the verifier role as an approver, like the other Lambda roles.
 - Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the global kill switch parameter only; `bedrock-agentcore:ListGatewayTargets`, `bedrock-agentcore:GetGatewayTarget` and `bedrock-agentcore:GetGateway` on this gateway (a denial shows as `unknown`); `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
@@ -861,6 +911,7 @@ Only the two tool Lambdas talk to the cluster. At runtime they make these calls,
 | Kubernetes API | both | the cluster endpoint |
 | `dynamodb:GetItem`, `PutItem`, `UpdateItem`, `Query` | both (`PutItem` read only) | `dynamodb.<region>.amazonaws.com` |
 | `ssm:GetParameter` (the global kill switch on apply; an agent's kill switch on plan, `request_approval` and apply, in identity mode) | write; both | `ssm.<region>.amazonaws.com` |
+| `ssm:GetParameter` (the change freezes, on plan and apply) | both | `ssm.<region>.amazonaws.com` |
 | `sns:Publish` (`request_approval`) | read | `sns.<region>.amazonaws.com` |
 
 The EKS token is a presigned `sts:GetCallerIdentity` URL built locally; the Lambdas never call STS, the API server does. Lambda delivers function logs itself, outside the function's network. So neither STS nor CloudWatch Logs has to be reachable from the Lambdas' subnets. The approver, sentinel, interceptor and verifier Lambdas never run in a VPC; the verifier reaches the write Lambda through the Lambda API, and the verification's own calls are the write Lambda's.
@@ -882,6 +933,8 @@ Agent identity, set on both tool Lambdas ([Agent identity](#agent-identity)):
 | `AGENT_KILL_SWITCH_PREFIX` | `/<name_prefix>/agents/`; required in identity mode | set from `name_prefix` |
 
 Outputs: `agent_client_ids` (every agent's `client_id` by name), `cognito_client_ids` (the clients created here) and `agent_kill_switch_parameters` (every agent's kill switch parameter by name).
+
+Change freezes, set on both tool Lambdas ([Change freezes](#change-freezes)): `FREEZES_PARAM`, `/<name_prefix>/freezes`, set from `name_prefix`; unset means no freezes are checked. Output: `freezes_parameter`.
 
 Verification, set on both tool Lambdas ([Verification and revert](#verification-and-revert)); the numbers must be positive integers with `60 <= VERIFY_WINDOW_MIN_SECONDS <= VERIFY_WINDOW_DEFAULT_SECONDS <= VERIFY_WINDOW_MAX_SECONDS`:
 

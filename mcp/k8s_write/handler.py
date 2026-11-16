@@ -40,6 +40,7 @@ from handrail_common.envelope import (
     Envelope,
     ok,
 )
+from handrail_common.freezes import FreezeStore, check_not_frozen, freeze_store
 from handrail_common.gitops import is_gitops_managed
 from handrail_common.killswitch import KillSwitch
 from handrail_common.observability import (
@@ -98,6 +99,8 @@ class Runtime:
     clock: Callable[[], float] = time.time
     # For the per-agent kill switches; the global one has its own client.
     ssm: Any = None
+    # None without FREEZES_PARAM: no freezes are checked.
+    freezes: FreezeStore | None = None
 
 
 _runtime: Runtime | None = None
@@ -118,6 +121,7 @@ def get_runtime() -> Runtime:
             store=PlanStore.from_name(settings.plans_table, settings.region),
             apps=lambda: k8s.AppsV1Api(api_client(settings.cluster_name)),
             ssm=ssm,
+            freezes=freeze_store(ssm, settings.freezes_param),
         )
     return _runtime
 
@@ -383,6 +387,10 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
     plan_id = require_plan_id(args.get("plan_id"))
 
     now = int(rt.clock())
+    # Before the consume, with the current time: an approval given before a freeze is not
+    # applied during it, and the plan is left unconsumed until it expires. The namespace is
+    # the request's, which the consume condition (args_hash) ties to the plan's.
+    check_not_frozen(rt.freezes, namespace, action.name, now)
     correlation_id = current_correlation_id()
     plan = rt.store.consume(
         plan_id,
@@ -778,7 +786,8 @@ def _patch_revert(
 
 def _revert(rt: Runtime, plan: Plan, now: int, deployment: Any) -> dict[str, Any] | None:
     """Undo a degraded change that was approved with revert_on_failure. Only the global kill
-    switch, the replica bounds, GitOps ownership and the spec precondition can stop it; it
+    switch, the replica bounds, GitOps ownership and the spec precondition can stop it (not a
+    change freeze: it never reaches _apply, where freezes are checked); it
     takes no budget unit and runs no history check (mcp/CONTRACT.md, Verification and
     revert). Returns the final revert state, or None to try again on the next run; any
     other failure also leaves the plan due, and verify_applied_plan ends it once late."""

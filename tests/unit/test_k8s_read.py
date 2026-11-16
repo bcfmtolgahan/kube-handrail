@@ -16,6 +16,7 @@ from moto import mock_aws
 
 from handrail_common.breaker import LAST_PLAN_ANNOTATION, retention_seconds
 from handrail_common.config import Agent, Settings
+from handrail_common.freezes import format_time
 from handrail_common.observability import bind_caller, unbind_caller
 from handrail_common.plans import (
     PlanStore,
@@ -2245,3 +2246,89 @@ def test_plan_outcome_of_a_reverted_change_and_its_revert(clients):
         "reason": None,
         "revert_plan_id": "r",
     }
+
+
+# --- change freezes -----------------------------------------------------------
+
+FREEZES = "/handrail/freezes"
+FROZEN = dataclasses.replace(SETTINGS, freezes_param=FREEZES)
+
+
+def set_freezes(clients, *entries: dict) -> None:
+    clients.ssm.put_parameter(
+        Name=FREEZES, Value=json.dumps(list(entries)), Type="String", Overwrite=True
+    )
+
+
+def window(namespaces=("sandbox",), start=NOW - 60, until=NOW + 600, **extra) -> dict:
+    return {
+        "namespaces": list(namespaces),
+        "start": format_time(start),
+        "until": format_time(until),
+        "reason": "release freeze",
+        **extra,
+    }
+
+
+def frozen_plan(clients, plan_tool=None, **args):
+    plan_tool = plan_tool or handler.plan_scale_deployment
+    args = {"namespace": "sandbox", "name": "web", **args}
+    with pytest.raises(GuardError) as exc:
+        plan_tool(args, FROZEN, clients, NOW)
+    return exc.value
+
+
+def test_a_freeze_refuses_the_plan_before_the_cluster_is_read(clients, table):
+    set_freezes(clients, window())
+    exc = frozen_plan(clients, replicas=3)
+    assert exc.code == "change_frozen"
+    assert exc.details == {
+        "namespace": "sandbox",
+        "reason": "release freeze",
+        "until": format_time(NOW + 600),
+    }
+    clients.apps.read_namespaced_deployment.assert_not_called()
+    assert table.scan()["Count"] == 0
+
+
+@pytest.mark.parametrize("tool", ["plan_restart_deployment", "plan_rollback_deployment"])
+def test_a_freeze_refuses_every_action(clients, tool):
+    set_freezes(clients, window())
+    args = {"revision": 3} if tool == "plan_rollback_deployment" else {}
+    assert frozen_plan(clients, getattr(handler, tool), **args).code == "change_frozen"
+
+
+def test_the_plan_passes_outside_the_window_and_namespace(clients):
+    set_freezes(
+        clients,
+        window(start=NOW + 1),
+        window(start=NOW - 600, until=NOW),
+        window(namespaces=("other",)),
+        window(actions=["restart"]),
+    )
+    assert handler.plan_scale_deployment(
+        {"namespace": "sandbox", "name": "web", "replicas": 3}, FROZEN, clients, NOW
+    )["ok"]
+
+
+def test_unreadable_freezes_refuse_the_plan(clients, table):
+    exc = frozen_plan(clients, replicas=3)
+    assert (exc.code, exc.details) == (
+        "remediation_disabled",
+        {"scope": "freezes", "reason": "unreadable"},
+    )
+    assert table.scan()["Count"] == 0
+
+
+def test_invalid_freezes_refuse_the_plan(clients):
+    set_freezes(clients, window(until=NOW - 600))
+    exc = frozen_plan(clients, replicas=3)
+    assert exc.details == {"scope": "freezes", "reason": "invalid"}
+
+
+def test_argument_checks_come_before_the_freezes(clients):
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(
+            {"namespace": "elsewhere", "name": "web", "replicas": 3}, FROZEN, clients, NOW
+        )
+    assert exc.value.code == "forbidden_namespace"

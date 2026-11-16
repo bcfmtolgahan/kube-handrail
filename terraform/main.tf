@@ -77,6 +77,9 @@ locals {
     VERIFY_GRACE_SECONDS          = tostring(var.verify_grace_seconds)
 
     METRIC_NAMESPACE = local.tools_metric_namespace
+
+    # Built from var.name_prefix, so it is known when the existing Lambdas are planned.
+    FREEZES_PARAM = local.freezes_param
   }
 
   # Every packaged Lambda => its requirements file. The sentinel, the approver and the verifier
@@ -117,6 +120,8 @@ locals {
   })
   # Per-agent kill switches are <prefix><name>/enabled.
   agent_kill_switch_prefix = "/${var.name_prefix}/agents/"
+  # Change freezes (mcp/CONTRACT.md, Change freezes).
+  freezes_param = "/${var.name_prefix}/freezes"
 
   cognito_domain        = "${var.name_prefix}-${local.account_id}"
   cognito_discovery_url = "https://cognito-idp.${local.region}.amazonaws.com/${aws_cognito_user_pool.this.id}/.well-known/openid-configuration"
@@ -237,6 +242,13 @@ data "aws_iam_policy_document" "lambda" {
     sid       = "AgentKillSwitches"
     actions   = ["ssm:GetParameter"]
     resources = ["arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${local.agent_kill_switch_prefix}*"]
+  }
+
+  # Both Lambdas read the change freezes: plan as well as apply.
+  statement {
+    sid       = "ChangeFreezes"
+    actions   = ["ssm:GetParameter"]
+    resources = [aws_ssm_parameter.freezes.arn]
   }
 
   dynamic "statement" {
@@ -485,6 +497,18 @@ resource "aws_ssm_parameter" "agent_enabled" {
   description = "Only the exact value \"true\" lets agent ${each.key} plan, request approval and apply."
   type        = "String"
   value       = "true"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# Change freezes: a JSON list of windows. Only operators write it (scripts/freeze.py).
+resource "aws_ssm_parameter" "freezes" {
+  name        = local.freezes_param
+  description = "Change freezes: a JSON list of windows in which no change is planned or applied."
+  type        = "String"
+  value       = "[]"
 
   lifecycle {
     ignore_changes = [value]

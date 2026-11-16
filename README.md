@@ -106,6 +106,8 @@ Milestone 2, item 2 (rollback by exact revision): `get_rollout_history` and `pla
 
 Milestone 2, item 3 (per-agent identity, budgets and kill switch): the caller interceptor is on by default, plans name the requesting agent, only that agent can request approval for its plan or apply it through the gateway, each agent has an hourly apply budget and a kill switch, and the drift sentinel checks the gateway's interceptor and allowed clients. Implemented and tested on a test cluster, in `client` and `server` mode and with DevOps Agent. See [Agent identity](mcp/CONTRACT.md#agent-identity).
 
+Milestone 2, item 5 (change freezes): an operator sets windows in which plans and applies in the named namespaces are refused with `change_frozen`, checked again at apply so an earlier approval is not applied during a freeze; a pre-approved revert is exempt. Implemented and tested on a test cluster. See [Change freezes](mcp/CONTRACT.md#change-freezes).
+
 Milestone 2, item 4 (verify and revert): plans take a verification window and, for a scale, `revert_on_failure`, pinned in the approval; the apply schedules the check, a scheduled verifier runs it through an internal entry point of the write Lambda, `get_plan_outcome` reports `healthy`, `degraded` or `unknown`, and a degraded change approved with revert is reverted under the spec-level precondition. Implemented and tested on a test cluster. See [Verification and revert](mcp/CONTRACT.md#verification-and-revert).
 
 ## Planned layout
@@ -139,6 +141,7 @@ AGENTS.md        tool contract for MCP clients
 - [ADR 0002: Server-verified approval](docs/adr/0002-server-verified-approval.md) - approvals pinned to exact arguments and verified by the server
 - [ADR 0003: Agent identity per OAuth client](docs/adr/0003-agent-identity.md) - which agent asked for each change, and per-agent limits
 - [ADR 0004: Pre-approved revert](docs/adr/0004-pre-approved-revert.md) - verifying every change, and reverting a degraded one the human approved with its revert
+- [ADR 0005: Change freezes](docs/adr/0005-change-freezes.md) - windows in which no change is planned or applied, and why there is no break-glass
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
 - [Deploying to a new account](docs/deploy.md) - prerequisites, names, RBAC, networking for clusters with a private endpoint, and the order of steps
 - [Guards](docs/guards.md) - blast-radius budget, impact preview, what a rollback trusts, the oscillation breaker (flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks), the per-agent budget and kill switch, and verify and revert

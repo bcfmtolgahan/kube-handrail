@@ -187,6 +187,13 @@ See [Verification and revert](../mcp/CONTRACT.md#verification-and-revert) and [A
 
 **Done when:** CI shows the three policy layers agreeing on the shared test cases; on a test deployment Cedar ran in log-only mode and admission policy in audit mode before both were enforced; a freeze refuses changes; and a break-glass change needs a ticket and two distinct approvers.
 
+Change freezes from this item are implemented and tested on a test cluster: windows in one SSM parameter, checked by the guard on plan and on apply (including approval-triggered applies), with a pre-approved revert exempt and no break-glass path. See [Change freezes](../mcp/CONTRACT.md#change-freezes) and [ADR 0005](adr/0005-change-freezes.md). On a test cluster:
+
+- The deployment upgraded in place with one `terraform apply` (a new SSM parameter and in-place updates of the tool Lambdas); the smoke test passed and `scripts/freeze.py list` showed no freezes.
+- The end-to-end suite with the freeze cases (`--with-freeze`) passed 48 of 48 in `client` mode and 43 of 43 in `server` mode: a freeze on another namespace left a sandbox plan `ok`; a plan in a frozen namespace was `change_frozen` with its reason and `until`; a plan made before the freeze (in `server` mode, an approval given before it) was refused at apply with `change_frozen` and stayed unconsumed, and applied once the freeze was removed. The stored freezes were the same before and after.
+- An invalid freezes value refused plans with `remediation_disabled` (`scope` `freezes`, `reason` `invalid`); `scripts/freeze.py remove --all` restored it.
+- In `client` mode, a DevOps Agent chat asked to scale a Deployment in a frozen namespace reported `change_frozen` with the reason and the end of the freeze, did not retry, and did not look for another way to make the change.
+
 ### 6. Tamper-evident audit ledger and evidence export
 
 **Goal:** prove afterwards who asked for each change, who approved it, and what ran it, even if the executor is compromised.

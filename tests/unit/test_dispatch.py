@@ -332,6 +332,28 @@ def test_rejection_reason_and_scope_are_recorded(capsys):
     )
 
 
+def test_freeze_scoped_disable_records_its_fixed_reason(capsys):
+    def handler(args):
+        raise GuardError("remediation_disabled", "no", {"scope": "freezes", "reason": "invalid"})
+
+    dispatch({"x": handler}, {}, full_ctx(), {})
+    (record,) = records(capsys)
+    assert (record["reason"], record["scope"]) == ("invalid", "freezes")
+
+
+def test_operator_free_text_reason_is_not_recorded(capsys):
+    def handler(args):
+        raise GuardError(
+            "change_frozen",
+            "frozen",
+            {"namespace": "sandbox", "reason": "year-end freeze", "until": "2027-01-02T00:00:00Z"},
+        )
+
+    dispatch({"x": handler}, {}, full_ctx(), {})
+    (record,) = records(capsys)
+    assert (record["Code"], record["reason"], record["scope"]) == ("change_frozen", None, None)
+
+
 # --- Internal handlers --------------------------------------------------------
 
 VERIFIER = {"kubeHandrailChannel": "verifier"}
