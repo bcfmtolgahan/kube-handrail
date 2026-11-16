@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import boto3
 import pytest
+import yaml
 from kubernetes import client as k8s
 from kubernetes.client.rest import ApiException
 from moto import mock_aws
@@ -179,46 +180,43 @@ def clients(table):
     )
 
 
-def admission_policy(bounds: dict[str, tuple[int, int]]) -> dict:
-    """The policy as terraform/modules/k8s-manifests renders it, as the API server returns it."""
-    names = sorted(bounds)
-    selector = {
+_RENDERED = Path(__file__).resolve().parents[1] / "k8s_render/golden/two-namespaces"
+
+
+def _rendered(kind: str) -> dict:
+    """The object of `kind` as terraform/modules/namespace-policy renders it."""
+    text = (_RENDERED / "admission-policy.yaml").read_text()
+    return next(d for d in yaml.safe_load_all(text) if d["kind"] == kind)
+
+
+def _selector(names: list[str]) -> dict:
+    return {
         "matchExpressions": [
-            {"key": "kubernetes.io/metadata.name", "operator": "In", "values": names}
+            {"key": "kubernetes.io/metadata.name", "operator": "In", "values": sorted(names)}
         ]
     }
-    return {
-        "metadata": {"name": "kube-handrail-writer-bounds"},
-        "spec": {
-            "failurePolicy": "Fail",
-            "matchConstraints": {"namespaceSelector": selector},
-            "variables": [
-                {"name": "minReplicas", "expression": json.dumps({n: bounds[n][0] for n in names})},
-                {"name": "maxReplicas", "expression": json.dumps({n: bounds[n][1] for n in names})},
-            ],
-        },
+
+
+def admission_policy(bounds: dict[str, tuple[int, int]]) -> dict:
+    """The rendered policy, with these bounds and their namespaces."""
+    names = sorted(bounds)
+    policy = _rendered("ValidatingAdmissionPolicy")
+    spec = policy["spec"]
+    spec["matchConstraints"]["namespaceSelector"] = _selector(names)
+    expressions = {
+        "minReplicas": json.dumps({n: bounds[n][0] for n in names}),
+        "maxReplicas": json.dumps({n: bounds[n][1] for n in names}),
     }
+    for variable in spec["variables"]:
+        variable["expression"] = expressions.get(variable["name"], variable["expression"])
+    return policy
 
 
 def admission_binding(namespaces: list[str], actions: list[str] | None = None) -> dict:
-    return {
-        "metadata": {"name": "kube-handrail-writer-bounds"},
-        "spec": {
-            "policyName": "kube-handrail-writer-bounds",
-            "validationActions": ["Deny"] if actions is None else actions,
-            "matchResources": {
-                "namespaceSelector": {
-                    "matchExpressions": [
-                        {
-                            "key": "kubernetes.io/metadata.name",
-                            "operator": "In",
-                            "values": sorted(namespaces),
-                        }
-                    ]
-                }
-            },
-        },
-    }
+    binding = _rendered("ValidatingAdmissionPolicyBinding")
+    binding["spec"]["validationActions"] = ["Deny"] if actions is None else actions
+    binding["spec"]["matchResources"] = {"namespaceSelector": _selector(namespaces)}
+    return binding
 
 
 def admission_api(policy: dict | None = None, binding: dict | None = None) -> MagicMock:

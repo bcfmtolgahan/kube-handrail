@@ -1,6 +1,7 @@
 """The namespace policy (namespace_policy.json), the action guard and the plan-time
 admission policy check (mcp/CONTRACT.md, Namespace policy and Admission policy)."""
 
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -222,41 +223,42 @@ def test_restart_is_allowed_where_the_policy_allows_it():
 # --- The admission policy check --------------------------------------------------------
 
 NAME = "kubernetes.io/metadata.name"
+GOLDEN = Path(__file__).resolve().parents[1] / "k8s_render" / "golden"
 
 
 def selector(names):
     return {"matchExpressions": [{"key": NAME, "operator": "In", "values": names}]}
 
 
+def rendered(kind):
+    """The object of `kind` as terraform/modules/namespace-policy renders it."""
+    text = (GOLDEN / "two-namespaces" / "admission-policy.yaml").read_text()
+    return copy.deepcopy(next(d for d in yaml.safe_load_all(text) if d["kind"] == kind))
+
+
 def policy(bounds, names=None):
+    """The rendered policy, with these bounds and namespaces."""
     names = sorted(bounds) if names is None else names
-    return {
-        "spec": {
-            "failurePolicy": "Fail",
-            "matchConstraints": {"namespaceSelector": selector(names)},
-            "variables": [
-                {
-                    "name": "minReplicas",
-                    "expression": json.dumps({n: b[0] for n, b in bounds.items()}),
-                },
-                {
-                    "name": "maxReplicas",
-                    "expression": json.dumps({n: b[1] for n, b in bounds.items()}),
-                },
-                {"name": "replicas", "expression": "object.spec.replicas"},
-            ],
-        }
+    value = rendered("ValidatingAdmissionPolicy")
+    spec = value["spec"]
+    spec["matchConstraints"]["namespaceSelector"] = selector(names)
+    expressions = {
+        "minReplicas": json.dumps({n: b[0] for n, b in bounds.items()}),
+        "maxReplicas": json.dumps({n: b[1] for n, b in bounds.items()}),
     }
+    for variable in spec["variables"]:
+        variable["expression"] = expressions.get(variable["name"], variable["expression"])
+    return value
 
 
 def binding(names, actions=("Deny",), policy_name="kube-handrail-writer-bounds"):
-    return {
-        "spec": {
-            "policyName": policy_name,
-            "validationActions": list(actions),
-            "matchResources": {"namespaceSelector": selector(names)},
-        }
-    }
+    value = rendered("ValidatingAdmissionPolicyBinding")
+    value["spec"].update(
+        policyName=policy_name,
+        validationActions=list(actions),
+        matchResources={"namespaceSelector": selector(names)},
+    )
+    return value
 
 
 def api(policy_obj, binding_obj, error=None):
@@ -322,6 +324,133 @@ def test_anything_short_of_a_matching_deny_policy_is_a_conflict(fake, reason):
     assert refusal(fake).details["reason"] == reason
 
 
+def tampered(change, target="policy"):
+    """A matching policy and binding, with `change` applied to the spec of one of them."""
+    p, b = policy(BOUNDS), binding(sorted(BOUNDS))
+    change((p if target == "policy" else b)["spec"])
+    return api(p, b)
+
+
+def set_path(path, value):
+    def change(spec):
+        *parents, last = path
+        for key in parents:
+            spec = spec[key]
+        spec[last] = value
+
+    return change
+
+
+@pytest.mark.parametrize(
+    ("change", "target", "reason"),
+    [
+        (set_path(["validations", 0, "expression"], "true"), "policy", "policy_modified"),
+        (set_path(["validations"], []), "policy", "policy_modified"),
+        (set_path(["matchConditions", 0, "expression"], "false"), "policy", "policy_modified"),
+        (
+            lambda s: s["matchConditions"].append({"name": "x", "expression": "false"}),
+            "policy",
+            "policy_modified",
+        ),
+        (set_path(["failurePolicy"], "Ignore"), "policy", "policy_modified"),
+        (
+            set_path(["matchConstraints", "resourceRules", 0, "operations"], ["CREATE"]),
+            "policy",
+            "policy_modified",
+        ),
+        (
+            set_path(["matchConstraints", "resourceRules", 0, "resources"], ["deployments"]),
+            "policy",
+            "policy_modified",
+        ),
+        (
+            set_path(["matchConstraints", "resourceRules", 0, "resourceNames"], ["web"]),
+            "policy",
+            "policy_modified",
+        ),
+        (
+            set_path(["matchConstraints", "objectSelector"], {"matchLabels": {"a": "b"}}),
+            "policy",
+            "policy_modified",
+        ),
+        (
+            set_path(["matchConstraints", "excludeResourceRules"], [{"resources": ["*"]}]),
+            "policy",
+            "policy_modified",
+        ),
+        (
+            set_path(["variables", 3, "expression"], "variables.oldReplicas"),
+            "policy",
+            "policy_modified",
+        ),
+        (
+            set_path(["paramKind"], {"apiVersion": "v1", "kind": "ConfigMap"}),
+            "policy",
+            "policy_modified",
+        ),
+        (
+            set_path(["matchResources", "objectSelector"], {"matchLabels": {"a": "b"}}),
+            "binding",
+            "binding_modified",
+        ),
+        (
+            set_path(["matchResources", "excludeResourceRules"], [{"resources": ["*"]}]),
+            "binding",
+            "binding_modified",
+        ),
+        (
+            set_path(
+                ["matchResources", "resourceRules"],
+                [
+                    {
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "operations": ["CREATE"],
+                        "resources": ["*"],
+                    }
+                ],
+            ),
+            "binding",
+            "binding_modified",
+        ),
+    ],
+)
+def test_a_policy_switched_off_with_its_bounds_intact_is_a_conflict(change, target, reason):
+    assert refusal(tampered(change, target)).details["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("change", "target"),
+    [
+        # Reformatted, or narrowed further: still enforcing.
+        (
+            set_path(
+                ["validations", 0, "expression"], admission.VALIDATION.replace(" || ", "\n  ||  ")
+            ),
+            "policy",
+        ),
+        (lambda s: s["validations"].append({"expression": "false"}), "policy"),
+        (set_path(["matchConstraints", "objectSelector"], {}), "policy"),
+        (
+            set_path(
+                ["matchConstraints", "resourceRules"],
+                [
+                    {
+                        "apiGroups": ["*"],
+                        "apiVersions": ["*"],
+                        "operations": ["*"],
+                        "resources": ["*"],
+                    }
+                ],
+            ),
+            "policy",
+        ),
+    ],
+)
+def test_equivalent_or_stricter_policies_pass(change, target):
+    admission.check_admission_policy(tampered(change, target), "team-a", (1, 3))
+
+
 def test_a_warn_binding_reports_its_actions():
     error = refusal(api(policy(BOUNDS), binding(["team-a"], ("Warn", "Audit"))))
     assert error.details["validation_actions"] == ["Warn", "Audit"]
@@ -366,8 +495,6 @@ def test_namespace_selectors(value, selected):
 
 
 # --- The rendered manifests and the Lambdas agree --------------------------------------
-
-GOLDEN = Path(__file__).resolve().parents[1] / "k8s_render" / "golden"
 
 
 @pytest.mark.parametrize("fixture", sorted(p.name for p in GOLDEN.iterdir()))
