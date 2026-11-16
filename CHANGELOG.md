@@ -4,7 +4,7 @@ All notable changes to kube-handrail are listed here. The format follows [Keep a
 
 ## [Unreleased]
 
-Milestone 3: implemented and tested on a test cluster, except the test profile and `--reset-counters`, which are implemented but not yet run. Milestone 4 (legacy mode and the verify switch removed, `make upgrade`): implemented and tested on a test cluster (`make upgrade` from Milestone 3 took 110 seconds; the plan showed only the 12 moves and package rebuilds). Milestone 5 (CI tier 1): implemented; the integration suite runs locally on kind, and its CI result is not known until the branch is pushed. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md` and both skills), so re-run `install-guidance` (`make upgrade` does).
+Milestone 3: implemented and tested on a test cluster, except the test profile and `--reset-counters`, which are implemented but not yet run. Milestone 4 (legacy mode and the verify switch removed, `make upgrade`): implemented and tested on a test cluster (`make upgrade` from Milestone 3 took 110 seconds; the plan showed only the 12 moves and package rebuilds). Milestone 5 (CI tier 1): implemented; the integration suite runs on kind in CI on every pull request (about 2.5 minutes), and `e2e_gateway.py --live-only` passed on a test deployment. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md` and both skills), so re-run `install-guidance` (`make upgrade` does).
 
 ### Changed
 

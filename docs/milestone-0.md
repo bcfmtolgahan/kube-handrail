@@ -122,7 +122,7 @@ The guard tests never change `web`, which belongs to the smoke test; they only p
 
 ### Integration suite (kind and moto)
 
-Most of these scenarios also run without AWS on every pull request: `tests/integration` calls the Lambda handlers in process against a kind cluster, impersonating the reader and writer groups, with moto for DynamoDB, SSM, SNS and S3. Run it with `make integration` (Docker and kind; a throwaway cluster with its own kubeconfig). Status: implemented; it runs locally on kind in about two to two and a half minutes including the cluster; the CI result is not known until pushed. Coverage, harness and moto gaps: [tests/integration/README.md](../tests/integration/README.md).
+Most of these scenarios also run without AWS on every pull request: `tests/integration` calls the Lambda handlers in process against a kind cluster, impersonating the reader and writer groups, with moto for DynamoDB, SSM, SNS and S3. Run it with `make integration` (Docker and kind; a throwaway cluster with its own kubeconfig). Status: implemented; it runs locally on kind in about two to two and a half minutes including the cluster; in CI the job takes about 2.5 minutes. Coverage, harness and moto gaps: [tests/integration/README.md](../tests/integration/README.md).
 
 `e2e_gateway.py --live-only` runs only what that suite cannot cover: Cognito authentication, the gateway's schema check, applies through the real gateway, interceptor, EKS access entries and VPC path, concurrent applies on real DynamoDB, the approval URL's IAM auth, and with `--with-identity` and `--with-audit` the identity and audit cases. The DevOps Agent association is checked by the sentinel. Without the flag every case runs as before.
 
