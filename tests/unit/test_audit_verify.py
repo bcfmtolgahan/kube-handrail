@@ -233,6 +233,17 @@ def test_a_flipped_use_or_a_second_result_or_verdict_is_a_rewrite(s3, change):
     assert ("finding", "executor_rewrite") in codes(audit.verify_plan(s3, BUCKET, plan_id))
 
 
+def test_a_consume_that_changes_more_than_it_writes_is_a_rewrite(s3):
+    plan_id = new_id()
+    plan = planned(plan_id, "server")
+    ok = approved(plan)
+    forged = {**consumed(ok, "approval-api"), "replicas_to": 9, "revert_to": 1}
+    write(s3, plan_id, [None, plan, ok, forged])
+    report = audit.verify_plan(s3, BUCKET, plan_id)
+    assert codes(report) == [("finding", "executor_rewrite")]
+    assert report["findings"][0]["details"]["changed"] == ["replicas_to"]
+
+
 def test_an_approval_rewritten_before_the_consume(s3):
     plan_id = new_id()
     plan = planned(plan_id, "server")

@@ -93,6 +93,8 @@ AFTER_CONSUME = frozenset(
         "verify_queue",
     }
 )
+# What the consume itself writes, in the one conditional update (PlanStore.consume).
+CONSUME = frozenset({"used", "channel", "verify_at", "verify_queue", "revert_to"})
 WRITE_ONCE = ("verification", "revert")
 # Written by the approval channel, in the one update that decides.
 APPROVAL_ATTRIBUTES = frozenset(
@@ -423,6 +425,18 @@ def check_rewrites(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
             continue
         old, new = entry.get("old_image") or {}, entry.get("new_image") or {}
         names = changed(old, new)
+        if index == consumed and names - CONSUME:
+            found.append(
+                finding(
+                    "executor_rewrite",
+                    "the consume changed more than it writes (used, channel, verify_at, "
+                    "verify_queue, revert_to)",
+                    key=entry.get("key"),
+                    changed=sorted(names - CONSUME),
+                    rewritten=[],
+                )
+            )
+            continue
         if consumed is not None and index > consumed:
             unexpected = sorted(names - AFTER_CONSUME)
             again = sorted(n for n in WRITE_ONCE if n in names and old.get(n) is not None)
