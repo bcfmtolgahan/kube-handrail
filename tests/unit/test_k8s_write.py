@@ -3330,3 +3330,17 @@ def test_every_pinned_revert_attribute_is_denied_to_the_read_role():
     for action in (handler.SCALE, handler.ADJUST):
         for target, _ in action.revert_pins:
             assert f'"{target}"' in block, target
+
+
+def test_a_scale_record_given_another_target_kind_is_plan_mismatch(rt):
+    """The verification and revert read the object of the record's target_kind, so a
+    record altered to name another kind is never applied."""
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET target_kind = :k",
+        ExpressionAttributeValues={":k": "HorizontalPodAutoscaler"},
+    )
+    assert error_code(apply(plan.plan_id)) == "plan_mismatch"
+    apps.patch_namespaced_deployment.assert_not_called()

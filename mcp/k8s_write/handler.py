@@ -398,6 +398,8 @@ def check_record_matches(
     if (
         dict(plan.args) != dict(args)
         or (plan.namespace, plan.name) != (namespace, name)
+        # The verification and the revert select the object by the record's target_kind.
+        or kind_of(plan) != action.ops.kind
         or (window is not None and plan.verify_window_seconds != window)
         or not action.record_matches(plan, args)
     ):
