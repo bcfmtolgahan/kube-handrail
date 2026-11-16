@@ -862,7 +862,7 @@ Authorization, before anything else:
 1. A request without an IAM identity is `forbidden`.
 2. A caller matching `DENIED_PRINCIPALS` (the roles of the read, write, sentinel and approver Lambdas, of the gateway, and, when deployed, of the interceptor, verifier and audit Lambdas, set by Terraform) is `forbidden`, even if it is also listed as an approver: machine identities never approve.
 3. The caller must match `APPROVER_PRINCIPALS` or the approvers of some namespace ([Namespace policy](#namespace-policy)): an IAM user ARN matches exactly that ARN (including its path); an IAM role ARN `arn:aws:iam::<account>:role[/path]/<name>` matches its sessions `arn:aws:sts::<account>:assumed-role/<name>/<any session>`. Otherwise `forbidden`.
-4. For a plan that exists (`GET`, and before either decision), the caller must be an approver of the plan's own namespace: its `approvers` when the namespace's policy lists any, and then only they (a global approver is refused there), otherwise `APPROVER_PRINCIPALS`; nobody for a namespace no longer in the policy. Otherwise `forbidden` with `details` `{"reason": "not_namespace_approver", "namespace": "<ns>"}`, and nothing is recorded. Status: implemented, not yet tested on a cluster.
+4. For a plan that exists (`GET`, and before either decision), the caller must be an approver of the plan's own namespace: its `approvers` when the namespace's policy lists any, and then only they (a global approver is refused there), otherwise `APPROVER_PRINCIPALS`; nobody for a namespace no longer in the policy. Otherwise `forbidden` with `details` `{"reason": "not_namespace_approver", "namespace": "<ns>"}`, and nothing is recorded. Status: tested on a test cluster.
 
 Requests (responses are the JSON envelope in the body):
 
@@ -1002,7 +1002,7 @@ Existing assets are found with `ListAssets` and checked before the first write; 
 
 ## Admission policy
 
-Status: the rendered two-namespace policy is checked in CI on kind (Kubernetes 1.31) by `tests/admission/run.sh`; the denial handling and the plan-time check have unit tests. The multi-namespace policy and the plan-time check are implemented, not yet tested on a cluster (the single-namespace policy before them was).
+Status: the rendered two-namespace policy is checked in CI on kind (Kubernetes 1.31) by `tests/admission/run.sh`; the denial handling and the plan-time check have unit tests. The multi-namespace policy and the plan-time check are tested on a test cluster with two namespaces.
 
 Terraform renders `build/k8s/admission-policy.yaml` (`terraform/modules/namespace-policy`, from `namespaces` and `admission_mode`): a ValidatingAdmissionPolicy and a ValidatingAdmissionPolicyBinding, both named `kube-handrail-writer-bounds` (`admissionregistration.k8s.io/v1`, Kubernetes 1.30 or later). It is a second check of the replica bounds in the cluster, for the case that the guard in the write Lambda is wrong or bypassed; the guard stays authoritative ([ADR 0006](../docs/adr/0006-admission-policy.md)).
 

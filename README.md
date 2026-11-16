@@ -78,7 +78,7 @@ A remediation follows this sequence:
   - `guard.py` in the write Lambda (authoritative check)
   - Cedar policy at the gateway ([AgentCore Policy examples](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html))
   - ValidatingAdmissionPolicy in the cluster ([Kubernetes docs](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/))
-    - Implemented for the replica bounds of the writer in each namespace of the policy (rendered to `build/k8s/admission-policy.yaml`; every plan checks it first, [Admission policy](mcp/CONTRACT.md#admission-policy), [ADR 0006](docs/adr/0006-admission-policy.md)); the single-namespace policy was tested on a test cluster, the per-namespace one and the plan-time check are implemented, not yet tested on a cluster. Cedar is deferred.
+    - Implemented for the replica bounds of the writer in each namespace of the policy (rendered to `build/k8s/admission-policy.yaml`; every plan checks it first, [Admission policy](mcp/CONTRACT.md#admission-policy), [ADR 0006](docs/adr/0006-admission-policy.md)); the single-namespace policy was tested on a test cluster, and the per-namespace one and the plan-time check were tested on a test cluster with two namespaces. Cedar is deferred.
   - Kubernetes RBAC with separate reader and writer identities, writer bound only to allowlisted namespaces
   - Server-verified approval, pinned to the plan's arguments (`server` and `both` mode)
   - Client-side approval (DevOps Agent directed actions)
