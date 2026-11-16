@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import subprocess
 import time
 import urllib.parse
@@ -20,6 +21,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import boto3
+import yaml
 from kubernetes import client as k8s
 from kubernetes import config as k8s_config
 from kubernetes.client.exceptions import ApiException
@@ -29,6 +31,9 @@ from handrail_common.plans import OBJECT_HISTORY_INDEX, VERIFY_DUE_INDEX
 
 REPO = Path(__file__).resolve().parents[2]
 NAMESPACE = "kube-handrail-sandbox"
+# A second namespace of the policy (namespaces.tfvars): restart only, with its own approver.
+NAMESPACE_2 = "kh-int-restart-only"
+CLUSTER = "kh-int"
 REGION = "us-east-1"
 TABLE = "kh-int-plans"
 BUCKET = "kh-int-audit"
@@ -44,21 +49,35 @@ AGENT_BUDGET_B = 2
 APPROVER_ROLE = "arn:aws:iam::123456789012:role/kh-int-approver"
 APPROVER = "arn:aws:sts::123456789012:assumed-role/kh-int-approver/operator"
 NOT_APPROVER = "arn:aws:sts::123456789012:assumed-role/kh-int-other/operator"
+# NAMESPACE_2's own approver (namespaces.tfvars); APPROVER decides NAMESPACE only.
+NAMESPACE_2_APPROVER = "arn:aws:sts::123456789012:assumed-role/kh-int-ns2-approver/operator"
 LAMBDA_ROLE = "arn:aws:iam::123456789012:role/kh-int-lambda"
 LAMBDA_SESSION = "arn:aws:sts::123456789012:assumed-role/kh-int-lambda/kh-int-k8s-write"
-# The impersonated groups are those of the two EKS access entries (k8s/sandbox/rbac.yaml).
+# The impersonated groups are those of the two EKS access entries, which the rendered
+# rbac.yaml and policy-reader.yaml bind.
 READER_GROUP = "kube-handrail-reader"
 WRITER_GROUP = "kube-handrail-writer"
-# The bounds of the Lambdas and, through the deploy sed, of the admission policy.
+# The namespace policy the suite runs with, rendered by terraform/modules/namespace-policy
+# through tests/k8s_render/render.sh: the Lambdas' namespace_policy.json and the cluster's
+# RBAC, policy reader and admission policy come from one render.
+POLICY_TFVARS = REPO / "tests" / "integration" / "namespaces.tfvars"
+RENDER = REPO / "tests" / "k8s_render" / "render.sh"
+MANIFESTS = ("rbac.yaml", "policy-reader.yaml", "admission-policy.yaml")
+POLICY_NAME = "kube-handrail-writer-bounds"
+# The bounds of each namespace in namespaces.tfvars (checked against the render).
 MIN_REPLICAS, MAX_REPLICAS = 0, 5
+MIN_REPLICAS_2, MAX_REPLICAS_2 = 1, 3
 # Preloaded on every kind node, so fixtures start without pulling anything.
 IMAGE = "registry.k8s.io/pause:3.10"
 QUOTA = "kh-int-besteffort"
 
 BASE_ENV = {
-    "CLUSTER_NAME": "kh-int",
+    "CLUSTER_NAME": CLUSTER,
     "PLANS_TABLE": TABLE,
-    "ALLOWED_NAMESPACES": NAMESPACE,
+    # As Terraform derives it from the policy; NAMESPACE_POLICY_FILE is set per session.
+    "ALLOWED_NAMESPACES": f"{NAMESPACE},{NAMESPACE_2}",
+    "ADMISSION_CHECK": "true",
+    # Required, and unused while the policy file names every namespace.
     "MIN_REPLICAS": str(MIN_REPLICAS),
     "MAX_REPLICAS": str(MAX_REPLICAS),
     "REMEDIATION_ENABLED_PARAM": KILL_SWITCH,
@@ -165,10 +184,14 @@ def write_impersonating_kubeconfig(admin: str, path: Path, user: str, group: str
     return path
 
 
-def kubectl(*args: str, stdin: str | None = None, check: bool = True) -> str:
-    """kubectl as the cluster admin, in the sandbox namespace unless args say otherwise."""
+def kubectl(
+    *args: str, stdin: str | None = None, check: bool = True, namespace: str | None = NAMESPACE
+) -> str:
+    """kubectl as the cluster admin, in the sandbox namespace unless told otherwise (None:
+    the namespaces the objects name)."""
+    scope = ["-n", namespace] if namespace else []
     result = subprocess.run(
-        ["kubectl", "-n", NAMESPACE, *args],
+        ["kubectl", *scope, *args],
         input=stdin,
         capture_output=True,
         text=True,
@@ -178,23 +201,65 @@ def kubectl(*args: str, stdin: str | None = None, check: bool = True) -> str:
     return result.stdout
 
 
-def admission_policy(min_replicas: int, max_replicas: int) -> str:
-    """k8s/sandbox/admission-policy.yaml with its bounds set by the sed in docs/deploy.md."""
-    return subprocess.run(
-        [
-            "sed",
-            "-e",
-            f's/"[0-9]*" # min_replicas/"{min_replicas}" # min_replicas/',
-            "-e",
-            f's/"[0-9]*" # max_replicas/"{max_replicas}" # max_replicas/',
-            "-e",
-            f"s/kube-handrail-sandbox/{NAMESPACE}/",
-            str(REPO / "k8s" / "sandbox" / "admission-policy.yaml"),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
+def render_manifests(tfvars: Path, out: Path) -> Path:
+    """tests/k8s_render/render.sh: the namespace policy and the cluster manifests for one
+    fixture, without AWS credentials (needs terraform)."""
+    subprocess.run([str(RENDER), str(tfvars), str(out)], check=True, capture_output=True)
+    return out
+
+
+def check_render(rendered: Path) -> None:
+    """The render holds the namespaces and bounds the tests are written against."""
+    policy = json.loads((rendered / "namespace_policy.json").read_text())["namespaces"]
+    expected = {
+        NAMESPACE: (MIN_REPLICAS, MAX_REPLICAS),
+        NAMESPACE_2: (MIN_REPLICAS_2, MAX_REPLICAS_2),
+    }
+    found = {ns: (p["min_replicas"], p["max_replicas"]) for ns, p in policy.items()}
+    if found != expected:
+        raise RuntimeError(f"{POLICY_TFVARS.name} renders {found}, the harness expects {expected}")
+    allowed = (rendered / "allowed_namespaces.txt").read_text().strip()
+    if set(allowed.split(",")) != set(BASE_ENV["ALLOWED_NAMESPACES"].split(",")):
+        raise RuntimeError(f"rendered allowed namespaces {allowed!r} differ from BASE_ENV")
+
+
+def apply_manifests(rendered: Path) -> None:
+    """The rendered YAML files, by name (the directory also holds non-YAML files), as
+    docs/deploy.md applies build/k8s, then the namespace label command."""
+    files = [arg for name in MANIFESTS for arg in ("-f", str(rendered / name))]
+    kubectl("apply", "--dry-run=server", *files, namespace=None)
+    kubectl("apply", *files, namespace=None)
+    command = shlex.split((rendered / "label_command.txt").read_text())
+    assert command[:3] == ["kubectl", "label", "namespace"], command
+    kubectl(*command[1:], namespace=None)
+
+
+def edited_policy(rendered: Path, namespace: str, min_replicas: int, max_replicas: int) -> str:
+    """The rendered admission policy and binding with one namespace's bounds changed, as
+    someone editing the policy in the cluster would leave it."""
+    docs = list(yaml.safe_load_all((rendered / "admission-policy.yaml").read_text()))
+    for doc in docs:
+        if doc["kind"] != "ValidatingAdmissionPolicy":
+            continue
+        for variable in doc["spec"]["variables"]:
+            bound = {"minReplicas": min_replicas, "maxReplicas": max_replicas}.get(variable["name"])
+            if bound is not None:
+                value = json.loads(variable["expression"])
+                value[namespace] = bound
+                variable["expression"] = json.dumps(value, separators=(",", ":"))
+    return yaml.safe_dump_all(docs)
+
+
+def set_binding_actions(*actions: str) -> None:
+    kubectl(
+        "patch",
+        "validatingadmissionpolicybinding",
+        POLICY_NAME,
+        "--type",
+        "merge",
+        "-p",
+        json.dumps({"spec": {"validationActions": list(actions)}}),
+    )
 
 
 def wait_until(what: str, condition: Callable[[], Any], timeout: float = 60) -> Any:
@@ -232,6 +297,7 @@ def deployment_manifest(
     image: str = IMAGE,
     revision_history_limit: int | None = None,
     surge_all: bool = False,
+    namespace: str = NAMESPACE,
 ) -> dict[str, Any]:
     """A Deployment the namespace's restricted Pod Security admits. Without best_effort it
     has requests, so the BestEffort quota never applies to it."""
@@ -274,7 +340,7 @@ def deployment_manifest(
         "kind": "Deployment",
         "metadata": {
             "name": name,
-            "namespace": NAMESPACE,
+            "namespace": namespace,
             "labels": {**selector, **(labels or {})},
             "annotations": dict(annotations or {}),
         },
@@ -455,6 +521,7 @@ class Harness:
         writer: k8s.ApiClient,
         admin: k8s.ApiClient,
         set_env: Callable[[Mapping[str, str]], None],
+        rendered: Path,
     ) -> None:
         self.read = handlers["k8s_read"]
         self.write = handlers["k8s_write"]
@@ -471,10 +538,12 @@ class Harness:
         self.apps = k8s.AppsV1Api(admin)
         self.core = k8s.CoreV1Api(admin)
         self._set_env = set_env
+        # The session's render: namespace_policy.json for the Lambdas, the YAML for the cluster.
+        self.rendered = rendered
         # Seconds added to the write Lambda's clock (Runtime.clock); 0 is the real time.
         self.write_offset = 0
         self.lambda_client = FakeLambda(self.write)
-        self.created: list[tuple[str, str]] = []
+        self.created: list[tuple[str, str, str]] = []
         self.configure()
 
     # Configuration
@@ -482,7 +551,14 @@ class Harness:
     def configure(self, **overrides: str) -> None:
         """Set the Lambda environment (BASE_ENV plus overrides) and start every handler as a
         fresh execution environment would."""
-        self._set_env({**BASE_ENV, "APPROVAL_TOPIC_ARN": self.aws["topic_arn"], **overrides})
+        self._set_env(
+            {
+                **BASE_ENV,
+                "APPROVAL_TOPIC_ARN": self.aws["topic_arn"],
+                "NAMESPACE_POLICY_FILE": str(self.rendered / "namespace_policy.json"),
+                **overrides,
+            }
+        )
         for cached in (self.read._settings, self.read._store, self.read._sns, self.read._ssm):
             cached.cache_clear()
         self.write._runtime = None
@@ -635,18 +711,25 @@ class Harness:
 
     def create(self, manifest: dict[str, Any]) -> dict[str, str]:
         name = manifest["metadata"]["name"]
-        self.created.append(("deployment", name))
-        self.apps.create_namespaced_deployment(NAMESPACE, manifest)
-        return {"namespace": NAMESPACE, "name": name}
+        namespace = manifest["metadata"]["namespace"]
+        self.created.append(("deployment", name, namespace))
+        self.apps.create_namespaced_deployment(namespace, manifest)
+        return {"namespace": namespace, "name": name}
 
-    def deployment(self, name: str) -> Any:
-        return self.apps.read_namespaced_deployment(name, NAMESPACE)
+    def deployment(self, name: str, namespace: str = NAMESPACE) -> Any:
+        return self.apps.read_namespaced_deployment(name, namespace)
 
-    def annotation(self, name: str, key: str) -> str | None:
-        return (self.deployment(name).metadata.annotations or {}).get(key)
+    def annotation(self, name: str, key: str, namespace: str = NAMESPACE) -> str | None:
+        return (self.deployment(name, namespace).metadata.annotations or {}).get(key)
 
     def patch(self, name: str, body: Mapping[str, Any]) -> Any:
         return self.apps.patch_namespaced_deployment(name, NAMESPACE, body)
+
+    # Admission policy (cluster-wide: the suite runs sequentially)
+
+    def restore_policy(self) -> None:
+        """The rendered policy and binding (in Deny) back, undoing an edit or a patch."""
+        kubectl("apply", "-f", str(self.rendered / "admission-policy.yaml"))
 
     def scale_by_hand(self, name: str, replicas: int) -> None:
         self.patch(name, {"spec": {"replicas": replicas}})
@@ -673,14 +756,21 @@ class Harness:
         return wait_until(f"{name} to have {replicas} available", available, timeout)
 
     def cleanup(self) -> None:
-        for kind, name in reversed(self.created):
+        for kind, name, namespace in reversed(self.created):
             try:
                 if kind == "deployment":
                     self.apps.delete_namespaced_deployment(
-                        name, NAMESPACE, propagation_policy="Background", grace_period_seconds=0
+                        name, namespace, propagation_policy="Background", grace_period_seconds=0
                     )
                 else:
-                    kubectl("delete", kind, name, "--ignore-not-found", "--wait=false")
+                    kubectl(
+                        "delete",
+                        kind,
+                        name,
+                        "--ignore-not-found",
+                        "--wait=false",
+                        namespace=namespace,
+                    )
             except ApiException as exc:
                 if exc.status != 404:
                     raise

@@ -34,29 +34,33 @@ def kubeconfig():
 
 
 @pytest.fixture(scope="session")
-def cluster(kubeconfig, tmp_path_factory):
-    """The sandbox manifests as docs/deploy.md applies them, the admission policy with the
-    Lambdas' bounds and its binding switched to Deny, and the BestEffort quota of the
+def rendered(tmp_path_factory):
+    """namespaces.tfvars rendered by terraform/modules/namespace-policy (render.sh)."""
+    out = harness.render_manifests(harness.POLICY_TFVARS, tmp_path_factory.mktemp("k8s"))
+    harness.check_render(out)
+    return out
+
+
+@pytest.fixture(scope="session")
+def cluster(kubeconfig, rendered, tmp_path_factory):
+    """Both namespaces with the restricted Pod Security of k8s/sandbox/namespace.yaml, the
+    sandbox's web Deployment, the rendered RBAC, policy reader and admission policy (its
+    binding in Deny) as docs/deploy.md applies build/k8s, and the BestEffort quota of the
     verification cases. Returns the admin configuration."""
     os.environ["KUBECONFIG"] = kubeconfig
     sandbox = harness.REPO / "k8s" / "sandbox"
-    for name in ("namespace.yaml", "rbac.yaml", "web-deployment.yaml"):
-        harness.kubectl("apply", "-f", str(sandbox / name))
+    namespace = (sandbox / "namespace.yaml").read_text()
+    harness.kubectl("apply", "-f", "-", stdin=namespace)
     harness.kubectl(
         "apply",
         "-f",
         "-",
-        stdin=harness.admission_policy(harness.MIN_REPLICAS, harness.MAX_REPLICAS),
+        stdin=namespace.replace(
+            f"name: {harness.NAMESPACE}\n", f"name: {harness.NAMESPACE_2}\n", 1
+        ),
     )
-    harness.kubectl(
-        "patch",
-        "validatingadmissionpolicybinding",
-        "kube-handrail-writer-bounds",
-        "--type",
-        "merge",
-        "-p",
-        '{"spec":{"validationActions":["Deny"]}}',
-    )
+    harness.kubectl("apply", "-f", str(sandbox / "web-deployment.yaml"))
+    harness.apply_manifests(rendered)
     harness.kubectl("apply", "-f", "-", stdin=json.dumps(harness.best_effort_quota()))
     configuration = harness.admin_configuration(kubeconfig)
     directory = tmp_path_factory.mktemp("kubeconfigs")
@@ -87,7 +91,7 @@ def handlers():
 
 
 @pytest.fixture
-def kh(clients, handlers, monkeypatch):
+def kh(clients, handlers, rendered, monkeypatch):
     """A fresh moto account and fresh Lambda execution environments for one test."""
     for key in ("AWS_PROFILE", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN", "AWS_ENDPOINT_URL"):
         monkeypatch.delenv(key, raising=False)
@@ -121,7 +125,13 @@ def kh(clients, handlers, monkeypatch):
     with mock_aws():
         aws = harness.create_aws_resources()
         h = harness.Harness(
-            handlers, aws, clients["reader"], clients["writer"], clients["admin"], set_env
+            handlers,
+            aws,
+            clients["reader"],
+            clients["writer"],
+            clients["admin"],
+            set_env,
+            rendered,
         )
         try:
             yield h

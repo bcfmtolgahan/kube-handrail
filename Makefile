@@ -53,6 +53,7 @@ smoke:
 destroy:
 	TF_DIR=$(TF_DIR) PYTHON=$(PYTHON) scripts/cleanup.sh $(CLEANUP_FLAGS)
 
-# Needs docker and kind; never touches AWS or the default kubeconfig (tests/integration/README.md).
+# Needs docker, kind and terraform; never touches AWS or the default kubeconfig
+# (tests/integration/README.md).
 integration:
 	PYTHON=$(PYTHON) tests/integration/run.sh

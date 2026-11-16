@@ -86,7 +86,9 @@ jobs:
 
   # The guard scenarios end to end (tests/integration): the Lambda handlers in process against
   # kind, impersonating the reader and writer groups, with moto for DynamoDB, SSM, SNS and S3.
-  # Same node image as the admission job; tests/integration/run.sh reads the first pin.
+  # The harness renders tests/integration/namespaces.tfvars with tests/k8s_render/render.sh
+  # (terraform, no AWS) and applies those manifests. Same node image as the admission job;
+  # tests/integration/run.sh reads the first pin.
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -95,6 +97,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
       - uses: helm/kind-action@v1
