@@ -211,6 +211,7 @@ def outcome_view(record: Mapping[str, Any], now: int, grace: int) -> tuple[dict[
     }
     return {
         "plan_id": plan.plan_id,
+        "cluster": plan.cluster,
         "action": plan.action,
         "namespace": plan.namespace,
         "name": plan.name,

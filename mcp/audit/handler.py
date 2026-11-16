@@ -44,6 +44,7 @@ EXPUNGED = "expunged"
 DELETED = "deleted"
 # Plan attributes copied into the summary as they are in the image.
 SUMMARY_ATTRIBUTES = (
+    "cluster",
     "kind",
     "action",
     "namespace",

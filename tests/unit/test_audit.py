@@ -331,3 +331,10 @@ def test_an_image_that_cannot_be_decoded_is_stored_raw(s3, monkeypatch):
     assert entry["new_image"] == record["dynamodb"]["NewImage"]
     assert entry["old_image"] == record["dynamodb"]["OldImage"]
     assert entry["summary"] == {"plan_id": PLAN_ID, "error": "TypeError"}
+
+
+def test_summary_names_the_cluster():
+    _, entry = handler.build_entry(
+        stream_record("INSERT", "102", new={**PLANNED, "cluster": "prod-eu"})
+    )
+    assert entry["summary"]["cluster"] == "prod-eu"

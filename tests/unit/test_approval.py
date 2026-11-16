@@ -1,6 +1,7 @@
 """Server-side approval in the plan store: the lifecycle, the consume condition, the
 approval request limits and what an approver is shown."""
 
+import dataclasses
 import uuid
 
 import pytest
@@ -715,3 +716,16 @@ def test_view_and_notification_show_the_scheduled_verification(store):
     message = notification(view, None)
     assert "Verify window: 90 s after the apply" in message
     assert "Revert on failure: yes, back to 1 replica(s) if the change is degraded" in message
+
+
+def test_view_and_notification_name_the_cluster(store):
+    plan = make_plan(store)
+    other = dataclasses.replace(plan, plan_id=str(uuid.uuid4()), cluster="prod-eu")
+    store.create(other)
+    view = plan_view(item(store, other.plan_id), NOW)
+    assert view["cluster"] == "prod-eu"
+    assert "Cluster: prod-eu" in notification(view, None)
+    # A plan made before the cluster was recorded says so.
+    older = plan_view(item(store, plan.plan_id), NOW)
+    assert older["cluster"] is None
+    assert "Cluster: not recorded" in notification(older, None)

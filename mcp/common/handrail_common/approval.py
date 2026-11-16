@@ -83,6 +83,7 @@ def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
     record = plain(item)
     view: dict[str, Any] = {
         "plan_id": record["plan_id"],
+        "cluster": record.get("cluster"),
         "status": derived_status(record, now),
         "action": record.get("action"),
         "namespace": record.get("namespace"),
@@ -218,6 +219,7 @@ def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
             "kube-handrail: a plan is waiting for approval.",
             "",
             f"Plan: {plan_id}",
+            f"Cluster: {view.get('cluster') or 'not recorded'}",
             f"Deployment: {view['namespace']}/{view['name']}",
             *change,
             f"Override manual change: {'yes' if view['override_manual_change'] else 'no'}",
