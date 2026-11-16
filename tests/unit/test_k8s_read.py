@@ -2916,7 +2916,22 @@ def test_every_plan_takes_a_change_ref(clients, table):
     assert item["args"]["change_ref"] == "CHG-8"
 
 
-@pytest.mark.parametrize("value", ["", " ", "x" * 129, "a\tb", "zero​width", 7, ["x"]])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        " ",
+        "x" * 129,
+        "a\tb",
+        "zero\u200bwidth",
+        "INC-42\u2028Requested by: oncall",
+        "INC-42\u2029x",
+        "INC\u00a042",
+        "INC\u300042",
+        7,
+        ["x"],
+    ],
+)
 def test_a_bad_change_ref_is_refused_before_any_api_call(clients, table, value):
     assert plan_error(clients, change_ref=value) == "invalid_argument"
     assert table.scan()["Count"] == 0

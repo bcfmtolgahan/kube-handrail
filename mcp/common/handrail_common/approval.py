@@ -267,15 +267,16 @@ def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
             f"Cluster: {view.get('cluster') or 'not recorded'}",
             target,
             *change,
+            f"Override manual change: {'yes' if view['override_manual_change'] else 'no'}",
+            *_verification_lines(view.get("verification")),
+            f"Requested by: {view['requested_by']}",
+            f"Expires at (epoch seconds): {view['expires_at']}",
+            # Last, after every line the server writes, so it cannot pose as one of them.
             *(
                 [f"Change reference (from the agent): {view['change_ref']}"]
                 if "change_ref" in view
                 else []
             ),
-            f"Override manual change: {'yes' if view['override_manual_change'] else 'no'}",
-            *_verification_lines(view.get("verification")),
-            f"Requested by: {view['requested_by']}",
-            f"Expires at (epoch seconds): {view['expires_at']}",
             "",
             *_impact_lines(view.get("impact")),
             "",
