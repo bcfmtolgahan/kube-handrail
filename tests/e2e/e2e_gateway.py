@@ -140,6 +140,21 @@ it (sent with an If-Match no object matches, so the probe cannot replace the ent
 the policy were missing) the bucket policy denies it (403). The operator needs
 s3:ListBucket, s3:GetObject and s3:PutObject on the bucket; nothing is written.
 
+With --with-namespaces, the namespace policy cases also run, against a fixture Deployment
+e2e-ns-restart created for this run in a second namespace, SECOND_NAMESPACE (required),
+whose policy (Terraform namespaces) allows restart only and lists approvers that do not
+include the operator running the test. The namespace must exist with the rendered RBAC
+(build/k8s). A restart is planned there, and a scale and a rollback there are
+forbidden_namespace with details.action naming the action. Then the admission policy
+binding is switched to Warn with kubectl: a plan is a conflict (admission_policy_match,
+binding_not_deny); the binding is put back in Deny, also when a case fails, and the next
+restart plan is made. In client mode that plan is applied; in server mode the operator, an
+approver of the other namespaces only, is refused with forbidden (not_namespace_approver)
+and the plan stays planned. The operator's kubeconfig needs get and patch on the binding.
+The policy is read from the namespaces output (NAMESPACE_POLICY, a JSON object) when it is
+available, to check that SECOND_NAMESPACE allows restart only. These cases add 1 apply to
+the smoke_test agent's budget in client mode.
+
 The per-object and global hourly budgets are not reached here: that takes 6 or 30
 applies. The unit tests cover them at the exact limits, and tests/integration on kind with
 small limits. The scale_to_zero and service_without_endpoints warnings are covered by unit
@@ -150,8 +165,9 @@ out_of_bounds.
 cannot cover, listed in LIVE_ONLY_CASES and docs/milestone-0.md: authentication, the
 gateway's schema check, one apply and concurrent applies through the gateway in client mode,
 every approval case in server mode (for the approval URL), and, with --with-identity and
---with-audit, the identity and audit cases. --with-rollout, --with-freeze, --with-expiry and the verification
-cases are ignored with it. Without the flag every case runs as before.
+--with-audit, the identity and audit cases. --with-rollout, --with-freeze, --with-expiry,
+--with-namespaces and the verification cases are ignored with it (tests/integration covers
+the namespace policy). Without the flag every case runs as before.
 """
 
 import argparse
@@ -243,6 +259,10 @@ OLD_IMAGE = "nginxinc/nginx-unprivileged:1.27.4-alpine"
 ROLLBACK_REVISIONS = ((OLD_IMAGE, "2"), (OLD_IMAGE, "3"), (OLD_IMAGE, "4"), (IMAGE, "5"))
 POD_TEMPLATE_HASH = "pod-template-hash"
 UNKNOWN_PLAN = "00000000-0000-4000-8000-000000000000"
+# --with-namespaces: the fixture in SECOND_NAMESPACE, and the admission policy binding the
+# Warn case switches (k8s rendered by terraform/modules/namespace-policy).
+SECOND_FIXTURE = "e2e-ns-restart"
+BINDING = "kube-handrail-writer-bounds"
 
 results: list[bool] = []
 
@@ -934,6 +954,8 @@ def env_from_outputs(outputs: dict[str, Any], env: dict[str, str]) -> dict[str, 
     values["APPLY_COOLDOWN_SECONDS"] = settings.get("apply_cooldown_seconds")
     if settings.get("gitops_markers") is not None:
         values["GITOPS_MARKERS"] = json.dumps(settings["gitops_markers"])
+    if outputs.get("namespaces"):
+        values["NAMESPACE_POLICY"] = json.dumps(outputs["namespaces"])
     clients = outputs.get("agent_client_ids") or {}
     agent_a = env.get("AGENT_NAME", "smoke_test")
     agent_b = env.get("AGENT_NAME_B", "e2e_peer")
@@ -2246,6 +2268,201 @@ async def freeze_cases(gw: Gateway, approval_mode: str, set_freezes: Any) -> Non
     )
 
 
+# --- Namespace policy (--with-namespaces) ----------------------------------------------
+
+
+def second_namespace() -> str:
+    return os.environ["SECOND_NAMESPACE"]
+
+
+def second_target() -> dict[str, str]:
+    return {"namespace": second_namespace(), "name": SECOND_FIXTURE}
+
+
+def kubectl_in(namespace: str, *args: str, stdin: str | None = None) -> str:
+    return subprocess.run(
+        ["kubectl", "-n", namespace, *args], check=True, capture_output=True, text=True, input=stdin
+    ).stdout
+
+
+def delete_second_fixture() -> None:
+    kubectl_in(
+        second_namespace(),
+        "delete",
+        "deployment",
+        SECOND_FIXTURE,
+        "--ignore-not-found",
+        "--wait=true",
+    )
+
+
+def create_second_fixture() -> None:
+    delete_second_fixture()
+    manifest = fixture(SECOND_FIXTURE)
+    manifest["metadata"]["namespace"] = second_namespace()
+    kubectl_in(second_namespace(), "create", "-f", "-", stdin=json.dumps(manifest))
+    kubectl_in(
+        second_namespace(), "rollout", "status", f"deploy/{SECOND_FIXTURE}", "--timeout=120s"
+    )
+
+
+def namespace_policy() -> dict[str, Any]:
+    """The deployment's namespace policy (the namespaces output), or {} when unknown."""
+    try:
+        value = json.loads(os.environ.get("NAMESPACE_POLICY") or "{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def binding_actions() -> list[str]:
+    out = subprocess.run(
+        [
+            "kubectl",
+            "get",
+            "validatingadmissionpolicybinding",
+            BINDING,
+            "-o",
+            "jsonpath={.spec.validationActions}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return json.loads(out or "[]")
+
+
+def set_binding_actions(actions: list[str]) -> None:
+    subprocess.run(
+        [
+            "kubectl",
+            "patch",
+            "validatingadmissionpolicybinding",
+            BINDING,
+            "--type",
+            "merge",
+            "-p",
+            json.dumps({"spec": {"validationActions": actions}}),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def namespace_preconditions() -> bool:
+    """SECOND_NAMESPACE allows restart only, as far as the namespaces output tells; without
+    it the cases run and say what they find. That the operator is not one of its approvers
+    is not checked here: if it is, the server-mode case fails, which shows it."""
+    policy = namespace_policy().get(second_namespace())
+    if not namespace_policy():
+        print("namespaces output unknown: the preconditions are not checked", flush=True)
+        return True
+    ok = policy is not None and sorted(policy.get("actions") or []) == ["restart"]
+    report(
+        f"namespaces: {second_namespace()} allows restart only",
+        ok,
+        (policy or {}).get("actions") if policy else "not in the namespace policy",
+    )
+    return ok
+
+
+async def namespace_tests(gw: Gateway, approval_mode: str) -> None:
+    if not namespace_preconditions():
+        return
+    target = second_target()
+    ns = target["namespace"]
+
+    envelope = await gw.call(PLAN_RESTART, target)
+    report(
+        f"namespaces: a restart is planned in {ns}, which allows it",
+        envelope.get("ok") is True,
+        code(envelope) or "ok",
+    )
+    checks = [c.get("check") for c in (envelope.get("data") or {}).get("preflight") or []]
+    report(
+        "namespaces: the plan reports action_allowed and admission_policy_match",
+        "action_allowed" in checks and "admission_policy_match" in checks,
+        checks,
+    )
+
+    envelope = await gw.call(PLAN, {**target, "replicas": 2})
+    details = (envelope.get("error") or {}).get("details") or {}
+    report(
+        f"namespaces: a scale in {ns} is forbidden_namespace naming the action",
+        code(envelope) == "forbidden_namespace"
+        and details.get("action") == "scale"
+        and details.get("allowed_actions") == ["restart"],
+        code(envelope) or "ok",
+    )
+    envelope = await gw.call(PLAN_ROLLBACK, {**target, "revision": 1})
+    details = (envelope.get("error") or {}).get("details") or {}
+    report(
+        f"namespaces: a rollback in {ns} is forbidden_namespace naming the action",
+        code(envelope) == "forbidden_namespace" and details.get("action") == "rollback",
+        code(envelope) or "ok",
+    )
+
+    # Before any apply: the restart plan that ends it would otherwise meet the cooldown.
+    restart_plan = await admission_warn_tests(gw)
+    if not restart_plan:
+        return
+    if approval_mode != "server":
+        envelope = await gw.call(APPLY_RESTART, {"plan_id": restart_plan, **target})
+        report(
+            f"namespaces: the restart in {ns} is applied",
+            envelope.get("ok") is True,
+            code(envelope) or "ok",
+        )
+        return
+    approve = approve_script()
+    url = os.environ["APPROVAL_URL"]
+    region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
+    status, envelope = approve.decide(url, region, restart_plan, "approve", None, True)
+    details = (envelope.get("error") or {}).get("details") or {}
+    report(
+        f"namespaces: an approver of other namespaces is refused in {ns}",
+        status == 403
+        and code(envelope) == "forbidden"
+        and details.get("reason") == "not_namespace_approver",
+        code(envelope) or status,
+    )
+    report(
+        "namespaces: the refused plan stays undecided",
+        plan_record(restart_plan).get("status") == "planned",
+        plan_record(restart_plan).get("status"),
+    )
+
+
+async def admission_warn_tests(gw: Gateway) -> str | None:
+    """The binding switched to Warn by hand: plans are refused until it is back in Deny.
+    Returns the id of the restart plan made once it is, if any."""
+    before = binding_actions()
+    if before != ["Deny"]:
+        report("namespaces: the binding is in Deny before the Warn case", False, before)
+        return None
+    try:
+        set_binding_actions(["Warn", "Audit"])
+        envelope = await gw.call(PLAN_RESTART, second_target())
+        details = (envelope.get("error") or {}).get("details") or {}
+        report(
+            "namespaces: with the binding in Warn a plan is a conflict",
+            code(envelope) == "conflict"
+            and details.get("check") == "admission_policy_match"
+            and details.get("reason") == "binding_not_deny",
+            code(envelope) or "ok",
+        )
+    finally:
+        set_binding_actions(before)
+    envelope = await gw.call(PLAN_RESTART, second_target())
+    report(
+        "namespaces: back in Deny, plans are made again",
+        envelope.get("ok") is True and binding_actions() == ["Deny"],
+        code(envelope) or "ok",
+    )
+    return (envelope.get("data") or {}).get("plan_id")
+
+
 async def run(
     with_expiry: bool,
     approval_mode: str,
@@ -2256,6 +2473,7 @@ async def run(
     with_audit: bool = False,
     started: int = 0,
     live_only: bool = False,
+    with_namespaces: bool = False,
 ) -> None:
     token = fetch_token()
     auth_tests(token)
@@ -2280,6 +2498,8 @@ async def run(
                     with_verify,
                     with_freeze,
                 )
+                if with_namespaces:
+                    await namespace_tests(gw, approval_mode)
     if with_audit:
         await audit_tests(started)
 
@@ -2515,6 +2735,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="also run the audit record cases (needs audit_enabled, the default, and AUDIT_BUCKET)",
     )
     parser.add_argument(
+        "--with-namespaces",
+        action="store_true",
+        help="also run the namespace policy cases (needs SECOND_NAMESPACE, restart only)",
+    )
+    parser.add_argument(
         "--approval-mode",
         choices=["client", "server"],
         default=None,
@@ -2543,6 +2768,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.with_verify = not args.skip_verify
     if args.live_only:
         args.with_rollout = args.with_verify = args.with_freeze = args.with_expiry = False
+        args.with_namespaces = False
     return args
 
 
@@ -2569,8 +2795,12 @@ def main() -> None:
     quotas_before = quota_objects() if args.with_verify else ""
     if args.with_freeze:
         freezes_param()
+    if args.with_namespaces:
+        second_namespace()
     try:
         create_fixtures(args.with_rollout, args.with_identity, args.with_verify, args.with_freeze)
+        if args.with_namespaces:
+            create_second_fixture()
         asyncio.run(
             run(
                 args.with_expiry,
@@ -2582,6 +2812,7 @@ def main() -> None:
                 args.with_audit,
                 int(started),
                 args.live_only,
+                args.with_namespaces,
             )
         )
     except Exception as exc:
@@ -2590,6 +2821,8 @@ def main() -> None:
         report("run completed", False, describe(exc)[:400])
     finally:
         delete_fixtures()
+        if args.with_namespaces:
+            delete_second_fixture()
     report("web was not changed", web_spec() == web_before, web_before)
     if args.with_verify:
         report(

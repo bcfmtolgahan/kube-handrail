@@ -29,28 +29,30 @@ terraform -chdir=terraform fmt -check -recursive
 
 ```sh
 export KUBECONFIG=/path/to/test-cluster-kubeconfig
-kubectl apply -f k8s/sandbox/
+kubectl apply -f k8s/sandbox/namespace.yaml -f k8s/sandbox/web-deployment.yaml
 kubectl -n kube-handrail-sandbox rollout status deployment/web
 ```
 
 This creates:
 
 - `namespace.yaml`: the `kube-handrail-sandbox` namespace (Pod Security `restricted`).
-- `rbac.yaml`: Roles and RoleBindings for the groups `kube-handrail-reader` (get/list Deployments and HPAs; list only on PodDisruptionBudgets, Services and EndpointSlices for the impact preview, on ReplicaSets for `get_workload_events` and the rollout history and rollback plan, and on Events for `get_workload_events`; no Pods) and `kube-handrail-writer` (get/patch Deployments; get on ReplicaSets, for the rollback apply). The groups are mapped to the Lambda roles by the EKS access entries created in step 2; nothing outside this namespace is granted.
 - `web-deployment.yaml`: an unprivileged nginx with 1 replica. Check the image tag against the registry before use, and consider pinning it by digest.
-- `admission-policy.yaml` (Milestone 2): the cluster-scoped ValidatingAdmissionPolicy `kube-handrail-writer-bounds` and its binding, in `[Warn, Audit]`. It needs Kubernetes 1.30 or later; on an older cluster the command exits non-zero for this file only. Re-applying the directory sets a binding switched to `Deny` back to `[Warn, Audit]`. See [Admission policy](deploy.md#admission-policy).
+
+The RBAC and the admission policy for the namespace are rendered by Terraform in step 2 and applied after it ([Namespaces, RBAC and admission policy](deploy.md#namespaces-rbac-and-admission-policy)): in every namespace of `namespaces`, Roles and RoleBindings for the groups `kube-handrail-reader` (get/list Deployments and HPAs; list only on PodDisruptionBudgets, Services and EndpointSlices for the impact preview, on ReplicaSets for `get_workload_events` and the rollout history and rollback plan, and on Events for `get_workload_events`; no Pods) and `kube-handrail-writer` (get/patch Deployments; get on ReplicaSets where rollback is allowed), the ClusterRole `kube-handrail-policy-reader`, and the admission policy `kube-handrail-writer-bounds` in `Deny` (Kubernetes 1.30 or later). The groups are mapped to the Lambda roles by the EKS access entries created in step 2. `k8s/sandbox/rbac.yaml` and `admission-policy.yaml` are superseded; do not apply them.
 
 The Deployment deliberately has no GitOps marker (the Argo CD tracking annotation, the Flux labels, or a key listed in `gitops_markers`) and no HorizontalPodAutoscaler. Any of these makes the plan step refuse it (`gitops_managed`, or the HPA check). Until Milestone 3 the `app.kubernetes.io/instance` label counted as a marker too.
 
 ## 2. Infrastructure
 
-Deploy the gateway, Lambdas, DynamoDB plan table, IAM roles, EKS access entries and the kill-switch parameter with Terraform, passing your cluster name, Region, allowed namespaces (`kube-handrail-sandbox`) and replica bounds as variables (copy `terraform/terraform.tfvars.example` to an untracked `terraform.tfvars`):
+Deploy the gateway, Lambdas, DynamoDB plan table, IAM roles, EKS access entries and the kill-switch parameter with Terraform, passing your cluster name, Region and `namespaces` (for example `kube-handrail-sandbox` with its replica bounds) as variables (copy `terraform/terraform.tfvars.example` to an untracked `terraform.tfvars`):
 
 ```sh
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # then edit
 terraform -chdir=terraform init
 terraform -chdir=terraform plan -out=tfplan
 terraform -chdir=terraform apply tfplan
+kubectl apply --dry-run=server -f build/k8s/ && kubectl apply -f build/k8s/
+$(terraform -chdir=terraform output -raw namespace_label_command)
 ```
 
 For a cluster with a private endpoint, or a public endpoint limited to `public_access_cidrs`, set the network variables first ([Network](deploy.md#network)); the plan stops if the cluster has no public endpoint and `lambda_subnet_ids` is empty.
@@ -116,15 +118,17 @@ The script reads the values Terraform knows (gateway and token URLs, the kill sw
 
 With `--with-identity` they also run the per-agent identity cases, which need a second agent's client; see [Agents](deploy.md#agents) for the variables and environment. These run against `approval_mode = "client"`. Against `server`, run `tests/e2e/e2e_gateway.py --approval-mode server` with `APPROVAL_URL` set and AWS credentials of a principal listed in `approver_principals`: it skips the cases that apply through the gateway and instead checks that an apply without approval is `approval_required`, that `request_approval` notifies once per cooldown, that the approval URL refuses the Cognito token and unsigned requests, that a signed approval applies the plan and its record names the approver, and that a rejected plan cannot be applied. `both` mode is not covered by the end-to-end tests, because its apply needs the DevOps Agent chat approval.
 
+With `--with-namespaces` the namespace policy cases run too, against a second namespace `SECOND_NAMESPACE` that allows restart only and lists its own approvers, not the operator (`terraform/test.tfvars.example`): a restart is planned there, a scale and a rollback are `forbidden_namespace` with `details.action`, a plan with the admission policy binding switched to `Warn` is `conflict` (the test puts it back to `Deny`), and then the restart is applied (client mode) or the operator's approval is refused as not an approver of that namespace (server mode). Tested on a test cluster.
+
 They check authentication (missing, malformed and tampered tokens), argument validation (including wrong types, which the gateway rejects against the tool schema), the namespace allowlist and replica bounds, the GitOps and HPA checks, unknown, mismatched, conflicting, concurrent and expired plans, the kill switch, and the oscillation breaker (a change right after an apply is `cooldown`, a single revert is allowed, a second reversal is `flapping`, a manual scale is `manual_change` unless overridden), the blast-radius budget (a plan from 1 to 3 replicas is `blast_radius_exceeded`), the impact preview (a Service and a PodDisruptionBudget in front of `e2e-target` are reported, and a scale-down past the budget's headroom warns `pdb_headroom`) and [untrusted output](../mcp/CONTRACT.md#untrusted-output). For the last, the test creates a Warning Event about `e2e-target` whose message holds a prompt-injection string (including a literal `</untrusted>`), a fake AWS access key ID and control and bidi characters, and is longer than the 1024-character field limit. It reads the Event with `get_workload_events` and checks that the message comes back wrapped, unable to close its wrapper, truncated with a marker, with the key redacted and the characters removed. It then checks in the plan table (with your AWS credentials, through `PLANS_TABLE`) that no plan record for `e2e-target` was created meanwhile, and deletes the Event. This case runs in both approval modes. Both modes also check the [correlation ID](../mcp/CONTRACT.md#observability): in `client` mode, that a successful apply's `correlation_id` is the Deployment's `kube-handrail.io/correlation-id` annotation and differs from its plan's; in `server` mode, that the plan record has an ID for each step (plan, approval request, decision, apply) and that the decision, the apply and the annotation share one. Set `APPLY_COOLDOWN_SECONDS` to the deployed value; the test waits it out after each apply. The blast-radius case expects the default `MAX_REPLICA_STEP_PERCENT` of 100 and a `max_replicas` of at least 3. The test turns the kill switch off briefly and restores it and applies `tests/e2e/fixtures/argo-managed.yaml` (zero replicas).
 
 The guard tests never change `web`, which belongs to the smoke test; they only plan against it for read-only validation cases that never reach apply. Every case that applies or edits a Deployment uses fixtures created for the run (`e2e-target`, `e2e-flap`, `e2e-manual`: 1-replica unprivileged nginx, plus a Service and a PodDisruptionBudget for `e2e-target`) and deleted at the end, so each run starts with an empty history. The per-object and global budgets are not reached live: that takes 6 or 30 real applies. Unit tests cover them at the exact limits, and `tests/integration` with small limits. The smoke test and a client-mode run of these tests apply about 11 times within the hour, more than the default per-agent budget of 10, so the `smoke_test` agent's `hourly_apply_budget` defaults to 30 ([Agents](deploy.md#agents)). The same goes for the `scale_to_zero` and `service_without_endpoints` warnings, which need a plan to 0 replicas: a sandbox with `min_replicas` of 1 refuses that as `out_of_bounds`.
 
 ### Integration suite (kind and moto)
 
-Most of these scenarios also run without AWS on every pull request: `tests/integration` calls the Lambda handlers in process against a kind cluster, impersonating the reader and writer groups, with moto for DynamoDB, SSM, SNS and S3. Run it with `make integration` (Docker and kind; a throwaway cluster with its own kubeconfig). Status: implemented; it runs locally on kind in about two to two and a half minutes including the cluster; in CI the job takes about 2.5 minutes. Coverage, harness and moto gaps: [tests/integration/README.md](../tests/integration/README.md).
+Most scenarios also run without AWS on every pull request: `tests/integration` runs the Lambda handlers in process against kind, on the manifests Terraform renders, with moto for DynamoDB, SSM, SNS and S3 (`make integration`: Docker, kind and Terraform). Status: implemented; about 2.5 minutes with the cluster. Coverage and gaps: [tests/integration/README.md](../tests/integration/README.md).
 
-`e2e_gateway.py --live-only` runs only what that suite cannot cover: Cognito authentication, the gateway's schema check, applies through the real gateway, interceptor, EKS access entries and VPC path, concurrent applies on real DynamoDB, the approval URL's IAM auth, and with `--with-identity` and `--with-audit` the identity and audit cases. The DevOps Agent association is checked by the sentinel. Without the flag every case runs as before.
+`e2e_gateway.py --live-only` runs only what it cannot cover: Cognito authentication, the gateway's schema check, applies through the real gateway, interceptor and EKS access entries, concurrent applies on real DynamoDB, the approval URL's IAM auth, and the `--with-identity` and `--with-audit` cases.
 
 ## 4. Register with AWS DevOps Agent
 

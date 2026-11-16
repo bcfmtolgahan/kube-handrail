@@ -4,7 +4,7 @@ All notable changes to kube-handrail are listed here. The format follows [Keep a
 
 ## [Unreleased]
 
-Milestone 3: implemented and tested on a test cluster, except the test profile and `--reset-counters`, which are implemented but not yet run. Milestone 4 (legacy mode and the verify switch removed, `make upgrade`): implemented and tested on a test cluster (`make upgrade` from Milestone 3 took 110 seconds; the plan showed only the 12 moves and package rebuilds). Milestone 5 (CI tier 1): implemented; the integration suite runs on kind in CI on every pull request (about 2.5 minutes), and `e2e_gateway.py --live-only` passed on a test deployment. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md` and both skills), so re-run `install-guidance` (`make upgrade` does).
+Milestone 3: implemented and tested on a test cluster, except the test profile and `--reset-counters`, which are implemented but not yet run. Milestone 4 (legacy mode and the verify switch removed, `make upgrade`): implemented and tested on a test cluster (`make upgrade` from Milestone 3 took 110 seconds; the plan showed only the 12 moves and package rebuilds). Milestone 5 (CI tier 1): implemented; the integration suite runs on kind in CI on every pull request (about 2.5 minutes), and `e2e_gateway.py --live-only` passed on a test deployment. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md` and both skills), so re-run `install-guidance` (`make upgrade` does). Milestone 6 (namespace policy, per-namespace approvers, rendered cluster manifests, plan-time admission check, the plan's cluster): implemented and tested on a test cluster with two namespaces (`make upgrade --with-k8s`, the admission cases in both namespaces, and the end-to-end run with `--with-namespaces` in client and server mode); the rendered admission policy and RBAC were checked on kind, and the integration suite runs on the rendered manifests. The tool schemas do not change in Milestone 6.
 
 ### Changed
 
@@ -19,10 +19,16 @@ Milestone 3: implemented and tested on a test cluster, except the test profile a
 
 ### Added
 
+- **Namespace policy** (Milestone 6). Terraform `namespaces` maps each namespace to its `min_replicas`, `max_replicas`, `actions` (`restart`, `rollback`, `scale`), `approvers` and `gitops_markers`. It ships in the tool Lambda and approver packages as `namespace_policy.json` (in their source hashes); `ALLOWED_NAMESPACES` is derived from it. An action the namespace does not allow is `forbidden_namespace` with `details` `{action, allowed_actions}`, on plan and apply; no new error code.
+- **Per-namespace approvers.** A namespace with its own `approvers` is decided only by them (`forbidden`, `details.reason` `not_namespace_approver`, for anyone else, global approvers included); the others by `approver_principals`. The approver URL's permissions and Terraform's checks cover both lists.
+- **Rendered cluster manifests** (`terraform/k8s.tf`, `terraform/modules/namespace-policy`): `build/k8s` holds per-namespace Roles and RoleBindings from the actions, one admission policy with the bounds of every namespace as CEL maps keyed by `request.namespace`, its binding in `admission_mode` (`Deny`, default, or `Warn`), and the ClusterRole `kube-handrail-policy-reader`. No kubernetes provider. Outputs `namespaces`, `k8s_manifests`, `namespace_label_command`.
+- **Plan-time admission check.** Every plan reads the admission policy and its binding and is refused with `conflict` (`details.check` `admission_policy_match`) unless the binding denies, both select the namespace and the bounds match; an unreadable policy fails closed. Preflight lists `action_allowed` and `admission_policy_match`. Only `admission_check = false` (read Lambda `ADMISSION_CHECK`) turns it off.
+- **The plan's cluster.** Plans record `cluster` (`CLUSTER_NAME`); the approval view, the notification ("Cluster: ..."), `get_plan_outcome`, the audit summary and `scripts/approve.py` show it.
+- `make upgrade UPGRADE_FLAGS=--with-k8s` (`--kube-context`): writes `build/k8s`, applies it after a server-side dry run, checks the binding and lists Roles no longer rendered; `--k8s-only` runs just that against the deployed state. `make upgrade` runs `terraform get` before planning (by hand: `terraform get` or `init` once).
+- `tests/k8s_render`: golden files for the rendered manifests, checked in CI without AWS. `tests/admission/run.sh` covers two namespaces with different bounds and the policy reader. `e2e_gateway.py --with-namespaces` (`SECOND_NAMESPACE`). `tests/integration` renders `tests/integration/namespaces.tfvars` and runs on those manifests and that `namespace_policy.json` with the admission check on (the CI job installs Terraform); it adds the namespace cases (`test_kind_namespaces.py`), and `admission_denied` is now a policy edited after the plan.
 - **Integration suite on kind and moto** (`tests/integration`): the guard scenarios of the live end-to-end test, run with the Lambda handlers in process against a kind cluster, impersonating the `kube-handrail-reader` and `kube-handrail-writer` groups, with the admission policy in `Deny` and moto for DynamoDB (with the stream), SSM, SNS and S3 (with Object Lock). It covers the namespace and bounds, GitOps and HPA, single use and expiry, conflicts, kill switches, budgets, the breaker, blast radius, freezes, `admission_denied`, restart and rollback, forged callers, server approval, verification and revert, and the audit record ([coverage](tests/integration/README.md)). Skipped unless `KH_INTEGRATION` is set. `make integration` (`tests/integration/run.sh`) runs it on a throwaway `kh-int-*` cluster with its own kubeconfig.
 - CI job `integration`: the suite on every push and pull request, on kind with the admission job's node image.
 - `e2e_gateway.py --live-only`: only the cases the integration suite cannot cover (Cognito authentication, the gateway's schema check, applies through the real gateway, interceptor and EKS access entries, concurrent applies on real DynamoDB, the approval URL's IAM auth, and with `--with-identity` and `--with-audit` the identity and audit cases). Without it every case runs as before.
-
 - `make upgrade` (`scripts/upgrade.py`): one resumable upgrade command. It refuses to start while the kill switch is off unless it turned it off itself, refuses a plan that deletes or replaces the gateway, its targets, Cognito, the plan table, the audit bucket or the kill switch and freezes parameters, applies known two-step migrations first, turns the kill switch off while the tool set changes, retries an "inconsistent final plan" once, runs `enable-write` and `install-guidance` only when needed, requires a sentinel `ok`, and ends with the smoke test. `--dry-run` stops after the plan check. Also `make bootstrap`, `deploy`, `register`, `smoke` and `destroy` (`scripts/cleanup.sh`).
 - `scripts/smoke_test.py --read-only`: the read path only, for `server` and `both` mode.
 - Outputs `gateway_id`, `approval_mode`, `devops_agent_space_id`, `devops_agent_association_id`, `tool_set_hash` and `cognito_user_pool_id`.
@@ -37,14 +43,27 @@ Milestone 3: implemented and tested on a test cluster, except the test profile a
 
 ### Deprecated
 
+- Terraform `sandbox_namespace`, `min_replicas` and `max_replicas` (now default `null`): replaced by `namespaces`. While `namespaces` is empty they still define the one namespace, with a warning (check `deprecated_namespace_variables`); together with `namespaces` they are refused. They will be removed in a later release.
+- `k8s/sandbox/rbac.yaml` and `k8s/sandbox/admission-policy.yaml`: superseded by `build/k8s`; do not apply them. They will be deleted once the test harnesses that read them move.
 - `plan_rate_limited`: never returned; it stays in the contract's error code list for this release only.
 - Terraform `plan_rate_limit` and `plan_rate_window_seconds`: ignored, with a warning (check `deprecated_plan_rate`) while set. They will be removed in a later release.
 - Terraform `caller_interceptor_enabled` and `verify_enabled`: ignored (default `null`), with a warning (check `deprecated_switches`) while set; `false` no longer turns anything off. Remove them from your tfvars; they will be removed in a later release.
 
 ### Removed
 
+- The `sed` recipes for the RBAC and the admission policy in the deploy guide.
 - Legacy mode and verification off: the `CALLER_INTERCEPTOR` and `VERIFY_ENABLED` Lambda environment variables, and the "verification is not enabled on this server" refusal.
 - The per-object plan rate limit. A plan changes nothing, and every apply passes the cooldown, flapping and budget checks, so it added no safety. Preflight still lists `plan_rate`, as `{"passed": true, "skipped": true}`, for this release. The `plan_scale_deployment` tool description still mentions the limit; it is corrected with the next tool schema batch, so this release needs no `enable-write`.
+
+### Upgrade notes (Milestone 6)
+
+Implemented, not yet tested on a cluster.
+
+1. `make upgrade UPGRADE_FLAGS=--with-k8s` with a kubeconfig for the cluster that may create Roles, a ClusterRole and the admission policy (cluster-admin). It prints the kubectl context before asking. Without `--with-k8s`, apply `build/k8s` yourself right after the upgrade (`kubectl apply --dry-run=server -f build/k8s/ && kubectl apply -f build/k8s/`): until then every plan is refused with `conflict` (`admission_policy_match`), because the read Lambda checks the new policy format through the new ClusterRole.
+2. The ClusterRole `kube-handrail-policy-reader` is new: `get` on the admission policy and its binding only, bound to the reader group. It is the reader's first cluster-scoped right; review it.
+3. Run the label command: `$(terraform -chdir=terraform output -raw namespace_label_command)`.
+4. With `namespaces` empty nothing changes in the enforced policy (plans are still refused until `build/k8s` is applied, note 1): the deprecated variables define the same namespace and bounds, with every action, and the rendered binding is in `Deny`. The plan rebuilds the packages, updates every Lambda in place (the read Lambda gains `ADMISSION_CHECK`), creates `terraform_data.k8s_manifests` and changes outputs; Terraform warns while the deprecated variables are set. To move to `namespaces`, copy the entry the warning prints.
+5. A deployment that kept its binding in `Warn` must either move to `Deny` (the default `admission_mode`) or set `admission_check = false`.
 
 ## History before this changelog
 

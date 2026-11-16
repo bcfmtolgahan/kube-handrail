@@ -75,8 +75,11 @@ output "guard_settings" {
     global_hourly_apply_budget = var.global_hourly_apply_budget
     agent_hourly_apply_budget  = var.agent_hourly_apply_budget
     agent_budgets              = { for name, agent in var.agents : name => coalesce(agent.hourly_apply_budget, var.agent_hourly_apply_budget) }
-    min_replicas               = var.min_replicas
-    max_replicas               = var.max_replicas
+    min_replicas               = local.legacy_min_replicas
+    max_replicas               = local.legacy_max_replicas
+    namespaces                 = local.namespaces
+    admission_mode             = var.admission_mode
+    admission_check            = var.admission_check
     max_replica_step_percent   = var.max_replica_step_percent
     verify_window_min_seconds  = var.verify_window_min_seconds
     gitops_markers             = var.gitops_markers
@@ -151,4 +154,19 @@ output "audit_dlq_url" {
 output "dashboard_name" {
   description = "CloudWatch dashboard of the tools, the sentinel, the verifier and the audit record, or null when the sentinel is disabled."
   value       = one(aws_cloudwatch_dashboard.this[*].dashboard_name)
+}
+
+output "namespaces" {
+  description = "The namespace policy the Lambdas run with: namespace => {min_replicas, max_replicas, actions, approvers, gitops_markers}."
+  value       = local.namespaces
+}
+
+output "k8s_manifests" {
+  description = "The cluster manifests in build/k8s, by file name. scripts/upgrade.py --with-k8s writes and applies them."
+  value       = local.k8s_manifests
+}
+
+output "namespace_label_command" {
+  description = "Labels the namespaces as kube-handrail's (kube-handrail.io/managed=true): an inventory label for operators and scripts/cleanup.sh. The manifests select namespaces by name, not by it. The namespaces must exist."
+  value       = module.namespace_policy.label_command
 }

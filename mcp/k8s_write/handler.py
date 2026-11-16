@@ -23,12 +23,13 @@ from handrail_common.breaker import (
     replica_baseline,
     retention_seconds,
 )
-from handrail_common.config import ConfigError, Settings, load_settings
+from handrail_common.config import ConfigError, Settings, action_name, load_settings
 from handrail_common.dispatch import dispatch
 from handrail_common.eks import api_client
 from handrail_common.envelope import (
     ADMISSION_DENIED,
     CONFLICT,
+    FORBIDDEN_NAMESPACE,
     GITOPS_MANAGED,
     INTERNAL,
     KUBERNETES_ERROR,
@@ -457,7 +458,7 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
             request,
             correlation_id,
             lambda deployment: check_breaker(rt, action, plan, deployment, override, now),
-            s.gitops_markers,
+            s.markers_for(namespace),
         )
     except GuardError as exc:
         _record(rt, plan_id, exc.code, correlation_id)
@@ -497,7 +498,7 @@ def _verify_request(
 
 def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, str, dict[str, Any]]:
     namespace, name, replicas = validate_scale_args(
-        args, settings.allowed_namespaces, settings.bounds_for
+        args, settings.allowed_namespaces, settings.bounds_for, settings.actions_for
     )
     override = require_override_flag(args)
     window, revert = _verify_request(args, settings, revert_allowed=True)
@@ -559,7 +560,9 @@ def apply_scale_deployment(args: Mapping[str, Any]) -> Envelope:
 def _validate_restart(
     args: Mapping[str, Any], settings: Settings
 ) -> tuple[str, str, dict[str, Any]]:
-    namespace, name = validate_target_args(args, settings.allowed_namespaces)
+    namespace, name = validate_target_args(
+        args, settings.allowed_namespaces, action_name(RESTART_DEPLOYMENT), settings.actions_for
+    )
     window, _ = _verify_request(args, settings)
     return namespace, name, restart_args(namespace, name, window)
 
@@ -607,7 +610,9 @@ def apply_restart_deployment(args: Mapping[str, Any]) -> Envelope:
 def _validate_rollback(
     args: Mapping[str, Any], settings: Settings
 ) -> tuple[str, str, dict[str, Any]]:
-    namespace, name = validate_target_args(args, settings.allowed_namespaces)
+    namespace, name = validate_target_args(
+        args, settings.allowed_namespaces, action_name(ROLLBACK_DEPLOYMENT), settings.actions_for
+    )
     revision = require_revision(args.get("revision"))
     override = require_override_flag(args)
     window, _ = _verify_request(args, settings)
@@ -786,6 +791,7 @@ def revert_record(rt: Runtime, plan: Plan, now: int) -> Plan:
         verify_at=now + window,
         kind=KIND_REVERT,
         reverts_plan_id=plan.plan_id,
+        cluster=plan.cluster,
     )
 
 
@@ -863,6 +869,10 @@ def _revert(rt: Runtime, plan: Plan, now: int, deployment: Any) -> dict[str, Any
     if not switch:
         # Final: by the time the switch is back on, the approved window has long passed.
         return _revert_state(verify.REVERT_SKIPPED, REMEDIATION_DISABLED, now)
+    # A namespace or action withdrawn since the apply is not reverted into.
+    allowed = plan.namespace in rt.settings.allowed_namespaces
+    if not allowed or "scale" not in rt.settings.actions_for(plan.namespace):
+        return _revert_state(verify.REVERT_REFUSED, FORBIDDEN_NAMESPACE, now)
     minimum, maximum = rt.settings.bounds_for(plan.namespace)
     if not minimum <= plan.revert_to <= maximum:
         return _revert_state(verify.REVERT_REFUSED, OUT_OF_BOUNDS, now)
@@ -871,7 +881,12 @@ def _revert(rt: Runtime, plan: Plan, now: int, deployment: Any) -> dict[str, Any
     correlation_id = current_correlation_id()
     try:
         updated = _patch_revert(
-            rt.apps(), plan, revert, deployment, correlation_id, rt.settings.gitops_markers
+            rt.apps(),
+            plan,
+            revert,
+            deployment,
+            correlation_id,
+            rt.settings.markers_for(plan.namespace),
         )
     except GuardError as exc:
         _record(rt, revert.plan_id, exc.code, correlation_id)

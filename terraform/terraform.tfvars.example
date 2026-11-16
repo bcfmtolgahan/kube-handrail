@@ -1,12 +1,26 @@
 # Copy to terraform.tfvars and adjust.
 
-cluster_name      = "my-cluster"
-region            = "eu-central-1"
-name_prefix       = "kube-handrail"
-sandbox_namespace = "kube-handrail-sandbox"
+cluster_name = "my-cluster"
+region       = "eu-central-1"
+name_prefix  = "kube-handrail"
 
-min_replicas = 0
-max_replicas = 5
+# Namespaces the tools may act in (mcp/CONTRACT.md, Namespace policy): replica bounds,
+# allowed actions (restart, rollback, scale; default all three), own approvers (default:
+# approver_principals) and extra GitOps marker keys. They must exist in the cluster; the
+# RBAC and the admission policy for them are rendered to build/k8s (docs/deploy.md).
+namespaces = {
+  "kube-handrail-sandbox" = { min_replicas = 0, max_replicas = 5 }
+  # "payments" = {
+  #   min_replicas = 2
+  #   max_replicas = 10
+  #   actions      = ["restart", "scale"]
+  #   approvers    = ["arn:aws:iam::111122223333:role/payments-oncall"]
+  # }
+}
+# Deny refuses the writer's out-of-bounds changes in the cluster; the read Lambda plans
+# only while the binding is in Deny (admission_check).
+admission_mode  = "Deny"
+admission_check = true
 # Unset (null): 900 s in client mode, 300 s in server and both mode. At most 3600.
 # plan_ttl_seconds = 300
 

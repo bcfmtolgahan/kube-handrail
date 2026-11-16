@@ -10,12 +10,13 @@ from unittest.mock import MagicMock
 
 import boto3
 import pytest
+import yaml
 from kubernetes import client as k8s
 from kubernetes.client.rest import ApiException
 from moto import mock_aws
 
 from handrail_common.breaker import LAST_PLAN_ANNOTATION, retention_seconds
-from handrail_common.config import Agent, Settings
+from handrail_common.config import Agent, NamespacePolicy, Settings
 from handrail_common.freezes import format_time
 from handrail_common.observability import bind_caller, unbind_caller
 from handrail_common.plans import (
@@ -173,9 +174,72 @@ def clients(table):
         policy=policy,
         core=core,
         discovery=discovery,
+        admission=admission_api(),
         store=PlanStore(table),
         ssm=_ssm_with_agent_switches(),
     )
+
+
+_RENDERED = Path(__file__).resolve().parents[1] / "k8s_render/golden/two-namespaces"
+
+
+def _rendered(kind: str) -> dict:
+    """The object of `kind` as terraform/modules/namespace-policy renders it."""
+    text = (_RENDERED / "admission-policy.yaml").read_text()
+    return next(d for d in yaml.safe_load_all(text) if d["kind"] == kind)
+
+
+def _selector(names: list[str]) -> dict:
+    return {
+        "matchExpressions": [
+            {"key": "kubernetes.io/metadata.name", "operator": "In", "values": sorted(names)}
+        ]
+    }
+
+
+def admission_policy(bounds: dict[str, tuple[int, int]]) -> dict:
+    """The rendered policy, with these bounds and their namespaces."""
+    names = sorted(bounds)
+    policy = _rendered("ValidatingAdmissionPolicy")
+    spec = policy["spec"]
+    spec["matchConstraints"]["namespaceSelector"] = _selector(names)
+    expressions = {
+        "minReplicas": json.dumps({n: bounds[n][0] for n in names}),
+        "maxReplicas": json.dumps({n: bounds[n][1] for n in names}),
+    }
+    for variable in spec["variables"]:
+        variable["expression"] = expressions.get(variable["name"], variable["expression"])
+    return policy
+
+
+def admission_binding(namespaces: list[str], actions: list[str] | None = None) -> dict:
+    binding = _rendered("ValidatingAdmissionPolicyBinding")
+    binding["spec"]["validationActions"] = ["Deny"] if actions is None else actions
+    binding["spec"]["matchResources"] = {"namespaceSelector": _selector(namespaces)}
+    return binding
+
+
+def admission_api(policy: dict | None = None, binding: dict | None = None) -> MagicMock:
+    """An AdmissionregistrationV1Api serving a policy and binding that back the sandbox's
+    bounds (0 to 5); set api.objects["policy"] or ["binding"] to change or remove one."""
+    api = MagicMock()
+    api.objects = {
+        "policy": admission_policy({"sandbox": (0, 5)}) if policy is None else policy,
+        "binding": admission_binding(["sandbox"]) if binding is None else binding,
+    }
+
+    def serve(kind):
+        def read(name, _preload_content=True):
+            value = api.objects.get(kind)
+            if value is None:
+                raise ApiException(status=404)
+            return SimpleNamespace(data=json.dumps(value).encode())
+
+        return read
+
+    api.read_validating_admission_policy.side_effect = serve("policy")
+    api.read_validating_admission_policy_binding.side_effect = serve("binding")
+    return api
 
 
 def _ssm_with_agent_switches():
@@ -1367,6 +1431,8 @@ def test_restart_plan_pins_the_template_with_its_plan_id(clients, table):
         "arguments",
         "agent_enabled",
         "namespace_allowed",
+        "action_allowed",
+        "admission_policy_match",
         "not_gitops_managed",
         "not_paused",
         "cooldown",
@@ -1695,6 +1761,8 @@ def test_rollback_plan_pins_the_replica_set_and_its_template(clients, table):
         "arguments",
         "agent_enabled",
         "namespace_allowed",
+        "action_allowed",
+        "admission_policy_match",
         "not_gitops_managed",
         "not_paused",
         "revision_found",
@@ -2228,6 +2296,7 @@ def test_plan_with_revert_on_a_healthy_deployment_has_no_warning(clients):
 
 def test_plan_with_revert_needs_a_revert_target_within_bounds(clients, table):
     settings = dataclasses.replace(VERIFY_SETTINGS, min_replicas=3)
+    clients.admission.objects["policy"] = admission_policy({"sandbox": (3, 5)})
     with pytest.raises(GuardError) as exc:
         handler.plan_scale_deployment(
             {
@@ -2347,3 +2416,114 @@ def test_argument_checks_come_before_the_freezes(clients):
             {"namespace": "elsewhere", "name": "web", "replicas": 3}, FROZEN, clients, NOW
         )
     assert exc.value.code == "forbidden_namespace"
+
+
+# --- Namespace policy and the admission policy check -----------------------------------
+
+POLICY_SETTINGS = dataclasses.replace(
+    SETTINGS,
+    allowed_namespaces=frozenset({"sandbox", "other"}),
+    namespace_policy={
+        # Restart only, with narrower bounds; scale is refused here whatever the count.
+        "sandbox": NamespacePolicy(1, 3, frozenset({"restart"})),
+        "other": NamespacePolicy(0, 8),
+    },
+)
+
+
+def test_a_restart_is_planned_where_the_namespace_allows_it(clients):
+    clients.admission.objects["policy"] = admission_policy({"sandbox": (1, 3), "other": (0, 8)})
+    result = handler.plan_restart_deployment(
+        {"namespace": "sandbox", "name": "web"}, POLICY_SETTINGS, clients, NOW
+    )
+    checks = [c["check"] for c in result["data"]["preflight"]]
+    assert checks[:5] == [
+        "arguments",
+        "agent_enabled",
+        "namespace_allowed",
+        "action_allowed",
+        "admission_policy_match",
+    ]
+
+
+def test_a_scale_where_the_namespace_does_not_allow_it_is_forbidden_namespace(clients, table):
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(
+            {"namespace": "sandbox", "name": "web", "replicas": 2}, POLICY_SETTINGS, clients, NOW
+        )
+    assert exc.value.code == "forbidden_namespace"
+    assert exc.value.details == {"action": "scale", "allowed_actions": ["restart"]}
+    clients.apps.read_namespaced_deployment.assert_not_called()
+    clients.admission.read_validating_admission_policy.assert_not_called()
+    assert table.scan()["Count"] == 0
+
+
+def test_a_rollback_where_the_namespace_does_not_allow_it_is_forbidden_namespace(clients):
+    with pytest.raises(GuardError) as exc:
+        handler.plan_rollback_deployment(
+            {"namespace": "sandbox", "name": "web", "revision": 3}, POLICY_SETTINGS, clients, NOW
+        )
+    assert (exc.value.code, exc.value.details["action"]) == ("forbidden_namespace", "rollback")
+
+
+@pytest.mark.parametrize(
+    ("policy", "binding", "reason"),
+    [
+        (
+            admission_policy({"sandbox": (0, 5)}),
+            admission_binding(["sandbox"], ["Warn", "Audit"]),
+            "binding_not_deny",
+        ),
+        (admission_policy({"sandbox": (0, 4)}), admission_binding(["sandbox"]), "bounds_mismatch"),
+        (
+            admission_policy({"sandbox": (0, 5)}),
+            admission_binding(["other"]),
+            "binding_not_selecting_namespace",
+        ),
+    ],
+)
+def test_a_plan_is_a_conflict_when_the_admission_policy_does_not_back_it(
+    clients, table, policy, binding, reason
+):
+    clients.admission.objects.update(policy=policy, binding=binding)
+    with pytest.raises(GuardError) as exc:
+        plan(clients)
+    assert exc.value.code == "conflict"
+    assert exc.value.details["check"] == "admission_policy_match"
+    assert exc.value.details["reason"] == reason
+    # Refused before the Deployment is read, and nothing is stored.
+    clients.apps.read_namespaced_deployment.assert_not_called()
+    assert table.scan()["Count"] == 0
+
+
+def test_a_missing_admission_policy_fails_closed(clients):
+    clients.admission.objects["policy"] = None
+    with pytest.raises(GuardError) as exc:
+        handler.plan_restart_deployment(
+            {"namespace": "sandbox", "name": "web"}, SETTINGS, clients, NOW
+        )
+    assert (exc.value.code, exc.value.details["reason"]) == ("conflict", "policy_missing")
+
+
+def test_an_unreadable_admission_policy_fails_closed(clients):
+    clients.admission.read_validating_admission_policy.side_effect = ApiException(status=403)
+    with pytest.raises(GuardError) as exc:
+        plan(clients)
+    assert (exc.value.code, exc.value.details["reason"]) == ("conflict", "unreadable")
+
+
+def test_with_the_admission_check_off_the_policy_is_not_read(clients):
+    clients.admission.objects["policy"] = None
+    settings = dataclasses.replace(SETTINGS, admission_check=False)
+    data = handler.plan_scale_deployment(
+        {"namespace": "sandbox", "name": "web", "replicas": 3}, settings, clients, NOW
+    )["data"]
+    assert {"check": "admission_policy_match", "passed": True, "skipped": True} in data["preflight"]
+    clients.admission.read_validating_admission_policy.assert_not_called()
+
+
+def test_the_plan_records_its_cluster(clients, table):
+    plan_id = plan(clients)["data"]["plan_id"]
+    assert table.get_item(Key={"plan_id": plan_id})["Item"]["cluster"] == "test-cluster"
+    outcome = handler.get_plan_outcome({"plan_id": plan_id}, SETTINGS, clients, NOW)
+    assert outcome["data"]["cluster"] == "test-cluster"

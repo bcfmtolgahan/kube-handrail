@@ -825,3 +825,111 @@ def test_an_approval_during_a_freeze_is_recorded_and_its_apply_refused(env):
     assert record["used"] is False and "result" not in record
     assert body["data"]["plan"]["status"] == "approved"
     env.apps.patch_namespaced_deployment.assert_not_called()
+
+
+# --- Per-namespace approvers -----------------------------------------------------------
+
+TEAM_ROLE = f"arn:aws:iam::{ACCOUNT}:role/team-a-approver"
+TEAM_SESSION = f"arn:aws:sts::{ACCOUNT}:assumed-role/team-a-approver/carol"
+
+
+def with_namespace_approvers(env, approvers: dict[str, tuple[str, ...]]) -> None:
+    env.rt.settings = dataclasses.replace(env.rt.settings, namespace_approvers=approvers)
+
+
+def test_a_namespace_with_its_own_approvers_is_decided_only_by_them(env):
+    with_namespace_approvers(env, {"sandbox": (TEAM_ROLE,)})
+    plan = make_plan(env.store)
+    # ALICE is a global approver, which a namespace with its own list does not accept.
+    status, body = approve(env, plan, caller=ALICE)
+    assert (status, body["error"]["code"]) == (403, "forbidden")
+    assert body["error"]["details"] == {"reason": "not_namespace_approver", "namespace": "sandbox"}
+    assert env.store.get(plan.plan_id)["status"] == "planned"
+    status, body = approve(env, plan, caller=TEAM_SESSION, apply=False)
+    assert status == 200
+    assert body["data"]["plan"]["approval"]["approved_by"] == TEAM_SESSION
+
+
+def test_the_approver_of_another_namespace_is_refused(env):
+    with_namespace_approvers(env, {"other": (TEAM_ROLE,)})
+    plan = make_plan(env.store)
+    status, body = approve(env, plan, caller=TEAM_SESSION)
+    assert (status, body["error"]["code"]) == (403, "forbidden")
+    assert body["error"]["details"]["reason"] == "not_namespace_approver"
+    # Nor can it reject, or read, the plan.
+    status, _ = call(env.rt, TEAM_SESSION, body={"plan_id": plan.plan_id, "decision": "reject"})
+    assert status == 403
+    status, _ = call(env.rt, TEAM_SESSION, method="GET", query={"plan_id": plan.plan_id})
+    assert status == 403
+    assert env.lam.calls == []
+    # The sandbox has no list of its own, so the global approvers decide it.
+    assert approve(env, plan, caller=ALICE, apply=False)[0] == 200
+
+
+def test_machine_identities_stay_refused_when_listed_for_a_namespace(env):
+    with_namespace_approvers(env, {"sandbox": (WRITE_ROLE,)})
+    plan = make_plan(env.store)
+    status, body = approve(env, plan, caller=WRITE_SESSION)
+    assert status == 403 and "machine" in body["error"]["message"]
+
+
+def test_namespace_approvers_come_from_the_packaged_policy(tmp_path):
+    policy = {
+        "namespaces": {
+            "sandbox": {
+                "min_replicas": 0,
+                "max_replicas": 5,
+                "actions": ["scale"],
+                "approvers": [],
+            },
+            "team-a": {
+                "min_replicas": 0,
+                "max_replicas": 5,
+                "actions": ["restart"],
+                "approvers": [TEAM_ROLE],
+            },
+        }
+    }
+    path = tmp_path / "namespace_policy.json"
+    path.write_text(json.dumps(policy))
+    s = handler.load_approver_settings(BASE_ENV | {"NAMESPACE_POLICY_FILE": str(path)})
+    assert s.namespace_approvers == {"team-a": (TEAM_ROLE,)}
+    assert s.approvers_for("team-a") == (TEAM_ROLE,)
+    assert s.approvers_for("sandbox") == (ALICE, OPERATOR_ROLE)
+    assert s.all_approvers == (ALICE, OPERATOR_ROLE, TEAM_ROLE)
+    # A namespace the policy no longer has: nobody, not the global approvers.
+    assert s.approvers_for("removed") == ()
+
+
+def test_a_plan_in_a_namespace_removed_from_the_policy_is_not_decidable(env):
+    env.rt.settings = dataclasses.replace(env.rt.settings, policy_namespaces=frozenset({"team-a"}))
+    plan = make_plan(env.store)
+    # ALICE is a global approver; the plan's namespace (sandbox) left the policy.
+    status, body = approve(env, plan, caller=ALICE)
+    assert (status, body["error"]["code"]) == (403, "forbidden")
+    assert body["error"]["details"] == {"reason": "not_namespace_approver", "namespace": "sandbox"}
+    assert env.store.get(plan.plan_id)["status"] == "planned"
+
+
+def test_a_namespace_approver_that_is_not_an_iam_arn_fails_the_load(tmp_path):
+    policy = {
+        "namespaces": {
+            "team-a": {
+                "min_replicas": 0,
+                "max_replicas": 5,
+                "actions": [],
+                "approvers": [TEAM_SESSION],
+            }
+        }
+    }
+    path = tmp_path / "namespace_policy.json"
+    path.write_text(json.dumps(policy))
+    with pytest.raises(ConfigError, match="team-a"):
+        handler.load_approver_settings(BASE_ENV | {"NAMESPACE_POLICY_FILE": str(path)})
+
+
+def test_show_names_the_cluster(env):
+    plan = dataclasses.replace(make_plan(env.store), plan_id=str(uuid.uuid4()), cluster="prod-eu")
+    env.store.create(plan)
+    _, body = call(env.rt, ALICE, method="GET", query={"plan_id": plan.plan_id})
+    assert body["data"]["cluster"] == "prod-eu"

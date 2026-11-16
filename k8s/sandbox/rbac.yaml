@@ -1,3 +1,10 @@
+# SUPERSEDED: Terraform renders the RBAC and the admission policy for every namespace of
+# var.namespaces to build/k8s (terraform/k8s.tf; docs/deploy.md, Namespaces, RBAC and
+# admission policy). Do not apply this file to a deployment: it lacks the ClusterRole
+# kube-handrail-policy-reader, without which the read Lambda refuses every plan
+# (conflict). It stays until the test harnesses that
+# still read it move to the rendered manifests, and will then be deleted.
+#
 # Bound to the kubernetes_groups of the two EKS access entries (mcp/CONTRACT.md, Identity).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

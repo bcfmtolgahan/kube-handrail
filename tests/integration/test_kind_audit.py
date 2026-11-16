@@ -6,7 +6,15 @@ import json
 
 import pytest
 from botocore.exceptions import ClientError
-from harness import AGENT_A, BUCKET, deployment_manifest, load_script, stream_records, unique
+from harness import (
+    AGENT_A,
+    BUCKET,
+    CLUSTER,
+    deployment_manifest,
+    load_script,
+    stream_records,
+    unique,
+)
 
 
 def test_plan_and_apply_reach_the_bucket_once(kh):
@@ -24,6 +32,7 @@ def test_plan_and_apply_reach_the_bucket_once(kh):
     entries = [json.loads(kh.s3.get_object(Bucket=BUCKET, Key=k)["Body"].read()) for k in keys]
     assert [e["event"] for e in entries][0] == "created" and len(entries) >= 2
     assert entries[-1]["new_image"]["used"] is True
+    assert all(e["summary"]["cluster"] == CLUSTER for e in entries)
     # Counter items share the table and are skipped, not recorded.
     budget = kh.s3.list_objects_v2(Bucket=BUCKET, Prefix="budget")
     assert budget.get("KeyCount", 0) == 0

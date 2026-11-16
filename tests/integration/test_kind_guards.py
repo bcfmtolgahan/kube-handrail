@@ -81,7 +81,7 @@ def test_deployment_targeted_by_an_hpa_is_conflict(kh):
     }
     autoscaling = k8s.AutoscalingV2Api(kh.apps.api_client)
     autoscaling.create_namespaced_horizontal_pod_autoscaler(NAMESPACE, hpa)
-    kh.created.append(("hpa", target["name"]))
+    kh.created.append(("hpa", target["name"], NAMESPACE))
     envelope = kh.call(PLAN, {**target, "replicas": 2})
     assert code(envelope) == "conflict" and not details(envelope)
 

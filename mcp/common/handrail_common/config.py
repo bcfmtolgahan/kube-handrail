@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from handrail_common.gitops import valid_marker
 
@@ -23,6 +24,14 @@ AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 MAX_PLAN_TTL_SECONDS = 3600
 # The verifier runs every minute, so a shorter window could not be kept.
 MIN_VERIFY_WINDOW_SECONDS = 60
+# The actions a namespace can allow (Terraform namespaces[*].actions); each is the plan
+# record's action without the _deployment suffix.
+ACTIONS = ("restart", "rollback", "scale")
+# The namespace policy Terraform renders into every Lambda package, next to handrail_common
+# (mcp/CONTRACT.md, Namespace policy). NAMESPACE_POLICY_FILE overrides the path (tests).
+POLICY_FILE_NAME = "namespace_policy.json"
+DEFAULT_POLICY_FILE = Path(__file__).resolve().parent.parent / POLICY_FILE_NAME
+_NAMESPACE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
 
 @dataclass(frozen=True)
@@ -32,6 +41,25 @@ class Agent:
     name: str
     client_id: str
     hourly_apply_budget: int
+
+
+@dataclass(frozen=True)
+class NamespacePolicy:
+    """What one namespace allows (mcp/CONTRACT.md, Namespace policy)."""
+
+    min_replicas: int
+    max_replicas: int
+    actions: frozenset[str] = frozenset(ACTIONS)
+    # IAM user or role ARNs that decide this namespace's plans; empty means the global
+    # APPROVER_PRINCIPALS. Checked by the approver only.
+    approvers: tuple[str, ...] = ()
+    # GitOps marker keys checked in this namespace in addition to GITOPS_MARKERS.
+    gitops_markers: tuple[str, ...] = ()
+
+
+def action_name(plan_action: str) -> str:
+    """scale_deployment => scale: the name a namespace policy allows."""
+    return plan_action.removesuffix("_deployment")
 
 
 @dataclass(frozen=True)
@@ -78,6 +106,13 @@ class Settings:
     # Label or annotation keys that mark GitOps ownership in addition to the defaults
     # (handrail_common.gitops), from GITOPS_MARKERS.
     gitops_markers: tuple[str, ...] = ()
+    # Namespace => policy, from namespace_policy.json. Empty when the package has no policy
+    # file (an older build, a test): every allowed namespace then allows every action
+    # within MIN_REPLICAS and MAX_REPLICAS.
+    namespace_policy: Mapping[str, NamespacePolicy] = field(default_factory=dict)
+    # Read Lambda: compare the cluster's admission policy with the bounds on every plan
+    # (mcp/CONTRACT.md, Admission policy). Off only through ADMISSION_CHECK=false.
+    admission_check: bool = True
 
     @property
     def approval_required(self) -> bool:
@@ -86,8 +121,22 @@ class Settings:
 
     def bounds_for(self, namespace: str) -> tuple[int, int]:
         """(minimum, maximum) replicas in an allowed namespace. Every replica bounds check
-        reads them through here; today the same bounds apply to every namespace."""
-        return self.min_replicas, self.max_replicas
+        reads them through here: the namespace's policy, else MIN_REPLICAS and MAX_REPLICAS."""
+        policy = self.namespace_policy.get(namespace)
+        if policy is None:
+            return self.min_replicas, self.max_replicas
+        return policy.min_replicas, policy.max_replicas
+
+    def actions_for(self, namespace: str) -> frozenset[str]:
+        """The actions (ACTIONS) an allowed namespace allows; every action without a policy."""
+        policy = self.namespace_policy.get(namespace)
+        return frozenset(ACTIONS) if policy is None else policy.actions
+
+    def markers_for(self, namespace: str) -> tuple[str, ...]:
+        """GITOPS_MARKERS and the namespace's own marker keys."""
+        policy = self.namespace_policy.get(namespace)
+        extra = () if policy is None else policy.gitops_markers
+        return tuple(dict.fromkeys((*self.gitops_markers, *extra)))
 
     @property
     def verify_window_bounds(self) -> tuple[int, int]:
@@ -140,6 +189,80 @@ def parse_gitops_markers(raw: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value))
 
 
+def _int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _strings(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) and v for v in value)
+
+
+def parse_namespace_policy(raw: str) -> dict[str, NamespacePolicy]:
+    """namespace_policy.json: {"namespaces": {"<ns>": {"min_replicas": N, "max_replicas": M,
+    "actions": [...], "approvers": [...], "gitops_markers": [...]}}}, at least one namespace.
+    Anything else fails the load: the file widens access, so a malformed one must not
+    silently fall back to anything."""
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        raise ConfigError(f"{POLICY_FILE_NAME} must be a JSON object") from None
+    namespaces = value.get("namespaces") if isinstance(value, dict) else None
+    if not isinstance(namespaces, dict) or not namespaces:
+        raise ConfigError(f"{POLICY_FILE_NAME} must list at least one namespace")
+    policy: dict[str, NamespacePolicy] = {}
+    for name, entry in namespaces.items():
+        where = f"{POLICY_FILE_NAME}: namespace {name!r}"
+        if not isinstance(name, str) or len(name) > 63 or not _NAMESPACE.match(name):
+            raise ConfigError(f"{where} is not a DNS-1123 label")
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where} must be an object")
+        minimum, maximum = entry.get("min_replicas"), entry.get("max_replicas")
+        if not (_int(minimum) and _int(maximum) and 0 <= minimum <= maximum):
+            raise ConfigError(f"{where}: require 0 <= min_replicas <= max_replicas")
+        actions = entry.get("actions")
+        if not _strings(actions) or not set(actions) <= set(ACTIONS):
+            raise ConfigError(f"{where}: actions must be a list of {', '.join(ACTIONS)}")
+        approvers = entry.get("approvers", [])
+        if not isinstance(approvers, list) or not (approvers == [] or _strings(approvers)):
+            raise ConfigError(f"{where}: approvers must be a list of ARNs")
+        markers = entry.get("gitops_markers", [])
+        if not isinstance(markers, list) or not all(valid_marker(key) for key in markers):
+            raise ConfigError(f"{where}: gitops_markers must be label or annotation keys")
+        policy[name] = NamespacePolicy(
+            min_replicas=minimum,
+            max_replicas=maximum,
+            actions=frozenset(actions),
+            approvers=tuple(dict.fromkeys(approvers)),
+            gitops_markers=tuple(dict.fromkeys(markers)),
+        )
+    return policy
+
+
+def policy_path(env: Mapping[str, str]) -> Path:
+    return Path(env.get("NAMESPACE_POLICY_FILE", "").strip() or DEFAULT_POLICY_FILE)
+
+
+def load_namespace_policy(env: Mapping[str, str]) -> dict[str, NamespacePolicy]:
+    """The packaged namespace policy, or {} when the package has none."""
+    path = policy_path(env)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if env.get("NAMESPACE_POLICY_FILE", "").strip():
+            # Named explicitly: a missing file is a mistake, not an older package.
+            raise ConfigError(f"NAMESPACE_POLICY_FILE: {path} does not exist") from None
+        return {}
+    return parse_namespace_policy(raw)
+
+
+def parse_admission_check(env: Mapping[str, str]) -> bool:
+    """ADMISSION_CHECK: only the exact value "false" turns the check off; unset is on."""
+    raw = env.get("ADMISSION_CHECK", "").strip()
+    if raw not in ("", "true", "false"):
+        raise ConfigError("ADMISSION_CHECK must be true or false")
+    return raw != "false"
+
+
 def parse_agents(raw: str, default_budget: int) -> dict[str, Agent]:
     """AGENTS: a JSON object {"<client_id>": {"name": "<agent>", "hourly_apply_budget": N}},
     at least one entry, with unique names; the budget is optional and positive."""
@@ -176,6 +299,12 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
     max_replicas = int_env(env, "MAX_REPLICAS")
     if min_replicas < 0 or max_replicas < min_replicas:
         raise ConfigError("require 0 <= MIN_REPLICAS <= MAX_REPLICAS")
+
+    # Terraform derives ALLOWED_NAMESPACES from the same map as the policy file; a package
+    # and an environment from different applies must not run together.
+    namespace_policy = load_namespace_policy(env)
+    if namespace_policy and set(namespace_policy) != namespaces:
+        raise ConfigError(f"ALLOWED_NAMESPACES does not match the namespaces of {POLICY_FILE_NAME}")
 
     ttl = int_env(env, "PLAN_TTL_SECONDS", 300)
     if not 0 < ttl <= MAX_PLAN_TTL_SECONDS:
@@ -258,4 +387,6 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         verify_grace_seconds=limits["VERIFY_GRACE_SECONDS"],
         freezes_param=env.get("FREEZES_PARAM", "").strip() or None,
         gitops_markers=parse_gitops_markers(env.get("GITOPS_MARKERS", "")),
+        namespace_policy=namespace_policy,
+        admission_check=parse_admission_check(env),
     )

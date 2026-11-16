@@ -1,0 +1,1 @@
+kubectl label namespace kube-handrail-sandbox kube-handrail.io/managed=true --overwrite
