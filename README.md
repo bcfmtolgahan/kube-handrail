@@ -113,7 +113,7 @@ Milestone 2, item 4 (verify and revert): plans take a verification window and, f
 
 Milestone 2, item 6 (durable audit record): every change to a plan record is written once, from the plan table's stream, to an S3 bucket with Object Lock that the tool Lambdas cannot write to, and `scripts/audit.py export` shows a plan's requesting agent, approver, channel, result, verification and revert. Implemented and tested on a test cluster. See [Audit record](mcp/CONTRACT.md#audit-record).
 
-Milestone 3 (quick wins and guard rails): GitOps ownership by controller markers (Helm releases are no longer refused, Flux-managed objects are), the plan TTL by approval mode, the plan rate limit removed, faster end-to-end runs, guidance sync tests, a release process and a dashboard. Implemented, not yet tested on a cluster. See [CHANGELOG.md](CHANGELOG.md).
+Milestone 3 (quick wins and guard rails): GitOps ownership by controller markers (Helm releases are no longer refused, Flux-managed objects are), the plan TTL by approval mode, the plan rate limit removed, faster end-to-end runs, guidance sync tests, a release process and a dashboard. Implemented and tested on a test cluster. See [CHANGELOG.md](CHANGELOG.md).
 
 **Which approval mode.** `server` is the default and the mode for an audit-grade record of who approved. With DevOps Agent in production, use `both`: the chat approval stays the agent's flow and the server approval is the record. `client` is an evaluation and convenience mode: the chat approval cannot be bound to a plan (CloudTrail records the approver but redacts the plan ID), so the approver is best-effort. See [Approval mode](docs/deploy.md#approval-mode).
 
