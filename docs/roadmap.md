@@ -176,11 +176,17 @@ See [Verification and revert](../mcp/CONTRACT.md#verification-and-revert) and [A
 
 **Done when:** a degraded change is detected and, if approved with revert, reverted, the revert itself is verified and never reverted, and an `unknown` outcome or a turned-off kill switch leaves the object as it is.
 
-### Admission policy (implemented, not yet tested on a cluster)
+### Admission policy (implemented)
 
 The cluster-side part of item 5, without the single policy file and without Cedar ([ADR 0006](adr/0006-admission-policy.md)). A ValidatingAdmissionPolicy, `kube-handrail-writer-bounds`, refuses a writer patch that changes a Deployment's replica count to a value outside the bounds, only for the writer group and only in the sandbox namespace. It rolls out in `Warn` and `Audit` and is switched to `Deny` by the operator. The write Lambda maps its denial to `admission_denied`. CI applies it on kind (Kubernetes 1.31) and runs server-side dry-run cases (`tests/admission/run.sh`). See [Admission policy](../mcp/CONTRACT.md#admission-policy).
 
 **Done when:** on a test cluster the policy ran in audit mode, then in `Deny`, and an apply over the bounds was refused with `admission_denied` while other users and namespaces were unaffected.
+
+On a test cluster (Kubernetes 1.35):
+
+- The policy type-checked without warnings. In audit mode, `tests/admission/run.sh` (bounds 1 and 3) showed a writer over the maximum admitted with a warning; in `Deny`, a writer scale within the bounds was admitted, over the maximum and below the minimum refused (also past RBAC, and through `deployments/scale`), a writer restart admitted, and another user over the maximum in the sandbox namespace admitted. The binding went back to `[Warn, Audit]` afterwards.
+- With a hand-edited copy of the policy (maximum 1, `Deny`, not committed), a scale to 2 that the guard allowed was refused by the cluster: the apply returned `admission_denied` naming the policy and binding, the plan was used with `result` `admission_denied`, the Deployment was unchanged, and the tool-errors alarm fired.
+- With the real bounds in `Deny`, the end-to-end suite with the restart and rollback cases passed 63 of 63, and the other applications on the cluster stayed healthy. The policy stays installed in `Deny`.
 
 ### 5. Single-source policy, change freezes and break-glass
 

@@ -41,7 +41,7 @@ The end-to-end guard tests only run against `kube-handrail-sandbox`.
 
 ## Admission policy
 
-`k8s/sandbox/admission-policy.yaml` is a second check of the replica bounds in the cluster, for the writer group in the sandbox namespace only ([Admission policy](../mcp/CONTRACT.md#admission-policy)). Status: implemented, not yet tested on a cluster; CI runs its cases on kind.
+`k8s/sandbox/admission-policy.yaml` is a second check of the replica bounds in the cluster, for the writer group in the sandbox namespace only ([Admission policy](../mcp/CONTRACT.md#admission-policy)). Status: implemented and tested on a test cluster; CI runs its cases on kind.
 
 - **Kubernetes 1.30 or later** (`admissionregistration.k8s.io/v1`). On an older cluster `kubectl apply -f k8s/sandbox/` fails for this file only; apply the other files one by one and skip it.
 - **Bounds.** The file commits `0` and `5`, the defaults of `min_replicas` and `max_replicas`. They must equal the Terraform values. For other values or another namespace:
@@ -190,4 +190,4 @@ Plans open across an upgrade may have to be planned again; their expiry is short
   - After the apply, run `scripts/freeze.py list` (it reads the `freezes_parameter` output) and the smoke test; a plan must still succeed with no freezes.
   - The end-to-end cases (`tests/e2e/e2e_gateway.py --with-freeze`, with `--approval-mode server` in server mode) need `FREEZES_PARAM` set to the `freezes_parameter` output and the operator's credentials need `ssm:GetParameter` and `ssm:PutParameter` on it. They add windows only for `kube-handrail-sandbox` and a namespace that does not exist on top of the stored freezes, never drop an operator's freeze, and always restore the stored value exactly. They refuse to run while a stored freeze covers `kube-handrail-sandbox`.
   - If `/<prefix>/freezes` already exists outside Terraform (created by hand), the apply fails with `ParameterAlreadyExists`: import it first (`terraform import 'aws_ssm_parameter.freezes' /<prefix>/freezes`) or delete it.
-- **Admission policy** (Milestone 2). Nothing changes in Terraform or the Lambdas' environment. Deploy the write Lambda (it maps a refusal by the policy to `admission_denied`), re-run `install-guidance` so agents get the new `AGENTS.md` row and skill text, then roll out the policy in audit mode and switch it to `Deny` after the check ([Admission policy](#admission-policy)). Implemented, not yet tested on a cluster. On a cluster below 1.30 skip the policy; the rest works as before.
+- **Admission policy** (Milestone 2). Nothing changes in Terraform or the Lambdas' environment. Deploy the write Lambda (it maps a refusal by the policy to `admission_denied`), re-run `install-guidance` so agents get the new `AGENTS.md` row and skill text, then roll out the policy in audit mode and switch it to `Deny` after the check ([Admission policy](#admission-policy)). On a cluster below 1.30 skip the policy; the rest works as before.

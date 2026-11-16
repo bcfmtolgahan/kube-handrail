@@ -903,7 +903,7 @@ Existing assets are found with `ListAssets` and checked before the first write; 
 
 ## Admission policy
 
-Status: implemented, not yet tested on a cluster. The policy itself is checked in CI on kind (Kubernetes 1.31) by `tests/admission/run.sh`, and the write Lambda's handling of a denial by unit tests.
+Status: implemented and tested on a test cluster. The policy itself is checked in CI on kind (Kubernetes 1.31) by `tests/admission/run.sh`, and the write Lambda's handling of a denial by unit tests.
 
 `k8s/sandbox/admission-policy.yaml` holds a ValidatingAdmissionPolicy and a ValidatingAdmissionPolicyBinding, both named `kube-handrail-writer-bounds` (`admissionregistration.k8s.io/v1`, Kubernetes 1.30 or later). It is a second check of the replica bounds in the cluster, for the case that the guard in the write Lambda is wrong or bypassed; the guard stays authoritative ([ADR 0006](../docs/adr/0006-admission-policy.md)).
 

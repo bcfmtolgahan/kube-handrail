@@ -8,7 +8,7 @@ Three independent checks stand between an agent and a Deployment; each assumes t
 
 1. **The guard in the write Lambda** (this page): authoritative. It checks every plan and apply against the namespace, the replica bounds, the blast radius, the breaker, the budgets, the approval and the kill switches.
 2. **Kubernetes RBAC**: the writer group can only `get` and `patch` Deployments and `get` ReplicaSets, in the sandbox namespace only (`k8s/sandbox/rbac.yaml`).
-3. **The admission policy** `kube-handrail-writer-bounds` (`k8s/sandbox/admission-policy.yaml`): in the cluster, a writer patch that changes the replica count to a value outside the bounds is refused even if the guard let it through (`admission_denied`). It applies only to the writer group in the sandbox namespace. It starts in `Warn` and `Audit` and is switched to `Deny` after a check ([deploy](deploy.md#admission-policy)). Implemented, not yet tested on a cluster. See [Admission policy](../mcp/CONTRACT.md#admission-policy) and [ADR 0006](adr/0006-admission-policy.md).
+3. **The admission policy** `kube-handrail-writer-bounds` (`k8s/sandbox/admission-policy.yaml`): in the cluster, a writer patch that changes the replica count to a value outside the bounds is refused even if the guard let it through (`admission_denied`). It applies only to the writer group in the sandbox namespace. It starts in `Warn` and `Audit` and is switched to `Deny` after a check ([deploy](deploy.md#admission-policy)). See [Admission policy](../mcp/CONTRACT.md#admission-policy) and [ADR 0006](adr/0006-admission-policy.md).
 
 The policy checks only the replica bounds. It does not check the pod template, the approval or the history, which need state that only the guard has.
 
