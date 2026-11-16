@@ -4,7 +4,7 @@ All notable changes to kube-handrail are listed here. The format follows [Keep a
 
 ## [Unreleased]
 
-Milestone 3. Implemented, not yet tested on a cluster. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md`), so re-run `install-guidance`.
+Milestone 3. Implemented and tested on a test cluster, except the test profile and `--reset-counters`, which are implemented but not yet run. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md`), so re-run `install-guidance`.
 
 ### Changed
 
