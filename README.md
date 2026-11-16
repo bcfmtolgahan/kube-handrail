@@ -115,6 +115,8 @@ Milestone 2, item 6 (durable audit record): every change to a plan record is wri
 
 Milestone 3 (quick wins and guard rails): GitOps ownership by controller markers (Helm releases are no longer refused, Flux-managed objects are), the plan TTL by approval mode, the plan rate limit removed, faster end-to-end runs, guidance sync tests, a release process and a dashboard. Implemented and tested on a test cluster. See [CHANGELOG.md](CHANGELOG.md).
 
+Milestone 8, item 1 (HPA adjust): `plan_adjust_hpa` / `apply_adjust_hpa` change a HorizontalPodAutoscaler's bounds within the namespace's, with the blast radius on the pods they move, verification and an optional revert of both bounds. Implemented and tested on kind, not yet on a cluster. See [Adjust HPA](mcp/CONTRACT.md#adjust-hpa).
+
 **Which approval mode.** `server` is the default and the mode for an audit-grade record of who approved. With DevOps Agent in production, use `both`: the chat approval stays the agent's flow and the server approval is the record. `client` is an evaluation and convenience mode: the chat approval cannot be bound to a plan (CloudTrail records the approver but redacts the plan ID), so the approver is best-effort. See [Approval mode](docs/deploy.md#approval-mode).
 
 **Supported versions** and the release rules are in [Releasing](docs/releasing.md): Kubernetes 1.30 or later for the admission policy, Terraform 1.5 or later with the AWS provider pinned in `terraform/versions.tf`.
