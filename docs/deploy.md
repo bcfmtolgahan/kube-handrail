@@ -13,7 +13,7 @@ Status: implemented and tested. A fresh deployment with its own prefix and state
   ```
 
 - **Region.** Amazon Bedrock AgentCore Gateway and AWS DevOps Agent must be available in the Region of the cluster.
-- **Operator credentials.** Rights to read the cluster (`eks:DescribeCluster`) and to create IAM roles and policies, Lambda functions and Function URLs, a DynamoDB table, an SSM parameter, SNS topics, a Cognito user pool, an AgentCore gateway, EventBridge rules, CloudWatch log groups and alarms, and EKS access entries; with the network options below, also security groups, security group rules and VPC endpoints, and the EC2 read actions `ec2:DescribeSubnets`, `ec2:DescribeVpcs`, `ec2:DescribeVpcAttribute`, `ec2:DescribeRouteTables`, `ec2:DescribeVpcEndpointServices`, `ec2:DescribeSecurityGroups` and `ec2:GetSecurityGroupsForVpc` (Lambda checks the last two on the caller that attaches a VPC). Destroying VPC Lambdas also needs `ec2:DescribeNetworkInterfaces`, `ec2:DetachNetworkInterface` and `ec2:DeleteNetworkInterface` (below). Applying the sandbox RBAC needs a kubeconfig with cluster-admin rights that can reach the cluster's API server; for a private endpoint that means from inside the VPC or over a VPN.
+- **Operator credentials.** Rights to read the cluster (`eks:DescribeCluster`) and to create IAM roles and policies, Lambda functions and Function URLs, a DynamoDB table, an SSM parameter, SNS topics, a Cognito user pool, an AgentCore gateway, EventBridge rules, CloudWatch log groups, alarms and a dashboard, and EKS access entries; with the network options below, also security groups, security group rules and VPC endpoints, and the EC2 read actions `ec2:DescribeSubnets`, `ec2:DescribeVpcs`, `ec2:DescribeVpcAttribute`, `ec2:DescribeRouteTables`, `ec2:DescribeVpcEndpointServices`, `ec2:DescribeSecurityGroups` and `ec2:GetSecurityGroupsForVpc` (Lambda checks the last two on the caller that attaches a VPC). Destroying VPC Lambdas also needs `ec2:DescribeNetworkInterfaces`, `ec2:DetachNetworkInterface` and `ec2:DeleteNetworkInterface` (below). Applying the sandbox RBAC needs a kubeconfig with cluster-admin rights that can reach the cluster's API server; for a private endpoint that means from inside the VPC or over a VPN.
 - **Build machine.** Terraform 1.5 or later (the AWS provider is pinned to `~> 6.70` in `terraform/versions.tf`, and `terraform/.terraform.lock.hcl` pins the exact versions), `/bin/bash`, and a Python with `pip` given by the `python` variable (default `python3`). The build runs `pip install --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.12`, so the interpreter's own version does not matter, but the machine needs access to PyPI during `terraform apply`.
 
 ## Names
@@ -113,6 +113,33 @@ Then, next to the variables the end-to-end tests already need, set `CLIENT_ID_B`
 
 The end-to-end tests do not remove the interceptor from the gateway. That case is a manual live test: with the interceptor detached, a plan whose `_kube_handrail_caller` the client set itself, to its own or another agent's `client_id`, must be refused with `forbidden`, `agent_unknown`, and the next sentinel run must report `missing_interceptor`.
 
+## Approval mode
+
+Recommendation (`approval_mode`):
+
+| Mode | Use it for | Who approved, in the record |
+|---|---|---|
+| `server` (default) | Production without DevOps Agent chat approvals, and any deployment that needs an audit-grade approver | The approver's IAM identity, checked by the approval API and pinned to the plan's exact arguments |
+| `both` | Production with DevOps Agent: the chat approval stays the agent's UX, and the server approval is the record | As `server` |
+| `client` | Evaluation and convenience: trying kube-handrail out, test deployments | Nobody, reliably: the approver is best-effort |
+
+In `client` mode the only approval is the one in the DevOps Agent chat, and kube-handrail cannot bind it to a plan. AWS CloudTrail records the chat approval (`UpdateApprovalAction`) as a management event with the approver's IAM identity, but every tool argument in it is redacted, the plan ID included, and it carries no approval ID. An approval can therefore only be matched to a plan by time, which does not hold up when two plans are approved close together. `server` and `both` record the approver on the plan itself, in the same conditional write that makes the apply possible ([Server-side approval](../mcp/CONTRACT.md#server-side-approval)).
+
+### Shadow mode
+
+To watch what the agent would do before letting it change anything, deploy in `server` mode and let no approver act. The agent investigates, plans and calls `request_approval` as usual; every plan, with its diff, impact preview and warnings, lands in the plan table, the audit record and the approval topic, and expires unapplied. Nothing reaches the cluster: in `server` mode the write Lambda refuses every apply without a server approval (`approval_required`).
+
+1. Set `approval_mode = "server"` and apply. `approver_principals` needs one entry in `server` mode: for a hard guarantee, a role nobody assumes during the trial; to let reviewers use `scripts/approve.py show`, the reviewers, who agree never to run `approve`.
+2. Subscribe reviewers to the approval topic (`approval_email`), and read plans with `scripts/audit.py export <plan_id>` or `scripts/approve.py show <plan_id>`. The dashboard (below) counts plans and refusals.
+3. Compare what the agent planned with what the on-call engineer did.
+4. To go live, set `approver_principals` to the real approvers, apply, and attach `approver_policy_arn` to each. No tool or registration changes, so `enable-write` is not needed.
+
+Leave the kill switch on: it only matters for applies, which `server` mode refuses without an approval anyway. This is a procedure, not a mode in the code.
+
+### Dashboard
+
+With `sentinel_enabled` (like the alarms), Terraform creates a CloudWatch dashboard named after `name_prefix`. It shows plan and apply calls per tool, guard rejections by code, tool errors, the sentinel's drift and unknown results and, when enabled, the verifier's runs, backlog, degraded changes and reverts and the audit record's dead letters, write failures and stream lag. It reads only the metrics the Lambdas already emit ([Observability](../mcp/CONTRACT.md#observability)). Tested on a test cluster: the dashboard is created and its body is accepted.
+
 ## Network
 
 The tool Lambdas (`k8s_read` and `k8s_write`) call the cluster's API server, `eks:DescribeCluster`, DynamoDB, SSM (the kill switches) and SNS (read), all over HTTPS. They never call STS or CloudWatch Logs. The approver, sentinel, interceptor and verifier Lambdas do not talk to the cluster and always run outside any VPC; a verification runs inside the write Lambda. Details are in the [contract](../mcp/CONTRACT.md#network).
@@ -161,7 +188,14 @@ It warns, and continues, when the public endpoint is limited to `public_access_c
 
 ## Upgrading
 
-Plans open across an upgrade may have to be planned again; their expiry is short, so waiting for them to expire also works.
+Plans open across an upgrade may have to be planned again; their expiry is short, so waiting for them to expire also works. Each release's changes are listed in [CHANGELOG.md](../CHANGELOG.md); the release rules are in [Releasing](releasing.md).
+
+- **GitOps markers, plan TTL, plan rate limit and dashboard** (the release after Milestone 2; tested on a test cluster, where the plan matched this list). Before applying, check that `terraform plan` rebuilds every package (`terraform_data.build[...]`, because the shared code changed) and shows every Lambda as an update in place; only the two tool Lambdas also change their environment (`GITOPS_MARKERS` added, `PLAN_RATE_LIMIT` and `PLAN_RATE_WINDOW_SECONDS` removed, and in `client` mode `PLAN_TTL_SECONDS` from 300 to 900 when `plan_ttl_seconds` is not set). It adds `aws_cloudwatch_dashboard.this[0]` with the sentinel, and changes nothing on the gateway, its targets, the Cognito clients or the plan table. All new environment values come from variables, so they are known when the existing functions are planned.
+  - **Helm releases are no longer GitOps-managed.** A Deployment with only `app.kubernetes.io/instance` can now be planned and applied. If your Argo CD uses label tracking, set `gitops_markers = ["app.kubernetes.io/instance"]` before this apply, or those objects become changeable through kube-handrail. Flux-managed objects are now refused with `gitops_managed`.
+  - **Plan TTL.** `plan_ttl_seconds` now defaults to `null`: 900 seconds in `client` mode, 300 otherwise. A tfvars that sets `plan_ttl_seconds = 300`, as the old example did, keeps 300; remove the line to get the default. More than 3600 is refused. In `client` mode with `plan_ttl_seconds` unset and `approval_wait_ttl_seconds` below 900, `terraform plan` now fails the approver's precondition (the approval wait must cover the plan TTL); raise `approval_wait_ttl_seconds` or set `plan_ttl_seconds`.
+  - **Plan rate limit removed.** `plan_rate_limit` and `plan_rate_window_seconds` are ignored, and Terraform warns (check `deprecated_plan_rate`) while they are set; remove them. Preflight still lists `plan_rate`, as skipped.
+  - The tool schemas do not change (`tools.json` is the same), so the sentinel sees no drift and `enable-write` is not needed. Re-run `install-guidance`: `AGENTS.md` changed (the `gitops_managed` row, and `plan_rate_limited` is gone).
+  - After the apply, run the smoke test, check that a client-mode plan's `expires_at - created_at` is 900, and open the dashboard.
 
 - **Plan argument record.** Plans now store the arguments they cover (`args`). A plan made before this change has none: its apply and its approval are refused with `plan_expired`, and the agent plans again.
 - **New tools** (`plan_restart_deployment`, `apply_restart_deployment`). Adding a tool changes the gateway's tool set before DevOps Agent's association knows it, so the drift sentinel reports drift and turns remediation off. With the DevOps Agent IDs configured, run `terraform apply`, then `scripts/devops_agent_register.py enable-write`, wait for a sentinel run that reports `ok`, then set the kill switch back to `true`. Re-run `install-guidance` so agents get the new `AGENTS.md` and the `kube-handrail-rollout` skill. The sandbox RBAC does not change: the writer's `patch` on Deployments covers the restart.

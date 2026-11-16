@@ -63,7 +63,7 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 | `forbidden_namespace` | Namespace not allowed. | Stop. |
 | `out_of_bounds` | `replicas`, or with `revert_on_failure` the current count it would revert to, outside the server's bounds. | Stop, or plan a value within bounds (or without revert) if the human agrees. |
 | `blast_radius_exceeded` | Step larger than allowed (`details.max_step`). | Plan a smaller step within `max_step`; never ask to lift the limit. |
-| `gitops_managed` | Managed by GitOps. | Stop. The change belongs in Git. |
+| `gitops_managed` | Managed by GitOps (Argo CD or Flux markers, or a marker the operator configured). | Stop. The change belongs in Git. |
 | `plan_not_found`, `plan_expired` | Plan unknown or expired (on `get_plan_outcome`: no such plan, or its record was removed after its retention). | Re-plan; for `get_plan_outcome`, check the `plan_id`. |
 | `plan_used` | Plan already consumed, possibly by the approval's own apply. | Check `get_workload_status`; do not re-plan unless the human asks. |
 | `plan_mismatch` | Apply arguments differ from the plan. | Apply again with exactly the plan's arguments, or re-plan. |
@@ -72,7 +72,7 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 | `manual_change` | Someone changed replicas (`details.last_applied_to`, `current`) or, on a rollback, the pod template (`details.last_applied_template`, `current_template`) outside kube-handrail since its last apply. | Stop and ask the human; see Never. |
 | `cooldown` | Too soon after the last apply. | Wait until `details.retry_after` (epoch seconds), then re-plan. |
 | `flapping` | Would reverse direction a second time (`details.history`); a revert counts as a change. | Stop. |
-| `object_budget_exceeded`, `plan_rate_limited` | Per-object limits reached. | Stop. |
+| `object_budget_exceeded` | Per-object limit reached. | Stop. |
 | `global_budget_exceeded` | Hourly budget for all objects reached. | Stop; not before `details.retry_after`. |
 | `agent_budget_exceeded` | Your agent's hourly apply budget is spent (`details.limit`). | Wait until `details.retry_after`, or hand over to a human. |
 | `approval_required` | No valid server approval. `details.status` says why. | `planned` or `awaiting_approval`: call `request_approval` if not done, then wait. `rejected`, `approval_expired`, `approval_invalid`: stop. |

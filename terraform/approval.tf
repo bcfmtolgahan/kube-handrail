@@ -126,8 +126,8 @@ resource "aws_lambda_function" "approver" {
       error_message = "approver_principals must not list the kube-handrail Lambda or gateway roles; machine identities can never approve."
     }
     precondition {
-      condition     = var.approval_wait_ttl_seconds >= var.plan_ttl_seconds
-      error_message = "approval_wait_ttl_seconds must be at least plan_ttl_seconds."
+      condition     = var.approval_wait_ttl_seconds >= local.plan_ttl
+      error_message = "approval_wait_ttl_seconds must be at least the plan TTL (plan_ttl_seconds, or 900 in client mode and 300 otherwise when it is null)."
     }
   }
 }

@@ -25,6 +25,7 @@ def repo(tmp_path):
         "terraform/main.tf",
         "mcp/CONTRACT.md",
         "AGENTS.md",
+        "mcp/common/handrail_common/envelope.py",
     ]:
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO / rel, tmp_path / rel)
@@ -148,6 +149,19 @@ def test_agents_md_missing_error_code_fails(repo):
     agents_md = repo / "AGENTS.md"
     agents_md.write_text(agents_md.read_text().replace("`flapping`", "flapping"))
     assert check_contract.check(repo) == ["AGENTS.md does not mention flapping"]
+
+
+def test_agents_md_naming_a_deprecated_code_fails(repo):
+    agents_md = repo / "AGENTS.md"
+    agents_md.write_text(agents_md.read_text() + "\n`plan_rate_limited`\n")
+    assert check_contract.check(repo) == ["AGENTS.md mentions deprecated plan_rate_limited"]
+
+
+def test_deprecated_codes_are_still_error_codes():
+    from handrail_common.envelope import DEPRECATED_ERROR_CODES, ERROR_CODES
+
+    assert DEPRECATED_ERROR_CODES == check_contract.deprecated_error_codes(REPO)
+    assert DEPRECATED_ERROR_CODES <= ERROR_CODES
 
 
 def test_contract_error_codes_match_envelope():

@@ -251,12 +251,32 @@ def test_plan_hpa_list_error_is_kubernetes_error(clients):
     "meta",
     [
         {"annotations": {"argocd.argoproj.io/tracking-id": "app:apps/Deployment:sandbox/web"}},
-        {"labels": {"app.kubernetes.io/instance": "web"}},
+        {"labels": {"kustomize.toolkit.fluxcd.io/name": "apps"}},
+        {"labels": {"helm.toolkit.fluxcd.io/name": "web"}},
     ],
 )
 def test_plan_rejects_gitops_managed(clients, table, meta):
     clients.apps.read_namespaced_deployment.return_value = deployment(**meta)
     assert plan_error(clients) == "gitops_managed"
+    assert table.scan()["Count"] == 0
+
+
+HELM_LABELS = {"app.kubernetes.io/instance": "web", "app.kubernetes.io/managed-by": "Helm"}
+
+
+def test_plan_accepts_a_helm_release(clients):
+    clients.apps.read_namespaced_deployment.return_value = deployment(labels=HELM_LABELS)
+    assert plan(clients)["ok"] is True
+
+
+def test_plan_rejects_a_configured_gitops_marker(clients, table):
+    # Argo CD label tracking: the operator lists the instance label in gitops_markers.
+    settings = dataclasses.replace(SETTINGS, gitops_markers=("app.kubernetes.io/instance",))
+    clients.apps.read_namespaced_deployment.return_value = deployment(labels=HELM_LABELS)
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3}
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(args, settings, clients, NOW)
+    assert exc.value.code == "gitops_managed"
     assert table.scan()["Count"] == 0
 
 
@@ -333,10 +353,18 @@ def test_status_conditions_are_untrusted_text(clients):
 
 def test_status_reports_gitops_managed(clients):
     clients.apps.read_namespaced_deployment.return_value = deployment(
-        labels={"app.kubernetes.io/instance": "web"}
+        labels={"kustomize.toolkit.fluxcd.io/name": "apps"}
     )
     result = handler.get_workload_status({"namespace": "sandbox", "name": "web"}, SETTINGS, clients)
     assert result["data"]["gitops_managed"] is True
+
+
+def test_status_uses_the_configured_gitops_markers(clients):
+    clients.apps.read_namespaced_deployment.return_value = deployment(labels=HELM_LABELS)
+    args = {"namespace": "sandbox", "name": "web"}
+    assert handler.get_workload_status(args, SETTINGS, clients)["data"]["gitops_managed"] is False
+    settings = dataclasses.replace(SETTINGS, gitops_markers=("app.kubernetes.io/instance",))
+    assert handler.get_workload_status(args, settings, clients)["data"]["gitops_managed"] is True
 
 
 def test_status_handles_empty_status(clients):
@@ -521,18 +549,12 @@ def test_plan_budget_counts_applies_of_plans_created_before_the_window(clients, 
     assert plan_error(clients) == "object_budget_exceeded"
 
 
-def test_plan_rate_limit(clients, table):
-    for i in range(19):
+def test_plan_rate_is_no_longer_limited(clients, table):
+    # The plan rate limit was removed; its preflight entry stays, skipped, for one release.
+    for i in range(30):
         seed(table, 2, 3, NOW - 500 + i)
-    assert plan(clients)["ok"] is True  # the 20th plan in the window
-    assert plan_error(clients) == "plan_rate_limited"
-
-
-def test_plan_rate_limit_window_edge(clients, table):
-    seed(table, 2, 3, NOW - SETTINGS.plan_rate_window_seconds)
-    for i in range(19):
-        seed(table, 2, 3, NOW - 10 - i)
-    assert plan(clients)["ok"] is True
+    data = plan(clients)["data"]
+    assert {"check": "plan_rate", "passed": True, "skipped": True} in data["preflight"]
 
 
 def test_plan_rejects_manual_change(clients, table):
@@ -928,7 +950,7 @@ def test_request_approval_within_the_cooldown_notifies_once(approvals):
 
 
 def test_request_approval_global_limit(approvals):
-    settings = dataclasses.replace(APPROVAL_SETTINGS, approval_request_limit=1, plan_rate_limit=50)
+    settings = dataclasses.replace(APPROVAL_SETTINGS, approval_request_limit=1)
     first = plan(approvals)["data"]["plan_id"]
     second = plan(approvals)["data"]["plan_id"]
     request(approvals, first, settings=settings)
@@ -1363,7 +1385,7 @@ def test_restart_plan_refuses_a_paused_rollout(clients, table):
 
 def test_restart_plan_refuses_gitops_managed(clients):
     clients.apps.read_namespaced_deployment.return_value = deployment(
-        labels={"app.kubernetes.io/instance": "x"}
+        labels={"helm.toolkit.fluxcd.io/name": "x"}
     )
     assert restart_error(clients) == "gitops_managed"
 
@@ -1951,13 +1973,13 @@ def test_identity_plan_reports_the_agent_checks_in_preflight(clients, caller):
     checks = [c["check"] for c in preflight]
     assert checks[:3] == ["arguments", "agent_enabled", "namespace_allowed"]
     assert checks[-2:] == ["global_budget", "agent_budget"]
-    assert all("skipped" not in c for c in preflight)
+    assert all("skipped" not in c for c in preflight if c["check"] != "plan_rate")
 
 
 def test_legacy_plan_reports_the_agent_checks_as_skipped(clients):
     preflight = plan(clients)["data"]["preflight"]
     skipped = [c["check"] for c in preflight if c.get("skipped")]
-    assert skipped == ["agent_enabled", "agent_budget"]
+    assert skipped == ["agent_enabled", "plan_rate", "agent_budget"]
     assert all(c["passed"] for c in preflight)
 
 

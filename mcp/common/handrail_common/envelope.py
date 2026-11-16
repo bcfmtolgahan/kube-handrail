@@ -65,6 +65,9 @@ ERROR_CODES = frozenset(
         INTERNAL,
     }
 )
+# Still accepted by err() and listed in mcp/CONTRACT.md for one release, but never emitted:
+# the plan rate limit was removed. Agent guidance does not list these.
+DEPRECATED_ERROR_CODES = frozenset({PLAN_RATE_LIMITED})
 
 Envelope = dict[str, Any]
 

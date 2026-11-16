@@ -1,0 +1,28 @@
+# Argo CD with annotation tracking (application.resourceTrackingMethod: annotation, the
+# default since Argo CD 3.0): the tracking id is <app>:<group>/<kind>:<namespace>/<name>.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: shop
+  labels:
+    app.kubernetes.io/name: checkout
+    app.kubernetes.io/instance: checkout
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: checkout-1.4.2
+  annotations:
+    argocd.argoproj.io/tracking-id: "shop-checkout:apps/Deployment:shop/checkout"
+    deployment.kubernetes.io/revision: "12"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: checkout
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: checkout
+    spec:
+      containers:
+        - name: checkout
+          image: registry.example.com/shop/checkout:1.4.2

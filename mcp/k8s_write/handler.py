@@ -312,9 +312,9 @@ def check_same_object(plan: Plan, deployment: Any) -> None:
         )
 
 
-def check_not_gitops_managed(deployment: Any) -> None:
+def check_not_gitops_managed(deployment: Any, gitops_markers: tuple[str, ...]) -> None:
     """Re-run guard check 4: a label-only change does not bump generation."""
-    if is_gitops_managed(deployment):
+    if is_gitops_managed(deployment, gitops_markers):
         raise GuardError(GITOPS_MANAGED, "deployment is managed by GitOps; change it in Git")
 
 
@@ -357,10 +357,10 @@ def check_record_matches(
         raise GuardError(PLAN_MISMATCH, "the plan record does not match the arguments")
 
 
-def check_target(plan: Plan, deployment: Any) -> None:
+def check_target(plan: Plan, deployment: Any, gitops_markers: tuple[str, ...]) -> None:
     """All checks on the live Deployment; run before every patch attempt."""
     check_same_object(plan, deployment)
-    check_not_gitops_managed(deployment)
+    check_not_gitops_managed(deployment, gitops_markers)
     check_spec_unchanged(plan, deployment)
 
 
@@ -382,10 +382,11 @@ def _patch(
     args: Mapping[str, Any],
     correlation_id: str | None,
     after_first_check: Callable[[Any], None],
+    gitops_markers: tuple[str, ...],
 ) -> Any:
     for attempt in range(1, PATCH_ATTEMPTS + 1):
         deployment = _read(apps, plan.namespace, plan.name)
-        check_target(plan, deployment)
+        check_target(plan, deployment, gitops_markers)
         extra = action.extra_checks(apps, plan, deployment)
         if attempt == 1:
             # A retry only follows a 409 on an unchanged spec, so history is checked once.
@@ -456,6 +457,7 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
             request,
             correlation_id,
             lambda deployment: check_breaker(rt, action, plan, deployment, override, now),
+            s.gitops_markers,
         )
     except GuardError as exc:
         _record(rt, plan_id, exc.code, correlation_id)
@@ -521,7 +523,6 @@ def _scale_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now
         rt.settings,
         plan.replicas_from,
         plan.replicas_to,
-        plan_rate=False,
         last_applied=last_applied,
     )
 
@@ -574,7 +575,6 @@ def _restart_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, n
         rt.settings,
         plan.replicas_from,
         plan.replicas_to,
-        plan_rate=False,
         last_applied=last_applied_plan(rt.store, deployment),
     )
 
@@ -663,7 +663,6 @@ def _rollback_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, 
         rt.settings,
         plan.replicas_from,
         plan.replicas_to,
-        plan_rate=False,
         last_applied=last_applied,
     )
 
@@ -793,7 +792,12 @@ def revert_record(rt: Runtime, plan: Plan, now: int) -> Plan:
 
 
 def _patch_revert(
-    apps: k8s.AppsV1Api, plan: Plan, revert: Plan, deployment: Any, correlation_id: str | None
+    apps: k8s.AppsV1Api,
+    plan: Plan,
+    revert: Plan,
+    deployment: Any,
+    correlation_id: str | None,
+    gitops_markers: tuple[str, ...],
 ) -> Any:
     """Patch replicas back to the parent's revert_to, only on the spec the parent's
     apply left: same uid, still annotated with the parent, generation + 1, replicas_to (the
@@ -807,7 +811,7 @@ def _patch_revert(
             return deployment
         if last_plan_id(deployment) != plan.plan_id:
             raise GuardError(CONFLICT, "Deployment changed since the apply it would revert")
-        check_target(revert, deployment)
+        check_target(revert, deployment, gitops_markers)
         body = scale_patch(
             revert.replicas_to,
             deployment.metadata.resource_version,
@@ -868,7 +872,9 @@ def _revert(rt: Runtime, plan: Plan, now: int, deployment: Any) -> dict[str, Any
     rt.store.create_revert(revert)
     correlation_id = current_correlation_id()
     try:
-        updated = _patch_revert(rt.apps(), plan, revert, deployment, correlation_id)
+        updated = _patch_revert(
+            rt.apps(), plan, revert, deployment, correlation_id, rt.settings.gitops_markers
+        )
     except GuardError as exc:
         _record(rt, revert.plan_id, exc.code, correlation_id)
         return _revert_state(verify.REVERT_REFUSED, exc.code, now, revert.plan_id)

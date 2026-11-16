@@ -28,6 +28,32 @@ output "agent_kill_switch_parameters" {
   value       = { for name, p in aws_ssm_parameter.agent_enabled : name => p.name }
 }
 
+output "plan_ttl_seconds" {
+  description = "Seconds a plan stays valid (PLAN_TTL_SECONDS): plan_ttl_seconds, or the approval_mode default when it is null."
+  value       = local.plan_ttl
+}
+
+output "guard_settings" {
+  description = "The guard settings the tool Lambdas run with, for tests (tests/e2e/e2e_gateway.py reads them) and operators. No secrets."
+  value = {
+    name_prefix                = var.name_prefix
+    approval_mode              = var.approval_mode
+    plan_ttl_seconds           = local.plan_ttl
+    apply_cooldown_seconds     = var.apply_cooldown_seconds
+    flap_window_seconds        = var.flap_window_seconds
+    object_hourly_apply_budget = var.object_hourly_apply_budget
+    global_hourly_apply_budget = var.global_hourly_apply_budget
+    agent_hourly_apply_budget  = var.agent_hourly_apply_budget
+    agent_budgets              = { for name, agent in var.agents : name => coalesce(agent.hourly_apply_budget, var.agent_hourly_apply_budget) }
+    min_replicas               = var.min_replicas
+    max_replicas               = var.max_replicas
+    max_replica_step_percent   = var.max_replica_step_percent
+    verify_enabled             = var.verify_enabled
+    verify_window_min_seconds  = var.verify_window_min_seconds
+    gitops_markers             = var.gitops_markers
+  }
+}
+
 output "plans_table_name" {
   description = "DynamoDB table holding plans."
   value       = aws_dynamodb_table.plans.name
@@ -91,4 +117,9 @@ output "audit_bucket_name" {
 output "audit_dlq_url" {
   description = "SQS queue that receives plan stream records the audit Lambda gave up on, or null when audit_enabled is false."
   value       = one(aws_sqs_queue.audit_dlq[*].url)
+}
+
+output "dashboard_name" {
+  description = "CloudWatch dashboard of the tools, the sentinel, the verifier and the audit record, or null when the sentinel is disabled."
+  value       = one(aws_cloudwatch_dashboard.this[*].dashboard_name)
 }

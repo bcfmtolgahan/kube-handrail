@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, item 2 (rollback by exact revision) is implemented and tested on a test cluster, item 3 (per-agent identity, budgets and kill switch) is implemented and tested on a test cluster, item 4 (verify and revert) is implemented and tested on a test cluster, and items 5 (change freezes and admission policy) and 6 (durable audit record), narrowed to what a production deployment needs, are implemented and tested on a test cluster. With that, Milestone 2 is complete; the deferred parts are listed at its end. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, item 2 (rollback by exact revision) is implemented and tested on a test cluster, item 3 (per-agent identity, budgets and kill switch) is implemented and tested on a test cluster, item 4 (verify and revert) is implemented and tested on a test cluster, and items 5 (change freezes and admission policy) and 6 (durable audit record), narrowed to what a production deployment needs, are implemented and tested on a test cluster. With that, Milestone 2 is complete; the deferred parts are listed at its end. Milestone 3 is implemented and tested on a test cluster, except the end-to-end test profile and `--reset-counters`. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -231,23 +231,74 @@ These move to "Later ideas":
 
 **Done when (milestone):** a degraded change is detected and, if approved with revert, reverted; a rollback to a named revision applies exactly that template; a freeze refuses changes and the cluster refuses a write outside the bounds; and each change can be exported with its approval chain from a record the executor cannot alter.
 
-## Milestone 3: Prometheus SLO tools and alert-triggered investigations
+## Milestone 3: Quick wins and guard rails (implemented and tested on a test cluster)
 
-**Goal:** fill the gap for self-hosted Prometheus and start investigations from existing alerts.
+**Goal:** fix what users hit first (Helm releases refused as GitOps, a plan TTL too short to approve in chat, slow end-to-end runs, no release process) and put tests around the agent guidance before it is shortened.
 
-- SLO status with multi-window burn rate, golden signals and firing alerts, returning an explicit "unknown" when Prometheus is unreachable.
-- An Alertmanager-to-DevOps Agent webhook trigger with deduplication, signing, throttling and a sanitized snapshot. ([Webhook docs](https://docs.aws.amazon.com/devopsagent/latest/userguide/configuring-integrations-and-knowledge-invoking-devops-agent-through-webhook.html))
+- GitOps ownership by controller markers: the Argo CD tracking-id annotation and the Flux kustomize and helm labels; `app.kubernetes.io/instance` alone no longer counts, and `gitops_markers` restores it for Argo CD label tracking ([Guards](guards.md#gitops-ownership)).
+- Plan TTL by approval mode (900 s in `client`, 300 s otherwise), capped at 3600 s.
+- The plan rate limit removed; `plan_rate_limited` stays in the contract for one release, never returned.
+- A test profile (`terraform/test.tfvars.example`), `e2e_gateway.py --reset-counters` for test deployments, and test values read from `terraform output`.
+- Guidance sync tests: the `AGENTS.md` tables against the tool schemas and error codes, tool and argument names in the skills, contract links, word-count ceilings.
+- [CHANGELOG.md](../CHANGELOG.md) and [Releasing](releasing.md) (semver, supported versions, one tool schema batch per release).
+- A CloudWatch dashboard and a shadow-mode recipe ([deploy](deploy.md#shadow-mode)); approval mode guidance ([deploy](deploy.md#approval-mode)).
 
-**Done when:** burn-rate math passes golden-value tests, and a crash-looping workload starts one investigation (not several) shortly after its alert fires.
+**Done when:** a Helm-only Deployment is not GitOps-managed and a Flux one is refused; a client-mode plan's `expires_at - created_at` is 900 on a test deployment; the e2e budget cases pass without waiting for the clock hour; the sync tests run in CI.
 
-## Milestone 4: Node triage and change correlation
+## Milestone 4: Simplify, then make upgrades one command
 
-**Goal:** summarizing read tools that help an agent connect symptoms to causes.
+**Goal:** remove the optional modes and turn the multi-step manual upgrade into one resumable command.
 
-- Node triage: unhealthy nodes, conditions, taints, resource pressure, failing pods.
-- Change correlation: recent rollouts, image changes and GitOps history in one timeline.
+- Remove legacy mode (`caller_interceptor_enabled = false`) and the `verify_enabled` switch, with `moved` blocks so existing deployments only see moves.
+- `make upgrade` (`scripts/upgrade.py`): preflight on the kill switch, a `terraform plan -json` safety check against deletes of the gateway, Cognito, the plan table or the audit bucket, known two-step migrations, `enable-write` only when the tool set changed, a sentinel run, `install-guidance` when the guidance changed, and the smoke test; resumable.
 
-**Done when:** nodes under pressure or tainted are summarized correctly, and a bad rollout appears in the timeline before the alert it caused.
+**Done when:** on the test deployment `terraform plan` shows only moves, and `make upgrade` runs end to end.
+
+## Milestone 5: CI tier 1 with kind and moto
+
+**Goal:** catch guard regressions on every pull request instead of only on a shared cluster.
+
+- An integration harness on kind with impersonated reader and writer groups and moto for DynamoDB, SSM and S3, calling the Lambda handlers in process; most end-to-end scenarios move there. Live runs keep only Cognito, the gateway interceptor, the DevOps Agent association, EKS access entries and VPC networking.
+
+**Done when:** the integration job is green on every pull request in under 10 minutes.
+
+## Milestone 6: Several namespaces, with policy and approvers per namespace
+
+**Goal:** point kube-handrail at real service namespaces.
+
+- `var.namespaces`: per namespace replica bounds, allowed actions, optional approvers and GitOps markers, packaged with the Lambdas (not SSM); empty keeps today's single sandbox namespace.
+- Approvers per namespace (optional; where set, only they may approve there).
+- RBAC and one admission policy rendered from the same policy, and a plan-time check that the cluster's admission policy matches it (a narrow ClusterRole reads the policy and its binding).
+
+**Done when:** in a two-namespace test, an action allowed in one namespace is refused in the other, the wrong namespace's approver is refused, and a binding switched to `Warn` makes plans `conflict`.
+
+## Milestone 7: Shorter docs and agent context
+
+**Goal:** about 30,000 words of documentation instead of 52,000, and about 2,600 words of agent context instead of 4,700.
+
+- `mcp/CONTRACT.md` as a reference of at most 6,500 words, with appendices; `AGENTS.md` at most 1,200 words with every "Never" rule kept; each skill at most 800 words; a quickstart.
+- The word-count ceilings of the Milestone 3 sync tests lowered to these targets.
+
+**Done when:** the sync tests pass with the new ceilings, and a before/after live chat comparison shows no change in behaviour.
+
+## Milestone 8: Tool schema release #1 (HPA, health checks, change reference)
+
+**Goal:** act on real workload capacity and verify changes by application health, in one schema release: one `enable-write`, one `install-guidance`.
+
+- `plan_adjust_hpa` / `apply_adjust_hpa`, with its own record fields, blast radius on the resulting pod change, verification and automatic revert.
+- `health_check` v1, CloudWatch only: named checks the operator defines, pinned in the plan, with `degraded` and revert on a regression. SLO and burn-rate checks, planned earlier as Prometheus SLO tools, are checks in this catalog.
+- `change_ref`, an untrusted display-only reference; `both` mode gets a live chat test.
+
+**Done when:** on kind, HPA changes verify and revert; a regressed custom metric reverts a scale-down; the upgrade finishes with one `enable-write`.
+
+## Milestone 9: Approver and executor identity, audit quality
+
+**Goal:** answer "who approved, who applied" honestly.
+
+- The chat approval in `client` mode cannot be bound to a plan (see Open questions), so the audit-grade approver is the server approval in `server` and `both` mode; this is documented, and no CloudTrail correlation is built.
+- `approval_mode` on the plan record; `scripts/audit.py verify` flags records consumed without an approver, on the wrong channel or rewritten by the executor; a User-Agent with plan and correlation ID for matching against the EKS audit log.
+
+**Done when:** `audit.py verify` reports nothing after an end-to-end run.
 
 ## Later ideas
 
@@ -263,6 +314,10 @@ Not committed; listed for discussion.
 - Moving the scheduled sentinel and sweeper to EventBridge Scheduler.
 - A signed, hash-chained audit ledger with write-once approval receipts, automatic detection of unexpected plan-record transitions, and offline verification of an export ([ADR 0007](adr/0007-durable-audit-record.md), alternative A).
 - A single policy file compiled to Cedar at the gateway and to the admission policy, with a CI check that the layers agree, and a break-glass path with a ticket and two approvers.
+- Prometheus and Amazon Managed Service for Prometheus as health check backends (after the CloudWatch catalog of Milestone 8 proves its value).
+- An Alertmanager-to-DevOps Agent webhook trigger with deduplication, signing, throttling and a sanitized snapshot. ([Webhook docs](https://docs.aws.amazon.com/devopsagent/latest/userguide/configuring-integrations-and-knowledge-invoking-devops-agent-through-webhook.html))
+- Node triage (unhealthy nodes, conditions, taints, pressure, failing pods) and change correlation (rollouts, image changes and GitOps history in one timeline).
+- StatefulSets; a stdio proxy and a second client guide; a nightly end-to-end run on real AWS; prebuilt Lambda packages; a fleet (multi-cluster) guide.
 
 ## Open questions
 
@@ -272,9 +327,12 @@ These are unverified and may change the design.
 - **Persistence of tool classification.** Whether `MUTATIVE` / `READ_ONLY` classifications survive infrastructure-as-code updates of the MCP server association, given that unclassified tools default to `READ_ONLY`. Partly answered: a Terraform update of a gateway target (a changed tool description) left the association's classifications unchanged; an update of the association itself replaces its whole configuration, which is why `enable-write` writes every tool explicitly and the drift sentinel watches it. ([Directed actions](https://docs.aws.amazon.com/devopsagent/latest/userguide/working-with-devops-agent-working-with-directed-actions.html))
 - **Conditional Cedar policies and tool listing.** How argument-conditioned `permit` and `forbid` policies affect which tools appear in `tools/list`. ([Action-scoped policies](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html))
 - **DevOps Agent tool limits.** The per-call timeout and response size limit for custom MCP tools, which determine output and time budgets.
-- **Flux ownership detection.** Which labels or annotations reliably identify Flux-managed objects, so they can be blocked like Argo CD-managed ones.
 - **DevOps Agent approval reference.** Whether the approval reference that DevOps Agent requires for `MUTATIVE` calls reaches the gateway. If it does, it could be recorded as evidence; it would not be used as a gate ([ADR 0002](adr/0002-server-verified-approval.md)).
 - **CloudTrail data events as executor identity.** Whether CloudTrail DynamoDB data events on the plan table can show the principal that consumed a plan, so that the executor identity of a change is observed rather than attributed by construction (Milestone 2, item 6).
+
+Answered by the identity spike for Milestone 9 (S0): CloudTrail records a DevOps Agent chat approval (`UpdateApprovalAction`) as a management event with the approver's IAM identity, but redacts every tool argument, the plan ID included, and the request carries no approval ID. A `client`-mode approval can therefore be matched to a plan only by time, not bound to it; the audit-grade approver is the server approval (`server` or `both`), and `client` is an evaluation and convenience mode ([deploy](deploy.md#approval-mode)).
+
+Answered by Milestone 3: Flux-managed objects carry the kustomize-controller labels `kustomize.toolkit.fluxcd.io/name` and `/namespace`, or the helm-controller labels `helm.toolkit.fluxcd.io/name` and `/namespace`; they are refused like Argo CD-managed ones (implemented from the Flux documentation and tested on a test cluster with the labels set by hand, not with a running Flux).
 
 Answered by Milestone 1, item 6: a gateway REQUEST interceptor can pass verified caller claims (the OAuth `client_id`) to the tool Lambdas, and a client cannot spoof them. A gateway has one REQUEST and one RESPONSE interceptor at most ([Interceptor types](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html)).
 

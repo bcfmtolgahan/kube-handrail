@@ -12,6 +12,22 @@ Three independent checks stand between an agent and a Deployment; each assumes t
 
 The policy checks only the replica bounds. It does not check the pod template, the approval or the history, which need state that only the guard has.
 
+## Approval modes
+
+The approval is a guard only when the server checks it. In `server` (the default) and `both` mode the write Lambda refuses an apply without an unexpired approval, by a listed human other than the requester, of exactly the planned arguments, and records that human on the plan. In `client` mode the only approval is the client's (the DevOps Agent chat): the server requires none and cannot bind it to a plan, because CloudTrail records the chat approval with every argument, the plan ID included, redacted. Use `server`, or `both` with DevOps Agent in production; `client` is for evaluation ([deploy](deploy.md#approval-mode)).
+
+## Plan lifetime
+
+A plan is valid for `PLAN_TTL_SECONDS`. When `plan_ttl_seconds` is not set, Terraform picks 900 seconds in `client` mode, where the human reads the plan and approves it in the DevOps Agent chat with nothing to extend it, and 300 seconds in `server` and `both` mode, where `request_approval` extends it to `approval_wait_ttl_seconds`. The TTL is capped at 3600 (tested on a test cluster: 900 seconds in `client` mode, 300 in `server` mode).
+
+The TTL is not a guard, and a longer one does not mean 15 minutes in which anything goes. It only bounds how long an approval can refer to a plan. Apply checks the live object again whatever the plan's age: the same `uid` and `generation` and the planned replica count (`conflict` otherwise), the per-object and global budgets, the cooldown and flapping rules, the change freezes and the kill switches. A plan that has gone stale is refused at apply, not applied.
+
+## GitOps ownership
+
+An object a GitOps controller owns is changed in Git, not here: plan and apply refuse it with `gitops_managed`. The markers are the ones the controllers set: the Argo CD annotation `argocd.argoproj.io/tracking-id`, and the Flux labels `kustomize.toolkit.fluxcd.io/name|namespace` and `helm.toolkit.fluxcd.io/name|namespace`. Malformed metadata counts as managed.
+
+`app.kubernetes.io/instance` alone is not a marker: Helm sets it on every release, and treating it as GitOps refused every Helm-installed Deployment. Argo CD's label tracking writes only that label, so a team using it adds it to `gitops_markers` (any label or annotation key listed there counts as a marker). This changed in the current release; before it, the label was a default marker. Tested on a test cluster with the labels and annotation set by hand. Details: [guard check 4](../mcp/CONTRACT.md#guard-checks).
+
 ## Blast-radius budget
 
 A single plan may change a Deployment's replica count by at most `MAX_REPLICA_STEP_PERCENT` (default 100) of its current count, rounded up and never less than 1. At the default, a Deployment at 1 replica can go to 0 or 2, one at 3 to anything from 0 to 6. A larger change is refused with `blast_radius_exceeded`, both when planning and again when applying, with the setting in force at apply time; an approval does not lift it. Bigger changes take several steps, each of which also passes the oscillation breaker below.
@@ -36,7 +52,7 @@ Two actors who disagree about a Deployment (an agent and a human, or two agents)
 - **Cooldown.** At least `APPLY_COOLDOWN_SECONDS` (default 60) between two applies to one Deployment, so the effect of a change can show before the next one (`cooldown`).
 - **Per-object budget.** At most `OBJECT_HOURLY_APPLY_BUDGET` applies (default 6) to one Deployment in any hour (`object_budget_exceeded`).
 - **Global budget.** At most `GLOBAL_HOURLY_APPLY_BUDGET` applies (default 30) across all Deployments in one clock hour (`global_budget_exceeded`). It caps the damage of many small changes that each pass the per-object checks. Apply counts against it with one atomic update, after every other check has passed.
-- **Plan rate limit.** At most `PLAN_RATE_LIMIT` plans (default 20) for one Deployment in `PLAN_RATE_WINDOW_SECONDS` (default 10 minutes), so an agent stuck in a loop stops at the planning step (`plan_rate_limited`).
+- **No plan rate limit.** Earlier versions also limited plans per Deployment (`plan_rate_limited`). A plan changes nothing, and every apply passes the cooldown, flapping and budget checks above, so the limit added no safety and only slowed tests; it was removed (tested on a test cluster). The code stays in the contract for one release and is never returned.
 - **Manual change.** kube-handrail marks each Deployment it changes with the plan it applied. If the replica count no longer matches that plan, someone changed it by other means, and a plan that would change it again is refused with `manual_change` unless it sets `override_manual_change: true`. The flag is part of the approved arguments, so the approver sees it. A restart undoes no change, so it is not checked. It keeps whatever count it finds, so a later scale still compares against the count kube-handrail set before the restart: a manual change made before a restart is still caught. A rollback is checked against the pod template instead: if kube-handrail's last apply changed the template (a rollback or restart) and the template is no longer the one it left, someone rolled forward since, and rolling back over that needs the override too. After a scale the template rule does not apply: rolling back a deploy made by someone else is what a rollback is for. The mark is an annotation on the Deployment, and `kubectl rollout undo` replaces all of its annotations with those of the revision it restores, so after such an undo the rule may not see kube-handrail's last apply; a roll-forward by `kubectl apply`, Helm or a patch keeps the mark.
 
 A restart or rollback counts like any other apply for the cooldown and the budgets. It leaves the replica count unchanged, so it has no direction: it is never flapping and does not affect the flapping check of later scales. A restart's pod template carries a new annotation each time, so it never reverses anything either. Rolling back and forth between two templates has no flapping rule of its own: every rollback needs a human approval, and the cooldown and the budgets bound how often it can happen.

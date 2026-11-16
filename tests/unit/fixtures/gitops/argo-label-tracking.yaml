@@ -1,0 +1,29 @@
+# Argo CD with label tracking (application.resourceTrackingMethod: label, the default
+# before Argo CD 3.0): Argo CD sets app.kubernetes.io/instance to the application name and
+# nothing else, so the object cannot be told apart from a plain Helm release unless the
+# operator lists app.kubernetes.io/instance in gitops_markers.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments
+  namespace: shop
+  labels:
+    app.kubernetes.io/name: payments
+    app.kubernetes.io/instance: shop-payments
+  annotations:
+    deployment.kubernetes.io/revision: "4"
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"labels":{"app.kubernetes.io/instance":"shop-payments"},"name":"payments","namespace":"shop"}}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payments
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payments
+    spec:
+      containers:
+        - name: payments
+          image: registry.example.com/shop/payments:2.0.1

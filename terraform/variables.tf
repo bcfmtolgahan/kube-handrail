@@ -45,13 +45,24 @@ variable "max_replicas" {
 }
 
 variable "plan_ttl_seconds" {
-  description = "Seconds a plan stays valid."
+  description = "Seconds a plan stays valid, at most 3600. null (the default) picks by approval_mode: 900 in client mode, where the human approves in the chat after reading the plan, and 300 in server and both mode, where request_approval extends it to approval_wait_ttl_seconds."
   type        = number
-  default     = 300
+  default     = null
 
   validation {
-    condition     = var.plan_ttl_seconds > 0
-    error_message = "plan_ttl_seconds must be positive."
+    condition     = var.plan_ttl_seconds == null || try(var.plan_ttl_seconds > 0 && var.plan_ttl_seconds <= 3600 && floor(var.plan_ttl_seconds) == var.plan_ttl_seconds, false)
+    error_message = "plan_ttl_seconds must be null or an integer from 1 to 3600."
+  }
+}
+
+variable "gitops_markers" {
+  description = "Label or annotation keys that mark a Deployment as GitOps-managed, in addition to the defaults (the Argo CD tracking-id annotation and the Flux kustomize and helm controller labels). A Deployment with any of these keys, as a label or an annotation, is refused with gitops_managed. Add \"app.kubernetes.io/instance\" when Argo CD uses label tracking; it is not a default because Helm sets it on every release."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for key in var.gitops_markers : can(regex("^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$", key))])
+    error_message = "gitops_markers must be Kubernetes label or annotation keys, such as app.kubernetes.io/instance."
   }
 }
 
@@ -77,26 +88,18 @@ variable "object_hourly_apply_budget" {
   }
 }
 
+# Deprecated and ignored: the plan rate limit was removed. Kept one release so existing
+# tfvars still plan; the check "deprecated_plan_rate" in main.tf warns while either is set.
 variable "plan_rate_limit" {
-  description = "Plans allowed per Deployment in plan_rate_window_seconds."
+  description = "Deprecated, ignored: the plan rate limit was removed. Remove it from your tfvars."
   type        = number
-  default     = 20
-
-  validation {
-    condition     = var.plan_rate_limit > 0 && floor(var.plan_rate_limit) == var.plan_rate_limit
-    error_message = "plan_rate_limit must be a positive integer."
-  }
+  default     = null
 }
 
 variable "plan_rate_window_seconds" {
-  description = "Window for plan_rate_limit."
+  description = "Deprecated, ignored: the plan rate limit was removed. Remove it from your tfvars."
   type        = number
-  default     = 600
-
-  validation {
-    condition     = var.plan_rate_window_seconds > 0 && floor(var.plan_rate_window_seconds) == var.plan_rate_window_seconds
-    error_message = "plan_rate_window_seconds must be a positive integer."
-  }
+  default     = null
 }
 
 variable "apply_cooldown_seconds" {

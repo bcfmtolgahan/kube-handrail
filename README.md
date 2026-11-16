@@ -82,7 +82,7 @@ A remediation follows this sequence:
   - Kubernetes RBAC with separate reader and writer identities, writer bound only to allowlisted namespaces
   - Server-verified approval, pinned to the plan's arguments (`server` and `both` mode)
   - Client-side approval (DevOps Agent directed actions)
-- **GitOps-aware.** Resources managed by Argo CD (and Flux, once its ownership markers are validated) are not modified; the plan returns the error `gitops_managed`. ([Argo CD resource tracking](https://argo-cd.readthedocs.io/en/stable/user-guide/resource_tracking/))
+- **GitOps-aware.** Resources managed by Argo CD (the `argocd.argoproj.io/tracking-id` annotation) or Flux (its kustomize and helm controller labels) are not modified; the plan returns the error `gitops_managed`. A Helm release on its own is not GitOps. Argo CD label tracking writes only `app.kubernetes.io/instance`, which Helm sets too, so a team using it lists that label in `gitops_markers` ([Argo CD resource tracking](https://argo-cd.readthedocs.io/en/stable/user-guide/resource_tracking/), [Flux](https://fluxcd.io/flux/components/kustomize/kustomizations/)).
 - **No delete-class tools.** No delete, no generic `apply_yaml`. The actions are scale, restart and rollback by exact revision of Deployments. A rollback writes only the template of a ReplicaSet the Deployment controls, re-read and hash-checked at apply.
 - **Tool output is untrusted.** In the tool Lambdas (the gateway interceptor in the diagram is not used for this), text from the cluster that anyone with write access can set (condition and event reasons and messages, container images and change-causes today; logs and alert annotations once there are tools for them) is stripped of control and format characters, redacted for common secret patterns, cut to a field limit with an explicit marker, and wrapped in `<untrusted>...</untrusted>`; list responses have a size limit. The delimiters are a hint to the model, not a security boundary: the boundary is that read tools change nothing and every change needs a human approval pinned to its arguments. See [Untrusted output](mcp/CONTRACT.md#untrusted-output). ([OWASP LLM01](https://genai.owasp.org/llmrisk/llm01-prompt-injection/))
 - **Bounded blast radius.** A kill switch in SSM Parameter Store, a maximum step per change (`MAX_REPLICA_STEP_PERCENT` of the current replica count, enforced whatever the approval says), a per-object cooldown, and per-object and global hourly apply budgets. Per agent, an hourly apply budget and a kill switch of its own.
@@ -112,6 +112,12 @@ Milestone 2, item 5 (change freezes): an operator sets windows in which plans an
 Milestone 2, item 4 (verify and revert): plans take a verification window and, for a scale, `revert_on_failure`, pinned in the approval; the apply schedules the check, a scheduled verifier runs it through an internal entry point of the write Lambda, `get_plan_outcome` reports `healthy`, `degraded` or `unknown`, and a degraded change approved with revert is reverted under the spec-level precondition. Implemented and tested on a test cluster. See [Verification and revert](mcp/CONTRACT.md#verification-and-revert).
 
 Milestone 2, item 6 (durable audit record): every change to a plan record is written once, from the plan table's stream, to an S3 bucket with Object Lock that the tool Lambdas cannot write to, and `scripts/audit.py export` shows a plan's requesting agent, approver, channel, result, verification and revert. Implemented and tested on a test cluster. See [Audit record](mcp/CONTRACT.md#audit-record).
+
+Milestone 3 (quick wins and guard rails): GitOps ownership by controller markers (Helm releases are no longer refused, Flux-managed objects are), the plan TTL by approval mode, the plan rate limit removed, faster end-to-end runs, guidance sync tests, a release process and a dashboard. Implemented and tested on a test cluster. See [CHANGELOG.md](CHANGELOG.md).
+
+**Which approval mode.** `server` is the default and the mode for an audit-grade record of who approved. With DevOps Agent in production, use `both`: the chat approval stays the agent's flow and the server approval is the record. `client` is an evaluation and convenience mode: the chat approval cannot be bound to a plan (CloudTrail records the approver but redacts the plan ID), so the approver is best-effort. See [Approval mode](docs/deploy.md#approval-mode).
+
+**Supported versions** and the release rules are in [Releasing](docs/releasing.md): Kubernetes 1.30 or later for the admission policy, Terraform 1.5 or later with the AWS provider pinned in `terraform/versions.tf`.
 
 ## Planned layout
 
@@ -148,12 +154,13 @@ AGENTS.md        tool contract for MCP clients
 - [ADR 0007: Durable audit record](docs/adr/0007-durable-audit-record.md) - a write-once record of every plan change, outside the executor's reach
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
 - [Deploying to a new account](docs/deploy.md) - prerequisites, names, RBAC, networking for clusters with a private endpoint, and the order of steps
-- [Guards](docs/guards.md) - blast-radius budget, impact preview, what a rollback trusts, the oscillation breaker (flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks), the per-agent budget and kill switch, and verify and revert
+- [Guards](docs/guards.md) - plan lifetime, GitOps ownership, blast-radius budget, impact preview, what a rollback trusts, the oscillation breaker (flapping, cooldown, per-object and global budgets and manual-change checks), the per-agent budget and kill switch, and verify and revert
 - [Drift sentinel](mcp/CONTRACT.md#drift-sentinel) - what it checks, outcomes, and how to restore remediation after drift
 - [Server-side approval](mcp/CONTRACT.md#server-side-approval) - approval modes, `request_approval`, the approval API and who can approve
 - [Observability](mcp/CONTRACT.md#observability) - correlation IDs, the per-call tool record and its metrics, and the internal error alarm
 - [Untrusted output](mcp/CONTRACT.md#untrusted-output) - how text from the cluster is cleaned and wrapped before an agent sees it, and why that is a hint rather than a boundary
 - [Roadmap](docs/roadmap.md) - milestones and open questions
+- [CHANGELOG.md](CHANGELOG.md) and [Releasing](docs/releasing.md) - what changed in each release, semver policy, supported versions and the one-schema-batch-per-release rule
 
 ## Contributing
 

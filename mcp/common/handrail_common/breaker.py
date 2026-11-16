@@ -15,7 +15,6 @@ from handrail_common.envelope import (
     FLAPPING,
     MANUAL_CHANGE,
     OBJECT_BUDGET_EXCEEDED,
-    PLAN_RATE_LIMITED,
 )
 from handrail_common.plans import RESULT_APPLIED, HistoryEntry, Plan, PlanStore
 from handrail_common.validation import GuardError
@@ -36,7 +35,6 @@ def retention_seconds(settings: Settings) -> int:
     window = max(
         BUDGET_WINDOW_SECONDS,
         settings.flap_window_seconds,
-        settings.plan_rate_window_seconds,
         settings.apply_cooldown_seconds,
     )
     verify = (
@@ -135,21 +133,6 @@ def check_cooldown(entries: Sequence[HistoryEntry], now: int, cooldown: int) -> 
         )
 
 
-def check_plan_rate(entries: Sequence[HistoryEntry], now: int, window: int, limit: int) -> None:
-    created = [e for e in entries if _within(e.created_at, now, window)]
-    if len(created) >= limit:
-        raise GuardError(
-            PLAN_RATE_LIMITED,
-            f"{len(created)} plans for this object in the last {window} s; the limit is {limit}",
-            {
-                "window_seconds": window,
-                "limit": limit,
-                "count": len(created),
-                "history": _history(applied_within(entries, now, window)),
-            },
-        )
-
-
 def with_last_applied(entries: Sequence[HistoryEntry], plan: Plan, now: int) -> list[HistoryEntry]:
     """The history with the plan the Deployment's last-plan annotation names counted as applied.
 
@@ -178,10 +161,9 @@ def check_history(
     replicas_from: int,
     replicas_to: int,
     *,
-    plan_rate: bool,
     last_applied: Plan | None = None,
 ) -> None:
-    """Cooldown, flapping and the hourly budget, plus the plan rate limit when `plan_rate` is set.
+    """Cooldown, flapping and the hourly budget, on plan and on apply.
 
     `last_applied` is the plan named by the Deployment's annotation (last_applied_plan); it
     is merged into the history so the most recent apply is never missed.
@@ -192,8 +174,6 @@ def check_history(
     check_cooldown(entries, now, settings.apply_cooldown_seconds)
     check_flapping(entries, now, settings.flap_window_seconds, replicas_from, replicas_to)
     check_object_budget(entries, now, settings.object_hourly_apply_budget)
-    if plan_rate:
-        check_plan_rate(entries, now, settings.plan_rate_window_seconds, settings.plan_rate_limit)
 
 
 def last_plan_id(deployment: Any) -> str | None:
