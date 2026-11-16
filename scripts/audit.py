@@ -8,12 +8,38 @@ agent, the approver, the channel the apply ran under, the result, and the verifi
 revert outcome. A plan's revert record, or the plan a revert record undid, is included under
 `linked`.
 
-`verify` checks a plan's entries for what the record should never show: a change after the
-consume to anything but the result, verification and revert (the executor-rewrite pattern),
-an apply on the wrong channel for the plan's approval mode, an apply without a server
-approval in server or both mode, a missing creation, gaps and deletions. In client mode the
-approval is the client's, which the record cannot see: such applies are reported as
-client-unobserved, for information. Exit status 1 when anything but information is found.
+`verify` checks a plan's entries for what no writer of the record produces, and exits 1 on
+any finding (information does not count):
+
+  no_entries, malformed, undecoded, not_plan (a prefix under plans/ that is not a plan id)
+  missing_creation, gap (an entry that does not start where the previous one ended), deleted
+  pre_consume_rewrite   before the consume, a change to an attribute set when the plan was
+                        made (args, args_hash, replicas_*, requested_by, ...)
+  approval_rewrite      approval or rejection attributes written, changed or removed outside
+                        the one decision of an undecided plan, or a decided status undone
+  approval_mode_changed
+  executor_rewrite      the consume writing more than used, channel, verify_at, verify_queue
+                        and revert_to; after it, a change to anything but result, applied_at,
+                        apply_correlation_id, applied_generation, verification, revert and
+                        verify_queue, or one of them written again
+  impossible_consume    a consume the consume's own condition refuses: rejected, expired, or
+                        a plan created consumed
+  invalid_revert        a revert record that is not created consumed by system:revert with a
+                        reverts_plan_id
+  wrong_channel         client and both apply through gateway, server through approval-api or
+                        gateway, a revert record on verifier
+  applied_without_approval  server or both mode, consumed without an approval of the plan's
+                        args_hash by someone other than the requester, through api, unexpired
+  info: client_unobserved   a client-mode apply: the approval was given in the DevOps Agent
+                        chat, which the record cannot see; CloudTrail logs it with the
+                        approver but without the plan id, so look in approval_window by time
+  info: approval_mode_unknown  a record made before approval_mode; --approval-mode MODE
+                        checks it as that mode
+  info: revert_retried  a revert's second run recorded applied over the first's error code
+
+The mode checked is the one recorded on the plan: a deployment whose APPROVAL_MODE changed
+while a plan was open reports that plan against the mode it was planned under. Stream times
+are approximate, so expiries are compared with a margin of a minute.
 
   audit.py export <plan_id> [--out FILE] [--no-links]
   audit.py verify (<plan_id> | --since SECONDS | --all) [--json] [--approval-mode MODE]
@@ -96,10 +122,60 @@ AFTER_CONSUME = frozenset(
 # What the consume itself writes, in the one conditional update (PlanStore.consume).
 CONSUME = frozenset({"used", "channel", "verify_at", "verify_queue", "revert_to"})
 WRITE_ONCE = ("verification", "revert")
+# record_result writes these together, once per plan; a revert record's second run may
+# record `applied` over the error code of the first.
+RESULT_ATTRIBUTES = frozenset(
+    {"result", "applied_at", "apply_correlation_id", "applied_generation"}
+)
+# Set when the plan is made and never written again: no update of the plan store touches
+# them (expires_at is not here: the approval request and both decisions set it).
+PINNED = frozenset(
+    {
+        "action",
+        "namespace",
+        "name",
+        "cluster",
+        "args",
+        "args_hash",
+        "replicas_from",
+        "replicas_to",
+        "resource_version",
+        "generation",
+        "uid",
+        "object_key",
+        "created_at",
+        "retain_until",
+        "requested_by",
+        "agent",
+        "requested_client_id",
+        "override_manual_change",
+        "impact",
+        "images",
+        "fields_changed",
+        "diff_truncated",
+        "template_from",
+        "template_to",
+        "revision_from",
+        "revision_to",
+        "target_rs_name",
+        "target_rs_uid",
+        "verify_window_seconds",
+        "plan_correlation_id",
+        "kind",
+        "reverts_plan_id",
+    }
+)
+DECIDED = ("approved", "rejected")
+REVERT_REQUESTER = "system:revert"
+# Stream times are approximate (whole seconds, another clock than the Lambda's): an expiry
+# is only reported when the consume came this much later.
+CLOCK_MARGIN_SECONDS = 60
 # Written by the approval channel, in the one update that decides.
 APPROVAL_ATTRIBUTES = frozenset(
     {"approved_by", "approved_at", "approved_args_hash", "approval_channel", "approval_expires_at"}
 )
+# ... or by a rejection, in the same way.
+DECISION_ATTRIBUTES = APPROVAL_ATTRIBUTES | {"rejected_by", "rejected_at", "reject_reason"}
 DECIDABLE = ("planned", "awaiting_approval")
 # Severities: a finding fails verify; information does not.
 FINDING, INFO = "finding", "info"
@@ -378,12 +454,27 @@ def consume_index(entries: list[Mapping[str, Any]]) -> int | None:
 
 
 def is_decision(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
-    """The approval channel's update: an undecided plan becomes approved or rejected."""
-    return old.get("status") in DECIDABLE and new.get("status") in ("approved", "rejected")
+    """The approval channel's update: an undecided plan, never decided before, becomes
+    approved or rejected."""
+    return (
+        old.get("status") in DECIDABLE
+        and new.get("status") in DECIDED
+        and old.get("approved_by") is None
+        and old.get("rejected_by") is None
+    )
+
+
+def is_revert(image: Mapping[str, Any]) -> bool:
+    return image.get("kind") == "revert" or image.get("status") == "revert"
+
+
+def is_plain(entry: Mapping[str, Any]) -> bool:
+    return entry.get("image_format", "plain") == "plain"
 
 
 def check_sequence(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Missing creation, gaps between consecutive entries, and deletions."""
+    """Missing creation, gaps between consecutive entries, and deletions. An undecoded entry
+    (reported on its own) is not compared with its neighbours."""
     found = []
     if not any(e.get("event") == "created" for e in entries):
         found.append(
@@ -395,6 +486,13 @@ def check_sequence(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
         )
     previous = None
     for entry in entries:
+        if entry.get("event") == "deleted":
+            found.append(
+                finding("deleted", "the plan record was deleted, not expired", key=entry.get("key"))
+            )
+        if not is_plain(entry):
+            previous = None
+            continue
         old = entry.get("old_image")
         if previous is not None and old is not None and old != previous.get("new_image"):
             found.append(
@@ -406,18 +504,16 @@ def check_sequence(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
                     after=previous.get("key"),
                 )
             )
-        if entry.get("event") == "deleted":
-            found.append(
-                finding("deleted", "the plan record was deleted, not expired", key=entry.get("key"))
-            )
         previous = entry
     return found
 
 
 def check_rewrites(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """The executor-rewrite pattern: after the consume, a change to anything but the result,
-    a second result, a verification or revert written twice; at any time, approval
-    attributes written outside the decision, or a changed approval mode."""
+    """Changes no writer of the record makes. Before the consume: an attribute fixed at
+    creation, or a decision written, changed or undone outside the one decision. The consume
+    changing more than it writes. After it (the executor-rewrite pattern): a change to
+    anything but the result, verification and revert, or one of them written again. At any
+    time: a changed approval mode."""
     found = []
     consumed = consume_index(entries)
     for index, entry in enumerate(entries):
@@ -425,81 +521,163 @@ def check_rewrites(entries: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
             continue
         old, new = entry.get("old_image") or {}, entry.get("new_image") or {}
         names = changed(old, new)
-        if index == consumed and names - CONSUME:
+        key = entry.get("key")
+        if "approval_mode" in names:
             found.append(
                 finding(
-                    "executor_rewrite",
-                    "the consume changed more than it writes (used, channel, verify_at, "
-                    "verify_queue, revert_to)",
-                    key=entry.get("key"),
-                    changed=sorted(names - CONSUME),
-                    rewritten=[],
+                    "approval_mode_changed",
+                    "the plan's approval mode changed after it was planned",
+                    key=key,
+                    before=old.get("approval_mode"),
+                    after=new.get("approval_mode"),
                 )
             )
+            names.discard("approval_mode")
+        if index == consumed:
+            if names - CONSUME:
+                found.append(
+                    finding(
+                        "executor_rewrite",
+                        "the consume changed more than it writes (used, channel, verify_at, "
+                        "verify_queue, revert_to)",
+                        key=key,
+                        changed=sorted(names - CONSUME),
+                        rewritten=[],
+                    )
+                )
             continue
         if consumed is not None and index > consumed:
             unexpected = sorted(names - AFTER_CONSUME)
-            again = sorted(n for n in WRITE_ONCE if n in names and old.get(n) is not None)
-            if old.get("result") is not None and "result" in names:
-                again.append("result")
+            again = [n for n in WRITE_ONCE if n in names and old.get(n) is not None]
+            result = names & RESULT_ATTRIBUTES
+            if result and (old.get("result") is not None or old.get("applied_at") is not None):
+                if revert_retried(old, new, names):
+                    found.append(
+                        finding(
+                            "revert_retried",
+                            "a revert's second run recorded applied over the error code "
+                            "of the first",
+                            INFO,
+                            key=key,
+                        )
+                    )
+                else:
+                    again += sorted(result)
             if unexpected or again:
                 found.append(
                     finding(
                         "executor_rewrite",
                         "the record changed after the consume beyond the result, "
                         "verification and revert; only the write role writes it then",
-                        key=entry.get("key"),
+                        key=key,
                         changed=unexpected,
                         rewritten=again,
                     )
                 )
-                continue
-        approval = sorted(names & APPROVAL_ATTRIBUTES)
-        if approval and not (is_decision(old, new) and old.get("approved_by") is None):
+            continue
+        pinned = sorted(names & PINNED)
+        if pinned:
+            found.append(
+                finding(
+                    "pre_consume_rewrite",
+                    "attributes fixed when the plan was made changed before the consume",
+                    key=key,
+                    changed=pinned,
+                )
+            )
+        decision = sorted(names & DECISION_ATTRIBUTES)
+        undone = old.get("status") in DECIDED and new.get("status") != old.get("status")
+        if undone or (decision and not is_decision(old, new)):
             found.append(
                 finding(
                     "approval_rewrite",
-                    "approval attributes were written outside the approval channel's decision",
-                    key=entry.get("key"),
-                    changed=approval,
-                )
-            )
-        if "approval_mode" in names:
-            found.append(
-                finding(
-                    "approval_mode_changed",
-                    "the plan's approval mode changed after it was planned",
-                    key=entry.get("key"),
-                    before=old.get("approval_mode"),
-                    after=new.get("approval_mode"),
+                    "a decision was written, changed or undone outside the approval "
+                    "channel's one decision",
+                    key=key,
+                    changed=decision,
+                    status={"from": old.get("status"), "to": new.get("status")},
                 )
             )
     return found
 
 
+def revert_retried(old: Mapping[str, Any], new: Mapping[str, Any], names: set[str]) -> bool:
+    """A revert record's second run: the first stopped with an error code, the second
+    patched (k8s_write: the plan's revert is written after the revert record's result)."""
+    return (
+        is_revert(new)
+        and names <= RESULT_ATTRIBUTES
+        and old.get("result") not in (None, "applied")
+        and new.get("result") == "applied"
+    )
+
+
+def check_revert(entry: Mapping[str, Any], record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """A revert record is created consumed, by the verifier, for a plan."""
+    key = entry.get("key")
+    found = []
+    if record.get("channel") != REVERT_CHANNEL:
+        found.append(
+            finding(
+                "wrong_channel",
+                f"a revert record must run on the {REVERT_CHANNEL} channel",
+                key=key,
+                channel=record.get("channel"),
+            )
+        )
+    problems = []
+    if entry.get("event") != "created":
+        problems.append("not created consumed")
+    if record.get("requested_by") != REVERT_REQUESTER:
+        problems.append(f"requested_by {record.get('requested_by')!r}")
+    if not is_plan_id(record.get("reverts_plan_id")):
+        problems.append("no reverts_plan_id")
+    if problems:
+        found.append(
+            finding(
+                "invalid_revert",
+                "not a revert record the verifier creates: " + ", ".join(problems),
+                key=key,
+            )
+        )
+    return found
+
+
 def check_apply(entries: list[Mapping[str, Any]], default_mode: str | None) -> list[dict[str, Any]]:
-    """Channel and approval of the consume, against the plan's approval mode."""
+    """The consume against its own condition, and its channel and approval against the
+    plan's approval mode."""
     consumed = consume_index(entries)
     if consumed is None:
         return []
     entry = entries[consumed]
     record = entry.get("new_image") or {}
     key = entry.get("key")
+    if is_revert(record):
+        return check_revert(entry, record)
+    found = []
+    at = entry["stream"]["approximate_creation_time"]
+    late = at - CLOCK_MARGIN_SECONDS
+    impossible = []
+    if entry.get("event") == "created":
+        impossible.append("created consumed")
+    if record.get("rejected_by") is not None or record.get("status") == "rejected":
+        impossible.append("rejected")
+    expires_at = record.get("expires_at")
+    if isinstance(expires_at, int) and expires_at <= late:
+        impossible.append(f"expired at {expires_at}")
+    if impossible:
+        found.append(
+            finding(
+                "impossible_consume",
+                "consumed although the consume's condition fails: " + ", ".join(impossible),
+                key=key,
+                consumed_at=at,
+            )
+        )
     channel = record.get("channel")
-    if record.get("kind") == "revert" or record.get("status") == "revert":
-        if channel != REVERT_CHANNEL:
-            return [
-                finding(
-                    "wrong_channel",
-                    f"a revert record must run on the {REVERT_CHANNEL} channel",
-                    key=key,
-                    channel=channel,
-                )
-            ]
-        return []
     mode = record.get("approval_mode") or default_mode
     if mode not in CHANNELS_BY_MODE:
-        return [
+        found.append(
             finding(
                 "approval_mode_unknown",
                 "the record has no approval mode (planned before it was recorded); pass "
@@ -507,8 +685,8 @@ def check_apply(entries: list[Mapping[str, Any]], default_mode: str | None) -> l
                 INFO,
                 key=key,
             )
-        ]
-    found = []
+        )
+        return found
     if channel not in CHANNELS_BY_MODE[mode]:
         found.append(
             finding(
@@ -533,6 +711,11 @@ def check_apply(entries: list[Mapping[str, Any]], default_mode: str | None) -> l
             problems.append("approval of other arguments")
         if approved_by and record.get("approval_channel") != APPROVAL_CHANNEL:
             problems.append(f"approval channel {record.get('approval_channel')!r}")
+        approval_expires_at = record.get("approval_expires_at")
+        if approved_by and (
+            not isinstance(approval_expires_at, int) or approval_expires_at <= late
+        ):
+            problems.append(f"approval expired at {approval_expires_at}")
         if problems:
             found.append(
                 finding(
@@ -553,7 +736,10 @@ def check_apply(entries: list[Mapping[str, Any]], default_mode: str | None) -> l
                 "the approver but without the plan id, so it can only be matched by time",
                 INFO,
                 key=key,
-                approval_window={"from": min(times), "to": max(times)},
+                approval_window={
+                    "from": min(times) - CLOCK_MARGIN_SECONDS,
+                    "to": max(times) + CLOCK_MARGIN_SECONDS,
+                },
             )
         )
     return found
@@ -571,7 +757,7 @@ def verify_plan(
         found.append(finding("malformed", "an object that is not an audit entry", key=key))
     readable = decoded(entries)
     for entry in entries:
-        if entry not in readable:
+        if not is_plain(entry):
             found.append(
                 finding(
                     "undecoded",
@@ -580,7 +766,7 @@ def verify_plan(
                 )
             )
     if entries:
-        found += check_sequence(readable)
+        found += check_sequence(entries)
         found += check_rewrites(readable)
         found += check_apply(readable, default_mode)
     found.sort(key=lambda f: f["severity"] != FINDING)
@@ -597,25 +783,35 @@ def verify(
     bucket: str,
     plan_ids: Iterable[str],
     default_mode: str | None = None,
+    not_plans: Iterable[str] = (),
 ) -> dict[str, Any]:
+    """`not_plans`: prefixes under plans/ that are not plan ids, which the audit Lambda
+    never writes; each counts as a finding."""
     plans = [verify_plan(s3, bucket, plan_id, default_mode) for plan_id in plan_ids]
+    not_plans = sorted(not_plans)
+    findings = sum(1 for plan in plans for f in plan["findings"] if f["severity"] == FINDING)
     return {
         "bucket": bucket,
         "verified_at": int(time.time()),
         "plans": plans,
-        "findings": sum(1 for plan in plans for f in plan["findings"] if f["severity"] == FINDING),
-        "ok": all(plan["ok"] for plan in plans),
+        "not_plans": not_plans,
+        "findings": findings + len(not_plans),
+        "ok": not not_plans and all(plan["ok"] for plan in plans),
     }
 
 
-def plans_since(s3: Any, bucket: str, since: int | None) -> list[str]:
-    """Plan ids with an entry at or after `since` (every plan when None), oldest first."""
-    plans = list_plans(s3, bucket, limit=None)
-    return [
-        plan["plan_id"]
-        for plan in reversed(plans)
-        if is_plan_id(plan["plan_id"]) and (since is None or plan["last_seen"] >= since)
+def plans_since(s3: Any, bucket: str, since: int | None) -> tuple[list[str], list[str]]:
+    """Plan ids with an entry at or after `since` (every plan when None), oldest first, and
+    the prefixes in the same window that are not plan ids."""
+    plans = [
+        plan
+        for plan in reversed(list_plans(s3, bucket, limit=None))
+        if since is None or plan["last_seen"] >= since
     ]
+    return (
+        [plan["plan_id"] for plan in plans if is_plan_id(plan["plan_id"])],
+        [plan["plan_id"] for plan in plans if not is_plan_id(plan["plan_id"])],
+    )
 
 
 def verify_text(report: Mapping[str, Any]) -> str:
@@ -625,6 +821,9 @@ def verify_text(report: Mapping[str, Any]) -> str:
         for f in plan["findings"]:
             where = f" ({f['details']['key']})" if f.get("details", {}).get("key") else ""
             lines.append(f"  {f['severity']}: {f['code']}: {f['message']}{where}")
+    for prefix in report.get("not_plans", []):
+        lines.append(f"{PLAN_PREFIX}{prefix}/: FINDINGS")
+        lines.append("  finding: not_plan: a prefix that is not a plan id; read it by hand")
     lines.append(f"{len(report['plans'])} plan(s), {report['findings']} finding(s)")
     return "\n".join(lines)
 
@@ -657,7 +856,13 @@ def main(argv: list[str] | None = None, s3: Any = None) -> int:
     exp.add_argument("plan_id", type=check_plan_id)
     exp.add_argument("--out", help="write the bundle to this file instead of stdout")
     exp.add_argument("--no-links", action="store_true", help="do not include linked reverts")
-    ver = sub.add_parser("verify", help="check plans' audit entries for anomalies")
+    doc = __doc__ or ""
+    ver = sub.add_parser(
+        "verify",
+        help="check plans' audit entries for anomalies",
+        description=doc[doc.find("`verify`") : doc.find("  audit.py export")],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     which = ver.add_mutually_exclusive_group(required=True)
     which.add_argument("plan_id", nargs="?", type=check_plan_id)
     which.add_argument(
@@ -683,12 +888,13 @@ def main(argv: list[str] | None = None, s3: Any = None) -> int:
         print(json.dumps(list_plans(s3, bucket, args.limit), indent=2))
         return 0
     if args.command == "verify":
+        not_plans: list[str] = []
         if args.plan_id:
             plan_ids = [args.plan_id]
         else:
             since = None if args.all else int(time.time()) - args.since
-            plan_ids = plans_since(s3, bucket, since)
-        report = verify(s3, bucket, plan_ids, args.approval_mode)
+            plan_ids, not_plans = plans_since(s3, bucket, since)
+        report = verify(s3, bucket, plan_ids, args.approval_mode, not_plans)
         print(json.dumps(report, indent=2, sort_keys=True) if args.json else verify_text(report))
         return 0 if report["ok"] else 1
     bundle = export(s3, bucket, args.plan_id, follow_links=not args.no_links)

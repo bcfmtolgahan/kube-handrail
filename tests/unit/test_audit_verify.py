@@ -44,6 +44,7 @@ def planned(plan_id: str, mode: str | None) -> dict:
         "status": "planned",
         "used": False,
         "created_at": T0,
+        "expires_at": T0 + 300,
     }
     if mode is not None:
         plan["approval_mode"] = mode
@@ -59,6 +60,7 @@ def approved(plan: dict, by: str = "approver-a") -> dict:
         "approved_args_hash": plan["args_hash"],
         "approval_channel": "api",
         "approval_expires_at": T0 + 310,
+        "expires_at": T0 + 310,
     }
 
 
@@ -162,7 +164,9 @@ def test_a_client_mode_apply_is_client_unobserved_for_information(s3):
     report = audit.verify_plan(s3, BUCKET, plan_id)
     assert report["ok"] is True
     assert codes(report) == [("info", "client_unobserved")]
-    assert report["findings"][0]["details"]["approval_window"] == {"from": T0, "to": T0 + 10}
+    # The chain's stream times with a margin: they are approximate.
+    window = report["findings"][0]["details"]["approval_window"]
+    assert window == {"from": T0 - 60, "to": T0 + 10 + 60}
 
 
 def test_a_client_mode_apply_with_a_recorded_approval_is_not_unobserved(s3):
@@ -300,6 +304,7 @@ def test_a_revert_record_runs_on_the_verifier_channel(s3):
         "kind": "revert",
         "status": "revert",
         "requested_by": "system:revert",
+        "reverts_plan_id": new_id(),
         "used": True,
         "channel": "verifier",
         "verify_queue": "due",
@@ -353,3 +358,185 @@ def test_main_needs_exactly_one_selection(s3, monkeypatch):
         audit.main(["verify"], s3=s3)
     with pytest.raises(SystemExit):
         audit.main(["verify", new_id(), "--all"], s3=s3)
+
+
+def test_a_rejection_and_a_repeated_approval_request_have_no_findings(s3):
+    plan_id = new_id()
+    plan = planned(plan_id, "server")
+    awaiting = {**plan, "status": "awaiting_approval", "approval_requested_at": T0 + 5}
+    again = {**awaiting, "approval_requested_at": T0 + 65, "expires_at": T0 + 600}
+    rejected = {
+        **again,
+        "status": "rejected",
+        "rejected_by": "approver-a",
+        "rejected_at": T0 + 70,
+        "reject_reason": "no",
+        "decision_correlation_id": "c-9",
+        "expires_at": T0 + 70,
+    }
+    write(s3, plan_id, [None, plan, awaiting, again, rejected])
+    assert audit.verify_plan(s3, BUCKET, plan_id)["findings"] == []
+
+
+def test_a_rejection_undone_and_then_approved(s3):
+    plan_id = new_id()
+    plan = planned(plan_id, "server")
+    rejected = {**plan, "status": "rejected", "rejected_by": "approver-a", "rejected_at": T0 + 5}
+    undone = {**plan, "status": "awaiting_approval"}
+    ok = approved(undone, by="approver-x")
+    used = consumed(ok, "gateway")
+    write(s3, plan_id, [None, plan, rejected, undone, ok, used, resulted(used)])
+    report = audit.verify_plan(s3, BUCKET, plan_id)
+    assert codes(report) == [("finding", "approval_rewrite")]
+    assert report["findings"][0]["details"]["changed"] == ["rejected_at", "rejected_by"]
+
+
+def test_an_approval_after_a_decided_status_was_reset_is_a_rewrite(s3):
+    plan_id = new_id()
+    plan = planned(plan_id, "server")
+    ok = approved(plan)
+    reset = {**ok, "status": "awaiting_approval"}
+    write(s3, plan_id, [None, plan, ok, reset])
+    assert codes(audit.verify_plan(s3, BUCKET, plan_id)) == [("finding", "approval_rewrite")]
+
+
+@pytest.mark.parametrize("mode", ["client", "server"])
+def test_attributes_fixed_at_creation_rewritten_before_the_consume(s3, mode):
+    plan_id = new_id()
+    plan = planned(plan_id, mode)
+    forged = {**plan, "replicas_to": 9, "args_hash": "h-2", "requested_by": "agent:other"}
+    chain = [None, plan, forged]
+    chain.append(approved(forged) if mode == "server" else forged)
+    used = consumed(chain[-1], "gateway")
+    write(s3, plan_id, [*chain[:3], *([chain[3]] if mode == "server" else []), used])
+    report = audit.verify_plan(s3, BUCKET, plan_id)
+    assert report["ok"] is False
+    rewrite = [f for f in report["findings"] if f["code"] == "pre_consume_rewrite"]
+    assert rewrite[0]["details"]["changed"] == ["args_hash", "replicas_to", "requested_by"]
+
+
+def test_result_attributes_written_again_after_the_result(s3):
+    plan_id = new_id()
+    chain = server_chain(plan_id)
+    backdated = {**chain[-1], "applied_at": T0 - 3600, "apply_correlation_id": "c-2"}
+    write(s3, plan_id, [*chain, backdated])
+    report = audit.verify_plan(s3, BUCKET, plan_id)
+    assert codes(report) == [("finding", "executor_rewrite")]
+    assert report["findings"][0]["details"]["rewritten"] == ["applied_at", "apply_correlation_id"]
+
+
+def revert_record(revert_id: str) -> dict:
+    return {
+        **planned(revert_id, "server"),
+        "kind": "revert",
+        "status": "revert",
+        "requested_by": "system:revert",
+        "reverts_plan_id": new_id(),
+        "expires_at": T0,
+        "used": True,
+        "channel": "verifier",
+        "verify_queue": "due",
+    }
+
+
+def test_a_revert_retried_after_an_error_is_information(s3):
+    revert_id = new_id()
+    revert = revert_record(revert_id)
+    failed = resulted(revert, "conflict")
+    write(s3, revert_id, [None, revert, failed, resulted(failed, "applied")])
+    report = audit.verify_plan(s3, BUCKET, revert_id)
+    assert report["ok"] is True
+    assert codes(report) == [("info", "revert_retried")]
+
+
+def test_a_revert_record_the_verifier_did_not_create(s3):
+    forged_id = new_id()
+    revert = revert_record(forged_id)
+    del revert["reverts_plan_id"]
+    write(s3, forged_id, [None, {**revert, "requested_by": "agent:devops_agent"}])
+    report = audit.verify_plan(s3, BUCKET, forged_id)
+    assert codes(report) == [("finding", "invalid_revert")]
+    assert "requested_by" in report["findings"][0]["message"]
+    assert "no reverts_plan_id" in report["findings"][0]["message"]
+    # A plan turned into a revert at its consume was not created consumed.
+    plan_id = new_id()
+    plan = planned(plan_id, "server")
+    turned = {**plan, **revert_record(plan_id), "created_at": T0}
+    write(s3, plan_id, [None, plan, turned])
+    found = audit.verify_plan(s3, BUCKET, plan_id)["findings"]
+    assert any(
+        f["code"] == "invalid_revert" and "not created consumed" in f["message"] for f in found
+    )
+
+
+def test_a_consume_after_the_approval_expired(s3):
+    plan_id = new_id()
+    plan = planned(plan_id, "server")
+    # Consumed at T0 + 20; the approval ran out 61 seconds before (beyond the margin).
+    ok = {**approved(plan), "approval_expires_at": T0 - 41}
+    write(s3, plan_id, [None, plan, ok, consumed(ok, "approval-api")])
+    report = audit.verify_plan(s3, BUCKET, plan_id)
+    assert codes(report) == [("finding", "applied_without_approval")]
+    assert f"approval expired at {T0 - 41}" in report["findings"][0]["message"]
+    # Within the margin it is not reported: stream times are approximate.
+    near_id = new_id()
+    near = {**approved(planned(near_id, "server")), "approval_expires_at": T0 + 15}
+    write(s3, near_id, [None, planned(near_id, "server"), near, consumed(near, "approval-api")])
+    assert audit.verify_plan(s3, BUCKET, near_id)["findings"] == []
+
+
+@pytest.mark.parametrize(
+    ("change", "problem"),
+    [
+        ({"rejected_by": "approver-a", "status": "rejected"}, "rejected"),
+        ({"expires_at": T0 - 100}, f"expired at {T0 - 100}"),
+    ],
+)
+def test_a_consume_its_condition_would_refuse(s3, change, problem):
+    plan_id = new_id()
+    plan = {**planned(plan_id, "client"), **change}
+    write(s3, plan_id, [None, plan, consumed(plan, "gateway")])
+    report = audit.verify_plan(s3, BUCKET, plan_id)
+    assert codes(report)[0] == ("finding", "impossible_consume")
+    assert problem in report["findings"][0]["message"]
+
+
+def test_a_plan_created_consumed(s3):
+    plan_id = new_id()
+    write(s3, plan_id, [None, consumed(planned(plan_id, "client"), "gateway")])
+    report = audit.verify_plan(s3, BUCKET, plan_id)
+    assert codes(report)[0] == ("finding", "impossible_consume")
+    assert "created consumed" in report["findings"][0]["message"]
+
+
+def test_an_undecoded_entry_is_not_also_a_gap():
+    def entry(key, event, old, new, image_format="plain"):
+        return {
+            "key": key,
+            "event": event,
+            "image_format": image_format,
+            "old_image": old,
+            "new_image": new,
+        }
+
+    a, b, c = {"v": 1}, {"v": 2}, {"v": 3}
+    entries = [
+        entry("1", "created", None, a),
+        entry("2", "modified", {"M": "dynamodb json"}, {"M": "dynamodb json"}, "dynamodb"),
+        entry("3", "modified", b, c),
+    ]
+    assert audit.check_sequence(entries) == []
+    assert [f["code"] for f in audit.check_sequence([entries[0], entries[2]])] == ["gap"]
+
+
+def test_main_reports_prefixes_that_are_not_plans(s3, monkeypatch, capsys):
+    monkeypatch.setenv("AUDIT_BUCKET", BUCKET)
+    plan_id = new_id()
+    write(s3, plan_id, server_chain(plan_id))
+    s3.put_object(Bucket=BUCKET, Key=f"plans/not-a-plan/{T0}-1.json", Body=b"{}")
+    assert audit.main(["verify", "--all", "--json"], s3=s3) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["not_plans"] == ["not-a-plan"] and report["findings"] == 1
+    assert [p["plan_id"] for p in report["plans"]] == [plan_id]
+    assert audit.main(["verify", "--all"], s3=s3) == 1
+    assert "not_plan" in capsys.readouterr().out
