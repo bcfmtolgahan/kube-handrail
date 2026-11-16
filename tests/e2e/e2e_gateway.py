@@ -167,10 +167,13 @@ utilization) created for this run in kube-handrail-sandbox and deleted at the en
 sandbox's policy must list adjust_hpa (checked against the namespaces output when it is
 available). A scale plan for e2e-hpa is a conflict naming the HPA (details.hpa and the
 hint); max_replicas over the namespace's maximum is out_of_bounds; min_replicas 1 -> 2 with
-a 90-second window is planned (the diff shows both bounds and the pods 1 -> 2), applied
-(through the gateway in client mode, by an approval through the approval URL in server
-mode), the HPA has bounds 2 to 3 and the Deployment 2 replicas, and get_plan_outcome
-reports it healthy with target_kind and hpa. These cases add 1 apply to the smoke_test
+a 90-second window and a change_ref is planned (the diff shows both bounds and the pods
+1 -> 2; a change_ref over 128 characters is invalid_argument), applied (through the
+gateway in client mode, after an apply without the change_ref is plan_mismatch; by an
+approval through the approval URL in server mode, where the approver sees the change_ref
+as untrusted text and get_plan_outcome then reports the approval), the HPA has bounds 2
+to 3 and the Deployment 2 replicas, and get_plan_outcome reports it healthy with
+target_kind and hpa. These cases add 1 apply to the smoke_test
 agent's budget. The writer's admission refusals are covered by tests/admission and
 tests/integration.
 
@@ -279,6 +282,7 @@ BINDING = "kube-handrail-writer-bounds"
 # --with-hpa: the Deployment and its HorizontalPodAutoscaler, same name.
 HPA_TARGET = {"namespace": NAMESPACE, "name": "e2e-hpa"}
 PLAN_HPA, APPLY_HPA = "k8sr___plan_adjust_hpa", "k8sw___apply_adjust_hpa"
+HPA_CHANGE_REF = "E2E-HPA-1 (e2e change reference)"
 
 results: list[bool] = []
 
@@ -2569,7 +2573,19 @@ async def hpa_tests(gw: Gateway, approval_mode: str) -> None:
         {**hpa, "max_replicas": maximum + 1},
         "out_of_bounds",
     )
-    arguments = {**hpa, "min_replicas": 2, "verify_window_seconds": HEALTHY_WINDOW}
+    arguments = {
+        **hpa,
+        "min_replicas": 2,
+        "verify_window_seconds": HEALTHY_WINDOW,
+        "change_ref": HPA_CHANGE_REF,
+    }
+    await expect(
+        gw,
+        "hpa: a change_ref over 128 characters is invalid_argument",
+        PLAN_HPA,
+        {**arguments, "change_ref": "x" * 129},
+        "invalid_argument",
+    )
     envelope = await gw.call(PLAN_HPA, arguments)
     data = envelope.get("data") or {}
     report(
@@ -2587,11 +2603,33 @@ async def hpa_tests(gw: Gateway, approval_mode: str) -> None:
         url = os.environ["APPROVAL_URL"]
         region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
         await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+        status, envelope = approve.show(url, region, plan_id)
+        shown = (envelope.get("data") or {}).get("change_ref")
+        report(
+            "hpa: the approver sees the change_ref as untrusted text",
+            shown == f"<untrusted>{HPA_CHANGE_REF}</untrusted>",
+            shown,
+        )
         status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
         applied = (envelope.get("data") or {}).get("apply") or {}
         ok = status == 200 and applied.get("ok") is True
         detail = (applied.get("error") or {}).get("code") or status
+        outcome = (await gw.call(OUTCOME, {"plan_id": plan_id})).get("data") or {}
+        approval = outcome.get("approval") or {}
+        report(
+            "hpa: get_plan_outcome reports the approval",
+            approval.get("status") == "approved" and bool(approval.get("approved_at")),
+            approval,
+        )
     else:
+        without = {k: v for k, v in arguments.items() if k != "change_ref"}
+        await expect(
+            gw,
+            "hpa: an apply without the planned change_ref is plan_mismatch",
+            APPLY_HPA,
+            {"plan_id": plan_id, **without},
+            "plan_mismatch",
+        )
         envelope = await gw.call(APPLY_HPA, {"plan_id": plan_id, **arguments})
         ok, detail = envelope.get("ok") is True, code(envelope) or "ok"
     report("hpa: the adjust is applied", ok, detail)
