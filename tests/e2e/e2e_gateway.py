@@ -161,6 +161,19 @@ small limits. The scale_to_zero and service_without_endpoints warnings are cover
 tests only: they need a plan to 0 replicas, which a sandbox with MIN_REPLICAS=1 refuses as
 out_of_bounds.
 
+With --with-hpa, the HPA adjust cases also run, against a fixture Deployment e2e-hpa (1
+replica, with requests) and a HorizontalPodAutoscaler e2e-hpa (bounds 1 to 3 on CPU
+utilization) created for this run in kube-handrail-sandbox and deleted at the end. The
+sandbox's policy must list adjust_hpa (checked against the namespaces output when it is
+available). A scale plan for e2e-hpa is a conflict naming the HPA (details.hpa and the
+hint); max_replicas over the namespace's maximum is out_of_bounds; min_replicas 1 -> 2 with
+a 90-second window is planned (the diff shows both bounds and the pods 1 -> 2), applied
+(through the gateway in client mode, by an approval through the approval URL in server
+mode), the HPA has bounds 2 to 3 and the Deployment 2 replicas, and get_plan_outcome
+reports it healthy with target_kind and hpa. These cases add 1 apply to the smoke_test
+agent's budget. The writer's admission refusals are covered by tests/admission and
+tests/integration.
+
 --live-only runs only the cases the kind and moto integration suite (tests/integration)
 cannot cover, listed in LIVE_ONLY_CASES and docs/milestone-0.md: authentication, the
 gateway's schema check, one apply and concurrent applies through the gateway in client mode,
@@ -263,6 +276,9 @@ UNKNOWN_PLAN = "00000000-0000-4000-8000-000000000000"
 # Warn case switches (k8s rendered by terraform/modules/namespace-policy).
 SECOND_FIXTURE = "e2e-ns-restart"
 BINDING = "kube-handrail-writer-bounds"
+# --with-hpa: the Deployment and its HorizontalPodAutoscaler, same name.
+HPA_TARGET = {"namespace": NAMESPACE, "name": "e2e-hpa"}
+PLAN_HPA, APPLY_HPA = "k8sr___plan_adjust_hpa", "k8sw___apply_adjust_hpa"
 
 results: list[bool] = []
 
@@ -2463,6 +2479,136 @@ async def admission_warn_tests(gw: Gateway) -> str | None:
     return (envelope.get("data") or {}).get("plan_id")
 
 
+# --- HPA adjust (--with-hpa) -----------------------------------------------------------
+
+
+def hpa_fixture() -> dict[str, Any]:
+    return {
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": {"name": HPA_TARGET["name"], "namespace": NAMESPACE},
+        "spec": {
+            "scaleTargetRef": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": HPA_TARGET["name"],
+            },
+            "minReplicas": 1,
+            "maxReplicas": 3,
+            "metrics": [
+                {
+                    "type": "Resource",
+                    "resource": {
+                        "name": "cpu",
+                        "target": {"type": "Utilization", "averageUtilization": 80},
+                    },
+                }
+            ],
+        },
+    }
+
+
+def delete_hpa_fixture() -> None:
+    kubectl("delete", "hpa", HPA_TARGET["name"], "--ignore-not-found")
+    kubectl("delete", "deployment", HPA_TARGET["name"], "--ignore-not-found", "--wait=true")
+
+
+def create_hpa_fixture() -> None:
+    delete_hpa_fixture()
+    kubectl("create", "-f", "-", stdin=json.dumps(fixture(HPA_TARGET["name"])))
+    kubectl("rollout", "status", f"deploy/{HPA_TARGET['name']}", "--timeout=120s")
+    kubectl("create", "-f", "-", stdin=json.dumps(hpa_fixture()))
+
+
+def hpa_bounds() -> tuple[int, int]:
+    out = kubectl(
+        "get",
+        "hpa",
+        HPA_TARGET["name"],
+        "-o",
+        "jsonpath={.spec.minReplicas} {.spec.maxReplicas}",
+    )
+    low, high = out.split()
+    return int(low), int(high)
+
+
+def hpa_preconditions() -> tuple[bool, int]:
+    """The sandbox allows adjust_hpa, as far as the namespaces output tells; returns that
+    and the sandbox's maximum (5 when unknown)."""
+    policy = namespace_policy().get(NAMESPACE)
+    if not namespace_policy():
+        print("namespaces output unknown: adjust_hpa is not checked", flush=True)
+        return True, 5
+    allowed = policy is not None and "adjust_hpa" in (policy.get("actions") or [])
+    report(
+        f"hpa: {NAMESPACE} allows adjust_hpa",
+        allowed,
+        (policy or {}).get("actions") if policy else "not in the namespace policy",
+    )
+    return allowed, int((policy or {}).get("max_replicas", 5))
+
+
+async def hpa_tests(gw: Gateway, approval_mode: str) -> None:
+    allowed, maximum = hpa_preconditions()
+    if not allowed:
+        return
+    hpa = HPA_TARGET
+    envelope = await gw.call(PLAN, {**hpa, "replicas": 2})
+    details = (envelope.get("error") or {}).get("details") or {}
+    report(
+        "hpa: a scale plan for an autoscaled Deployment names the HPA",
+        code(envelope) == "conflict"
+        and details.get("hpa") == [hpa["name"]]
+        and details.get("hint") == f"use plan_adjust_hpa on {hpa['name']}",
+        code(envelope) or "ok",
+    )
+    await expect(
+        gw,
+        "hpa: max_replicas over the namespace's maximum is out_of_bounds",
+        PLAN_HPA,
+        {**hpa, "max_replicas": maximum + 1},
+        "out_of_bounds",
+    )
+    arguments = {**hpa, "min_replicas": 2, "verify_window_seconds": HEALTHY_WINDOW}
+    envelope = await gw.call(PLAN_HPA, arguments)
+    data = envelope.get("data") or {}
+    report(
+        "hpa: min_replicas 1 -> 2 is planned with both bounds and the pods",
+        envelope.get("ok") is True
+        and (data.get("diff") or {}).get("hpa", {}).get("min_replicas") == {"from": 1, "to": 2}
+        and (data.get("diff") or {}).get("replicas") == {"from": 1, "to": 2},
+        code(envelope) or data.get("diff"),
+    )
+    plan_id = data.get("plan_id")
+    if not plan_id:
+        return
+    if approval_mode == "server":
+        approve = approve_script()
+        url = os.environ["APPROVAL_URL"]
+        region = approve.region_of(url, os.environ.get("APPROVAL_REGION"))
+        await gw.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+        status, envelope = approve.decide(url, region, plan_id, "approve", None, True)
+        applied = (envelope.get("data") or {}).get("apply") or {}
+        ok = status == 200 and applied.get("ok") is True
+        detail = (applied.get("error") or {}).get("code") or status
+    else:
+        envelope = await gw.call(APPLY_HPA, {"plan_id": plan_id, **arguments})
+        ok, detail = envelope.get("ok") is True, code(envelope) or "ok"
+    report("hpa: the adjust is applied", ok, detail)
+    if not ok:
+        return
+    report("hpa: the HPA has bounds 2 to 3", hpa_bounds() == (2, 3), hpa_bounds())
+    wait_for("the HPA to scale e2e-hpa to 2", lambda: replicas_of(hpa) == 2)
+    data = await wait_outcome(gw, plan_id, HEALTHY_WINDOW)
+    report(
+        "hpa: get_plan_outcome reports it healthy, with target_kind and hpa",
+        outcome_status(data) == ("healthy", "target_reached")
+        and data.get("target_kind") == "HorizontalPodAutoscaler"
+        and (data.get("hpa") or {}).get("scale_target") == hpa["name"],
+        outcome_status(data),
+    )
+
+
 async def run(
     with_expiry: bool,
     approval_mode: str,
@@ -2474,6 +2620,7 @@ async def run(
     started: int = 0,
     live_only: bool = False,
     with_namespaces: bool = False,
+    with_hpa: bool = False,
 ) -> None:
     token = fetch_token()
     auth_tests(token)
@@ -2500,6 +2647,8 @@ async def run(
                 )
                 if with_namespaces:
                     await namespace_tests(gw, approval_mode)
+                if with_hpa:
+                    await hpa_tests(gw, approval_mode)
     if with_audit:
         await audit_tests(started)
 
@@ -2740,6 +2889,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="also run the namespace policy cases (needs SECOND_NAMESPACE, restart only)",
     )
     parser.add_argument(
+        "--with-hpa",
+        action="store_true",
+        help="also run the HPA adjust cases (the sandbox's actions must list adjust_hpa)",
+    )
+    parser.add_argument(
         "--approval-mode",
         choices=["client", "server"],
         default=None,
@@ -2768,7 +2922,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.with_verify = not args.skip_verify
     if args.live_only:
         args.with_rollout = args.with_verify = args.with_freeze = args.with_expiry = False
-        args.with_namespaces = False
+        args.with_namespaces = args.with_hpa = False
     return args
 
 
@@ -2801,6 +2955,8 @@ def main() -> None:
         create_fixtures(args.with_rollout, args.with_identity, args.with_verify, args.with_freeze)
         if args.with_namespaces:
             create_second_fixture()
+        if args.with_hpa:
+            create_hpa_fixture()
         asyncio.run(
             run(
                 args.with_expiry,
@@ -2813,6 +2969,7 @@ def main() -> None:
                 int(started),
                 args.live_only,
                 args.with_namespaces,
+                args.with_hpa,
             )
         )
     except Exception as exc:
@@ -2823,6 +2980,8 @@ def main() -> None:
         delete_fixtures()
         if args.with_namespaces:
             delete_second_fixture()
+        if args.with_hpa:
+            delete_hpa_fixture()
     report("web was not changed", web_spec() == web_before, web_before)
     if args.with_verify:
         report(
