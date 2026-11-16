@@ -40,7 +40,7 @@ This creates:
 - `web-deployment.yaml`: an unprivileged nginx with 1 replica. Check the image tag against the registry before use, and consider pinning it by digest.
 - `admission-policy.yaml` (Milestone 2): the cluster-scoped ValidatingAdmissionPolicy `kube-handrail-writer-bounds` and its binding, in `[Warn, Audit]`. It needs Kubernetes 1.30 or later; on an older cluster the command exits non-zero for this file only. Re-applying the directory sets a binding switched to `Deny` back to `[Warn, Audit]`. See [Admission policy](deploy.md#admission-policy).
 
-The Deployment deliberately has no `app.kubernetes.io/instance` label, no Argo CD tracking annotation and no HorizontalPodAutoscaler. Any of these makes the plan step refuse it (`gitops_managed`, or the HPA check).
+The Deployment deliberately has no GitOps marker (the Argo CD tracking annotation, the Flux labels, or a key listed in `gitops_markers`) and no HorizontalPodAutoscaler. Any of these makes the plan step refuse it (`gitops_managed`, or the HPA check). Until Milestone 3 the `app.kubernetes.io/instance` label counted as a marker too.
 
 ## 2. Infrastructure
 

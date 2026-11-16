@@ -1,6 +1,6 @@
 # Sandbox target for the scale tools. It must stay free of GitOps markers
-# (app.kubernetes.io/instance label, Argo CD tracking-id annotation) and HPAs,
-# otherwise plan_scale_deployment refuses it.
+# (Argo CD tracking-id annotation, Flux kustomize/helm labels, keys in
+# gitops_markers) and HPAs, otherwise plan_scale_deployment refuses it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
