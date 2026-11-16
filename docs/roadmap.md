@@ -274,7 +274,7 @@ These move to "Later ideas":
 
 - `var.namespaces`: per namespace replica bounds, allowed actions, optional approvers and GitOps markers, packaged with the Lambdas (not SSM); empty keeps today's single sandbox namespace.
 - Approvers per namespace (optional; where set, only they may approve there).
-- RBAC and one admission policy rendered from the same policy, and a plan-time check that the cluster's admission policy matches it (a narrow ClusterRole reads the policy and its binding).
+- RBAC and one admission policy (two since Milestone 8) rendered from the same policy, and a plan-time check that the cluster's admission policy matches it (a narrow ClusterRole reads the policy and its binding).
 
 **Done when:** in a two-namespace test, an action allowed in one namespace is refused in the other, the wrong namespace's approver is refused, and a binding switched to `Warn` makes plans `conflict`.
 
