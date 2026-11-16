@@ -13,11 +13,14 @@
 #   DEPLOYMENT       Deployment in it, at a count below the maximum (default web)
 #   MIN_REPLICAS     the policy's minimum there (default 0)
 #   MAX_REPLICAS     the policy's maximum there (default 5)
+#   ACTIONS          the actions the policy allows there, comma-separated, for the writer's
+#                    RBAC cases (default restart,rollback,scale; empty for none)
 #   NAMESPACE_2      if set, a second namespace of the policy with other bounds; the bound
 #                    cases run there too, and a count allowed in one is checked in the other
 #   DEPLOYMENT_2     Deployment in it, below its maximum (default web)
 #   MIN_REPLICAS_2   the policy's minimum there (default 0)
 #   MAX_REPLICAS_2   the policy's maximum there (default 5)
+#   ACTIONS_2        the actions allowed there (default restart,rollback,scale)
 #   OTHER_NAMESPACE  if set, create this namespace with a Deployment, check that the policy
 #                    does not touch it, and delete it again. Leave it unset on a shared cluster.
 #   KEEP_DENY        if 1, leave the binding in Deny at the end; otherwise restore the
@@ -31,6 +34,8 @@ MAX_REPLICAS=${MAX_REPLICAS:-5}
 DEPLOYMENT_2=${DEPLOYMENT_2:-web}
 MIN_REPLICAS_2=${MIN_REPLICAS_2:-0}
 MAX_REPLICAS_2=${MAX_REPLICAS_2:-5}
+ACTIONS=${ACTIONS-restart,rollback,scale}
+ACTIONS_2=${ACTIONS_2-restart,rollback,scale}
 POLICY=kube-handrail-writer-bounds
 READER=(--as kube-handrail-admission-reader --as-group kube-handrail-reader)
 WRITER=(--as kube-handrail-admission-test --as-group kube-handrail-writer)
@@ -256,6 +261,32 @@ expect_answer "policy reader: no list" no \
   list "validatingadmissionpolicies.admissionregistration.k8s.io" "${READER[@]}"
 expect_answer "policy reader: no patch" no \
   patch "validatingadmissionpolicybindings.admissionregistration.k8s.io/$POLICY" "${READER[@]}"
+
+# The writer's Role per namespace: get and patch on Deployments where any action is
+# allowed, get on ReplicaSets only where rollback is; never the scale subresource or delete.
+rbac_cases() {
+  local ns=$1 actions=$2 any=no rollback=no
+  [[ -n "$actions" ]] && any=yes
+  [[ ",$actions," == *,rollback,* ]] && rollback=yes
+  expect_answer "rbac: $ns: writer get deployments ($any)" "$any" \
+    get deployments -n "$ns" "${WRITER[@]}"
+  expect_answer "rbac: $ns: writer patch deployments ($any)" "$any" \
+    patch deployments -n "$ns" "${WRITER[@]}"
+  expect_answer "rbac: $ns: writer get replicasets ($rollback, rollback)" "$rollback" \
+    get replicasets -n "$ns" "${WRITER[@]}"
+  expect_answer "rbac: $ns: writer no patch deployments/scale" no \
+    patch deployments -n "$ns" --subresource=scale "${WRITER[@]}"
+  expect_answer "rbac: $ns: writer no delete deployments" no \
+    delete deployments -n "$ns" "${WRITER[@]}"
+  expect_answer "rbac: $ns: reader get deployments" yes \
+    get deployments -n "$ns" "${READER[@]}"
+  expect_answer "rbac: $ns: reader no patch deployments" no \
+    patch deployments -n "$ns" "${READER[@]}"
+}
+rbac_cases "$NAMESPACE" "$ACTIONS"
+if [[ -n "${NAMESPACE_2:-}" ]]; then
+  rbac_cases "$NAMESPACE_2" "$ACTIONS_2"
+fi
 
 if [[ -n "${OTHER_NAMESPACE:-}" ]]; then
   expect_allowed "deny mode: writer over the maximum in another namespace" \

@@ -77,6 +77,7 @@ jobs:
           NAMESPACE: kube-handrail-sandbox
           MIN_REPLICAS: "1"
           MAX_REPLICAS: "3"
+          ACTIONS: restart
           NAMESPACE_2: kube-handrail-sandbox-2
           MIN_REPLICAS_2: "0"
           MAX_REPLICAS_2: "6"
