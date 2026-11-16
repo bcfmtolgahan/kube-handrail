@@ -149,7 +149,12 @@ def test_concurrent_applies_of_one_plan_exactly_one_succeeds(kh):
         thread.start()
     for thread in threads:
         thread.join()
-    assert sorted(code(r) or "ok" for r in results) == ["ok", "plan_used"]
+    # In-process threads do not always overlap: when the second apply starts after the first
+    # has scaled the Deployment, its spec check refuses it with conflict before it reaches the
+    # single-use condition. Either way exactly one apply succeeds; the live run keeps the
+    # truly concurrent case on real DynamoDB.
+    codes = sorted(code(r) or "ok" for r in results)
+    assert codes in (["ok", "plan_used"], ["conflict", "ok"])
 
 
 def test_step_beyond_the_blast_radius_is_refused(kh):
