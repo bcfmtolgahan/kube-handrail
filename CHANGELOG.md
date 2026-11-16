@@ -4,7 +4,7 @@ All notable changes to kube-handrail are listed here. The format follows [Keep a
 
 ## [Unreleased]
 
-Milestone 3: implemented and tested on a test cluster, except the test profile and `--reset-counters`, which are implemented but not yet run. Milestone 4 (legacy mode and the verify switch removed, `make upgrade`): implemented, not yet tested on a cluster. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md` and both skills), so re-run `install-guidance` (`make upgrade` does).
+Milestone 3: implemented and tested on a test cluster, except the test profile and `--reset-counters`, which are implemented but not yet run. Milestone 4 (legacy mode and the verify switch removed, `make upgrade`): implemented and tested on a test cluster (`make upgrade` from Milestone 3 took 110 seconds; the plan showed only the 12 moves and package rebuilds). Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md` and both skills), so re-run `install-guidance` (`make upgrade` does).
 
 ### Changed
 
