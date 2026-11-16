@@ -34,6 +34,7 @@ OK = "ok"
 DRIFT = "drift"
 UNKNOWN = "unknown"
 DISABLED = "false"
+ENABLED = "true"
 ALERT_SUBJECT = "kube-handrail: drift, remediation disabled"
 
 
@@ -173,13 +174,17 @@ def describe_error(exc: Exception) -> str:
 
 
 def disable_remediation(ssm: Any, name: str) -> str:
-    """Set the kill switch to "false". It is never set back to "true" here."""
+    """Set the kill switch to "false". It is never set back to "true" here.
+
+    Any value other than "true" already disables remediation (KillSwitch.state) and is
+    left as it is: make upgrade turns the switch off with its own marker value and must
+    still recognise it afterwards."""
     try:
         current = ssm.get_parameter(Name=name)["Parameter"]["Value"]
     except Exception:
         logger.exception("cannot read kill switch parameter; writing it anyway")
         current = None
-    if current == DISABLED:
+    if current is not None and current != ENABLED:
         return "already_off"
     ssm.put_parameter(Name=name, Value=DISABLED, Type="String", Overwrite=True)
     return "turned_off"

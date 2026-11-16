@@ -498,3 +498,15 @@ def test_an_unreadable_interceptor_configuration_is_unknown(ssm):
     rt = runtime(ssm)
     rt.gateway.interceptors = [{"interceptionPoints": ["REQUEST"]}]
     assert handler.run(rt)["status"] == "unknown"
+
+
+@pytest.mark.parametrize("value", ["false:upgrade:abc123", "off"])
+def test_drift_leaves_any_value_other_than_true_alone(ssm, value):
+    # make upgrade turns the switch off with its own marker; the sentinel must not
+    # overwrite it, or the upgrade can no longer tell that the switch is its own.
+    ssm.put_parameter(Name=PARAM, Value=value, Type="String", Overwrite=True)
+    devops = FakeDevOps()
+    devops.classifications[WRITE_TOOL] = "READ_ONLY"
+    result = handler.run(runtime(ssm, devops))
+    assert result["kill_switch"] == "already_off"
+    assert kill_switch(ssm)[0] == value
