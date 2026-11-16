@@ -6,6 +6,7 @@ import pytest
 
 from handrail_common.dispatch import caller_signature, dispatch, tool_name
 from handrail_common.envelope import (
+    ADMISSION_DENIED,
     CONFLICT,
     FORBIDDEN_NAMESPACE,
     INTERNAL,
@@ -219,6 +220,9 @@ def test_guard_rejection_is_counted_per_code(capsys):
         (GuardError(INTERNAL, "history unavailable"), INTERNAL),
         # A failing Kubernetes API (RBAC, access entry, 5xx) must reach the alarm.
         (GuardError(KUBERNETES_ERROR, "Kubernetes API error (403)"), KUBERNETES_ERROR),
+        # The cluster refused what the guard allowed: the bounds drifted or the guard is
+        # wrong, so a human must look (the alarm), not a guard rejection metric.
+        (GuardError(ADMISSION_DENIED, "refused by the admission policy"), ADMISSION_DENIED),
     ],
 )
 def test_errors_are_tool_errors_not_rejections(capsys, error, outcome):

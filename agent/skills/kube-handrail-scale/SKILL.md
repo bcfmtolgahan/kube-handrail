@@ -53,6 +53,8 @@ If a human rejects the plan, or the approval expires, stop. Do not plan the same
 
 Call `apply_scale_deployment` with the same `plan_id`, `namespace`, `name`, `replicas`, `override_manual_change`, `verify_window_seconds` and `revert_on_failure` as the plan (omit what the plan omitted). Do not change any value. On `conflict`, read the status first: the Deployment changed since the plan, possibly by a human; re-plan only if the change is still wanted. On `plan_expired` or `plan_not_found`, re-plan. Re-plan at most once, then go back to Step 3 (the new plan needs its own approval). On `plan_used`, check status instead: the plan was already applied.
 
+On `admission_denied`, the cluster's admission policy refused the change after the server's checks passed. The plan is used. Stop and report it to the human; do not retry, re-plan or try another count.
+
 ## Step 6: Verify
 
 The server checks the change once its window has passed (counted from the apply). After the window, call `get_plan_outcome(plan_id)`, again every minute or so while `verification.status` or `revert.status` is `pending` (a revert of a degraded change can still follow its verdict), and report:

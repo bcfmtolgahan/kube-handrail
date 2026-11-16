@@ -39,3 +39,21 @@ jobs:
         run: terraform -chdir=terraform init -backend=false -input=false
       - name: Validate
         run: terraform -chdir=terraform validate
+
+  # The admission policy against a real API server (tests/admission/run.sh). Kubernetes 1.31,
+  # pinned by digest; ValidatingAdmissionPolicy v1 needs 1.30 or later.
+  admission:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.31.0
+          node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
+          cluster_name: kube-handrail-admission
+      - name: Apply the sandbox manifests and the policy
+        run: kubectl apply -f k8s/sandbox/
+      - name: Admission cases
+        env:
+          OTHER_NAMESPACE: kube-handrail-admission-other
+        run: tests/admission/run.sh

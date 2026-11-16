@@ -27,6 +27,7 @@ from handrail_common.config import ConfigError, Settings, load_settings
 from handrail_common.dispatch import dispatch
 from handrail_common.eks import api_client
 from handrail_common.envelope import (
+    ADMISSION_DENIED,
     CONFLICT,
     GITOPS_MANAGED,
     INTERNAL,
@@ -88,6 +89,13 @@ DEFAULT_REPLICAS = 1
 PATCH_ATTEMPTS = 3
 # Set by every apply of a plan that names its agent, so humans and admission see who asked.
 REQUESTED_BY_ANNOTATION = "kube-handrail.io/requested-by"
+# The ValidatingAdmissionPolicy and its binding in k8s/sandbox/admission-policy.yaml.
+ADMISSION_POLICY = "kube-handrail-writer-bounds"
+# How the API server words a denial by a ValidatingAdmissionPolicy (HTTP 422, reason Invalid).
+ADMISSION_DENIAL = (
+    f"ValidatingAdmissionPolicy '{ADMISSION_POLICY}' with binding '{ADMISSION_POLICY}' "
+    "denied request"
+)
 
 
 @dataclass
@@ -241,11 +249,44 @@ def rollback_patch(
     ]
 
 
+def _status_messages(exc: ApiException) -> list[str]:
+    """The message and the cause messages of the Status object in an API error's body."""
+    body = exc.body
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    try:
+        status = json.loads(body) if isinstance(body, str) else None
+    except ValueError:
+        return []
+    if not isinstance(status, dict):
+        return []
+    messages = [status.get("message")]
+    details = status.get("details")
+    causes = details.get("causes") if isinstance(details, dict) else None
+    if isinstance(causes, list):
+        messages += [cause.get("message") for cause in causes if isinstance(cause, dict)]
+    return [message for message in messages if isinstance(message, str)]
+
+
+def is_admission_denial(exc: ApiException) -> bool:
+    """A 422 from kube-handrail's own admission policy, not from validation or another
+    policy. The cluster's text is matched, never returned."""
+    return exc.status == 422 and any(ADMISSION_DENIAL in m for m in _status_messages(exc))
+
+
 def _api_error(exc: ApiException) -> GuardError:
     if exc.status == 409:
         return GuardError(CONFLICT, "Deployment changed since the plan was made")
     if exc.status == 404:
         return GuardError(NOT_FOUND, "Deployment not found")
+    if is_admission_denial(exc):
+        logger.warning("refused by admission policy %s", ADMISSION_POLICY)
+        # Raised by the dry run or the patch, both after the plan was consumed.
+        return GuardError(
+            ADMISSION_DENIED,
+            "the cluster's admission policy refused the change; the plan is used",
+            {"policy": ADMISSION_POLICY, "binding": ADMISSION_POLICY},
+        )
     logger.error("Kubernetes API error: status=%s reason=%s", exc.status, exc.reason)
     return GuardError(KUBERNETES_ERROR, f"Kubernetes API error ({exc.status})")
 
