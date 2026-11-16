@@ -15,7 +15,7 @@ KH_INTEGRATION=1 KUBECONFIG=<kind kubeconfig> .venv/bin/python -m pytest tests/i
 ## What runs
 
 - **Cluster.** `k8s/sandbox/` (namespace, RBAC, `web`), the admission policy with the bounds `0` and `5` through the `sed` of [Admission policy](../../docs/deploy.md#admission-policy), its binding switched to `Deny`, and a ResourceQuota that admits one BestEffort pod (the verification cases). Fixtures run `registry.k8s.io/pause:3.10`, preloaded on kind nodes, under the namespace's restricted Pod Security; the rollback fixture runs no pods.
-- **Identities.** The read Lambda gets a client that impersonates `kube-handrail-reader` through its existing seam, `eks.ClientCache(factory=...)`. The write Lambda's `Runtime` (built by `get_runtime()` from the environment) gets a client that impersonates `kube-handrail-writer` and a clock the test can move. `test_harness.py` checks that both get exactly the sandbox RBAC. Kubeconfig files with `as` and `as-groups` for both are written to pytest's temporary directory for `kubectl` debugging.
+- **Identities.** The read Lambda gets a client that impersonates `kube-handrail-reader` through its existing seam, `eks.ClientCache(factory=...)`. The write Lambda's `Runtime` (built by `get_runtime()` from the environment) gets a client that impersonates `kube-handrail-writer` and a clock the test can move. `test_kind_harness.py` checks that both get exactly the sandbox RBAC. Kubeconfig files with `as` and `as-groups` for both are written to pytest's temporary directory for `kubectl` debugging.
 - **AWS.** The plan table with the key schema, both indexes, the TTL attribute and the `NEW_AND_OLD_IMAGES` stream of `terraform/main.tf`; the kill switch, both agents' switches and the freezes parameter; the approvals topic; the audit bucket with Object Lock and a default GOVERNANCE retention.
 - **Calls.** A tool call is a `tools/call` body run through `mcp/interceptor` with a token-shaped `client_id` and the test `CALLER_KEY`, then the handler with `bedrockAgentCoreToolName` and `bedrockAgentCoreAwsRequestId` in its client context, as the gateway calls it. The approver gets `requestContext.authorizer.iam.userArn`, as its Function URL reports a SigV4-signed caller (example ARNs in account `123456789012`). The approver and the verifier invoke the write Lambda through a fake `lambda` client that runs it in process with their client context. The audit Lambda gets the records of moto's stream, shaped as the event source mapping delivers them.
 - **Time.** Nothing sleeps for a window. Verification cases move the plan's `verify_at` one second into the past and run the verifier once; the expiry, cooldown and flapping cases move the write Lambda's clock; budgets are reached with real applies against small limits.
@@ -24,23 +24,23 @@ KH_INTEGRATION=1 KUBECONFIG=<kind kubeconfig> .venv/bin/python -m pytest tests/i
 
 | Scenario in `e2e_gateway.py` | Integration test | Still live |
 |---|---|---|
-| Namespace allowlist, replica bounds, names, missing Deployment | `test_guards.py` | Wrong argument types rejected by the gateway's tool schema (the Lambda's own check is covered) |
-| GitOps: Argo CD annotation, Flux label added after the plan, Helm instance label and `gitops_markers`; HPA | `test_guards.py` | |
-| Unknown, mismatched, single-use and expired plans; label-only change; correlation IDs | `test_guards.py` (expiry by the write clock, no TTL wait) | |
-| Conflicts: spec change, manual scale; concurrent applies | `test_guards.py` | Concurrent applies: the conditional write on real DynamoDB |
-| Blast radius | `test_guards.py` | |
+| Namespace allowlist, replica bounds, names, missing Deployment | `test_kind_guards.py` | Wrong argument types rejected by the gateway's tool schema (the Lambda's own check is covered) |
+| GitOps: Argo CD annotation, Flux label added after the plan, Helm instance label and `gitops_markers`; HPA | `test_kind_guards.py` | |
+| Unknown, mismatched, single-use and expired plans; label-only change; correlation IDs | `test_kind_guards.py` (expiry by the write clock, no TTL wait) | |
+| Conflicts: spec change, manual scale; concurrent applies | `test_kind_guards.py` | Concurrent applies: the conditional write on real DynamoDB |
+| Blast radius | `test_kind_guards.py` | |
 | Impact preview (Service, PodDisruptionBudget, `pdb_headroom`) | not ported: needs controller-filled EndpointSlices and PDB status; unit tests cover the preview | default live run |
-| Untrusted event text | `test_harness.py`, with the RBAC of both impersonated groups | |
-| Kill switch, global (including unreadable and not exactly `true`) and per agent | `test_switches.py` | |
-| Agent identity, `not_requester`, client-sent caller argument; forged callers (unsigned, wrong key, unknown client) | `test_switches.py`, `test_approval.py` | Through the real gateway and interceptor (`--with-identity`); detaching the interceptor stays a manual case ([Agents](../../docs/deploy.md#agents)) |
-| Budgets: global, per agent, per object | `test_switches.py`, real applies against small limits, no clock-hour wait | Agent budget counter on real DynamoDB (`--with-identity`) |
-| Oscillation breaker: cooldown, single revert, flapping, manual change and override | `test_breaker.py` | |
-| Change freezes, including an unreadable freeze parameter | `test_switches.py` | |
-| `admission_denied`: the policy narrower than the Lambdas' bounds | `test_rollout.py` (new: before, unit tests and `tests/admission/run.sh` only) | |
-| Restart; rollback history, refusals, ReplicaSet edited, apply, manual change and override | `test_rollout.py` | |
-| Server approval: `approval_required`, request cooldown, show, approve applies, record names the approver, correlation IDs, reject; `both` mode; approval identity | `test_approval.py` | The approval URL refusing a Cognito token and unsigned requests, and a real SigV4 signature |
-| Verification: pending, healthy, unknown after a change by hand, degraded and reverted (the revert verified, then `flapping`), revert skipped with the kill switch off, degraded without revert | `test_verify.py` | |
-| Audit record: entries per stream record, export, redelivery, no overwrite, a different entry under an existing key | `test_audit.py` | The bucket policy's 403 on an overwrite without `If-None-Match`, the real stream and event source mapping (`--with-audit`) |
+| Untrusted event text | `test_kind_harness.py`, with the RBAC of both impersonated groups | |
+| Kill switch, global (including unreadable and not exactly `true`) and per agent | `test_kind_switches.py` | |
+| Agent identity, `not_requester`, client-sent caller argument; forged callers (unsigned, wrong key, unknown client) | `test_kind_switches.py`, `test_kind_approval.py` | Through the real gateway and interceptor (`--with-identity`); detaching the interceptor stays a manual case ([Agents](../../docs/deploy.md#agents)) |
+| Budgets: global, per agent, per object | `test_kind_switches.py`, real applies against small limits, no clock-hour wait | Agent budget counter on real DynamoDB (`--with-identity`) |
+| Oscillation breaker: cooldown, single revert, flapping, manual change and override | `test_kind_breaker.py` | |
+| Change freezes, including an unreadable freeze parameter | `test_kind_switches.py` | |
+| `admission_denied`: the policy narrower than the Lambdas' bounds | `test_kind_rollout.py` (new: before, unit tests and `tests/admission/run.sh` only) | |
+| Restart; rollback history, refusals, ReplicaSet edited, apply, manual change and override | `test_kind_rollout.py` | |
+| Server approval: `approval_required`, request cooldown, show, approve applies, record names the approver, correlation IDs, reject; `both` mode; approval identity | `test_kind_approval.py` | The approval URL refusing a Cognito token and unsigned requests, and a real SigV4 signature |
+| Verification: pending, healthy, unknown after a change by hand, degraded and reverted (the revert verified, then `flapping`), revert skipped with the kill switch off, degraded without revert | `test_kind_verify.py` | |
+| Audit record: entries per stream record, export, redelivery, no overwrite, a different entry under an existing key | `test_kind_audit.py` | The bucket policy's 403 on an overwrite without `If-None-Match`, the real stream and event source mapping (`--with-audit`) |
 | Authentication: missing, malformed, tampered token | not portable | live only |
 | Drift sentinel | not ported: moto has no Bedrock AgentCore gateway or DevOps Agent APIs; unit tests cover it | live (scheduled) |
 
