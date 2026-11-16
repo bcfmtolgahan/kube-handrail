@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import time
+import urllib.parse
 import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -115,7 +116,19 @@ def require_kind_kubeconfig() -> str:
     _, active = k8s_config.list_kube_config_contexts(config_file=path)
     if not active["name"].startswith("kind-"):
         raise RuntimeError(f"refusing context {active['name']!r}: not a kind cluster")
+    server = admin_configuration(path).host
+    if urllib.parse.urlsplit(server).hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise RuntimeError(f"refusing API server {server!r}: a kind cluster listens on localhost")
     return path
+
+
+def wait_out_hour_boundary(margin: int = 90) -> None:
+    """Budgets count applies per clock hour (on the Lambdas' real clock, which the read
+    Lambda does not let a test move). A case that needs one hour sleeps past the boundary
+    when fewer than `margin` seconds of the hour are left."""
+    left = 3600 - int(time.time()) % 3600
+    if left < margin:
+        time.sleep(left + 1)
 
 
 def admin_configuration(kubeconfig: str) -> k8s.Configuration:

@@ -16,7 +16,7 @@ from moto import mock_aws
 from handrail_common import eks
 
 HERE = Path(__file__).resolve().parent
-ENABLED = bool(os.environ.get("KH_INTEGRATION"))
+ENABLED = os.environ.get("KH_INTEGRATION", "").lower() in ("1", "true", "yes")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -100,12 +100,23 @@ def kh(clients, handlers, monkeypatch):
     # The read Lambda's only Kubernetes client: the impersonated reader.
     monkeypatch.setattr(eks, "_cache", eks.ClientCache(factory=lambda _name: clients["reader"]))
 
+    # Optional settings the tests override: a value from the outer environment must not leak in.
+    previous: set[str] = {
+        "APPLY_COOLDOWN_SECONDS",
+        "APPROVAL_MODE",
+        "GITOPS_MARKERS",
+        "GLOBAL_HOURLY_APPLY_BUDGET",
+        "OBJECT_HOURLY_APPLY_BUDGET",
+    }
+
     def set_env(env):
+        # An override of an earlier configure() that the new call leaves out is removed.
+        for key in previous - env.keys():
+            monkeypatch.delenv(key, raising=False)
         for key, value in env.items():
             monkeypatch.setenv(key, value)
-        for key in ("GITOPS_MARKERS",):
-            if key not in env:
-                monkeypatch.delenv(key, raising=False)
+        previous.clear()
+        previous.update(env)
 
     with mock_aws():
         aws = harness.create_aws_resources()

@@ -19,6 +19,7 @@ from harness import (
     deployment_manifest,
     details,
     unique,
+    wait_out_hour_boundary,
 )
 
 from handrail_common.dispatch import CALLER_ARGUMENT, caller_signature
@@ -107,6 +108,7 @@ def test_forged_callers_are_refused(kh):
 
 
 def test_global_budget(kh):
+    wait_out_hour_boundary()
     kh.configure(GLOBAL_HOURLY_APPLY_BUDGET="2")
     first, second, third = (fixture(kh, f"it-global-{i}") for i in range(3))
     late = kh.plan(third, 2)
@@ -120,6 +122,7 @@ def test_global_budget(kh):
 
 
 def test_agent_budget(kh):
+    wait_out_hour_boundary()
     targets = [fixture(kh, f"it-agent-budget-{i}") for i in range(3)]
     late = kh.plan(targets[2], 2, client=CLIENT_B)
     for target in targets[:2]:
@@ -132,6 +135,7 @@ def test_agent_budget(kh):
 
 
 def test_object_budget(kh):
+    wait_out_hour_boundary()
     kh.configure(OBJECT_HOURLY_APPLY_BUDGET="2")
     target = fixture(kh, "it-object-budget")
     for replicas in (2, 3):
