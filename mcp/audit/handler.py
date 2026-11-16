@@ -54,6 +54,7 @@ SUMMARY_ATTRIBUTES = (
     "requested_client_id",
     "approved_by",
     "approval_channel",
+    "approval_mode",
     "rejected_by",
     "channel",
     "applied_at",

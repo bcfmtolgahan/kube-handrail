@@ -35,18 +35,21 @@ OK = "ok"
 ERROR_OUTCOMES = (INTERNAL, KUBERNETES_ERROR, ADMISSION_DENIED)
 
 # Only a short token is accepted: the value goes into logs, the plan record and a
-# Kubernetes annotation.
-_CORRELATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+# Kubernetes annotation and User-Agent; fullmatch, so a trailing newline is refused too.
+_CORRELATION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 _correlation_id: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 _caller: ContextVar[str | None] = ContextVar("caller", default=None)
 _channel: ContextVar[str] = ContextVar("channel", default=CHANNEL_GATEWAY)
+# The plan the invocation works on, for the User-Agent of its Kubernetes requests
+# (handrail_common.eks). dispatch binds the plan_id argument, plan tools the new plan's id.
+_plan_id: ContextVar[str | None] = ContextVar("plan_id", default=None)
 
 
 def _valid(value: Any) -> str | None:
     if isinstance(value, int) and not isinstance(value, bool):
         value = str(value)
-    if isinstance(value, str) and _CORRELATION_ID.match(value):
+    if isinstance(value, str) and _CORRELATION_ID.fullmatch(value):
         return value
     return None
 
@@ -75,6 +78,21 @@ def bind_correlation_id(value: str | None) -> Any:
 
 def unbind_correlation_id(token: Any) -> None:
     _correlation_id.reset(token)
+
+
+def current_plan_id() -> str | None:
+    """The plan of the invocation dispatch is running, or None."""
+    return _plan_id.get()
+
+
+def bind_plan_id(value: str | None) -> Any:
+    """Set the plan for the rest of the invocation (a validated UUID, or None); dispatch
+    resets it when the invocation ends."""
+    return _plan_id.set(value)
+
+
+def unbind_plan_id(token: Any) -> None:
+    _plan_id.reset(token)
 
 
 def channel(context: Any) -> str:

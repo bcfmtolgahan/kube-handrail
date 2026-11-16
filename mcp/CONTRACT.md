@@ -76,6 +76,7 @@ The ID is carried to:
 - the plan record: `plan_correlation_id` (plan), `approval_request_correlation_id` (the `request_approval` call that notified), `decision_correlation_id` (the approver's request that approved or rejected), `apply_correlation_id` (the apply that recorded its `result`, whether it succeeded or not) and `verification.correlation_id` (the verifier run that checked it). See [Plan record](#plan-record-dynamodb);
 - the Deployment: the apply's patch sets the annotation `kube-handrail.io/correlation-id` to the apply's ID, next to `kube-handrail.io/last-plan-id`. Both are set by the same patch, which bumps `generation` once, as before;
 - `data.correlation_id` in successful `plan_*`, `request_approval` and `apply_*` responses (`null` only outside a Lambda).
+- the Kubernetes API: the User-Agent `kube-handrail/<version> plan/<plan_id> corr/<correlation_id>` (each part when known; `<version>` is `handrail_common.__version__`), for matching EKS audit log entries. The plan is the one being made (a refused plan names an ID never stored), applied, verified or reverted. Tested on a test cluster.
 
 In `server` mode the approver passes its own request ID to the write Lambda as `kubeHandrailCorrelationId`, so the decision, the apply it runs, `apply_correlation_id` and the annotation share one ID, also when the apply fails.
 
@@ -294,6 +295,7 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `override_manual_change` | BOOL | the value pinned in `args_hash` |
 | `impact` | M | the impact preview returned with the plan, so the approval channel renders the server's own record |
 | `approval_requested_at` | N | last `request_approval` that notified |
+| `approval_mode` | S | the read Lambda's `APPROVAL_MODE` at plan time (a revert record copies its plan's). Evidence only: apply checks its own |
 | `approved_by`, `approved_at`, `approved_args_hash`, `approval_channel`, `approval_expires_at` | S, N, S, S, N | written by an approval: the approver's IAM principal ARN as it signed the request, the time, the plan's own `args_hash` copied in the same update, `api`, and `approved_at + APPLY_AFTER_APPROVAL_TTL_SECONDS` |
 | `rejected_by`, `rejected_at`, `reject_reason` | S, N, S | written by a rejection; the reason is at most 500 characters with control characters removed |
 | `applied_at`, `result`, `apply_correlation_id` | N, S, S | written by apply after the patch, on a best-effort basis: `result` is `applied`, or the error code that stopped the apply; `apply_correlation_id` is the apply's correlation ID. An applied plan can therefore lack them; the Deployment's `kube-handrail.io/last-plan-id` annotation is the authoritative record of the last apply (see History checks) |
@@ -674,6 +676,7 @@ The revert record is verified one window later like any applied plan and reports
   "plan_id": "...", "cluster": "my-cluster", "action": "scale_deployment", "namespace": "sandbox", "name": "web",
   "kind": "change", "reverts_plan_id": null,
   "replicas": { "from": 1, "to": 2 },
+  "approval_mode": "server",
   "plan_status": "applied",
   "verification": {
     "window_seconds": 120, "verify_at": 1700000120,
@@ -692,6 +695,7 @@ The revert record is verified one window later like any applied plan and reports
 - `verification.status` is the recorded outcome, with its `reason`, `checked_at` and `observed`, or, before there is one: `not_applied` (not consumed yet), `pending` (scheduled, and now is at most `verify_at + VERIFY_GRACE_SECONDS`), `unknown` with reason `check_overdue` (scheduled, and the check has not run within the grace period) or `unknown` with reason `not_scheduled` (consumed without a schedule: before verification was deployed, or while it was off). `checked_at` and `observed` are then `null`.
 - `cluster` is the record's `cluster` (`null` on a record made before it).
 - `kind` is `change`, or `revert` for a revert record, with `reverts_plan_id`.
+- `approval_mode` is the record's, or `null`.
 - `revert` is `{"requested": false, "status": "not_requested"}` without `revert_on_failure` and on a revert record. With it, `{"requested": true, "status"}`: `pending` (no verdict yet, or `degraded` and not yet acted on), `not_needed` (the outcome is not `degraded`), or the recorded `reverted`, `skipped` or `refused` with its `reason` and `revert_plan_id`.
 - `correlation_ids` holds those recorded, by step: `plan`, `apply`, `verification`.
 - Condition reasons in `observed` are returned as [untrusted text](#untrusted-output): anyone who can write the Deployment's status sets them. A reason cut at its limit sets the envelope's `truncated`. Every other value was set by the server.
@@ -898,7 +902,7 @@ Known limits:
 
 With `audit_enabled` (Terraform, default `true`), every change to a plan record is written once, as one JSON object, to an S3 bucket with Object Lock, where the tool Lambdas cannot change or delete it. Implemented and tested on a test cluster.
 
-The record detects after the fact; it blocks nothing. The apply path does not wait for it or depend on it, so an audit failure never refuses a change; it alarms instead. It is a record of plan-record state: a call refused before a record is written or changed is only in the [tool record](#tool-record) (CloudWatch Logs). A signed hash chain, approval receipts and anomaly detection are not part of it ([ADR 0007](../docs/adr/0007-durable-audit-record.md)).
+The record detects after the fact and blocks nothing: the apply path does not depend on it, so an audit failure alarms instead of refusing a change. It is a record of plan-record state: a call refused before a record is written or changed is only in the [tool record](#tool-record) (CloudWatch Logs). A signed hash chain, approval receipts and anomaly detection are not part of it ([ADR 0007](../docs/adr/0007-durable-audit-record.md)).
 
 ### Source
 
@@ -918,7 +922,7 @@ One object per stream record of a plan, at
 plans/<plan_id>/<approximate creation time, epoch seconds, 10 digits>-<sequence number, 40 digits>.json
 ```
 
-Both numbers are zero-padded, so listing a plan's prefix returns its entries in event order, and a plan's entries are found with one `ListObjectsV2` on its prefix. The key and the bytes come from the stream record alone (no processing time), so a redelivered record maps to the same key and the same bytes.
+Both numbers are zero-padded, so one `ListObjectsV2` on the prefix returns a plan's entries in event order. The key and the bytes come from the stream record alone (no processing time), so a redelivered record maps to the same key and the same bytes.
 
 The object is `json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True)` of:
 
@@ -930,7 +934,7 @@ The object is `json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_a
 | `stream` | `event_name`, `event_id`, `sequence_number`, `approximate_creation_time`, `ttl_removal` (bool), `user_identity` (as in the record, or `null`) |
 | `image_format` | `plain`, or `dynamodb` when an image could not be decoded |
 | `old_image`, `new_image` | the item before and after, as plain JSON (`null` when absent): integral numbers as integers, other numbers as their exact decimal string, sets as sorted lists, binary as base64. The source of truth. With `image_format` `dynamodb`, the images are kept exactly as the stream delivered them (DynamoDB JSON) and `summary` is only `{plan_id, error}`, the exception class: a value written into the plan record never keeps its change out of the record |
-| `summary` | derived for humans: `plan_id`; `cluster`, `kind`, `action`, `namespace`, `name`, `requested_by`, `agent`, `requested_client_id`, `approved_by`, `approval_channel`, `rejected_by`, `channel`, `applied_at`, `reverts_plan_id` when present; `status`, `used` and `result` as a value, or as `{"from": ..., "to": ...}` when the record changed it; `verification` (its `outcome`) and `revert` (`status`, `revert_plan_id`) when present; `changed`, the sorted names of the attributes the record changed |
+| `summary` | derived for humans: `plan_id`; `cluster`, `kind`, `action`, `namespace`, `name`, `requested_by`, `agent`, `requested_client_id`, `approved_by`, `approval_channel`, `approval_mode`, `rejected_by`, `channel`, `applied_at`, `reverts_plan_id` when present; `status`, `used` and `result` as a value, or as `{"from": ..., "to": ...}` when the record changed it; `verification` (its `outcome`) and `revert` (`status`, `revert_plan_id`) when present; `changed`, the sorted names of the attributes the record changed |
 
 Each object is written with `PutObject` and `If-None-Match: *` (and `Content-MD5`; Object Lock requires an integrity header). A `412 PreconditionFailed` means the key exists: the Lambda reads the object, and an entry that is identical except for `summary` counts as written (a redelivery; a newer handler version may derive the summary differently). Any other difference is a failure of that record (`Mismatches`), which stops the shard, raises the failures alarm and, once the retries are spent, the dead-letter alarm. The put never sets a retention: the bucket's default applies.
 
@@ -942,18 +946,22 @@ Each object is written with `PutObject` and `If-None-Match: *` (and `Content-MD5
 - `s3:PutObject` without the `s3:if-none-match` condition key, so every put is conditional;
 - to the read, write, approver, verifier, sentinel, interceptor and gateway roles (by `aws:PrincipalArn`): `s3:PutObject*`, `s3:DeleteObject*`, `s3:BypassGovernanceRetention`, `s3:RestoreObject`, `s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:PutBucket*`, `s3:DeleteBucket*`, `s3:PutLifecycleConfiguration`, `s3:PutReplicationConfiguration` and `s3:PutEncryptionConfiguration`. None of these roles has any S3 grant either.
 
-Under `GOVERNANCE`, a principal allowed `s3:BypassGovernanceRetention` (an account administrator) can still delete an object version or shorten its retention; under `COMPLIANCE` nobody can before the retention ends, and the bucket cannot be deleted while it holds such objects. Retention applies per object version: a plan's entries are kept for the retention period after they were written, whatever happens to the plan table, whose own records expire after about an hour or two.
+Under `GOVERNANCE`, a principal allowed `s3:BypassGovernanceRetention` can still delete an entry or shorten its retention; under `COMPLIANCE` nobody can before it ends, and the bucket cannot be deleted until then ([deploy](../docs/deploy.md#audit-record-retention)). Retention is per object version, so entries outlive the plan table's records, which expire after an hour or two.
 
 ### What it shows, and how strongly
 
 - **Requesting agent:** `requested_by` and `agent` in the images, as strong as [Agent identity](#agent-identity) makes them.
 - **Approver:** `approved_by` (the IAM identity of the approval request), `approval_channel` and `decision_correlation_id`. The record shows what the table held; it does not prove that the approval channel wrote it.
-- **Executing role:** not observed. Stream records carry no principal (except for TTL removals). A consume (`used` from `false` to `true`) and the result are attributed to the write Lambda's role by construction: only it can consume a plan through the guard and only it is in `kube-handrail-writer`. `channel` (`gateway`, `approval-api` or `verifier`) and `apply_correlation_id` join the entry to the write Lambda's tool record and the Deployment's `kube-handrail.io/correlation-id` annotation.
-- **Tampering by the executor:** the write role can still change the plan table (see [Identity](#identity)), but every change becomes another entry, and it cannot replace or delete an earlier one. A rewritten `result` or a flipped `used` therefore shows as a later `modified` entry next to the original one. Nothing flags it automatically.
+- **Executing role:** not observed: stream records carry no principal (except TTL removals). A consume (`used` from `false` to `true`) and the result are attributed to the write Lambda's role by construction (only it can consume through the guard and only it is in `kube-handrail-writer`); `channel` and `apply_correlation_id` join the entry to its tool record and the Deployment's `kube-handrail.io/correlation-id` annotation.
+- **Tampering by the executor:** the write role can still change the plan table (see [Identity](#identity)), but every change becomes another entry, and it cannot replace or delete an earlier one. A rewritten `result` or a flipped `used` therefore shows as a later `modified` entry, which `audit.py verify` reports; nothing flags it as it happens.
 
 ### Export
 
-`scripts/audit.py export <plan_id> [--out FILE] [--no-links]`, with the operator's credentials (`s3:ListBucket` and `s3:GetObject`; `--bucket`, else `AUDIT_BUCKET`, else `terraform output -raw audit_bucket_name` in `TF_DIR`), prints one JSON bundle: `plan_id`, `bucket`, `exported_at`, `entries` (every entry in order, each with its `key`), `malformed` (keys under the plan's prefix that are not JSON entries in the Lambda's shape, reported and not read further), `summary` and `linked`. The summary takes from the latest image `kind`, `action`, `namespace`, `name`, `requested_by`, `agent`, `requested_client_id`, `approval_channel`, `rejected_by`, `reject_reason`, `channel`, `result`, `applied_at`, `used`, `status` and `reverts_plan_id`, and adds `approved_by` (every distinct approver, in order), `status_history`, `executed_by` (the attribution above, for a consumed plan), `verification` (`outcome`, `reason`), `revert` (`status`, `reason`, `revert_plan_id`), `has_creation` (false when the creation is missing: a plan created before the stream was enabled, or a record that went to the dead-letter queue), `removed` (`expunged`, `deleted` or `null`), `first_seen`, `last_seen`, `undecoded` (entries with `image_format` `dynamodb`, which are in `entries` but not read for the summary) and `malformed` (their count). `linked` holds, one level deep, the revert record named by `revert.revert_plan_id` (`relation` `revert`) or the plan named by a revert record's `reverts_plan_id` (`relation` `reverts`), each with its own summary and entries. Exit status 1 when the plan has no entries. `audit.py list [--limit N]` lists plans by their latest entry, newest first; it lists every key in the bucket.
+`scripts/audit.py`, with the operator's credentials (`s3:ListBucket` and `s3:GetObject`; `--bucket`, else `AUDIT_BUCKET`, else `terraform output -raw audit_bucket_name` in `TF_DIR`). Its docstring and `--help` give the fields and finding codes.
+
+- `export <plan_id> [--out FILE] [--no-links]` prints one JSON bundle: every entry in order, `malformed` keys (not read further), a `summary` (the latest image, every approver, `status_history`, verification and revert, `has_creation`) and `linked` (the revert record or reverted plan). For a consumed plan, `executed_by` holds the attribution above and CloudWatch Logs Insights templates: the Lambda logs by plan and correlation IDs, and the EKS audit log by the User-Agent. Exit status 1 without entries.
+- `verify (<plan_id> | --since SECONDS | --all) [--json] [--approval-mode MODE]` exits 1 when a plan's entries show what no writer of the record produces: rewrites before, at or after the consume, an impossible consume, gaps, or a channel or missing server approval wrong for the plan's `approval_mode`. A `client`-mode apply is information, with a time window for CloudTrail. Tested on a test cluster.
+- `list [--limit N]` lists plans by their latest entry, newest first, reading every key in the bucket.
 
 ### Alarms and metrics
 

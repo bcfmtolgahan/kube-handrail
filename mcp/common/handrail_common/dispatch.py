@@ -15,6 +15,7 @@ from handrail_common.observability import (
     OK,
     bind_caller,
     bind_correlation_id,
+    bind_plan_id,
     channel,
     correlation_id,
     current_correlation_id,
@@ -22,6 +23,7 @@ from handrail_common.observability import (
     tool_record,
     unbind_caller,
     unbind_correlation_id,
+    unbind_plan_id,
 )
 from handrail_common.validation import GuardError, require_plan_id
 
@@ -127,6 +129,13 @@ def logged_plan_id(envelope: Envelope, args: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _plan_argument(args: Mapping[str, Any]) -> str | None:
+    try:
+        return require_plan_id(args.get("plan_id"))
+    except GuardError:
+        return None
+
+
 def _run(handler: Handler | None, name: str | None, args: dict[str, Any]) -> Envelope:
     if handler is None:
         return err(UNKNOWN_TOOL, f"unknown tool: {name!r}")
@@ -158,9 +167,13 @@ def dispatch(
     token = bind_correlation_id(correlation)
     # Handlers read the caller and channel through observability, as the correlation id.
     tokens = bind_caller(caller, channel_name)
+    # The plan an apply or a verification names, for the User-Agent of its Kubernetes
+    # requests; a plan tool binds its new plan's id itself.
+    plan_token = bind_plan_id(_plan_argument(args))
     try:
         envelope = _run(handler, name, args)
     finally:
+        unbind_plan_id(plan_token)
         unbind_caller(tokens)
         unbind_correlation_id(token)
     outcome = OK if envelope.get("ok") else str((envelope.get("error") or {}).get("code"))

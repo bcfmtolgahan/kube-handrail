@@ -141,6 +141,12 @@ def test_verification_and_revert_in_summary():
     assert entry["summary"]["revert"] == {"status": "reverted", "revert_plan_id": "r-1"}
 
 
+def test_summary_names_the_approval_mode():
+    planned = {**PLANNED, "approval_mode": "both"}
+    _, entry = handler.build_entry(stream_record("INSERT", "100", new=planned))
+    assert entry["summary"]["approval_mode"] == "both"
+
+
 def test_remove_by_ttl_is_expunged():
     _, entry = handler.build_entry(
         stream_record("REMOVE", "103", old=APPLIED, identity=TTL_IDENTITY)

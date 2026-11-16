@@ -11,11 +11,58 @@ import boto3
 from botocore.signers import RequestSigner
 from kubernetes import client as k8s
 
+from handrail_common import __version__
+from handrail_common.observability import current_correlation_id, current_plan_id
+
 TOKEN_PREFIX = "k8s-aws-v1."
 CLUSTER_ID_HEADER = "x-k8s-aws-id"
 # EKS accepts a token for 15 minutes after signing; refresh well before that.
 CLIENT_TTL_SECONDS = 600.0
 PRESIGN_EXPIRES_SECONDS = 60
+USER_AGENT_PRODUCT = "kube-handrail"
+
+
+def user_agent() -> str:
+    """`kube-handrail/<version> plan/<plan_id> corr/<correlation_id>`, each part only when
+    known, so an EKS audit log entry (userAgent) can be matched to a plan and a tool record.
+    Both ids are validated tokens (a UUID, the correlation id pattern)."""
+    parts = [f"{USER_AGENT_PRODUCT}/{__version__}"]
+    plan_id = current_plan_id()
+    if plan_id is not None:
+        parts.append(f"plan/{plan_id}")
+    correlation = current_correlation_id()
+    if correlation is not None:
+        parts.append(f"corr/{correlation}")
+    return " ".join(parts)
+
+
+class HandrailApiClient(k8s.ApiClient):
+    """An ApiClient that sets the User-Agent per request, from the invocation's plan and
+    correlation id. The client is cached and shared across invocations, so the header is
+    not stored on it."""
+
+    def request(
+        self,
+        method,
+        url,
+        query_params=None,
+        headers=None,
+        post_params=None,
+        body=None,
+        _preload_content=True,
+        _request_timeout=None,
+    ):
+        headers = {**(headers or {}), "User-Agent": user_agent()}
+        return super().request(
+            method,
+            url,
+            query_params=query_params,
+            headers=headers,
+            post_params=post_params,
+            body=body,
+            _preload_content=_preload_content,
+            _request_timeout=_request_timeout,
+        )
 
 
 def get_token(cluster_name: str, session: boto3.Session, region: str) -> str:
@@ -65,7 +112,7 @@ def build_api_client(cluster_name: str, session: boto3.Session | None = None) ->
     config.verify_ssl = True
     config.api_key = {"authorization": get_token(cluster_name, session, region)}
     config.api_key_prefix = {"authorization": "Bearer"}
-    return k8s.ApiClient(config)
+    return HandrailApiClient(config)
 
 
 @dataclass
