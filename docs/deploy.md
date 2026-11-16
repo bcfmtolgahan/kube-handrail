@@ -27,60 +27,50 @@ Every AWS resource name starts with `name_prefix` (default `kube-handrail`): IAM
 Not derived from `name_prefix`:
 
 - The Kubernetes groups `kube-handrail-reader` and `kube-handrail-writer`, which the access entries map the Lambda roles to. Deployments on the same cluster share them, and with them the RoleBindings.
-- The namespace in `k8s/sandbox/*.yaml` and in `tests/e2e/e2e_gateway.py`, `kube-handrail-sandbox`, which is also the default of `sandbox_namespace`. `scripts/smoke_test.py` takes `NAMESPACE`.
+- The cluster objects in `build/k8s`: the Roles `kube-handrail-reader` and `kube-handrail-writer`, the ClusterRole `kube-handrail-policy-reader` and the admission policy `kube-handrail-writer-bounds`. A cluster holds one copy, so it holds one kube-handrail deployment.
+- The test namespace in `k8s/sandbox/namespace.yaml` and in `tests/e2e/e2e_gateway.py`, `kube-handrail-sandbox`. `scripts/smoke_test.py` takes `NAMESPACE`.
 
-## Namespace and RBAC
+## Namespaces, RBAC and admission policy
 
-The Lambdas can do nothing in the cluster until the Roles and RoleBindings in `k8s/sandbox/rbac.yaml` exist in the allowed namespace. For the default namespace, `kubectl apply -f k8s/sandbox/` creates the namespace, the RBAC and the `web` test Deployment ([Milestone 0, step 1](milestone-0.md#1-sandbox-namespace-rbac-and-target-workload)). For another `sandbox_namespace`, create the namespace and apply the same RBAC there; the group names must stay as they are:
+Status: implemented, not yet tested on a cluster. The rendered manifests are checked against golden files, and the admission policy for two namespaces on kind, in CI.
 
-```sh
-sed 's/kube-handrail-sandbox/<namespace>/' k8s/sandbox/rbac.yaml | kubectl apply -f -
+The tools act only in the namespaces of `namespaces`, each with its own replica bounds, allowed actions, approvers and GitOps markers ([Namespace policy](../mcp/CONTRACT.md#namespace-policy)):
+
+```hcl
+namespaces = {
+  "kube-handrail-sandbox" = { min_replicas = 0, max_replicas = 5 }
+  "payments" = {
+    min_replicas = 2
+    max_replicas = 10
+    actions      = ["restart", "scale"]                             # default: restart, rollback, scale
+    approvers    = ["arn:aws:iam::111122223333:role/payments-oncall"] # default: approver_principals
+  }
+}
 ```
 
-The end-to-end guard tests only run against `kube-handrail-sandbox`.
+Without `namespaces`, the deprecated `sandbox_namespace`, `min_replicas` and `max_replicas` still define one namespace, as before; Terraform warns while they are set and refuses them together with `namespaces`. To move, write their values into `namespaces` (the warning prints the entry) and remove them; the rendered policy stays the same.
 
-## Admission policy
-
-`k8s/sandbox/admission-policy.yaml` is a second check of the replica bounds in the cluster, for the writer group in the sandbox namespace only ([Admission policy](../mcp/CONTRACT.md#admission-policy)). Status: implemented and tested on a test cluster; CI runs its cases on kind.
-
-- **Kubernetes 1.30 or later** (`admissionregistration.k8s.io/v1`). On an older cluster `kubectl apply -f k8s/sandbox/` fails for this file only; apply the other files one by one and skip it.
-- **Bounds.** The file commits `0` and `5`, the defaults of `min_replicas` and `max_replicas`. They must equal the Terraform values. For other values or another namespace:
-
-  ```sh
-  sed -e 's/"[0-9]*" # min_replicas/"<min>" # min_replicas/' \
-      -e 's/"[0-9]*" # max_replicas/"<max>" # max_replicas/' \
-      -e 's/kube-handrail-sandbox/<namespace>/' \
-      k8s/sandbox/admission-policy.yaml | kubectl apply -f -
-  ```
-
-Roll it out in three steps:
-
-1. **Audit.** Apply it as committed (`kubectl apply -f k8s/sandbox/admission-policy.yaml`, or the `sed` above). The binding has `validationActions: [Warn, Audit]`: nothing is refused.
-2. **Check.** `kubectl get validatingadmissionpolicy kube-handrail-writer-bounds -o jsonpath='{.status.typeChecking}'` shows no `expressionWarnings`. Run `tests/admission/run.sh` (with `MIN_REPLICAS=<min>` and `MAX_REPLICAS=<max>` when they are not 0 and 5; it impersonates the writer group, so it needs cluster-admin, makes only server-side dry runs, and switches the binding to `Deny` and back). Leave `OTHER_NAMESPACE` unset on a shared cluster: it creates and deletes a namespace. Then run the smoke test, and look in the API server audit log, if it is enabled, for the annotation `validation.policy.admission.k8s.io/validation_failure` on requests of the writer.
-3. **Deny.**
-
-   ```sh
-   kubectl patch validatingadmissionpolicybinding kube-handrail-writer-bounds \
-     --type merge -p '{"spec":{"validationActions":["Deny"]}}'
-   ```
-
-   A later `kubectl apply` of the file, or of `k8s/sandbox/`, sets the binding back to `[Warn, Audit]` without any warning; patch it again afterwards, or apply a copy with `validationActions: [Deny]`. After every such apply, check that enforcement is still on:
-
-   ```sh
-   kubectl get validatingadmissionpolicybinding kube-handrail-writer-bounds \
-     -o jsonpath='{.spec.validationActions}'
-   ```
-
-To go back to audit, patch `validationActions` to `["Warn","Audit"]`. To remove it:
+`terraform apply` writes the cluster side to `build/k8s/` (also the `k8s_manifests` output): `rbac.yaml` (in every namespace a reader Role, and a writer Role where an action is allowed, bound to the access entries' groups, whose names must stay as they are), `policy-reader.yaml` (the ClusterRole `kube-handrail-policy-reader`: `get` on the admission policy and its binding only, the reader's one cluster-scoped right) and `admission-policy.yaml`. Terraform does not talk to the cluster and creates no namespaces. With a kubeconfig that may create these objects (cluster-admin):
 
 ```sh
-kubectl delete validatingadmissionpolicybinding kube-handrail-writer-bounds
-kubectl delete validatingadmissionpolicy kube-handrail-writer-bounds
+kubectl apply --dry-run=server -f build/k8s/ && kubectl apply -f build/k8s/
+$(terraform -chdir=terraform output -raw namespace_label_command)   # kube-handrail.io/managed=true
 ```
 
-`scripts/cleanup.sh` deletes it with the rest of `k8s/sandbox`. On a cluster below 1.30 that delete fails on the unknown kind; delete the other files one by one instead.
+or `make upgrade UPGRADE_FLAGS=--with-k8s`, which does the same after the Terraform apply. The namespaces must exist first. The label is an inventory marker for operators and `scripts/cleanup.sh`; the policy and the bindings select namespaces by name, so removing it weakens nothing. `kubectl apply` never deletes: after removing a namespace or narrowing its actions, delete the Roles that are no longer rendered (`make upgrade UPGRADE_FLAGS=--with-k8s` lists them).
 
-The policy and binding names are fixed, so a cluster holds one copy. Two kube-handrail deployments on one cluster share the writer group; if they use different sandbox namespaces, applying the second one's copy replaces the first one's namespace selector and the first namespace loses this check.
+For the test namespace, `kubectl apply -f k8s/sandbox/namespace.yaml -f k8s/sandbox/web-deployment.yaml` creates it with the `web` Deployment ([Milestone 0, step 1](milestone-0.md#1-sandbox-namespace-rbac-and-target-workload)). `k8s/sandbox/rbac.yaml` and `admission-policy.yaml` are superseded by `build/k8s`; do not apply them.
+
+### Admission policy
+
+The policy is a second check of the replica bounds in the cluster, for the writer group in the policy's namespaces only ([Admission policy](../mcp/CONTRACT.md#admission-policy)). It needs **Kubernetes 1.30 or later**.
+
+- **Mode.** `admission_mode` (default `Deny`) is rendered into the binding, so applying `build/k8s` again never turns enforcement off silently; change it in Terraform, not with `kubectl patch`.
+- **Plan-time check.** Before every plan the read Lambda reads the policy and the binding and refuses the plan with `conflict` (`details.check = "admission_policy_match"`, `details.reason` saying what) unless the binding is in `Deny`, both select the namespace and the bounds equal Terraform's. It fails closed: if it cannot read them (no ClusterRole, an API error), plans are refused too. So after an apply that changes bounds or namespaces, plans are refused until `build/k8s` is applied, and a binding switched to `Warn` by hand stops all plans.
+- **Trial.** To watch the policy before enforcing it, set `admission_mode = "Warn"` and `admission_check = false` (Terraform warns about `Warn` with the check on), apply both sides, and check that `kubectl get validatingadmissionpolicy kube-handrail-writer-bounds -o jsonpath='{.status.typeChecking}'` shows no `expressionWarnings`. `tests/admission/run.sh` impersonates the writer and reader groups with server-side dry runs (cluster-admin; `NAMESPACE`, `MIN_REPLICAS`, `MAX_REPLICAS`, and `NAMESPACE_2`, `MIN_REPLICAS_2`, `MAX_REPLICAS_2` for a second namespace); leave `OTHER_NAMESPACE` unset on a shared cluster, where it would create and delete a namespace. Then set `Deny` and `admission_check = true` and apply both sides again.
+- **Older clusters.** Below 1.30, set `admission_check = false` and apply only `build/k8s/rbac.yaml`.
+
+`scripts/cleanup.sh` deletes `build/k8s` from the cluster and removes the label; the namespaces stay.
 
 ## Agents
 
@@ -163,13 +153,13 @@ On `terraform destroy`, Lambda releases the network interfaces of VPC functions 
 
 ## Order of steps
 
-1. **Sandbox RBAC.** Apply the namespace and RBAC (above). The bindings name the groups, not the roles, so they can exist before the roles do.
-2. **Variables.** Copy `terraform/terraform.tfvars.example` to `terraform/terraform.tfvars` and set at least `cluster_name`, `region` and, for a private endpoint, the network variables. Adjust `agents` if more than DevOps Agent and the tests will call the gateway ([Agents](#agents)). For the first tests set `approval_mode = "client"`: the smoke test and the default guard tests apply through the gateway, which `server` mode refuses without an approval.
-3. **Infrastructure.** `terraform -chdir=terraform init`, `plan`, `apply` ([Milestone 0, step 2](milestone-0.md#2-infrastructure)). The plan fails early if the authentication mode, the endpoint access or the network variables do not fit together.
+1. **Namespaces.** Create the namespaces the tools will act in, for a test the sandbox (above).
+2. **Variables.** Copy `terraform/terraform.tfvars.example` to `terraform/terraform.tfvars` and set at least `cluster_name`, `region`, `namespaces` and, for a private endpoint, the network variables. Adjust `agents` if more than DevOps Agent and the tests will call the gateway ([Agents](#agents)). For the first tests set `approval_mode = "client"`: the smoke test and the default guard tests apply through the gateway, which `server` mode refuses without an approval.
+3. **Infrastructure.** `terraform -chdir=terraform init`, `plan`, `apply` ([Milestone 0, step 2](milestone-0.md#2-infrastructure)). The plan fails early if the authentication mode, the endpoint access or the network variables do not fit together. Then apply `build/k8s` and run the label command ([above](#namespaces-rbac-and-admission-policy)); the bindings name the groups, not the roles.
 4. **Smoke and guard tests** through the gateway ([Milestone 0, step 3](milestone-0.md#3-smoke-test-through-the-gateway)). On a private-endpoint cluster, `kubectl` for the guard tests must reach the API server; the tool calls themselves go through the gateway and need no network access to the cluster from where they are run.
 5. **Register with AWS DevOps Agent**: `create-space`, `register-mcp`, `associate-read`, check in chat, then `enable-write` ([Milestone 0, step 4](milestone-0.md#4-register-with-aws-devops-agent)).
 6. **Let the sentinel watch the association.** Set `devops_agent_space_id` and `devops_agent_association_id` and apply again.
-7. **Server-side approval.** Set `approval_mode = "server"` (or `both`) and `approver_principals`, apply, and attach the `approver_policy_arn` policy to each approver ([Server-side approval](milestone-0.md#server-side-approval)). The tool set does not change, so the sentinel sees no drift.
+7. **Server-side approval.** Set `approval_mode = "server"` (or `both`) and `approver_principals` (and a namespace's own `approvers` where only they may decide its plans), apply, and attach the `approver_policy_arn` policy to each approver, the namespaces' approvers included ([Server-side approval](milestone-0.md#server-side-approval)). The tool set does not change, so the sentinel sees no drift.
 8. **Subscriptions.** SNS email subscriptions (`alert_email`, `approval_email`) stay pending until the address confirms them.
 
 ## Checks before anything is created
@@ -192,7 +182,7 @@ Upgrade with `make upgrade` (`scripts/upgrade.py`) from a checkout of the new re
 1. refuses to start while the global kill switch is off, unless this script turned it off in the run it resumes;
 2. plans and checks the plan: it stops if the plan deletes or replaces the gateway, a gateway target, the Cognito user pool, domain or a client, the plan table, the audit bucket, the kill switch or the freezes parameter, or replaces an agent's kill switch. It shows the plan and asks before applying (`--yes` skips the question);
 3. turns the kill switch off first when the tool set changes (`tools.json` or `classification.json` differ from the deployed `tool_set_hash`), so no agent writes while the gateway and DevOps Agent disagree;
-4. applies a known two-step migration first with `-target`, then the plan, and plans and applies once more when Terraform fails with "inconsistent final plan";
+4. applies a known two-step migration first with `-target`, then the plan, and plans and applies once more when Terraform fails with "inconsistent final plan" (it runs `terraform get` before every plan, so a new module is installed). With `--with-k8s` (`make upgrade UPGRADE_FLAGS=--with-k8s`), writes `build/k8s` from the `k8s_manifests` output, runs `kubectl apply --dry-run=server` on all of it, applies it only if that passed, checks that the binding has the `admission_mode`, and lists kube-handrail Roles no longer rendered (it never deletes them). It uses the current kubectl context, or `--kube-context`, and prints it before asking. Without `--with-k8s` it warns when the manifests changed;
 5. runs `enable-write` when the tool set changed, invokes the drift sentinel and requires `ok`, and turns the kill switch on again only if it turned it off and nothing else wrote it since (a sentinel that finds drift writes `false`, and then it stays off);
 6. runs `install-guidance` when `AGENTS.md` or a skill differs from what is installed, prints the asset versions, and warns that running chats may keep the old guidance for about half an hour;
 7. runs the smoke test, with `--read-only` in `server` and `both` mode.
@@ -202,3 +192,4 @@ Upgrade with `make upgrade` (`scripts/upgrade.py`) from a checkout of the new re
 Each release's changes, and anything to do by hand, are in [CHANGELOG.md](../CHANGELOG.md); the release rules are in [Releasing](releasing.md). The notes of the releases before `make upgrade` are in [Upgrade notes before Milestone 4](history/upgrading.md). Tested on a test cluster, upgrading from Milestone 3 in 110 seconds.
 
 - **Interceptor and verifier always on** (the release after Milestone 3). `caller_interceptor_enabled` and `verify_enabled` are deprecated and ignored; Terraform warns (check `deprecated_switches`) while either is set, so remove them from your tfvars. On a deployment that had both enabled (the default), `terraform plan` shows 12 moves (`terraform_data.caller_key`, the interceptor's role, log group, role policy and function, and the verifier's role, log group, role policy, function, schedule rule, target and permission, each from `[0]`), rebuilds every package, updates every Lambda in place (the tool Lambdas also drop `CALLER_INTERCEPTOR` and `VERIFY_ENABLED` from their environment) and adds outputs. Any create or destroy of the interceptor, the verifier or their roles is a bug: stop and report it. A deployment with `caller_interceptor_enabled = false` or `verify_enabled = false` gets the missing resources; `make upgrade` creates the caller key, the interceptor and the verifier role first with `-target` (by hand: `terraform apply -target=terraform_data.caller_key -target=aws_iam_role.interceptor -target=aws_lambda_function.interceptor -target=aws_iam_role.verifier`, then `terraform apply`), because the tool Lambdas, the approver and the sentinel read them. The tool schemas do not change.
+- **Namespaces and the admission check** (the release after Milestone 4). Implemented, not yet tested on a cluster. Run `make upgrade UPGRADE_FLAGS=--with-k8s` with a kubeconfig for the cluster (cluster-admin), or apply `build/k8s` right after `make upgrade`: until it is applied, every plan is refused with `conflict` (`admission_policy_match`), because the read Lambda now checks the new policy format and needs the new ClusterRole `kube-handrail-policy-reader`. With `namespaces` empty, `terraform plan` rebuilds every package, updates every Lambda in place (the read Lambda gains `ADMISSION_CHECK=true`; `ALLOWED_NAMESPACES`, `MIN_REPLICAS` and `MAX_REPLICAS` keep their values), creates `terraform_data.k8s_manifests`, changes outputs (`guard_settings` gains `namespaces`, `admission_mode`, `admission_check`; new `namespaces`, `k8s_manifests`, `namespace_label_command`) and warns about the deprecated variables if they are set. Any create, destroy or replace of anything else is a bug: stop and report it. The tool schemas do not change. The rendered policy for the deprecated variables equals the earlier one in effect (one namespace, the same bounds, every action) and its binding is in `Deny`; applying it replaces the earlier policy's variables and labels. Then run the label command (`terraform output -raw namespace_label_command`).

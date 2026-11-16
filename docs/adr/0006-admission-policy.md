@@ -42,3 +42,11 @@ Restart and rollback must change the template, and the annotations carry the pla
 ### C. Deny create and delete for the writer in the policy
 
 RBAC already gives the writer neither. Left out to keep the policy to the one rule RBAC cannot express.
+
+## Update: rendered per namespace, checked at plan time
+
+Implemented with the namespace policy, not yet tested on a cluster. Three consequences above no longer hold, and the decision changes accordingly:
+
+- **Rendered, not edited.** Terraform renders the policy from `namespaces` (`terraform/modules/namespace-policy`): one policy and one binding select every namespace of the policy by name, and the bounds are two CEL maps keyed by `request.namespace`. The `sed` recipes are gone, and the bounds no longer live in two places a human keeps equal. A `paramRef` ConfigMap was rejected again: a namespace admin who can edit it could widen the backstop, and its resolution adds behaviour to verify.
+- **The mode is rendered too.** `admission_mode` (default `Deny`) is part of the binding, so applying the manifests again keeps enforcement.
+- **Drift is caught before a plan.** Every plan reads the policy and the binding through a ClusterRole limited to `get` on these two names, and is refused with `conflict` unless the binding denies, both select the namespace and the bounds equal the server's. It fails closed when they cannot be read; only Terraform `admission_check = false` turns it off, for clusters without the policy. This is the reader's only cluster-scoped right; the alternative, an offline check in CI and at upgrade only, would not see a policy deleted or switched to `Warn` in the live cluster.

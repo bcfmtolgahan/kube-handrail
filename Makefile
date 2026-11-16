@@ -17,6 +17,7 @@ help:
 	@echo "make register    register the gateway with DevOps Agent, read tools only"
 	@echo "                 (AGENT_SPACE_ID, CLIENT_ID, CLIENT_SECRET of devops_agent)"
 	@echo "make upgrade     scripts/upgrade.py \$$(UPGRADE_FLAGS), e.g. UPGRADE_FLAGS=--dry-run"
+	@echo "                 UPGRADE_FLAGS=--with-k8s also applies build/k8s with kubectl"
 	@echo "make smoke       the smoke test (--read-only in server and both mode)"
 	@echo "make destroy     scripts/cleanup.sh \$$(CLEANUP_FLAGS)"
 
