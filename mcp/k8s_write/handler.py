@@ -831,8 +831,16 @@ def _hpa_target_pods(rt: Runtime, plan: Plan, hpa: Mapping[str, Any]) -> int:
             "the Deployment this HorizontalPodAutoscaler scales is managed by GitOps; change it "
             "in Git",
         )
-    replicas = target.spec.replicas
-    return DEFAULT_REPLICAS if replicas is None else replicas
+    replicas = DEFAULT_REPLICAS if target.spec.replicas is None else target.spec.replicas
+    if replicas == 0:
+        # As at plan time: the HPA controller does not act on a target scaled to 0.
+        raise GuardError(
+            CONFLICT,
+            f"Deployment {plan.hpa_target} is scaled to 0, which turns the "
+            "HorizontalPodAutoscaler off; its bounds would change nothing",
+            {"reason": "scaling_disabled"},
+        )
+    return replicas
 
 
 def _hpa_breaker(rt: Runtime, plan: Plan, hpa: Any, override: bool, now: int) -> None:

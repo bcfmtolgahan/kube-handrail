@@ -3210,6 +3210,19 @@ def test_apply_adjust_hpa_recomputes_the_blast_radius_on_the_pods_now(hpa_rt):
     assert fake.patches == []
 
 
+@pytest.mark.parametrize(("min_to", "max_to"), [(None, 4), (2, None)])
+def test_apply_adjust_hpa_refuses_a_target_scaled_to_zero(hpa_rt, min_to, max_to):
+    """The HPA controller does nothing while its target is at 0, as at plan time."""
+    runtime_, apps, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store, min_to=min_to, max_to=max_to)
+    apps.read_namespaced_deployment.return_value = target_deployment(replicas=0)
+    args = {k: v for k, v in (("min_replicas", min_to), ("max_replicas", max_to)) if v}
+    response = apply_hpa(plan.plan_id, **args)
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"] == {"reason": "scaling_disabled"}
+    assert fake.patches == []
+
+
 def test_apply_adjust_hpa_refuses_a_gitops_managed_target(hpa_rt):
     runtime_, apps, fake = hpa_rt
     plan = create_hpa_plan(runtime_.store)
