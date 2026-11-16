@@ -2,7 +2,7 @@
 
 Guarded remediation layer for AI agents on Kubernetes: **plan → policy → approve → apply → audit**. MCP tools for Amazon EKS, intended to work with AWS DevOps Agent and other MCP clients.
 
-> **Status: Milestones 0 and 1 are implemented and tested on test clusters.** That covers a workload status tool and one guarded plan/apply pair for scaling, server-verified approval, the oscillation breaker, the impact preview and the drift sentinel. Correlation IDs, tool output hygiene with a workload events tool, agent guidance, and deployment to private-endpoint clusters are tested as well. Restart (Milestone 2, item 1) is implemented and tested on a test cluster. Rollback by exact revision (item 2) is implemented and tested on a test cluster. Per-agent identity, budgets and kill switch (item 3) are implemented and tested on a test cluster. Verify and revert (item 4) is implemented and tested on a test cluster. The Cedar and admission policy layers and the later milestones are planned, not built. See [Status](#status).
+> **Status: Milestones 0, 1 and 2 are implemented and tested on test clusters.** That covers a workload status tool and guarded plan/apply for scale, restart and rollback by exact revision, server-verified approval, the oscillation breaker, the impact preview and the drift sentinel; correlation IDs, tool output hygiene, agent guidance and deployment to private-endpoint clusters; per-agent identity, budgets and kill switch; verification after every apply with a pre-approved revert; change freezes; a cluster-side admission policy for the replica bounds; and a durable write-once audit record. Cedar at the gateway, break-glass, a signed audit ledger and the later milestones are planned, not built. See [Status](#status).
 
 ## Why
 
@@ -74,7 +74,7 @@ A remediation follows this sequence:
 - **Plan/apply split.** Every write is two tools: a `READ_ONLY` `plan_*` and a `MUTATIVE` `apply_*` with identical arguments, so policy and the human approver see real values.
 - **Single-use, short-lived plans.** A plan can be applied once, within minutes, and only to the object it was computed from (same `uid`) with its spec unchanged (same `generation` and replica count). Concurrent spec changes return a conflict; status churn during a rollout does not.
 - **Misclassification loses the approval, not the limits.** If the write tool is accidentally left `READ_ONLY`, DevOps Agent can plan and apply on its own without asking anyone (observed in testing). The server-side limits still hold: allowed namespaces, replica bounds, the blast-radius budget, GitOps and HPA checks, single-use plans and the kill switch. Classification is therefore checked after every registration change, and a scheduled [drift sentinel](mcp/CONTRACT.md#drift-sentinel) turns the kill switch off and alerts when a write tool is no longer `MUTATIVE` or the tool set changes. In `server` mode a misclassified write tool still cannot apply anything without a server approval.
-- **Defense in depth (target design; Cedar and admission policy are planned).** Each layer assumes the others may fail:
+- **Defense in depth (target design; the admission policy is implemented, Cedar is planned).** Each layer assumes the others may fail:
   - `guard.py` in the write Lambda (authoritative check)
   - Cedar policy at the gateway ([AgentCore Policy examples](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html))
   - ValidatingAdmissionPolicy in the cluster ([Kubernetes docs](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/))
@@ -111,6 +111,8 @@ Milestone 2, item 5 (change freezes): an operator sets windows in which plans an
 
 Milestone 2, item 4 (verify and revert): plans take a verification window and, for a scale, `revert_on_failure`, pinned in the approval; the apply schedules the check, a scheduled verifier runs it through an internal entry point of the write Lambda, `get_plan_outcome` reports `healthy`, `degraded` or `unknown`, and a degraded change approved with revert is reverted under the spec-level precondition. Implemented and tested on a test cluster. See [Verification and revert](mcp/CONTRACT.md#verification-and-revert).
 
+Milestone 2, item 6 (durable audit record): every change to a plan record is written once, from the plan table's stream, to an S3 bucket with Object Lock that the tool Lambdas cannot write to, and `scripts/audit.py export` shows a plan's requesting agent, approver, channel, result, verification and revert. Implemented and tested on a test cluster. See [Audit record](mcp/CONTRACT.md#audit-record).
+
 ## Planned layout
 
 Subject to change as the design is validated.
@@ -143,6 +145,7 @@ AGENTS.md        tool contract for MCP clients
 - [ADR 0003: Agent identity per OAuth client](docs/adr/0003-agent-identity.md) - which agent asked for each change, and per-agent limits
 - [ADR 0004: Pre-approved revert](docs/adr/0004-pre-approved-revert.md) - verifying every change, and reverting a degraded one the human approved with its revert
 - [ADR 0005: Change freezes](docs/adr/0005-change-freezes.md) - windows in which no change is planned or applied, and why there is no break-glass
+- [ADR 0007: Durable audit record](docs/adr/0007-durable-audit-record.md) - a write-once record of every plan change, outside the executor's reach
 - [Milestone 0](docs/milestone-0.md) - deploying and testing the vertical slice
 - [Deploying to a new account](docs/deploy.md) - prerequisites, names, RBAC, networking for clusters with a private endpoint, and the order of steps
 - [Guards](docs/guards.md) - blast-radius budget, impact preview, what a rollback trusts, the oscillation breaker (flapping, cooldown, per-object and global budgets, plan rate limit and manual-change checks), the per-agent budget and kill switch, and verify and revert

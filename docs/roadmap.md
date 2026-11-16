@@ -1,6 +1,6 @@
 # Roadmap
 
-Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, item 2 (rollback by exact revision) is implemented and tested on a test cluster, item 3 (per-agent identity, budgets and kill switch) is implemented and tested on a test cluster, and item 4 (verify and revert) is implemented and tested on a test cluster. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
+Milestone 0 is implemented and tested. In Milestone 1, items 1 (spec-level conflict detection), 2 (per-object oscillation breaker), 3 (classification drift sentinel and CI checks), 4 (measured impact preview and blast-radius budget) and 5 (server-side approval) are implemented and tested on a test cluster, and the item 6 spike (caller identity) is done. Of the work listed under "Later in this milestone", the correlation ID, tool output hygiene and the DevOps Agent skills and `AGENTS.md` are implemented and tested on a test cluster, and the infrastructure as code for new accounts and private-endpoint clusters is implemented and tested, including a fresh deployment against a cluster with only a private endpoint. With that, Milestone 1 is complete. In Milestone 2, item 1 (action framework and restart) is implemented and tested on a test cluster, item 2 (rollback by exact revision) is implemented and tested on a test cluster, item 3 (per-agent identity, budgets and kill switch) is implemented and tested on a test cluster, item 4 (verify and revert) is implemented and tested on a test cluster, and items 5 (change freezes and admission policy) and 6 (durable audit record), narrowed to what a production deployment needs, are implemented and tested on a test cluster. With that, Milestone 2 is complete; the deferred parts are listed at its end. The rest of the later milestones is planned and not yet implemented, and the order may change as the design is validated.
 
 ## Milestone 0: Vertical slice (done)
 
@@ -176,55 +176,60 @@ See [Verification and revert](../mcp/CONTRACT.md#verification-and-revert) and [A
 
 **Done when:** a degraded change is detected and, if approved with revert, reverted, the revert itself is verified and never reverted, and an `unknown` outcome or a turned-off kill switch leaves the object as it is.
 
-### Admission policy (implemented)
+### 5. Change freezes and admission policy (implemented)
 
-The cluster-side part of item 5, without the single policy file and without Cedar ([ADR 0006](adr/0006-admission-policy.md)). A ValidatingAdmissionPolicy, `kube-handrail-writer-bounds`, refuses a writer patch that changes a Deployment's replica count to a value outside the bounds, only for the writer group and only in the sandbox namespace. It rolls out in `Warn` and `Audit` and is switched to `Deny` by the operator. The write Lambda maps its denial to `admission_denied`. CI applies it on kind (Kubernetes 1.31) and runs server-side dry-run cases (`tests/admission/run.sh`). See [Admission policy](../mcp/CONTRACT.md#admission-policy).
+The scope was narrowed to the two parts a production deployment needs; the single policy file, Cedar at the gateway and break-glass are deferred (below).
 
-**Done when:** on a test cluster the policy ran in audit mode, then in `Deny`, and an apply over the bounds was refused with `admission_denied` while other users and namespaces were unaffected.
+**Goal:** stop changes during declared freezes, and have the cluster itself refuse a write outside the bounds even if the guard is wrong.
 
-On a test cluster (Kubernetes 1.35):
+- Change freezes: windows in one SSM parameter (namespaces, start, until, reason, optional actions), changed by operators with `scripts/freeze.py` without a deploy. The guard checks them on every plan and again at apply with the current time, so an approval given before a freeze is not applied during it; a refused apply does not consume the plan. An unreadable or invalid value refuses writes like the kill switch. A pre-approved revert is exempt. There is no break-glass path: an operator removes the freeze. See [Change freezes](../mcp/CONTRACT.md#change-freezes) and [ADR 0005](adr/0005-change-freezes.md).
+- Admission policy: a ValidatingAdmissionPolicy, `kube-handrail-writer-bounds`, refuses a writer patch that changes a Deployment's replica count to a value outside the bounds, only for the writer group and only in the sandbox namespace. It rolls out in `Warn` and `Audit` and is switched to `Deny` by the operator. The write Lambda maps its denial to `admission_denied`. CI applies it on kind (Kubernetes 1.31) and runs server-side dry-run cases (`tests/admission/run.sh`). See [Admission policy](../mcp/CONTRACT.md#admission-policy) and [ADR 0006](adr/0006-admission-policy.md).
 
-- The policy type-checked without warnings. In audit mode, `tests/admission/run.sh` (bounds 1 and 3) showed a writer over the maximum admitted with a warning; in `Deny`, a writer scale within the bounds was admitted, over the maximum and below the minimum refused (also past RBAC, and through `deployments/scale`), a writer restart admitted, and another user over the maximum in the sandbox namespace admitted. The binding went back to `[Warn, Audit]` afterwards.
-- With a hand-edited copy of the policy (maximum 1, `Deny`, not committed), a scale to 2 that the guard allowed was refused by the cluster: the apply returned `admission_denied` naming the policy and binding, the plan was used with `result` `admission_denied`, the Deployment was unchanged, and the tool-errors alarm fired.
-- With the real bounds in `Deny`, the end-to-end suite with the restart and rollback cases passed 63 of 63, and the other applications on the cluster stayed healthy. The policy stays installed in `Deny`.
+**Done when:** a freeze refuses plans and applies, including an apply of a plan approved before the freeze; and on a test cluster the admission policy ran in audit mode, then in `Deny`, and an apply over the bounds was refused with `admission_denied` while other users and namespaces were unaffected.
 
-### 5. Single-source policy, change freezes and break-glass
-
-**Goal:** one reviewed policy file that the gateway, the cluster and the guard all enforce the same way.
-
-- `policy/policy.json` (namespaces with replica bounds, allowed actions, freeze windows, break-glass, rollout state) is compiled to Cedar at the gateway and to a ValidatingAdmissionPolicy that applies only to the kube-handrail writer in allowed namespaces. The guard reads the same file. A CI check shows that all three agree on shared test cases.
-- Cedar rolls out in log-only mode and admission policy in audit mode before enforcement ([Policy enforcement modes](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-enforcement-modes.html), [ValidatingAdmissionPolicy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/)). The drift sentinel reports a detached engine, a mode change or a policy switched to log-only.
-- Change-freeze windows are enforced by the guard on plan, `request_approval` and apply, including approval-triggered applies that Cedar never sees.
-- A break-glass path lifts only a freeze. It requires a ticket reference pinned in the plan arguments and a second approver from a different approver entry, and is available in `server` and `both` approval modes.
-
-**Done when:** CI shows the three policy layers agreeing on the shared test cases; on a test deployment Cedar ran in log-only mode and admission policy in audit mode before both were enforced; a freeze refuses changes; and a break-glass change needs a ticket and two distinct approvers.
-
-Change freezes from this item are implemented and tested on a test cluster: windows in one SSM parameter, checked by the guard on plan and on apply (including approval-triggered applies), with a pre-approved revert exempt and no break-glass path. See [Change freezes](../mcp/CONTRACT.md#change-freezes) and [ADR 0005](adr/0005-change-freezes.md). On a test cluster:
+Change freezes, on a test cluster:
 
 - The deployment upgraded in place with one `terraform apply` (a new SSM parameter and in-place updates of the tool Lambdas); the smoke test passed and `scripts/freeze.py list` showed no freezes.
 - The end-to-end suite with the freeze cases (`--with-freeze`) passed 48 of 48 in `client` mode and 43 of 43 in `server` mode: a freeze on another namespace left a sandbox plan `ok`; a plan in a frozen namespace was `change_frozen` with its reason and `until`; a plan made before the freeze (in `server` mode, an approval given before it) was refused at apply with `change_frozen` and stayed unconsumed, and applied once the freeze was removed. The stored freezes were the same before and after.
 - An invalid freezes value refused plans with `remediation_disabled` (`scope` `freezes`, `reason` `invalid`); `scripts/freeze.py remove --all` restored it.
 - In `client` mode, a DevOps Agent chat asked to scale a Deployment in a frozen namespace reported `change_frozen` with the reason and the end of the freeze, did not retry, and did not look for another way to make the change.
 
-### 6. Tamper-evident audit ledger and evidence export
+Admission policy, on a test cluster (Kubernetes 1.35):
 
-**Goal:** prove afterwards who asked for each change, who approved it, and what ran it, even if the executor is compromised.
+- The policy type-checked without warnings. In audit mode, `tests/admission/run.sh` (bounds 1 and 3) showed a writer over the maximum admitted with a warning; in `Deny`, a writer scale within the bounds was admitted, over the maximum and below the minimum refused (also past RBAC, and through `deployments/scale`), a writer restart admitted, and another user over the maximum in the sandbox namespace admitted. The binding went back to `[Warn, Audit]` afterwards.
+- With a hand-edited copy of the policy (maximum 1, `Deny`, not committed), a scale to 2 that the guard allowed was refused by the cluster: the apply returned `admission_denied` naming the policy and binding, the plan was used with `result` `admission_denied`, the Deployment was unchanged, and the tool-errors alarm fired.
+- With the real bounds in `Deny`, the end-to-end suite with the restart and rollback cases passed 63 of 63, and the other applications on the cluster stayed healthy. The policy stays installed in `Deny`.
 
-- Every change to a plan record is captured from the table's stream by a separate writer and appended as a signed, hash-chained entry to write-once storage. The executor writes no ledger records and cannot alter them.
-- The approval channel writes a write-once receipt for each decision. An approval, consume or result that does not match its receipts or the expected transitions is flagged as an anomaly and alerts.
-- `scripts/ledger.py` verifies the chain and signatures offline and exports one plan's evidence: the requesting agent, the approver or approvers, the executing role and channel, and the verification and revert outcome.
+### 6. Durable audit record and evidence export (implemented)
 
-**Done when:** a forged approval or rewritten result written with the executor's own credentials is detected, and a change can be exported with its full approval chain and verified offline.
+The scope was narrowed to a write-once record outside the executor's reach; signing, hash chaining, approval receipts and automatic anomaly detection are deferred (below). See [Audit record](../mcp/CONTRACT.md#audit-record) and [ADR 0007](adr/0007-durable-audit-record.md).
+
+**Goal:** show afterwards who asked for each change, who approved it, and how it ran, in a record the executor cannot alter.
+
+- Every change to a plan record is captured from the table's stream by a separate Lambda and written once, as one object, to an S3 bucket with Object Lock. The tool Lambdas, the approver and the verifier are denied any write to the bucket.
+- A redelivered record maps to the same key and bytes; an existing key with other content stops the shard and alarms. Failed records go to a dead-letter queue, with alarms on it, the iterator age and the Lambda's errors.
+- `scripts/audit.py export` gives one plan's entries and a summary: the requesting agent, the approver, the channel, the result, and the verification and revert outcome, following the link to a revert record.
+
+**Done when:** a change can be exported with its approval chain after its plan record has expired, and an overwrite of an entry is refused.
+
+On a test cluster:
+
+- The deployment upgraded in place with one `terraform apply`: the stream was turned on for the existing plan table, and the bucket, the audit Lambda, its event source mapping, the dead-letter queue and the alarms were created. No gateway or Cognito client was replaced.
+- The end-to-end suite with the verification and audit cases (`--with-verify --with-audit`) passed 75 of 75: a plan's creation and its consume appeared in the bucket within seconds, the export named the requesting agent, the result and the channel, an overwrite of an entry with If-None-Match was `PreconditionFailed`, and a put without it was denied by the bucket policy.
+- The export of a scale that was verified `degraded` and reverted showed the verification, the revert with its revert plan ID, and the revert record's own entries.
+- IAM policy simulation with the bucket policy gave `explicitDeny` for the write role on `s3:PutObject`, `s3:DeleteObjectVersion` and `s3:BypassGovernanceRetention`; the read role, the approver and the verifier have no permission on the bucket.
 
 ### Deferred from this milestone
 
 These move to "Later ideas":
 
+- A single policy file compiled to Cedar at the gateway and to the admission policy, with a CI check that the layers agree, and a break-glass path with a ticket and two approvers.
+- A signed, hash-chained audit ledger with write-once approval receipts, automatic detection of unexpected plan-record transitions (turning remediation off), and offline verification of an export.
 - Revert of a rollback (a rollback to the previous template, by hash).
 - Agent-facing evidence tool; weekly freeze windows; per-agent Cedar permits.
 - Moving the scheduled sentinel and sweeper to EventBridge Scheduler.
 
-**Done when (milestone):** a degraded change is detected and, if approved with revert, reverted; a rollback to a named revision applies exactly that template; each change can be exported with its full approval chain; and the three policy layers agree on the shared test cases.
+**Done when (milestone):** a degraded change is detected and, if approved with revert, reverted; a rollback to a named revision applies exactly that template; a freeze refuses changes and the cluster refuses a write outside the bounds; and each change can be exported with its approval chain from a record the executor cannot alter.
 
 ## Milestone 3: Prometheus SLO tools and alert-triggered investigations
 
@@ -256,6 +261,8 @@ Not committed; listed for discussion.
 - Revert of a rollback (a rollback to the previous template, by hash).
 - An agent-facing evidence tool, weekly freeze windows and per-agent Cedar permits.
 - Moving the scheduled sentinel and sweeper to EventBridge Scheduler.
+- A signed, hash-chained audit ledger with write-once approval receipts, automatic detection of unexpected plan-record transitions, and offline verification of an export ([ADR 0007](adr/0007-durable-audit-record.md), alternative A).
+- A single policy file compiled to Cedar at the gateway and to the admission policy, with a CI check that the layers agree, and a break-glass path with a ticket and two approvers.
 
 ## Open questions
 

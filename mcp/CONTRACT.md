@@ -836,7 +836,7 @@ The approver Lambda (`mcp/approver/`) is not a gateway target and has no MCP too
 Authorization, before anything else:
 
 1. A request without an IAM identity is `forbidden`.
-2. A caller matching `DENIED_PRINCIPALS` (the roles of the read, write, sentinel and approver Lambdas and of the gateway, set by Terraform) is `forbidden`, even if it is also listed as an approver: machine identities never approve.
+2. A caller matching `DENIED_PRINCIPALS` (the roles of the read, write, sentinel and approver Lambdas, of the gateway, and, when deployed, of the interceptor, verifier and audit Lambdas, set by Terraform) is `forbidden`, even if it is also listed as an approver: machine identities never approve.
 3. The caller must match `APPROVER_PRINCIPALS`: an IAM user ARN matches exactly that ARN (including its path); an IAM role ARN `arn:aws:iam::<account>:role[/path]/<name>` matches its sessions `arn:aws:sts::<account>:assumed-role/<name>/<any session>`. Otherwise `forbidden`.
 
 Requests (responses are the JSON envelope in the body):
@@ -869,6 +869,78 @@ Known limits:
 - The apply triggered by the approval channel does not pass through the gateway, so gateway policy (Cedar, once added) does not see it; the write guard and RBAC do.
 - Slack is not an approval channel yet; the implemented channel is this IAM-authenticated API and its CLI.
 
+## Audit record
+
+With `audit_enabled` (Terraform, default `true`), every change to a plan record is written once, as one JSON object, to an S3 bucket with Object Lock, where the tool Lambdas cannot change or delete it. Implemented and tested on a test cluster.
+
+The record detects after the fact; it blocks nothing. The apply path does not wait for it or depend on it, so an audit failure never refuses a change; it alarms instead. It is a record of plan-record state: a call refused before a record is written or changed is only in the [tool record](#tool-record) (CloudWatch Logs). A signed hash chain, approval receipts and anomaly detection are not part of it ([ADR 0007](../docs/adr/0007-durable-audit-record.md)).
+
+### Source
+
+The plan table has a DynamoDB stream with view type `NEW_AND_OLD_IMAGES`. Any write that changes an item yields exactly one stream record, in order per item; a write that changes nothing yields none. A Lambda event source mapping delivers the records to the audit Lambda (`mcp/audit/`), which runs outside any VPC with its own role:
+
+- `starting_position` `TRIM_HORIZON`, `batch_size` 10, `parallelization_factor` 1 (one batch per shard at a time, so each plan's records are handled in order);
+- `function_response_types` `["ReportBatchItemFailures"]` and `bisect_batch_on_function_error`;
+- `maximum_retry_attempts` 10 and `maximum_record_age_in_seconds` 21600, then the batch's metadata (shard, sequence number range, not the records) goes to the SQS queue `<name_prefix>-audit-failures` (`destination_config.on_failure`, SSE, 14-day retention). The records stay in the stream for 24 hours after they were written.
+
+The Lambda handles a batch's records in order. On the first record it cannot write it returns `{"batchItemFailures": [{"itemIdentifier": "<its sequence number>"}]}` and does not touch the rest, so the mapping retries from that record and no later record of the shard is written before it. Records whose key is not a plan id (the counters `budget#...` and `approval#global#...` that share the table) are skipped. The Lambda's package bundles a pinned `boto3` (`mcp/audit/requirements.txt`, the same pin as the sentinel's), because the runtime's copy may predate S3 conditional writes.
+
+### Objects
+
+One object per stream record of a plan, at
+
+```
+plans/<plan_id>/<approximate creation time, epoch seconds, 10 digits>-<sequence number, 40 digits>.json
+```
+
+Both numbers are zero-padded, so listing a plan's prefix returns its entries in event order, and a plan's entries are found with one `ListObjectsV2` on its prefix. The key and the bytes come from the stream record alone (no processing time), so a redelivered record maps to the same key and the same bytes.
+
+The object is `json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True)` of:
+
+| Field | Notes |
+|---|---|
+| `v` | `1` |
+| `plan_id` | the item's key |
+| `event` | `created` (INSERT), `modified` (MODIFY), `expunged` (REMOVE by the table's TTL: `userIdentity` `{"type": "Service", "principalId": "dynamodb.amazonaws.com"}`) or `deleted` (any other REMOVE) |
+| `stream` | `event_name`, `event_id`, `sequence_number`, `approximate_creation_time`, `ttl_removal` (bool), `user_identity` (as in the record, or `null`) |
+| `image_format` | `plain`, or `dynamodb` when an image could not be decoded |
+| `old_image`, `new_image` | the item before and after, as plain JSON (`null` when absent): integral numbers as integers, other numbers as their exact decimal string, sets as sorted lists, binary as base64. The source of truth. With `image_format` `dynamodb`, the images are kept exactly as the stream delivered them (DynamoDB JSON) and `summary` is only `{plan_id, error}`, the exception class: a value written into the plan record never keeps its change out of the record |
+| `summary` | derived for humans: `plan_id`; `kind`, `action`, `namespace`, `name`, `requested_by`, `agent`, `requested_client_id`, `approved_by`, `approval_channel`, `rejected_by`, `channel`, `applied_at`, `reverts_plan_id` when present; `status`, `used` and `result` as a value, or as `{"from": ..., "to": ...}` when the record changed it; `verification` (its `outcome`) and `revert` (`status`, `revert_plan_id`) when present; `changed`, the sorted names of the attributes the record changed |
+
+Each object is written with `PutObject` and `If-None-Match: *` (and `Content-MD5`; Object Lock requires an integrity header). A `412 PreconditionFailed` means the key exists: the Lambda reads the object, and an entry that is identical except for `summary` counts as written (a redelivery; a newer handler version may derive the summary differently). Any other difference is a failure of that record (`Mismatches`), which stops the shard, raises the failures alarm and, once the retries are spent, the dead-letter alarm. The put never sets a retention: the bucket's default applies.
+
+### Bucket
+
+`<name_prefix>-audit-<account id>`: Object Lock enabled at creation (with versioning, which cannot be suspended), default retention `audit_object_lock_mode` (`GOVERNANCE` by default, or `COMPLIANCE`) for `audit_retention_days` (30), SSE-S3, all public access blocked, `BucketOwnerEnforced`. The bucket policy denies:
+
+- any request without TLS (`aws:SecureTransport` false);
+- `s3:PutObject` without the `s3:if-none-match` condition key, so every put is conditional;
+- to the read, write, approver, verifier, sentinel, interceptor and gateway roles (by `aws:PrincipalArn`): `s3:PutObject*`, `s3:DeleteObject*`, `s3:BypassGovernanceRetention`, `s3:RestoreObject`, `s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:PutBucket*`, `s3:DeleteBucket*`, `s3:PutLifecycleConfiguration`, `s3:PutReplicationConfiguration` and `s3:PutEncryptionConfiguration`. None of these roles has any S3 grant either.
+
+Under `GOVERNANCE`, a principal allowed `s3:BypassGovernanceRetention` (an account administrator) can still delete an object version or shorten its retention; under `COMPLIANCE` nobody can before the retention ends, and the bucket cannot be deleted while it holds such objects. Retention applies per object version: a plan's entries are kept for the retention period after they were written, whatever happens to the plan table, whose own records expire after about an hour or two.
+
+### What it shows, and how strongly
+
+- **Requesting agent:** `requested_by` and `agent` in the images, as strong as [Agent identity](#agent-identity) makes them.
+- **Approver:** `approved_by` (the IAM identity of the approval request), `approval_channel` and `decision_correlation_id`. The record shows what the table held; it does not prove that the approval channel wrote it.
+- **Executing role:** not observed. Stream records carry no principal (except for TTL removals). A consume (`used` from `false` to `true`) and the result are attributed to the write Lambda's role by construction: only it can consume a plan through the guard and only it is in `kube-handrail-writer`. `channel` (`gateway`, `approval-api` or `verifier`) and `apply_correlation_id` join the entry to the write Lambda's tool record and the Deployment's `kube-handrail.io/correlation-id` annotation.
+- **Tampering by the executor:** the write role can still change the plan table (see [Identity](#identity)), but every change becomes another entry, and it cannot replace or delete an earlier one. A rewritten `result` or a flipped `used` therefore shows as a later `modified` entry next to the original one. Nothing flags it automatically.
+
+### Export
+
+`scripts/audit.py export <plan_id> [--out FILE] [--no-links]`, with the operator's credentials (`s3:ListBucket` and `s3:GetObject`; `--bucket`, else `AUDIT_BUCKET`, else `terraform output -raw audit_bucket_name` in `TF_DIR`), prints one JSON bundle: `plan_id`, `bucket`, `exported_at`, `entries` (every entry in order, each with its `key`), `malformed` (keys under the plan's prefix that are not JSON entries in the Lambda's shape, reported and not read further), `summary` and `linked`. The summary takes from the latest image `kind`, `action`, `namespace`, `name`, `requested_by`, `agent`, `requested_client_id`, `approval_channel`, `rejected_by`, `reject_reason`, `channel`, `result`, `applied_at`, `used`, `status` and `reverts_plan_id`, and adds `approved_by` (every distinct approver, in order), `status_history`, `executed_by` (the attribution above, for a consumed plan), `verification` (`outcome`, `reason`), `revert` (`status`, `reason`, `revert_plan_id`), `has_creation` (false when the creation is missing: a plan created before the stream was enabled, or a record that went to the dead-letter queue), `removed` (`expunged`, `deleted` or `null`), `first_seen`, `last_seen`, `undecoded` (entries with `image_format` `dynamodb`, which are in `entries` but not read for the summary) and `malformed` (their count). `linked` holds, one level deep, the revert record named by `revert.revert_plan_id` (`relation` `revert`) or the plan named by a revert record's `reverts_plan_id` (`relation` `reverts`), each with its own summary and entries. Exit status 1 when the plan has no entries. `audit.py list [--limit N]` lists plans by their latest entry, newest first; it lists every key in the bucket.
+
+### Alarms and metrics
+
+Each invocation prints one JSON line, also an embedded metric record in `<name_prefix>/audit` (no dimensions): `Records`, `Written`, `Duplicates` (redeliveries), `Skipped` (counters), `Failures` and `Mismatches`, plus `failed_sequence_numbers` and `correlation_id`. Plan contents are not logged. With `sentinel_enabled` and `audit_enabled`, Terraform creates these alarms on the alert topic:
+
+- `<name_prefix>-audit-dead-letters`: `ApproximateNumberOfMessagesVisible` of the failures queue, maximum over 5 minutes greater than 0;
+- `<name_prefix>-audit-iterator-age`: `AWS/Lambda` `IteratorAge` of the audit Lambda, maximum over 5 minutes above 300 000 ms;
+- `<name_prefix>-audit-errors`: `AWS/Lambda` `Errors` of the audit Lambda, sum over 5 minutes at least 1;
+- `<name_prefix>-audit-failures`: `Failures`, sum over 5 minutes greater than 0. A record the Lambda reports back as failed is not a Lambda error, so `Errors` alone would not see it.
+
+Audit role: `dynamodb:DescribeStream`, `GetRecords`, `GetShardIterator` and `ListStreams` on the plan table's stream; `s3:PutObject` and `s3:GetObject` (for the redelivery comparison) on the bucket's objects; `sqs:SendMessage` on the failures queue (the mapping sends with the function's role); its own log group. No table item, EKS, SSM or Lambda access. The approver refuses it as an approver, like the other Lambda roles. Environment: `AUDIT_BUCKET`, `METRIC_NAMESPACE` (`<name_prefix>/audit`). Outputs: `audit_bucket_name`, `audit_dlq_url` (`null` without `audit_enabled`).
+
 ## Agent guidance
 
 Instructions for agents, derived from this contract; where they disagree, this contract is right.
@@ -895,6 +967,7 @@ Existing assets are found with `ListAssets` and checked before the first write; 
 - Approver role: `dynamodb:GetItem` and `dynamodb:UpdateItem` on the plan table, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS access: the apply it triggers runs as the write Lambda.
 - Verifier role (with `verify_enabled`): `dynamodb:Query` on the `verify-due` index ARN only, `lambda:InvokeFunction` on the write Lambda only, its own log group. No EKS, SSM or table item access: the verification runs as the write Lambda, whose role needs nothing new. The approver refuses the verifier role as an approver, like the other Lambda roles.
 - Sentinel role: `ssm:GetParameter` and `ssm:PutParameter` on the global kill switch parameter only; `bedrock-agentcore:ListGatewayTargets`, `bedrock-agentcore:GetGatewayTarget` and `bedrock-agentcore:GetGateway` on this gateway (a denial shows as `unknown`); `aidevops:GetAgentSpace` and `aidevops:GetAssociation` on the configured agent space and association (only when configured); `sns:Publish` on the alert topic; its own log group. No EKS access.
+- Audit role (with `audit_enabled`): the plan table's stream, `s3:PutObject` and `s3:GetObject` on the audit bucket's objects, `sqs:SendMessage` on its failures queue, its own log group ([Audit record](#audit-record)). The audit bucket's policy denies writes, deletes, the governance bypass and bucket changes to the read, write, approver, verifier, sentinel, interceptor and gateway roles, so the executor cannot alter the record of what it did.
 - With `lambda_subnet_ids` set, both tool roles also have, in a separate role policy, the network interface actions Lambda needs to run in a VPC (`ec2:CreateNetworkInterface`, `ec2:DescribeNetworkInterfaces`, `ec2:DescribeSubnets`, `ec2:DeleteNetworkInterface`, `ec2:AssignPrivateIpAddresses`, `ec2:UnassignPrivateIpAddresses`, on `*`). This is the EC2 part of `AWSLambdaVPCAccessExecutionRole`, without its `logs` actions on every log group. A `Deny` on these actions and `ec2:DetachNetworkInterface`, conditioned on `lambda:SourceFunctionArn` being the function itself, keeps them from the function's code: only the Lambda service can use them.
 - Two EKS access entries, type `STANDARD`, with `kubernetes_groups` `kube-handrail-reader` and `kube-handrail-writer`. No access policy associations. The group names are fixed, not derived from `name_prefix`: deployments that share a cluster share the groups and their RoleBindings. The cluster's authentication mode must be `API` or `API_AND_CONFIG_MAP`; Terraform checks it before creating the entries.
 - RBAC in the sandbox namespace only:
@@ -967,6 +1040,8 @@ Verification, set on both tool Lambdas ([Verification and revert](#verification-
 | `VERIFY_GRACE_SECONDS` | 300 | `verify_grace_seconds` |
 
 Verifier: `PLANS_TABLE`, `WRITE_FUNCTION_NAME`, `VERIFY_BATCH_LIMIT` (10), `METRIC_NAMESPACE` (`<name_prefix>/verifier`). Output: `verifier_function_name` (`null` without `verify_enabled`).
+
+Audit record ([Audit record](#audit-record)): the audit Lambda reads `AUDIT_BUCKET` and `METRIC_NAMESPACE` (`<name_prefix>/audit`); the tool Lambdas' environments do not change. Terraform variables: `audit_enabled` (default `true`), `audit_object_lock_mode` (`GOVERNANCE`, default, or `COMPLIANCE`), `audit_retention_days` (30), `audit_force_destroy` (default `false`). Outputs: `audit_bucket_name`, `audit_dlq_url`.
 
 Server-side approval, set on both tool Lambdas (the approver reads `APPROVAL_MODE` and `APPLY_AFTER_APPROVAL_TTL_SECONDS` as well):
 

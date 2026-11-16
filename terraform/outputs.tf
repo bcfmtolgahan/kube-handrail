@@ -82,3 +82,13 @@ output "lambda_security_group_ids" {
   description = "Security groups of the tool Lambdas, created or given; empty when they run outside a VPC. Allow inbound 443 from these on the cluster's API server."
   value       = local.lambda_security_group_ids
 }
+
+output "audit_bucket_name" {
+  description = "S3 bucket with the audit record (scripts/audit.py, AUDIT_BUCKET), or null when audit_enabled is false."
+  value       = one(aws_s3_bucket.audit[*].bucket)
+}
+
+output "audit_dlq_url" {
+  description = "SQS queue that receives plan stream records the audit Lambda gave up on, or null when audit_enabled is false."
+  value       = one(aws_sqs_queue.audit_dlq[*].url)
+}

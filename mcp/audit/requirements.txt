@@ -1,0 +1,4 @@
+# Bundled into the audit package only. The writes use S3 conditional writes (IfNoneMatch),
+# which the Lambda runtime's boto3 may predate, so a pinned copy is shipped. Keep it equal to
+# the boto3 pin in requirements-dev.txt.
+boto3==1.43.119

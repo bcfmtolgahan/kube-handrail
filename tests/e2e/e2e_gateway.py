@@ -111,6 +111,15 @@ before a freeze is refused at apply (client mode) or by the approval's apply (se
 with change_frozen and is not consumed, and once the freeze is removed the same plan
 applies through the gateway (in server mode within the approval's apply window). These
 cases add 1 apply to the smoke_test agent's budget.
+With --with-audit (the deployment has audit_enabled, the default; AUDIT_BUCKET is the
+audit_bucket_name output), the audit record cases run at the end, without an apply of their
+own: they take a plan this run applied (read from PLANS_TABLE), wait up to 120 seconds for
+its creation and its consume to appear under plans/<plan_id>/ in the bucket, check that
+scripts/audit.py export names the requesting agent and the result, and try to overwrite
+the first entry as the operator: with If-None-Match it is PreconditionFailed (412), without
+it (sent with an If-Match no object matches, so the probe cannot replace the entry even if
+the policy were missing) the bucket policy denies it (403). The operator needs
+s3:ListBucket, s3:GetObject and s3:PutObject on the bucket; nothing is written.
 
 The per-object and global hourly budgets and the plan rate limit are covered by
 unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
@@ -2083,6 +2092,8 @@ async def run(
     with_identity: bool = False,
     with_verify: bool = False,
     with_freeze: bool = False,
+    with_audit: bool = False,
+    started: int = 0,
 ) -> None:
     token = fetch_token()
     auth_tests(token)
@@ -2115,6 +2126,107 @@ async def run(
                 await verify_tests(gw, approval_mode)
             if with_freeze:
                 await freeze_tests(gw, approval_mode)
+    if with_audit:
+        await audit_tests(started)
+
+
+def audit_script() -> Any:
+    """scripts/audit.py, so the export is checked exactly as an operator runs it."""
+    spec = importlib.util.spec_from_file_location(
+        "audit_export", Path(__file__).parents[2] / "scripts" / "audit.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def applied_plan_since(started: int) -> dict[str, Any] | None:
+    """A plan this run applied, read from the plan table with the operator's credentials."""
+    from boto3.dynamodb.conditions import Attr
+
+    table = plans_table()
+    condition = (
+        Attr("created_at").gte(started)
+        & Attr("used").eq(True)
+        & Attr("result").exists()
+        & ~Attr("requested_by").begins_with("system:")
+    )
+    kwargs: dict[str, Any] = {"FilterExpression": condition}
+    while True:
+        page = table.scan(**kwargs)
+        if page.get("Items"):
+            return page["Items"][0]
+        if "LastEvaluatedKey" not in page:
+            return None
+        kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
+async def audit_tests(started: int) -> None:
+    """The plan's stream records reach the audit bucket, the export names the chain, and an
+    existing entry cannot be overwritten."""
+    from botocore.exceptions import ClientError
+
+    bucket = os.environ.get("AUDIT_BUCKET")
+    if not bucket:
+        report("audit: AUDIT_BUCKET is set", False, "export the audit_bucket_name output")
+        return
+    plan = applied_plan_since(started)
+    if plan is None:
+        report("audit: this run applied a plan", False, "no applied plan since the start")
+        return
+    plan_id = plan["plan_id"]
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    s3 = boto3.client("s3", region_name=region)
+    audit = audit_script()
+    deadline = time.time() + 120
+    entries: list[dict[str, Any]] = []
+    while time.time() < deadline:
+        entries, _ = audit.read_entries(s3, bucket, plan_id)
+        events = [e["event"] for e in entries]
+        consumed = any(
+            (e.get("old_image") or {}).get("used") is False
+            and (e.get("new_image") or {}).get("used") is True
+            for e in entries
+        )
+        if "created" in events and consumed:
+            break
+        await asyncio.sleep(5)
+    events = [e["event"] for e in entries]
+    report(
+        "audit: the plan's creation and consume are in the bucket",
+        "created" in events
+        and any((e.get("new_image") or {}).get("used") is True for e in entries),
+        events,
+    )
+    if not entries:
+        return
+    summary = audit.export(s3, bucket, plan_id)["summary"]
+    report(
+        "audit: the export names the requesting agent and the result",
+        summary.get("requested_by") == plan.get("requested_by")
+        and summary.get("result") == plan.get("result"),
+        {k: summary.get(k) for k in ("requested_by", "result", "approved_by", "channel")},
+    )
+    key = entries[0]["key"]
+
+    def put_code(**extra: Any) -> str:
+        try:
+            s3.put_object(Bucket=bucket, Key=key, Body=b"{}", **extra)
+        except ClientError as exc:
+            return str(exc.response.get("Error", {}).get("Code"))
+        return "written"
+
+    report(
+        "audit: overwriting an entry with If-None-Match is PreconditionFailed",
+        put_code(IfNoneMatch="*") == "PreconditionFailed",
+    )
+    # If-Match with an ETag no object has: the put lacks If-None-Match, so the bucket policy
+    # denies it, and if the policy were missing it would fail as 412 instead of replacing
+    # the entry. The probe never writes.
+    report(
+        "audit: a put without If-None-Match is denied by the bucket policy",
+        put_code(IfMatch='"00000000000000000000000000000000"') == "AccessDenied",
+    )
 
 
 async def run_identity(gw_a: Gateway, approval_mode: str) -> None:
@@ -2158,6 +2270,11 @@ def main() -> None:
         help="also run the change freeze cases (needs FREEZES_PARAM)",
     )
     parser.add_argument(
+        "--with-audit",
+        action="store_true",
+        help="also run the audit record cases (needs audit_enabled, the default, and AUDIT_BUCKET)",
+    )
+    parser.add_argument(
         "--approval-mode",
         choices=["client", "server"],
         default="client",
@@ -2179,6 +2296,8 @@ def main() -> None:
                 args.with_identity,
                 args.with_verify,
                 args.with_freeze,
+                args.with_audit,
+                int(started),
             )
         )
     except Exception as exc:
