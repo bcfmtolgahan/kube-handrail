@@ -33,6 +33,8 @@ crash.*.log
 *.tfvars
 *.tfvars.json
 !*.tfvars.example
+# Golden-test fixtures (placeholder values only).
+!tests/k8s_render/fixtures/*.tfvars
 override.tf
 override.tf.json
 *_override.tf

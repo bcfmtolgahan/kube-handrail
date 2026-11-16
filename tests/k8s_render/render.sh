@@ -3,6 +3,8 @@
 # terraform/modules/namespace-policy, without AWS credentials.
 #
 #   tests/k8s_render/render.sh <fixture.tfvars> <out-dir>   render one fixture into out-dir
+#     (out-dir also holds namespace_policy.json and .txt files: apply its YAML files by
+#     name, kubectl apply -f out/rbac.yaml -f ..., not the directory)
 #   tests/k8s_render/render.sh --check                       diff every fixture against golden/
 #   tests/k8s_render/render.sh --update                      rewrite golden/ from the fixtures
 #
@@ -33,7 +35,12 @@ for name, text in json.load(sys.stdin).items():
 case "${1:-}" in
   --check | --update)
     status=0
-    for vars in "$here"/fixtures/*.tfvars; do
+    fixtures=("$here"/fixtures/*.tfvars)
+    if [[ ! -e "${fixtures[0]}" ]]; then
+      echo "no fixtures found in $here/fixtures" >&2
+      exit 1
+    fi
+    for vars in "${fixtures[@]}"; do
       name="$(basename "$vars" .tfvars)"
       render "$vars" "$work/out/$name"
       if [[ "$1" == --update ]]; then
