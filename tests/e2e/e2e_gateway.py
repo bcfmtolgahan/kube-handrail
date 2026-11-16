@@ -2268,7 +2268,10 @@ def main() -> None:
         "--with-freeze",
         action="store_true",
         help="also run the change freeze cases (needs FREEZES_PARAM)",
+    )
+    parser.add_argument(
         "--with-audit",
+        action="store_true",
         help="also run the audit record cases (needs audit_enabled, the default, and AUDIT_BUCKET)",
     )
     parser.add_argument(
