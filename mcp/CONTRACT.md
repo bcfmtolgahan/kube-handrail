@@ -862,7 +862,7 @@ Authorization, before anything else:
 1. A request without an IAM identity is `forbidden`.
 2. A caller matching `DENIED_PRINCIPALS` (the roles of the read, write, sentinel and approver Lambdas, of the gateway, and, when deployed, of the interceptor, verifier and audit Lambdas, set by Terraform) is `forbidden`, even if it is also listed as an approver: machine identities never approve.
 3. The caller must match `APPROVER_PRINCIPALS` or the approvers of some namespace ([Namespace policy](#namespace-policy)): an IAM user ARN matches exactly that ARN (including its path); an IAM role ARN `arn:aws:iam::<account>:role[/path]/<name>` matches its sessions `arn:aws:sts::<account>:assumed-role/<name>/<any session>`. Otherwise `forbidden`.
-4. For a plan that exists (`GET`, and before either decision), the caller must be an approver of the plan's own namespace: its `approvers` when the namespace's policy lists any, and then only they (a global approver is refused there), otherwise `APPROVER_PRINCIPALS`. Otherwise `forbidden` with `details` `{"reason": "not_namespace_approver", "namespace": "<ns>"}`, and nothing is recorded. Status: implemented, not yet tested on a cluster.
+4. For a plan that exists (`GET`, and before either decision), the caller must be an approver of the plan's own namespace: its `approvers` when the namespace's policy lists any, and then only they (a global approver is refused there), otherwise `APPROVER_PRINCIPALS`; nobody, for a namespace the packaged policy no longer has. Otherwise `forbidden` with `details` `{"reason": "not_namespace_approver", "namespace": "<ns>"}`, and nothing is recorded. Status: implemented, not yet tested on a cluster.
 
 Requests (responses are the JSON envelope in the body):
 

@@ -897,6 +897,18 @@ def test_namespace_approvers_come_from_the_packaged_policy(tmp_path):
     assert s.approvers_for("team-a") == (TEAM_ROLE,)
     assert s.approvers_for("sandbox") == (ALICE, OPERATOR_ROLE)
     assert s.all_approvers == (ALICE, OPERATOR_ROLE, TEAM_ROLE)
+    # A namespace the policy no longer has: nobody, not the global approvers.
+    assert s.approvers_for("removed") == ()
+
+
+def test_a_plan_in_a_namespace_removed_from_the_policy_is_not_decidable(env):
+    env.rt.settings = dataclasses.replace(env.rt.settings, policy_namespaces=frozenset({"team-a"}))
+    plan = make_plan(env.store)
+    # ALICE is a global approver; the plan's namespace (sandbox) left the policy.
+    status, body = approve(env, plan, caller=ALICE)
+    assert (status, body["error"]["code"]) == (403, "forbidden")
+    assert body["error"]["details"] == {"reason": "not_namespace_approver", "namespace": "sandbox"}
+    assert env.store.get(plan.plan_id)["status"] == "planned"
 
 
 def test_a_namespace_approver_that_is_not_an_iam_arn_fails_the_load(tmp_path):

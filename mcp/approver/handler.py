@@ -102,10 +102,15 @@ class ApproverSettings:
     region: str | None
     # Namespace => its own approvers, for the namespaces whose policy lists any.
     namespace_approvers: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    # Every namespace of the packaged policy; empty without a policy file.
+    policy_namespaces: frozenset[str] = frozenset()
 
     def approvers_for(self, namespace: Any) -> tuple[str, ...]:
         """Who decides a plan in this namespace: its own approvers when its policy lists
-        any (the global ones then cannot), otherwise APPROVER_PRINCIPALS."""
+        any (the global ones then cannot), otherwise APPROVER_PRINCIPALS. Nobody, for a
+        namespace that a packaged policy no longer has."""
+        if self.policy_namespaces and namespace not in self.policy_namespaces:
+            return ()
         return self.namespace_approvers.get(namespace) or self.approvers
 
     @property
@@ -135,7 +140,8 @@ def load_approver_settings(env: Mapping[str, str] | None = None) -> ApproverSett
     if ttl <= 0:
         raise ConfigError("APPLY_AFTER_APPROVAL_TTL_SECONDS must be positive")
     namespace_approvers = {}
-    for namespace, policy in load_namespace_policy(env).items():
+    namespace_policy = load_namespace_policy(env)
+    for namespace, policy in namespace_policy.items():
         for value in policy.approvers:
             if not _IAM_ARN.match(value):
                 raise ConfigError(
@@ -152,6 +158,7 @@ def load_approver_settings(env: Mapping[str, str] | None = None) -> ApproverSett
         apply_after_approval_ttl_seconds=ttl,
         region=env.get("AWS_REGION") or None,
         namespace_approvers=namespace_approvers,
+        policy_namespaces=frozenset(namespace_policy),
     )
 
 
