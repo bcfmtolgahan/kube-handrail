@@ -871,7 +871,7 @@ Known limits:
 
 ## Audit record
 
-With `audit_enabled` (Terraform, default `true`), every change to a plan record is written once, as one JSON object, to an S3 bucket with Object Lock, where the tool Lambdas cannot change or delete it. Implemented, not yet tested on a cluster.
+With `audit_enabled` (Terraform, default `true`), every change to a plan record is written once, as one JSON object, to an S3 bucket with Object Lock, where the tool Lambdas cannot change or delete it. Implemented and tested on a test cluster.
 
 The record detects after the fact; it blocks nothing. The apply path does not wait for it or depend on it, so an audit failure never refuses a change; it alarms instead. It is a record of plan-record state: a call refused before a record is written or changed is only in the [tool record](#tool-record) (CloudWatch Logs). A signed hash chain, approval receipts and anomaly detection are not part of it ([ADR 0007](../docs/adr/0007-durable-audit-record.md)).
 
