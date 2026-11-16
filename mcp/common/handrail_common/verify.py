@@ -209,7 +209,7 @@ def outcome_view(record: Mapping[str, Any], now: int, grace: int) -> tuple[dict[
         )
         if value is not None
     }
-    return {
+    view = {
         "plan_id": plan.plan_id,
         "cluster": plan.cluster,
         "action": plan.action,
@@ -222,4 +222,13 @@ def outcome_view(record: Mapping[str, Any], now: int, grace: int) -> tuple[dict[
         "verification": verification,
         "revert": revert_view(plan, verification["status"]),
         "correlation_ids": correlation,
-    }, truncated
+    }
+    if plan.target_kind is not None:
+        # An HPA adjust: the object is the HPA; replicas are its target's pods.
+        view["target_kind"] = plan.target_kind
+        view["hpa"] = {
+            "min_replicas": {"from": plan.min_from, "to": plan.min_to},
+            "max_replicas": {"from": plan.max_from, "to": plan.max_to},
+            "scale_target": plan.hpa_target,
+        }
+    return view, truncated

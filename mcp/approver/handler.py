@@ -49,6 +49,7 @@ from handrail_common.observability import (
     emit,
 )
 from handrail_common.plans import (
+    ADJUST_HPA,
     RESTART_DEPLOYMENT,
     ROLLBACK_DEPLOYMENT,
     SCALE_DEPLOYMENT,
@@ -65,6 +66,7 @@ APPLY_TOOLS = {
     SCALE_DEPLOYMENT: "k8sw___apply_scale_deployment",
     RESTART_DEPLOYMENT: "k8sw___apply_restart_deployment",
     ROLLBACK_DEPLOYMENT: "k8sw___apply_rollback_deployment",
+    ADJUST_HPA: "k8sw___apply_adjust_hpa",
 }
 APPROVE = "approve"
 REJECT = "reject"

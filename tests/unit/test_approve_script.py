@@ -154,3 +154,31 @@ def test_summary_names_the_scheduled_verification():
     )
     view["verification"] = {"window_seconds": 120, "revert_on_failure": False}
     assert approve.summary(view).endswith("; verified 120 s after the apply")
+
+
+def test_summaries_of_an_hpa_adjust():
+    view = {
+        "action": "adjust_hpa",
+        "namespace": "sandbox",
+        "name": "web-hpa",
+        "replicas": {"from": 2, "to": 3},
+        "change": {
+            "hpa": {
+                "min_replicas": {"from": 1, "to": 3},
+                "max_replicas": {"from": 5, "to": 5},
+                "scale_target": "web",
+            },
+            "replicas": {"from": 2, "to": 3},
+        },
+    }
+    assert approve.change_summary(view) == (
+        "adjust_hpa sandbox/web-hpa: HPA bounds 1-5 -> 3-5 (Deployment web: pods 2 -> 3)"
+    )
+    verification = {
+        "window_seconds": 60,
+        "revert_on_failure": True,
+        "revert_to": {"min_replicas": 1, "max_replicas": 5},
+    }
+    assert approve.verification_summary(verification) == (
+        "; verified 60 s after the apply, reverted to bounds 1-5 if degraded"
+    )

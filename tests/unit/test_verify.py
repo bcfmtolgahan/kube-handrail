@@ -295,3 +295,25 @@ def test_outcome_view_of_a_record():
     assert view["verification"]["status"] == HEALTHY
     assert view["revert"] == {"requested": True, "status": "not_needed"}
     assert view["correlation_ids"] == {"plan": "plan-1", "apply": "apply-1", "verification": "v-1"}
+
+
+def test_outcome_view_of_an_hpa_adjust_names_its_bounds():
+    record = dataclasses.replace(
+        with_revert(),
+        target_kind="HorizontalPodAutoscaler",
+        hpa_target="web",
+        min_from=1,
+        min_to=2,
+        max_from=5,
+        max_to=5,
+    ).to_item()
+    view, _ = outcome_view(record, NOW + 60, 300)
+    assert view["target_kind"] == "HorizontalPodAutoscaler"
+    assert view["hpa"] == {
+        "min_replicas": {"from": 1, "to": 2},
+        "max_replicas": {"from": 5, "to": 5},
+        "scale_target": "web",
+    }
+    # A Deployment plan has neither.
+    plain, _ = outcome_view(with_revert().to_item(), NOW + 60, 300)
+    assert "target_kind" not in plain and "hpa" not in plain

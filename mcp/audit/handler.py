@@ -47,6 +47,7 @@ SUMMARY_ATTRIBUTES = (
     "cluster",
     "kind",
     "action",
+    "target_kind",
     "namespace",
     "name",
     "requested_by",

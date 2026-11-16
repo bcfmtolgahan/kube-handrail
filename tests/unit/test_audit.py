@@ -338,3 +338,10 @@ def test_summary_names_the_cluster():
         stream_record("INSERT", "102", new={**PLANNED, "cluster": "prod-eu"})
     )
     assert entry["summary"]["cluster"] == "prod-eu"
+
+
+def test_summary_names_the_target_kind_of_an_hpa_adjust():
+    _, entry = handler.build_entry(
+        stream_record("INSERT", "103", new={**PLANNED, "target_kind": "HorizontalPodAutoscaler"})
+    )
+    assert entry["summary"]["target_kind"] == "HorizontalPodAutoscaler"
