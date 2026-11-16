@@ -9,6 +9,9 @@ requires-python = ">=3.12"
 [tool.pytest.ini_options]
 pythonpath = ["mcp/common", "mcp/k8s_read", "mcp/k8s_write"]
 testpaths = ["tests"]
+markers = [
+    "integration: needs a kind cluster and KH_INTEGRATION=1 (tests/integration); skipped otherwise",
+]
 
 [tool.ruff]
 line-length = 100
