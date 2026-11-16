@@ -204,7 +204,10 @@ def kubectl(
 def render_manifests(tfvars: Path, out: Path) -> Path:
     """tests/k8s_render/render.sh: the namespace policy and the cluster manifests for one
     fixture, without AWS credentials (needs terraform)."""
-    subprocess.run([str(RENDER), str(tfvars), str(out)], check=True, capture_output=True)
+    try:
+        subprocess.run([str(RENDER), str(tfvars), str(out)], check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"render.sh {tfvars.name}: {exc.stderr.decode().strip()}") from None
     return out
 
 
