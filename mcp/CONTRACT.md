@@ -312,7 +312,7 @@ Plan (`k8s_read`):
 1. Arguments valid: namespace and name match DNS-1123; `replicas` integer.
 2. Namespace in `ALLOWED_NAMESPACES`.
 3. `MIN_REPLICAS <= replicas <= MAX_REPLICAS`.
-4. Deployment exists and is not GitOps-managed. Fail closed: treat it as managed if it has the Argo CD `argocd.argoproj.io/tracking-id` annotation or the `app.kubernetes.io/instance` label (Argo CD label tracking; may also match Helm releases, which is acceptable).
+4. Deployment exists and is not GitOps-managed: it has none of the Argo CD annotation `argocd.argoproj.io/tracking-id` (annotation tracking), the Flux labels `kustomize.toolkit.fluxcd.io/name`, `kustomize.toolkit.fluxcd.io/namespace`, `helm.toolkit.fluxcd.io/name` and `helm.toolkit.fluxcd.io/namespace`, and no label or annotation named in `GITOPS_MARKERS`. Malformed labels or annotations count as managed. `app.kubernetes.io/instance` alone is not a marker, because Helm sets it on every release; a deployment whose Argo CD uses label tracking, which writes only that label, lists it in `GITOPS_MARKERS` (Terraform `gitops_markers`). Until this release that label was a default marker, so every Helm release was refused (implemented, not yet tested on a cluster).
 5. Deployment has no HorizontalPodAutoscaler targeting it; otherwise `conflict` without `details`.
 6. Blast-radius budget: `|replicas - current| <= max(1, ceil(current * MAX_REPLICA_STEP_PERCENT / 100))`, where `current` is `spec.replicas` (unset counts as 1); otherwise `blast_radius_exceeded`. It is enforced whatever the approval says.
 7. History checks: manual change, cooldown, flapping, object budget (below).
@@ -1013,7 +1013,7 @@ The EKS token is a presigned `sts:GetCallerIdentity` URL built locally; the Lamb
 
 ## Configuration (environment variables)
 
-`CLUSTER_NAME`, `PLANS_TABLE`, `ALLOWED_NAMESPACES` (comma-separated), `MIN_REPLICAS`, `MAX_REPLICAS`, `PLAN_TTL_SECONDS`, `REMEDIATION_ENABLED_PARAM` (write only), `METRIC_NAMESPACE` (the [tool record](#observability)'s metric namespace; Terraform sets `<name_prefix>/tools`, default `kube-handrail/tools`). `AWS_REGION` is provided by Lambda.
+`CLUSTER_NAME`, `PLANS_TABLE`, `ALLOWED_NAMESPACES` (comma-separated), `MIN_REPLICAS`, `MAX_REPLICAS`, `PLAN_TTL_SECONDS`, `GITOPS_MARKERS` (a JSON array of label or annotation keys that mark GitOps ownership besides the defaults of [guard check 4](#guard-checks); unset or `[]` is none, anything that is not an array of valid keys fails the Lambda's start; Terraform `gitops_markers`, default `[]`), `REMEDIATION_ENABLED_PARAM` (write only), `METRIC_NAMESPACE` (the [tool record](#observability)'s metric namespace; Terraform sets `<name_prefix>/tools`, default `kube-handrail/tools`). `AWS_REGION` is provided by Lambda.
 
 Agent identity, set on both tool Lambdas ([Agent identity](#agent-identity)):
 

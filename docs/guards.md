@@ -12,6 +12,12 @@ Three independent checks stand between an agent and a Deployment; each assumes t
 
 The policy checks only the replica bounds. It does not check the pod template, the approval or the history, which need state that only the guard has.
 
+## GitOps ownership
+
+An object a GitOps controller owns is changed in Git, not here: plan and apply refuse it with `gitops_managed`. The markers are the ones the controllers set: the Argo CD annotation `argocd.argoproj.io/tracking-id`, and the Flux labels `kustomize.toolkit.fluxcd.io/name|namespace` and `helm.toolkit.fluxcd.io/name|namespace`. Malformed metadata counts as managed.
+
+`app.kubernetes.io/instance` alone is not a marker: Helm sets it on every release, and treating it as GitOps refused every Helm-installed Deployment. Argo CD's label tracking writes only that label, so a team using it adds it to `gitops_markers` (any label or annotation key listed there counts as a marker). This changed in the current release; before it, the label was a default marker. Implemented, not yet tested on a cluster. Details: [guard check 4](../mcp/CONTRACT.md#guard-checks).
+
 ## Blast-radius budget
 
 A single plan may change a Deployment's replica count by at most `MAX_REPLICA_STEP_PERCENT` (default 100) of its current count, rounded up and never less than 1. At the default, a Deployment at 1 replica can go to 0 or 2, one at 3 to anything from 0 to 6. A larger change is refused with `blast_radius_exceeded`, both when planning and again when applying, with the setting in force at apply time; an approval does not lift it. Bigger changes take several steps, each of which also passes the oscillation breaker below.

@@ -230,7 +230,7 @@ def _conditions(status: Any) -> tuple[list[dict[str, Any]], bool]:
     return conditions, truncated
 
 
-def _summary(deployment: Any) -> tuple[dict[str, Any], bool]:
+def _summary(deployment: Any, gitops_markers: tuple[str, ...]) -> tuple[dict[str, Any], bool]:
     meta = deployment.metadata
     status = deployment.status
     conditions, truncated = _conditions(status)
@@ -246,7 +246,7 @@ def _summary(deployment: Any) -> tuple[dict[str, Any], bool]:
         "conditions": conditions,
         "revision": (meta.annotations or {}).get(REVISION_ANNOTATION),
         "resource_version": meta.resource_version,
-        "gitops_managed": is_gitops_managed(deployment),
+        "gitops_managed": is_gitops_managed(deployment, gitops_markers),
     }
     return summary, truncated
 
@@ -431,7 +431,8 @@ def get_workload_status(args: dict[str, Any], settings: Settings, clients: Clien
     namespace = require_namespace(args.get("namespace"))
     name = require_name(args.get("name"))
     check_namespace_allowed(namespace, settings.allowed_namespaces)
-    summary, truncated = _summary(_read_deployment(clients.apps, namespace, name))
+    deployment = _read_deployment(clients.apps, namespace, name)
+    summary, truncated = _summary(deployment, settings.gitops_markers)
     return ok(summary, truncated=truncated)
 
 
@@ -575,7 +576,7 @@ def _plan(
     check_not_frozen(freeze_store(clients.ssm, settings.freezes_param), namespace, action.name, now)
     override = request.get("override_manual_change", False) is True
     deployment, raw = _read_deployment_raw(clients.apps, namespace, name)
-    if is_gitops_managed(deployment):
+    if is_gitops_managed(deployment, settings.gitops_markers):
         raise GuardError(GITOPS_MANAGED, "deployment is managed by GitOps; change it in Git")
     current = _desired_replicas(deployment)
     template = (raw.get("spec") or {}).get("template") or {}

@@ -55,6 +55,17 @@ variable "plan_ttl_seconds" {
   }
 }
 
+variable "gitops_markers" {
+  description = "Label or annotation keys that mark a Deployment as GitOps-managed, in addition to the defaults (the Argo CD tracking-id annotation and the Flux kustomize and helm controller labels). A Deployment with any of these keys, as a label or an annotation, is refused with gitops_managed. Add \"app.kubernetes.io/instance\" when Argo CD uses label tracking; it is not a default because Helm sets it on every release."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for key in var.gitops_markers : can(regex("^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$", key))])
+    error_message = "gitops_markers must be Kubernetes label or annotation keys, such as app.kubernetes.io/instance."
+  }
+}
+
 variable "flap_window_seconds" {
   description = "Window in which a second reversal of scaling direction on one Deployment is rejected as flapping."
   type        = number

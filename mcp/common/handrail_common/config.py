@@ -6,6 +6,8 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from handrail_common.gitops import valid_marker
+
 
 class ConfigError(Exception):
     pass
@@ -17,6 +19,8 @@ BOTH = "both"
 APPROVAL_MODES = (CLIENT, SERVER, BOTH)
 # The keys of the Terraform agents map; also part of SSM parameter names and counter keys.
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+# A plan is a snapshot of the cluster; an hour-old plan is approved against a stale view.
+MAX_PLAN_TTL_SECONDS = 3600
 # The verifier runs every minute, so a shorter window could not be kept.
 MIN_VERIFY_WINDOW_SECONDS = 60
 
@@ -74,6 +78,9 @@ class Settings:
     # The SSM parameter holding the change freezes (mcp/CONTRACT.md, Change freezes); unset
     # means no freezes are checked.
     freezes_param: str | None = None
+    # Label or annotation keys that mark GitOps ownership in addition to the defaults
+    # (handrail_common.gitops), from GITOPS_MARKERS.
+    gitops_markers: tuple[str, ...] = ()
 
     @property
     def approval_required(self) -> bool:
@@ -122,6 +129,20 @@ def approval_mode(env: Mapping[str, str]) -> str:
     return mode
 
 
+def parse_gitops_markers(raw: str) -> tuple[str, ...]:
+    """GITOPS_MARKERS: a JSON array of label or annotation keys; unset or empty is none.
+    Anything else fails the load, so a typo cannot silently turn the guard off."""
+    if not raw.strip():
+        return ()
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        raise ConfigError("GITOPS_MARKERS must be a JSON array of strings") from None
+    if not isinstance(value, list) or not all(valid_marker(key) for key in value):
+        raise ConfigError("GITOPS_MARKERS must be a JSON array of label or annotation keys")
+    return tuple(dict.fromkeys(value))
+
+
 def parse_agents(raw: str, default_budget: int) -> dict[str, Agent]:
     """AGENTS: a JSON object {"<client_id>": {"name": "<agent>", "hourly_apply_budget": N}},
     at least one entry, with unique names; the budget is optional and positive."""
@@ -160,8 +181,8 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         raise ConfigError("require 0 <= MIN_REPLICAS <= MAX_REPLICAS")
 
     ttl = int_env(env, "PLAN_TTL_SECONDS", 300)
-    if ttl <= 0:
-        raise ConfigError("PLAN_TTL_SECONDS must be positive")
+    if not 0 < ttl <= MAX_PLAN_TTL_SECONDS:
+        raise ConfigError(f"PLAN_TTL_SECONDS must be between 1 and {MAX_PLAN_TTL_SECONDS}")
 
     limits = {
         key: int_env(env, key, default)
@@ -244,4 +265,5 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         verify_window_max_seconds=limits["VERIFY_WINDOW_MAX_SECONDS"],
         verify_grace_seconds=limits["VERIFY_GRACE_SECONDS"],
         freezes_param=env.get("FREEZES_PARAM", "").strip() or None,
+        gitops_markers=parse_gitops_markers(env.get("GITOPS_MARKERS", "")),
     )

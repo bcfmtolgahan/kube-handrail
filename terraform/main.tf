@@ -50,6 +50,8 @@ locals {
     MIN_REPLICAS       = tostring(var.min_replicas)
     MAX_REPLICAS       = tostring(var.max_replicas)
     PLAN_TTL_SECONDS   = tostring(var.plan_ttl_seconds)
+    # From a variable, so it is known when the existing Lambdas are planned.
+    GITOPS_MARKERS = jsonencode(var.gitops_markers)
 
     FLAP_WINDOW_SECONDS        = tostring(var.flap_window_seconds)
     OBJECT_HOURLY_APPLY_BUDGET = tostring(var.object_hourly_apply_budget)

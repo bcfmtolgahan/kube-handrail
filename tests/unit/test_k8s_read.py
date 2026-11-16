@@ -251,12 +251,32 @@ def test_plan_hpa_list_error_is_kubernetes_error(clients):
     "meta",
     [
         {"annotations": {"argocd.argoproj.io/tracking-id": "app:apps/Deployment:sandbox/web"}},
-        {"labels": {"app.kubernetes.io/instance": "web"}},
+        {"labels": {"kustomize.toolkit.fluxcd.io/name": "apps"}},
+        {"labels": {"helm.toolkit.fluxcd.io/name": "web"}},
     ],
 )
 def test_plan_rejects_gitops_managed(clients, table, meta):
     clients.apps.read_namespaced_deployment.return_value = deployment(**meta)
     assert plan_error(clients) == "gitops_managed"
+    assert table.scan()["Count"] == 0
+
+
+HELM_LABELS = {"app.kubernetes.io/instance": "web", "app.kubernetes.io/managed-by": "Helm"}
+
+
+def test_plan_accepts_a_helm_release(clients):
+    clients.apps.read_namespaced_deployment.return_value = deployment(labels=HELM_LABELS)
+    assert plan(clients)["ok"] is True
+
+
+def test_plan_rejects_a_configured_gitops_marker(clients, table):
+    # Argo CD label tracking: the operator lists the instance label in gitops_markers.
+    settings = dataclasses.replace(SETTINGS, gitops_markers=("app.kubernetes.io/instance",))
+    clients.apps.read_namespaced_deployment.return_value = deployment(labels=HELM_LABELS)
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3}
+    with pytest.raises(GuardError) as exc:
+        handler.plan_scale_deployment(args, settings, clients, NOW)
+    assert exc.value.code == "gitops_managed"
     assert table.scan()["Count"] == 0
 
 
@@ -333,10 +353,18 @@ def test_status_conditions_are_untrusted_text(clients):
 
 def test_status_reports_gitops_managed(clients):
     clients.apps.read_namespaced_deployment.return_value = deployment(
-        labels={"app.kubernetes.io/instance": "web"}
+        labels={"kustomize.toolkit.fluxcd.io/name": "apps"}
     )
     result = handler.get_workload_status({"namespace": "sandbox", "name": "web"}, SETTINGS, clients)
     assert result["data"]["gitops_managed"] is True
+
+
+def test_status_uses_the_configured_gitops_markers(clients):
+    clients.apps.read_namespaced_deployment.return_value = deployment(labels=HELM_LABELS)
+    args = {"namespace": "sandbox", "name": "web"}
+    assert handler.get_workload_status(args, SETTINGS, clients)["data"]["gitops_managed"] is False
+    settings = dataclasses.replace(SETTINGS, gitops_markers=("app.kubernetes.io/instance",))
+    assert handler.get_workload_status(args, settings, clients)["data"]["gitops_managed"] is True
 
 
 def test_status_handles_empty_status(clients):
@@ -1357,7 +1385,7 @@ def test_restart_plan_refuses_a_paused_rollout(clients, table):
 
 def test_restart_plan_refuses_gitops_managed(clients):
     clients.apps.read_namespaced_deployment.return_value = deployment(
-        labels={"app.kubernetes.io/instance": "x"}
+        labels={"helm.toolkit.fluxcd.io/name": "x"}
     )
     assert restart_error(clients) == "gitops_managed"
 

@@ -1,0 +1,32 @@
+# A chart installed with helm install / helm upgrade: Helm's recommended labels and its
+# release annotations, no GitOps controller.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: shop
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/instance: web
+    app.kubernetes.io/version: "3.2.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: web-0.9.0
+  annotations:
+    meta.helm.sh/release-name: web
+    meta.helm.sh/release-namespace: shop
+    deployment.kubernetes.io/revision: "7"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web
+      app.kubernetes.io/instance: web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web
+        app.kubernetes.io/instance: web
+    spec:
+      containers:
+        - name: web
+          image: registry.example.com/shop/web:3.2.0

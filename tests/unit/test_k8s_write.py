@@ -424,7 +424,7 @@ def test_recreated_deployment_is_conflict(rt):
 @pytest.mark.parametrize(
     "marker",
     [
-        {"labels": {"app.kubernetes.io/instance": "web"}},
+        {"labels": {"kustomize.toolkit.fluxcd.io/name": "apps"}},
         {"annotations": {"argocd.argoproj.io/tracking-id": "x:apps/Deployment:sandbox/web"}},
     ],
 )
@@ -447,13 +447,37 @@ def test_gitops_marker_detected_on_retry(rt):
     runtime_, apps = rt
     apps.read_namespaced_deployment.side_effect = [
         deployment(),
-        deployment(labels={"app.kubernetes.io/instance": "web"}),
+        deployment(labels={"helm.toolkit.fluxcd.io/name": "web"}),
     ]
     apps.patch_namespaced_deployment.side_effect = conflict()
     plan = create_plan(runtime_.store)
 
     assert error_code(apply(plan.plan_id)) == "gitops_managed"
     assert apps.patch_namespaced_deployment.call_count == 1
+
+
+HELM_LABELS = {"app.kubernetes.io/instance": "web", "app.kubernetes.io/managed-by": "Helm"}
+
+
+def test_a_helm_release_is_applied(rt):
+    runtime_, apps = rt
+    apps.read_namespaced_deployment.return_value = deployment(labels=HELM_LABELS)
+    assert apply(create_plan(runtime_.store).plan_id)["ok"] is True
+
+
+def test_apply_checks_the_configured_gitops_markers(rt, monkeypatch):
+    runtime_, apps = rt
+    settings = dataclasses.replace(
+        runtime_.settings, gitops_markers=("app.kubernetes.io/instance",)
+    )
+    monkeypatch.setattr(
+        handler, "get_runtime", lambda: dataclasses.replace(runtime_, settings=settings)
+    )
+    apps.read_namespaced_deployment.return_value = deployment(labels=HELM_LABELS)
+    plan = create_plan(runtime_.store)
+
+    assert error_code(apply(plan.plan_id)) == "gitops_managed"
+    apps.patch_namespaced_deployment.assert_not_called()
 
 
 def test_conflict_on_dry_run_is_retried(rt):
@@ -2391,7 +2415,7 @@ def test_a_deployment_now_managed_by_gitops_is_not_reverted(verify_rt):
     runtime_, apps = verify_rt
     plan = applied_with_revert(runtime_, apps)
     managed = live(plan.plan_id, available=1)
-    managed.metadata.labels = {"app.kubernetes.io/instance": "argo"}
+    managed.metadata.labels = {"kustomize.toolkit.fluxcd.io/name": "apps"}
     apps.read_namespaced_deployment.return_value = managed
     assert verify(plan.plan_id)["data"]["revert"] == "refused"
     revert_id = handler.revert_plan_id(plan.plan_id)

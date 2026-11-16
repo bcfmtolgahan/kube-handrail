@@ -63,7 +63,7 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 | `forbidden_namespace` | Namespace not allowed. | Stop. |
 | `out_of_bounds` | `replicas`, or with `revert_on_failure` the current count it would revert to, outside the server's bounds. | Stop, or plan a value within bounds (or without revert) if the human agrees. |
 | `blast_radius_exceeded` | Step larger than allowed (`details.max_step`). | Plan a smaller step within `max_step`; never ask to lift the limit. |
-| `gitops_managed` | Managed by GitOps. | Stop. The change belongs in Git. |
+| `gitops_managed` | Managed by GitOps (Argo CD or Flux markers, or a marker the operator configured). | Stop. The change belongs in Git. |
 | `plan_not_found`, `plan_expired` | Plan unknown or expired (on `get_plan_outcome`: no such plan, or its record was removed after its retention). | Re-plan; for `get_plan_outcome`, check the `plan_id`. |
 | `plan_used` | Plan already consumed, possibly by the approval's own apply. | Check `get_workload_status`; do not re-plan unless the human asks. |
 | `plan_mismatch` | Apply arguments differ from the plan. | Apply again with exactly the plan's arguments, or re-plan. |
