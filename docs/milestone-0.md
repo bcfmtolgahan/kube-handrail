@@ -120,6 +120,12 @@ They check authentication (missing, malformed and tampered tokens), argument val
 
 The guard tests never change `web`, which belongs to the smoke test; they only plan against it for read-only validation cases that never reach apply. Every case that applies or edits a Deployment uses fixtures created for the run (`e2e-target`, `e2e-flap`, `e2e-manual`: 1-replica unprivileged nginx, plus a Service and a PodDisruptionBudget for `e2e-target`) and deleted at the end, so each run starts with an empty history. The per-object and global budgets are covered by unit tests only: reaching them takes 6 or 30 real applies, which is slow and adds nothing the unit tests at the exact limits do not show. The smoke test and a client-mode run of these tests apply about 11 times within the hour, more than the default per-agent budget of 10, so the `smoke_test` agent's `hourly_apply_budget` defaults to 30 ([Agents](deploy.md#agents)). The same goes for the `scale_to_zero` and `service_without_endpoints` warnings, which need a plan to 0 replicas: a sandbox with `min_replicas` of 1 refuses that as `out_of_bounds`.
 
+### Integration suite (kind and moto)
+
+Most of these scenarios also run without AWS on every pull request: `tests/integration` calls the Lambda handlers in process against a kind cluster, impersonating the reader and writer groups, with moto for DynamoDB, SSM, SNS and S3. Run it with `make integration` (Docker and kind; a throwaway cluster with its own kubeconfig). Status: implemented; it runs locally on kind in about two minutes including the cluster; the CI result is not known until pushed. Coverage, harness and moto gaps: [tests/integration/README.md](../tests/integration/README.md).
+
+`e2e_gateway.py --live-only` runs only what that suite cannot cover: Cognito authentication, the gateway's schema check, applies through the real gateway, interceptor, EKS access entries and VPC path, concurrent applies on real DynamoDB, the approval URL's IAM auth, and with `--with-identity` and `--with-audit` the identity and audit cases. The DevOps Agent association is checked by the sentinel. Without the flag every case runs as before.
+
 ## 4. Register with AWS DevOps Agent
 
 Each step prints the IDs the next step needs as JSON. Client credentials are read from the environment and never printed.

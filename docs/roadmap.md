@@ -256,13 +256,15 @@ These move to "Later ideas":
 
 **Status:** implemented and tested on a test cluster. On the test deployment, `make upgrade` from Milestone 3 showed only the 12 moves and package rebuilds, ran the sentinel, install-guidance and the smoke test, and took 110 seconds; a second dry run showed no changes. Legacy mode and the `verify_enabled` switch are removed (12 `moved` blocks; the two variables stay one release as deprecated), and `make upgrade` (`scripts/upgrade.py`, `Makefile`) runs the steps above; `request_approval` in `client` mode has a clearer message. The live plan and the duration of `make upgrade` on the shared test deployment are still to be recorded here.
 
-## Milestone 5: CI tier 1 with kind and moto
+## Milestone 5: CI tier 1 with kind and moto (implemented; integration suite runs locally on kind)
 
 **Goal:** catch guard regressions on every pull request instead of only on a shared cluster.
 
 - An integration harness on kind with impersonated reader and writer groups and moto for DynamoDB, SSM and S3, calling the Lambda handlers in process; most end-to-end scenarios move there. Live runs keep only Cognito, the gateway interceptor, the DevOps Agent association, EKS access entries and VPC networking.
 
 **Done when:** the integration job is green on every pull request in under 10 minutes.
+
+**Status:** implemented; the integration suite runs locally on kind (48 cases in about 75 seconds on a laptop, plus the cluster); the CI result is not known until the branch is pushed. `tests/integration` covers every scenario listed for this milestone and the untrusted event text; the impact preview and the drift sentinel are not ported. `e2e_gateway.py --live-only` runs the live-only cases; the other live cases are kept for now ([Integration suite](milestone-0.md#integration-suite-kind-and-moto)).
 
 ## Milestone 6: Several namespaces, with policy and approvers per namespace
 
