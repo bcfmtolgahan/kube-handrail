@@ -96,6 +96,13 @@ locals {
     var.audit_enabled ? { audit = "mcp/audit/requirements.txt" } : {},
   )
 
+  # The tool set as registered: the targets' tool schemas and their classification.
+  # scripts/upgrade.py computes the same hash (tool_set_hash) from the working tree.
+  tool_set_hash = sha256(join("", concat(
+    [filesha256("${local.repo_root}/mcp/classification.json")],
+    [for fn in sort(keys(local.functions)) : filesha256("${local.repo_root}/mcp/${fn}/tools.json")],
+  )))
+
   # Tolerates a function directory that has no Python sources yet.
   source_hashes = {
     for fn, requirements in local.packages : fn => sha256(join("", concat(

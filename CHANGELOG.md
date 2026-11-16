@@ -1,21 +1,26 @@
 # Changelog
 
-All notable changes to kube-handrail are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) as described in [Releasing](docs/releasing.md). Each entry says whether the tool schemas changed (`enable-write` needed) and whether the agent guidance changed (`install-guidance` needed); upgrade steps are in [deploy](docs/deploy.md#upgrading).
+All notable changes to kube-handrail are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) as described in [Releasing](docs/releasing.md). Each entry says whether the tool schemas changed (`enable-write` needed) and whether the agent guidance changed (`install-guidance` needed); `make upgrade` runs both when needed ([deploy](docs/deploy.md#upgrading)).
 
 ## [Unreleased]
 
-Milestones 3 and 4. Implemented, not yet tested on a cluster. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md`), so re-run `install-guidance`.
+Milestones 3 and 4. Implemented, not yet tested on a cluster. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md`), so re-run `install-guidance` (`make upgrade` does).
 
 ### Changed
 
 - **GitOps ownership is detected by controller markers.** A Deployment is `gitops_managed` when it has the Argo CD annotation `argocd.argoproj.io/tracking-id` or a Flux kustomize-controller or helm-controller label (`kustomize.toolkit.fluxcd.io/name|namespace`, `helm.toolkit.fluxcd.io/name|namespace`). `app.kubernetes.io/instance` alone no longer counts: Helm sets it on every release, so every Helm-installed Deployment used to be refused. **Behaviour change:** if your Argo CD uses label tracking, set `gitops_markers = ["app.kubernetes.io/instance"]` before upgrading, or those objects become changeable through kube-handrail. Flux-managed objects, which were not detected before, are now refused.
 - **Plan TTL by approval mode.** `plan_ttl_seconds` defaults to `null`: 900 seconds in `client` mode, where the human approves in the chat within the plan's own TTL, and 300 seconds in `server` and `both` mode. A value set in tfvars still wins. The TTL is not a guard; apply checks the live object again ([Guards](docs/guards.md#plan-lifetime)).
 - `e2e_gateway.py` reads the values Terraform knows from `terraform output` of a test deployment (other states are ignored); set variables still win. Its `--approval-mode` defaults to the deployment's mode.
-- **The gateway request interceptor and the verifier are always deployed.** Legacy mode (`caller_interceptor_enabled = false`) and the `verify_enabled` switch are gone: every plan names its agent, every caller of a write path must be a configured agent, and every apply is verified. The tool Lambdas require `AGENTS` and `AGENT_KILL_SWITCH_PREFIX` and do not start without them; a plan response always has `verification`; preflight no longer reports `agent_enabled` and `agent_budget` as skipped. The sentinel requires `EXPECT_INTERCEPTOR_ARN` and always checks the gateway's interceptor. On a deployment that had both enabled (the default) the upgrade is moves only for these resources; a deployment that had either off gets them in a two-step apply: `terraform apply -target=terraform_data.caller_key -target=aws_iam_role.interceptor -target=aws_lambda_function.interceptor -target=aws_iam_role.verifier`, then `terraform apply`.
+- **The gateway request interceptor and the verifier are always deployed.** Legacy mode (`caller_interceptor_enabled = false`) and the `verify_enabled` switch are gone: every plan names its agent, every caller of a write path must be a configured agent, and every apply is verified. The tool Lambdas require `AGENTS` and `AGENT_KILL_SWITCH_PREFIX` and do not start without them; a plan response always has `verification`; preflight no longer reports `agent_enabled` and `agent_budget` as skipped. The sentinel requires `EXPECT_INTERCEPTOR_ARN` and always checks the gateway's interceptor. On a deployment that had both enabled (the default) the upgrade is moves only for these resources; a deployment that had either off gets them in a two-step apply ([deploy](docs/deploy.md#upgrading)).
 - `e2e_gateway.py` runs the verification cases by default; `--skip-verify` leaves them out, and `--with-verify` is accepted and does nothing.
+- The per-release upgrade notes moved to [Upgrade notes before Milestone 4](docs/history/upgrading.md); [deploy](docs/deploy.md#upgrading) describes `make upgrade`.
 
 ### Added
 
+- `make upgrade` (`scripts/upgrade.py`): one resumable upgrade command. It refuses to start while the kill switch is off unless it turned it off itself, refuses a plan that deletes or replaces the gateway, its targets, Cognito, the plan table, the audit bucket or the kill switch and freezes parameters, applies known two-step migrations first, turns the kill switch off while the tool set changes, retries an "inconsistent final plan" once, runs `enable-write` and `install-guidance` only when needed, requires a sentinel `ok`, and ends with the smoke test. `--dry-run` stops after the plan check. Also `make bootstrap`, `deploy`, `register`, `smoke` and `destroy` (`scripts/cleanup.sh`).
+- `scripts/smoke_test.py --read-only`: the read path only, for `server` and `both` mode.
+- Outputs `gateway_id`, `approval_mode`, `devops_agent_space_id`, `devops_agent_association_id`, `tool_set_hash` and `cognito_user_pool_id`.
+- `terraform/backend.tf.example`: remote state in S3 with a lock file.
 - `gitops_markers` (Terraform) / `GITOPS_MARKERS` (Lambda environment): extra label or annotation keys that mark GitOps ownership.
 - Validation: `plan_ttl_seconds` and `PLAN_TTL_SECONDS` at most 3600.
 - Outputs `plan_ttl_seconds`, `guard_settings` and `dashboard_name`.

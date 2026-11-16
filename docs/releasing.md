@@ -41,7 +41,7 @@ Why: every schema change costs the operator a sequence that takes effect only in
 3. **`install-guidance`**: agents need the new `AGENTS.md` and skills to use the new arguments.
 4. **Stale-skill window**: a DevOps Agent chat can keep reading the previous skill version for about half an hour after `install-guidance` (observed on a test deployment), so for that time agents may call the new schema with old instructions.
 
-Two schema changes in two releases mean two outages of remediation and two stale windows; one batch means one. A change that does not touch `tools.json` (a guard, a Terraform default, the contract text) needs none of this, and can ship in any release. When a fix would need a schema change, for example a tool description that has gone out of date, it waits for the next batch and the changelog says so.
+`make upgrade` ([deploy](deploy.md#upgrading)) runs these steps in order: it turns the kill switch off before such an apply and on again after a sentinel `ok`. Two schema changes in two releases mean two outages of remediation and two stale windows; one batch means one. A change that does not touch `tools.json` (a guard, a Terraform default, the contract text) needs none of this, and can ship in any release. When a fix would need a schema change, for example a tool description that has gone out of date, it waits for the next batch and the changelog says so.
 
 ## Release checklist
 

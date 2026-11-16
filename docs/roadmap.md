@@ -254,6 +254,8 @@ These move to "Later ideas":
 
 **Done when:** on the test deployment `terraform plan` shows only moves, and `make upgrade` runs end to end.
 
+**Status:** implemented, not yet tested on a cluster. Legacy mode and the `verify_enabled` switch are removed (12 `moved` blocks; the two variables stay one release as deprecated), and `make upgrade` (`scripts/upgrade.py`, `Makefile`) runs the steps above. The live plan and the duration of `make upgrade` on the shared test deployment are still to be recorded here.
+
 ## Milestone 5: CI tier 1 with kind and moto
 
 **Goal:** catch guard regressions on every pull request instead of only on a shared cluster.

@@ -12,6 +12,8 @@ the two applies the test waits out APPLY_COOLDOWN_SECONDS.
 It applies through the gateway, so it needs approval_mode client. In server or both
 mode its applies are refused with approval_required unless each plan is approved
 through the approval URL (scripts/approve.py approve --no-apply) before the apply.
+--read-only (for server and both mode) stops after the read path: the token, the
+tool list and get_workload_status of the target, which changes nothing.
 
 Configuration (flags override environment variables):
   GATEWAY_URL, TOKEN_URL, CLIENT_ID, CLIENT_SECRET, SCOPE (optional,
@@ -60,6 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scope", default=env("SCOPE"))
     parser.add_argument("--namespace", default=env("NAMESPACE", "kube-handrail-sandbox"))
     parser.add_argument("--name", default=env("NAME", "web"))
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="check the token, the tool list and get_workload_status only; plan and apply nothing",
+    )
     args = parser.parse_args()
     args.client_secret = env("CLIENT_SECRET")
     missing = [
@@ -189,6 +196,12 @@ async def run(args: argparse.Namespace, token: str) -> None:
 
             target = {"namespace": args.namespace, "name": args.name}
             initial = await status(gw, **target)
+            if args.read_only:
+                check(
+                    isinstance(initial.get("replicas"), dict),
+                    "get_workload_status reads the target",
+                )
+                return
             check(initial["gitops_managed"] is False, "target is not GitOps-managed")
             check(initial["replicas"]["desired"] == 1, "target starts at 1 replica")
 

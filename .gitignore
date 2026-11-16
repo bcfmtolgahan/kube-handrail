@@ -55,3 +55,7 @@ kubeconfig*
 .vscode/
 *.swp
 .DS_Store
+
+# scripts/upgrade.py progress
+.upgrade-state.json
+.upgrade-state.tmp

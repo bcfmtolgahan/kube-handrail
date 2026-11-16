@@ -1,0 +1,1045 @@
+{
+ "format_version": "1.2",
+ "terraform_version": "1.9.8",
+ "planned_values": {
+  "root_module": {}
+ },
+ "resource_changes": [
+  {
+   "address": "aws_bedrockagentcore_gateway.this",
+   "mode": "managed",
+   "type": "aws_bedrockagentcore_gateway",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "delete",
+     "create"
+    ],
+    "before": {
+     "gateway_id": "gw-abc123",
+     "name": "kh-test",
+     "protocol_type": "MCP",
+     "interceptor_configuration": [
+      {
+       "interception_points": [
+        "REQUEST"
+       ],
+       "interceptor": [
+        {
+         "lambda": [
+          {
+           "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-interceptor"
+          }
+         ]
+        }
+       ],
+       "input_configuration": [
+        {
+         "pass_request_headers": true
+        }
+       ]
+      }
+     ]
+    },
+    "after": {
+     "gateway_id": "gw-abc123",
+     "name": "kh-test",
+     "protocol_type": "MCP",
+     "interceptor_configuration": [
+      {
+       "interception_points": [
+        "REQUEST"
+       ],
+       "interceptor": [
+        {
+         "lambda": [
+          {
+           "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-interceptor"
+          }
+         ]
+        }
+       ],
+       "input_configuration": [
+        {
+         "pass_request_headers": true
+        }
+       ]
+      }
+     ]
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "action_reason": "replace_because_cannot_update"
+  },
+  {
+   "address": "aws_bedrockagentcore_gateway_target.this[\"k8s_read\"]",
+   "mode": "managed",
+   "type": "aws_bedrockagentcore_gateway_target",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "k8sr"
+    },
+    "after": {
+     "name": "k8sr"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "k8s_read"
+  },
+  {
+   "address": "aws_bedrockagentcore_gateway_target.this[\"k8s_write\"]",
+   "mode": "managed",
+   "type": "aws_bedrockagentcore_gateway_target",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "k8sw"
+    },
+    "after": {
+     "name": "k8sw"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "k8s_write"
+  },
+  {
+   "address": "aws_cognito_user_pool.this",
+   "mode": "managed",
+   "type": "aws_cognito_user_pool",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "kh-test"
+    },
+    "after": {
+     "name": "kh-test"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_cognito_user_pool_client.this[\"devops_agent\"]",
+   "mode": "managed",
+   "type": "aws_cognito_user_pool_client",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "kh-test-devops-agent"
+    },
+    "after": {
+     "name": "kh-test-devops-agent"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "devops_agent"
+  },
+  {
+   "address": "aws_dynamodb_table.plans",
+   "mode": "managed",
+   "type": "aws_dynamodb_table",
+   "name": "plans",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "delete"
+    ],
+    "before": {
+     "name": "kh-test-plans"
+    },
+    "after": null,
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_s3_bucket.audit[0]",
+   "mode": "managed",
+   "type": "aws_s3_bucket",
+   "name": "audit",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "bucket": "kh-test-audit-111122223333"
+    },
+    "after": {
+     "bucket": "kh-test-audit-111122223333"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": 0
+  },
+  {
+   "address": "aws_ssm_parameter.kill_switch",
+   "mode": "managed",
+   "type": "aws_ssm_parameter",
+   "name": "kill_switch",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "/kh-test/remediation-enabled"
+    },
+    "after": {
+     "name": "/kh-test/remediation-enabled"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_ssm_parameter.freezes",
+   "mode": "managed",
+   "type": "aws_ssm_parameter",
+   "name": "freezes",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "/kh-test/freezes"
+    },
+    "after": {
+     "name": "/kh-test/freezes"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_ssm_parameter.agent_enabled[\"devops_agent\"]",
+   "mode": "managed",
+   "type": "aws_ssm_parameter",
+   "name": "agent_enabled",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create",
+     "delete"
+    ],
+    "before": {
+     "name": "/kh-test/agents/devops_agent/enabled"
+    },
+    "after": {
+     "name": "/kh-test/agents/devops_agent/enabled"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "devops_agent"
+  },
+  {
+   "address": "terraform_data.caller_key",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "caller_key",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "input": "(key)",
+     "output": "(key)"
+    },
+    "after": {
+     "input": "(key)",
+     "output": "(key)"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "terraform_data.caller_key[0]"
+  },
+  {
+   "address": "aws_iam_role.interceptor",
+   "mode": "managed",
+   "type": "aws_iam_role",
+   "name": "interceptor",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "kh-test-interceptor",
+     "arn": "arn:aws:iam::111122223333:role/kh-test-interceptor"
+    },
+    "after": {
+     "name": "kh-test-interceptor",
+     "arn": "arn:aws:iam::111122223333:role/kh-test-interceptor"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_iam_role.interceptor[0]"
+  },
+  {
+   "address": "aws_cloudwatch_log_group.interceptor",
+   "mode": "managed",
+   "type": "aws_cloudwatch_log_group",
+   "name": "interceptor",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "/aws/lambda/kh-test-interceptor"
+    },
+    "after": {
+     "name": "/aws/lambda/kh-test-interceptor"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_cloudwatch_log_group.interceptor[0]"
+  },
+  {
+   "address": "aws_iam_role_policy.interceptor",
+   "mode": "managed",
+   "type": "aws_iam_role_policy",
+   "name": "interceptor",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "runtime"
+    },
+    "after": {
+     "name": "runtime"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_iam_role_policy.interceptor[0]"
+  },
+  {
+   "address": "aws_iam_role.verifier",
+   "mode": "managed",
+   "type": "aws_iam_role",
+   "name": "verifier",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "kh-test-verifier"
+    },
+    "after": {
+     "name": "kh-test-verifier"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_iam_role.verifier[0]"
+  },
+  {
+   "address": "aws_cloudwatch_log_group.verifier",
+   "mode": "managed",
+   "type": "aws_cloudwatch_log_group",
+   "name": "verifier",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "/aws/lambda/kh-test-verifier"
+    },
+    "after": {
+     "name": "/aws/lambda/kh-test-verifier"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_cloudwatch_log_group.verifier[0]"
+  },
+  {
+   "address": "aws_iam_role_policy.verifier",
+   "mode": "managed",
+   "type": "aws_iam_role_policy",
+   "name": "verifier",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "runtime"
+    },
+    "after": {
+     "name": "runtime"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_iam_role_policy.verifier[0]"
+  },
+  {
+   "address": "aws_cloudwatch_event_rule.verifier",
+   "mode": "managed",
+   "type": "aws_cloudwatch_event_rule",
+   "name": "verifier",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "kh-test-verifier"
+    },
+    "after": {
+     "name": "kh-test-verifier"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_cloudwatch_event_rule.verifier[0]"
+  },
+  {
+   "address": "aws_cloudwatch_event_target.verifier",
+   "mode": "managed",
+   "type": "aws_cloudwatch_event_target",
+   "name": "verifier",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "rule": "kh-test-verifier"
+    },
+    "after": {
+     "rule": "kh-test-verifier"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_cloudwatch_event_target.verifier[0]"
+  },
+  {
+   "address": "aws_lambda_permission.verifier",
+   "mode": "managed",
+   "type": "aws_lambda_permission",
+   "name": "verifier",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "statement_id": "AllowSchedule"
+    },
+    "after": {
+     "statement_id": "AllowSchedule"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_lambda_permission.verifier[0]"
+  },
+  {
+   "address": "aws_lambda_function.interceptor",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "interceptor",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "function_name": "kh-test-interceptor",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-interceptor",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "old",
+     "environment": [
+      {
+       "variables": {
+        "CALLER_KEY": "(sensitive)"
+       }
+      }
+     ]
+    },
+    "after": {
+     "function_name": "kh-test-interceptor",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-interceptor",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "new",
+     "environment": [
+      {
+       "variables": {
+        "CALLER_KEY": "(sensitive)"
+       }
+      }
+     ]
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_lambda_function.interceptor[0]"
+  },
+  {
+   "address": "aws_lambda_function.verifier",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "verifier",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "function_name": "kh-test-verifier",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-verifier",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "old",
+     "environment": [
+      {
+       "variables": {
+        "PLANS_TABLE": "kh-test-plans"
+       }
+      }
+     ]
+    },
+    "after": {
+     "function_name": "kh-test-verifier",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-verifier",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "new",
+     "environment": [
+      {
+       "variables": {
+        "PLANS_TABLE": "kh-test-plans"
+       }
+      }
+     ]
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "previous_address": "aws_lambda_function.verifier[0]"
+  },
+  {
+   "address": "terraform_data.build[\"approver\"]",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "build",
+   "provider_name": "terraform.io/builtin/terraform",
+   "change": {
+    "actions": [
+     "delete",
+     "create"
+    ],
+    "before": {
+     "id": "x"
+    },
+    "after": {
+     "id": null
+    },
+    "after_unknown": {
+     "id": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "approver",
+   "action_reason": "replace_by_triggers"
+  },
+  {
+   "address": "terraform_data.build[\"audit\"]",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "build",
+   "provider_name": "terraform.io/builtin/terraform",
+   "change": {
+    "actions": [
+     "delete",
+     "create"
+    ],
+    "before": {
+     "id": "x"
+    },
+    "after": {
+     "id": null
+    },
+    "after_unknown": {
+     "id": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "audit",
+   "action_reason": "replace_by_triggers"
+  },
+  {
+   "address": "terraform_data.build[\"interceptor\"]",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "build",
+   "provider_name": "terraform.io/builtin/terraform",
+   "change": {
+    "actions": [
+     "delete",
+     "create"
+    ],
+    "before": {
+     "id": "x"
+    },
+    "after": {
+     "id": null
+    },
+    "after_unknown": {
+     "id": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "interceptor",
+   "action_reason": "replace_by_triggers"
+  },
+  {
+   "address": "terraform_data.build[\"k8s_read\"]",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "build",
+   "provider_name": "terraform.io/builtin/terraform",
+   "change": {
+    "actions": [
+     "delete",
+     "create"
+    ],
+    "before": {
+     "id": "x"
+    },
+    "after": {
+     "id": null
+    },
+    "after_unknown": {
+     "id": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "k8s_read",
+   "action_reason": "replace_by_triggers"
+  },
+  {
+   "address": "terraform_data.build[\"k8s_write\"]",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "build",
+   "provider_name": "terraform.io/builtin/terraform",
+   "change": {
+    "actions": [
+     "delete",
+     "create"
+    ],
+    "before": {
+     "id": "x"
+    },
+    "after": {
+     "id": null
+    },
+    "after_unknown": {
+     "id": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "k8s_write",
+   "action_reason": "replace_by_triggers"
+  },
+  {
+   "address": "terraform_data.build[\"sentinel\"]",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "build",
+   "provider_name": "terraform.io/builtin/terraform",
+   "change": {
+    "actions": [
+     "delete",
+     "create"
+    ],
+    "before": {
+     "id": "x"
+    },
+    "after": {
+     "id": null
+    },
+    "after_unknown": {
+     "id": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "sentinel",
+   "action_reason": "replace_by_triggers"
+  },
+  {
+   "address": "terraform_data.build[\"verifier\"]",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "build",
+   "provider_name": "terraform.io/builtin/terraform",
+   "change": {
+    "actions": [
+     "delete",
+     "create"
+    ],
+    "before": {
+     "id": "x"
+    },
+    "after": {
+     "id": null
+    },
+    "after_unknown": {
+     "id": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "verifier",
+   "action_reason": "replace_by_triggers"
+  },
+  {
+   "address": "aws_lambda_function.this[\"k8s_read\"]",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "function_name": "kh-test-k8s-read",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-k8s-read",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "old",
+     "environment": [
+      {
+       "variables": {
+        "CLUSTER_NAME": "demo",
+        "PLANS_TABLE": "kh-test-plans",
+        "ALLOWED_NAMESPACES": "kube-handrail-sandbox",
+        "AGENTS": "{\"c1\":{\"name\":\"devops_agent\"}}",
+        "AGENT_KILL_SWITCH_PREFIX": "/kh-test/agents/",
+        "VERIFY_WINDOW_DEFAULT_SECONDS": "120",
+        "CALLER_KEY": "(sensitive)",
+        "CALLER_INTERCEPTOR": "true",
+        "VERIFY_ENABLED": "true"
+       }
+      }
+     ]
+    },
+    "after": {
+     "function_name": "kh-test-k8s-read",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-k8s-read",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": null,
+     "environment": [
+      {
+       "variables": {
+        "CLUSTER_NAME": "demo",
+        "PLANS_TABLE": "kh-test-plans",
+        "ALLOWED_NAMESPACES": "kube-handrail-sandbox",
+        "AGENTS": "{\"c1\":{\"name\":\"devops_agent\"}}",
+        "AGENT_KILL_SWITCH_PREFIX": "/kh-test/agents/",
+        "VERIFY_WINDOW_DEFAULT_SECONDS": "120",
+        "CALLER_KEY": "(sensitive)"
+       }
+      }
+     ]
+    },
+    "after_unknown": {
+     "source_code_hash": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "k8s_read"
+  },
+  {
+   "address": "aws_lambda_function.this[\"k8s_write\"]",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "function_name": "kh-test-k8s-write",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-k8s-write",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "old",
+     "environment": [
+      {
+       "variables": {
+        "CLUSTER_NAME": "demo",
+        "PLANS_TABLE": "kh-test-plans",
+        "ALLOWED_NAMESPACES": "kube-handrail-sandbox",
+        "AGENTS": "{\"c1\":{\"name\":\"devops_agent\"}}",
+        "AGENT_KILL_SWITCH_PREFIX": "/kh-test/agents/",
+        "VERIFY_WINDOW_DEFAULT_SECONDS": "120",
+        "CALLER_KEY": "(sensitive)",
+        "CALLER_INTERCEPTOR": "true",
+        "VERIFY_ENABLED": "true"
+       }
+      }
+     ]
+    },
+    "after": {
+     "function_name": "kh-test-k8s-write",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-k8s-write",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": null,
+     "environment": [
+      {
+       "variables": {
+        "CLUSTER_NAME": "demo",
+        "PLANS_TABLE": "kh-test-plans",
+        "ALLOWED_NAMESPACES": "kube-handrail-sandbox",
+        "AGENTS": "{\"c1\":{\"name\":\"devops_agent\"}}",
+        "AGENT_KILL_SWITCH_PREFIX": "/kh-test/agents/",
+        "VERIFY_WINDOW_DEFAULT_SECONDS": "120",
+        "CALLER_KEY": "(sensitive)"
+       }
+      }
+     ]
+    },
+    "after_unknown": {
+     "source_code_hash": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "k8s_write"
+  },
+  {
+   "address": "aws_lambda_function.approver",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "approver",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "function_name": "kh-test-approver",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-approver",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "old",
+     "environment": [
+      {
+       "variables": {}
+      }
+     ]
+    },
+    "after": {
+     "function_name": "kh-test-approver",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-approver",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": null,
+     "environment": [
+      {
+       "variables": {}
+      }
+     ]
+    },
+    "after_unknown": {
+     "source_code_hash": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_lambda_function.sentinel[0]",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "sentinel",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "function_name": "kh-test-sentinel",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-sentinel",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "old",
+     "environment": [
+      {
+       "variables": {
+        "GATEWAY_ID": "gw-abc123",
+        "TOOL_CLASSIFICATION": "{\"k8sr___get_workload_status\":\"READ_ONLY\",\"k8sw___apply_scale_deployment\":\"MUTATIVE\"}",
+        "EXPECT_INTERCEPTOR_ARN": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-interceptor",
+        "EXPECT_ALLOWED_CLIENTS": "[\"c1\",\"c2\"]"
+       }
+      }
+     ]
+    },
+    "after": {
+     "function_name": "kh-test-sentinel",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-sentinel",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": null,
+     "environment": [
+      {
+       "variables": {
+        "GATEWAY_ID": "gw-abc123",
+        "TOOL_CLASSIFICATION": "{\"k8sr___get_workload_status\":\"READ_ONLY\",\"k8sw___apply_scale_deployment\":\"MUTATIVE\"}",
+        "EXPECT_INTERCEPTOR_ARN": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-interceptor",
+        "EXPECT_ALLOWED_CLIENTS": "[\"c1\",\"c2\"]"
+       }
+      }
+     ]
+    },
+    "after_unknown": {
+     "source_code_hash": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": 0
+  },
+  {
+   "address": "aws_lambda_function.audit[0]",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "audit",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "function_name": "kh-test-audit",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-audit",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "old",
+     "environment": [
+      {
+       "variables": {}
+      }
+     ]
+    },
+    "after": {
+     "function_name": "kh-test-audit",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-audit",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": null,
+     "environment": [
+      {
+       "variables": {}
+      }
+     ]
+    },
+    "after_unknown": {
+     "source_code_hash": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": 0
+  }
+ ],
+ "output_changes": {
+  "tool_set_hash": {
+   "actions": [
+    "create"
+   ],
+   "before": null,
+   "after": "abc",
+   "after_unknown": false
+  },
+  "gateway_id": {
+   "actions": [
+    "create"
+   ],
+   "before": null,
+   "after": "gw-abc123",
+   "after_unknown": false
+  }
+ },
+ "configuration": {
+  "root_module": {}
+ },
+ "timestamp": "2026-11-16T10:00:00Z",
+ "applyable": true,
+ "complete": true,
+ "errored": false
+}
