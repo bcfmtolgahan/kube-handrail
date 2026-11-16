@@ -19,7 +19,7 @@ Milestone 3. Implemented, not yet tested on a cluster. Tool schemas: unchanged, 
 - Outputs `plan_ttl_seconds`, `guard_settings` and `dashboard_name`.
 - A CloudWatch dashboard (with `sentinel_enabled`): plan and apply calls, guard rejections by code, tool errors, sentinel results, verifier runs, backlog and reverts, audit dead letters, failures and lag.
 - `terraform/test.tfvars.example`, a test profile from the normal variables, and `e2e_gateway.py --reset-counters`, which deletes the current hour's apply counters on a test deployment only (a `name_prefix` with `test`, `e2e` or `ci` as a word).
-- Guidance sync tests (`tests/unit/test_guidance_sync.py`, `scripts/check_contract.py`): the `AGENTS.md` tool and error tables against `tools.json` and the error codes, tool and argument names in the skills, contract links, and word-count ceilings.
+- Guidance sync tests (`tests/unit/test_guidance_sync.py`, `scripts/check_contract.py`): the `AGENTS.md` tool and error tables and the `CONTRACT.md` error code line against `tools.json` and the error codes, tool and argument names in the skills, contract links, and word-count ceilings.
 - `docs/releasing.md` and this changelog. Approval mode guidance and a shadow-mode recipe in [deploy](docs/deploy.md#approval-mode).
 
 ### Deprecated

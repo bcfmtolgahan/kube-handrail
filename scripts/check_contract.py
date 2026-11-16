@@ -185,8 +185,12 @@ TOOL_MENTION = re.compile(
     r"\b(?:k8s[rw]___)?((?:plan|apply)_[a-z]+(?:_[a-z]+)*_deployment|get_[a-z]+(?:_[a-z]+)*"
     r"|request_[a-z]+(?:_[a-z]+)*)\b"
 )
-# A call written as tool(arg, arg, ...).
-TOOL_CALL = re.compile(r"\b(?:k8s[rw]___)?([a-z_]+)\(([a-z_, ]*)\)")
+# A call written as tool(arg, ...) or tool(arg=value, ...).
+TOOL_CALL = re.compile(r"\b(?:k8s[rw]___)?([a-z]+(?:_[a-z]+)+)\(([^()\n`]*)\)")
+IDENTIFIER = re.compile(r"[a-z_]+")
+# `name: true` or `name: false` sets an argument, unless name is one of these response fields.
+SETTING = re.compile(r"`([a-z]+(?:_[a-z]+)*): (?:true|false)`")
+RESPONSE_FIELDS = frozenset({"notified"})
 # Python modules whose "code": CONSTANT entries are the impact warnings.
 WARNING_MODULES = ("impact.py", "rollout.py")
 WARNING_CODE = re.compile(r"[\"']code[\"']:\s*([A-Z_]+)")
@@ -264,14 +268,18 @@ def check_skills(root: Path) -> list[str]:
     skills = sorted((root / "agent/skills").glob("*/SKILL.md"))
     texts = {path.relative_to(root).as_posix(): path.read_text() for path in skills}
     for rel, text in texts.items():
-        for name in sorted(set(TOOL_MENTION.findall(text)) - set(tools)):
-            errors.append(f"{rel}: names unknown tool {name}")
-        for name, raw in TOOL_CALL.findall(text):
+        unknown = set(TOOL_MENTION.findall(text)) - set(tools)
+        errors += [f"{rel}: names unknown tool {name}" for name in sorted(unknown)]
+        calls = TOOL_CALL.findall(text)
+        # A call to a name outside the TOOL_MENTION patterns (cancel_plan(plan_id)).
+        for name in sorted({name for name, _ in calls} - set(tools) - unknown):
+            errors.append(f"{rel}: calls unknown tool {name}")
+        for name, raw in calls:
             if name not in tools:
                 continue
             properties = tools[name].get("inputSchema", {}).get("properties", {})
-            for arg in (a.strip() for a in raw.split(",") if a.strip()):
-                if arg not in properties:
+            for arg in (a.split("=", 1)[0].strip() for a in raw.split(",")):
+                if IDENTIFIER.fullmatch(arg) and arg not in properties:
                     errors.append(f"{rel}: {name} has no argument {arg}")
     named = set(re.findall(r"`([a-z_]+)`", "\n".join(texts.values())))
     errors += [f"no skill names warning {c}" for c in sorted(warning_codes(root) - named)]
@@ -284,6 +292,8 @@ def check_skills(root: Path) -> list[str]:
             close = difflib.get_close_matches(token, arguments, n=1, cutoff=0.85)
             if close:
                 errors.append(f"{rel}: {token} looks like the argument {close[0]}")
+            elif token in SETTING.findall(text) and token not in RESPONSE_FIELDS:
+                errors.append(f"{rel}: sets {token}, which no tool takes")
     return errors
 
 
@@ -331,8 +341,23 @@ def check_links(root: Path) -> list[str]:
     return errors
 
 
+def check_contract_codes(root: Path) -> list[str]:
+    """The CONTRACT.md 'Error codes:' line lists exactly ERROR_CODES, deprecated ones included."""
+    codes = contract_error_codes((root / "mcp/CONTRACT.md").read_text())
+    expected = set(envelope_module(root).ERROR_CODES)
+    prefix = "mcp/CONTRACT.md 'Error codes:' line"
+    return [f"{prefix} does not list {c}" for c in sorted(expected - set(codes))] + [
+        f"{prefix} lists unknown {c}" for c in sorted(set(codes) - expected)
+    ]
+
+
 def check_guidance(root: Path) -> list[str]:
-    return check_agents_tables(root) + check_skills(root) + check_links(root)
+    return (
+        check_agents_tables(root)
+        + check_contract_codes(root)
+        + check_skills(root)
+        + check_links(root)
+    )
 
 
 def main() -> None:

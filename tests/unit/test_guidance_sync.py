@@ -146,6 +146,55 @@ def test_skill_misspells_an_argument(repo):
     ]
 
 
+def test_skill_passes_an_unknown_keyword_argument(repo):
+    edit(
+        repo / SCALE_SKILL,
+        "plan_scale_deployment(namespace, name, replicas)",
+        "plan_scale_deployment(namespace=ns, name=name, count=3)",
+    )
+    assert check_contract.check_skills(repo) == [
+        f"{SCALE_SKILL}: plan_scale_deployment has no argument count"
+    ]
+
+
+def test_skill_calls_an_unknown_tool(repo):
+    edit(
+        repo / SCALE_SKILL,
+        "plan_scale_deployment(namespace, name, replicas)",
+        "cancel_plan(plan_id)",
+    )
+    assert check_contract.check_skills(repo) == [f"{SCALE_SKILL}: calls unknown tool cancel_plan"]
+
+
+def test_skill_sets_an_argument_the_tools_dropped(repo):
+    for directory in ["k8s_read", "k8s_write"]:
+        path = repo / "mcp" / directory / "tools.json"
+        tools = json.loads(path.read_text())
+        for tool in tools:
+            tool.get("inputSchema", {}).get("properties", {}).pop("revert_on_failure", None)
+        path.write_text(json.dumps(tools))
+    errors = check_contract.check_skills(repo)
+    assert f"{SCALE_SKILL}: sets revert_on_failure, which no tool takes" in errors
+    assert f"{AGENTS}: sets revert_on_failure, which no tool takes" in errors
+
+
+def test_a_response_field_set_in_prose_is_not_an_argument(repo):
+    assert "`notified: false`" in (repo / SCALE_SKILL).read_text()
+    assert check_contract.check_skills(repo) == []
+
+
+def test_contract_error_codes_line_matches_the_envelope(repo):
+    edit(repo / "mcp/CONTRACT.md", "`plan_used`, ", "")
+    assert check_contract.check_contract_codes(repo) == [
+        "mcp/CONTRACT.md 'Error codes:' line does not list plan_used"
+    ]
+    edit(repo / "mcp/CONTRACT.md", "`conflict`, ", "`conflict`, `made_up`, ")
+    assert check_contract.check_contract_codes(repo) == [
+        "mcp/CONTRACT.md 'Error codes:' line does not list plan_used",
+        "mcp/CONTRACT.md 'Error codes:' line lists unknown made_up",
+    ]
+
+
 def test_warning_no_skill_names(repo):
     impact = repo / "mcp/common/handrail_common/impact.py"
     edit(impact, 'NO_PODS = "no_pods"', 'NO_PODS = "no_pods_left"')
