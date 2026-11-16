@@ -15,6 +15,22 @@ Pass --with-expiry to also wait out a plan TTL (PLAN_TTL_SECONDS, default 300). 
 match the deployment: the test waits it out after each apply. The blast-radius
 case expects MAX_REPLICA_STEP_PERCENT=100 (the default) and MAX_REPLICAS >= 3.
 
+Values the deployment knows are read from `terraform output -json` in --tf-dir (default:
+the repository's terraform/ directory) when that works, so they need not be exported:
+GATEWAY_URL, TOKEN_URL, KILL_SWITCH_PARAM, PLANS_TABLE, APPROVAL_URL, FREEZES_PARAM,
+AUDIT_BUCKET, CLIENT_ID and CLIENT_ID_B (by agent name), PLAN_TTL_SECONDS,
+APPLY_COOLDOWN_SECONDS, AGENT_BUDGET_B and the approval mode. A variable that is set
+always wins. The client secrets are never output and stay in the environment.
+
+--reset-counters deletes the current clock hour's apply counters (the global one and
+those of the two test agents) and the current approval request window's counter from the
+plan table, at the start and again before a budget case would otherwise wait for the
+next hour. It only runs against a test deployment: the table must be
+<name_prefix>-plans with a name_prefix that has test, e2e or ci as one of its
+hyphen-separated words (for example kh-e2e, as in terraform/test.tfvars.example). On any
+other table it refuses and the run stops, so it can never reset a production budget.
+Without it, budget cases wait for the next clock hour when this hour's units are spent.
+
 The test never changes `web`, which belongs to the smoke test; it only plans
 against it for validation cases that are refused before apply. Every case that
 applies or edits a Deployment uses fixture Deployments created for this run in
@@ -133,6 +149,7 @@ import base64
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -176,7 +193,16 @@ CORRELATION_ANNOTATION = "kube-handrail.io/correlation-id"
 # The plan history index is eventually consistent; give a just-recorded apply time to show up.
 HISTORY_SETTLE_SECONDS = 3
 # Must match the deployed APPLY_COOLDOWN_SECONDS; a lower value here makes cases fail.
+# main() sets it again after reading the Terraform outputs.
 COOLDOWN_SECONDS = int(os.environ.get("APPLY_COOLDOWN_SECONDS", "60"))
+# --reset-counters: only a table whose name prefix has one of these words is a test
+# deployment (see the module docstring).
+TEST_TABLE = re.compile(r"^(?:[a-z0-9-]+-)?(?:test|e2e|ci)(?:-[a-z0-9-]+)?-plans$")
+# The counter keys of handrail_common/plans.py (GLOBAL_BUDGET_PREFIX, AGENT_BUDGET_PREFIX,
+# APPROVAL_REQUEST_PREFIX) and their windows.
+BUDGET_WINDOW_SECONDS = 3600
+APPROVAL_WINDOW_SECONDS = 600
+RESET_COUNTERS = False
 PLAN, APPLY = "k8sr___plan_scale_deployment", "k8sw___apply_scale_deployment"
 PLAN_RESTART, APPLY_RESTART = "k8sr___plan_restart_deployment", "k8sw___apply_restart_deployment"
 PLAN_ROLLBACK, APPLY_ROLLBACK = (
@@ -789,6 +815,84 @@ def injection_event(name: str, uid: str) -> dict[str, Any]:
         "firstTimestamp": now,
         "lastTimestamp": now,
         "source": {"component": "kube-handrail-e2e"},
+    }
+
+
+def is_test_table(name: str) -> bool:
+    return bool(TEST_TABLE.match(name))
+
+
+def counter_keys(agents: tuple[str, ...], now: int) -> list[str]:
+    """The plan table keys of the counters for the clock hour and approval window that
+    contain `now`."""
+    hour = now - now % BUDGET_WINDOW_SECONDS
+    window = now - now % APPROVAL_WINDOW_SECONDS
+    return [
+        f"budget#global#{hour}",
+        *(f"budget#agent#{name}#{hour}" for name in agents),
+        f"approval#global#{window}",
+    ]
+
+
+def reset_counters(table_name: str, agents: tuple[str, ...], table: Any = None) -> list[str]:
+    """Delete the current counters of a test deployment; refuse any other table."""
+    if not is_test_table(table_name):
+        raise SystemExit(
+            f"--reset-counters refused: {table_name} is not a test deployment's table "
+            "(<name_prefix>-plans with test, e2e or ci in name_prefix)"
+        )
+    table = table if table is not None else plans_table()
+    keys = counter_keys(agents, int(time.time()))
+    for key in keys:
+        table.delete_item(Key={"plan_id": key})
+    print(f"reset counters: {', '.join(keys)}", flush=True)
+    return keys
+
+
+# Terraform output => environment variable, for values not already set.
+OUTPUT_ENV = {
+    "gateway_url": "GATEWAY_URL",
+    "cognito_token_endpoint": "TOKEN_URL",
+    "kill_switch_parameter": "KILL_SWITCH_PARAM",
+    "plans_table_name": "PLANS_TABLE",
+    "approval_url": "APPROVAL_URL",
+    "freezes_parameter": "FREEZES_PARAM",
+    "audit_bucket_name": "AUDIT_BUCKET",
+    "plan_ttl_seconds": "PLAN_TTL_SECONDS",
+}
+
+
+def terraform_outputs(tf_dir: Path) -> dict[str, Any]:
+    """`terraform output -json` as {name: value}; empty when Terraform or its state is not
+    available, so the environment alone is used."""
+    try:
+        result = subprocess.run(
+            ["terraform", f"-chdir={tf_dir}", "output", "-json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return {name: entry.get("value") for name, entry in json.loads(result.stdout).items()}
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return {}
+
+
+def env_from_outputs(outputs: dict[str, Any], env: dict[str, str]) -> dict[str, str]:
+    """The variables the outputs provide that `env` does not set already."""
+    values: dict[str, Any] = {var: outputs.get(name) for name, var in OUTPUT_ENV.items()}
+    settings = outputs.get("guard_settings") or {}
+    values["APPLY_COOLDOWN_SECONDS"] = settings.get("apply_cooldown_seconds")
+    clients = outputs.get("agent_client_ids") or {}
+    agent_a = env.get("AGENT_NAME", "smoke_test")
+    agent_b = env.get("AGENT_NAME_B", "e2e_peer")
+    values["CLIENT_ID"] = clients.get(agent_a)
+    values["CLIENT_ID_B"] = clients.get(agent_b)
+    values["AGENT_BUDGET_B"] = (settings.get("agent_budgets") or {}).get(agent_b)
+    return {
+        var: str(value)
+        for var, value in values.items()
+        if value is not None and value != "" and not env.get(var)
     }
 
 
@@ -1795,9 +1899,15 @@ def details(envelope: dict[str, Any]) -> dict[str, Any]:
 async def wait_for_a_whole_window(seconds: int = 300, budget_left: bool = False) -> None:
     """Counters are per clock hour: start a budget case well inside one, and with
     `budget_left` in one where B has a unit left (a client-mode run this hour may have
-    spent them)."""
+    spent them). With --reset-counters a spent budget is reset instead of waited out; a
+    case is still not started in the last minutes of an hour, where the counter would
+    start again in the middle of it."""
     left = 3600 - int(time.time()) % 3600
-    if left < seconds or (budget_left and agent_applies(AGENT_B) >= AGENT_BUDGET_B):
+    spent = budget_left and agent_applies(AGENT_B) >= AGENT_BUDGET_B
+    if spent and RESET_COUNTERS and left >= seconds:
+        reset_counters(os.environ["PLANS_TABLE"], (AGENT_A, AGENT_B))
+        return
+    if left < seconds or spent:
         print(f"waiting {left + 5}s for the next clock hour", flush=True)
         await asyncio.sleep(left + 5)
 
@@ -2277,10 +2387,36 @@ def main() -> None:
     parser.add_argument(
         "--approval-mode",
         choices=["client", "server"],
-        default="client",
-        help="server: the deployment's approval_mode is server",
+        default=None,
+        help="server: the deployment's approval_mode is server (default: from the "
+        "Terraform outputs, else client; both runs as server)",
+    )
+    parser.add_argument(
+        "--reset-counters",
+        action="store_true",
+        help="delete this hour's apply counters first; test deployments only",
+    )
+    parser.add_argument(
+        "--tf-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[2] / "terraform",
+        help="Terraform directory whose outputs fill unset variables",
     )
     args = parser.parse_args()
+    outputs = terraform_outputs(args.tf_dir)
+    filled = env_from_outputs(outputs, dict(os.environ))
+    os.environ.update(filled)
+    if filled:
+        print(f"from terraform output: {', '.join(sorted(filled))}", flush=True)
+    global COOLDOWN_SECONDS, AGENT_BUDGET_B, RESET_COUNTERS
+    COOLDOWN_SECONDS = int(os.environ.get("APPLY_COOLDOWN_SECONDS", "60"))
+    AGENT_BUDGET_B = int(os.environ.get("AGENT_BUDGET_B", "2"))
+    if args.approval_mode is None:
+        mode = (outputs.get("guard_settings") or {}).get("approval_mode", "client")
+        args.approval_mode = "client" if mode == "client" else "server"
+    if args.reset_counters:
+        RESET_COUNTERS = True
+        reset_counters(os.environ["PLANS_TABLE"], (AGENT_A, AGENT_B))
     started = time.time()
     web_before = web_spec()
     quotas_before = quota_objects() if args.with_verify else ""

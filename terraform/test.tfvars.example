@@ -1,0 +1,57 @@
+# Test profile for a disposable deployment that runs the smoke and end-to-end tests
+# (tests/e2e/e2e_gateway.py). Not for production: it shortens the waits the tests spend
+# most of their time on, and relaxes settings only a test identity needs.
+#
+#   cp test.tfvars.example test.tfvars   # adjust cluster_name and approver_principals
+#   terraform plan -var-file=test.tfvars
+#
+# It uses only the normal variables; there is no test-only setting in the code. Budgets
+# stay per clock hour: the e2e script's --reset-counters deletes the current hour's
+# counters instead, and only on a deployment whose name_prefix has test, e2e or ci as a
+# word, like the one below.
+
+cluster_name      = "my-test-cluster"
+region            = "eu-central-1"
+name_prefix       = "kh-e2e"
+sandbox_namespace = "kube-handrail-sandbox"
+
+min_replicas = 0
+max_replicas = 5
+
+# A short TTL makes --with-expiry wait about a minute instead of five. Every case
+# applies its plan within seconds; request_approval still extends a plan to
+# approval_wait_ttl_seconds.
+plan_ttl_seconds = 60
+
+# The script waits out the cooldown after every apply. It cannot be 0: cases check
+# that a change right after an apply is refused with cooldown, a few seconds after it.
+apply_cooldown_seconds = 20
+# The default flap window is kept: fixtures are created fresh for each run, so it costs
+# no waiting, and the verify cases need it to cover a revert 1-2 minutes after its apply.
+flap_window_seconds = 600
+
+# The second agent the identity cases use, with the budget they expect (AGENT_BUDGET_B).
+agents = {
+  devops_agent = {}
+  smoke_test   = { hourly_apply_budget = 30 }
+  e2e_peer     = { hourly_apply_budget = 2 }
+}
+
+# The verify cases use windows of 60 and 90 seconds.
+verify_enabled            = true
+verify_window_min_seconds = 60
+
+# Run the suite once per approval mode: client, then server.
+approval_mode        = "client"
+approver_principals  = ["arn:aws:iam::111122223333:role/my-test-operator"]
+approval_require_mfa = false # test identities without MFA only
+
+# Let destroy remove the audit bucket (GOVERNANCE retention, with
+# s3:BypassGovernanceRetention).
+audit_enabled          = true
+audit_object_lock_mode = "GOVERNANCE"
+audit_retention_days   = 1
+audit_force_destroy    = true
+
+sentinel_enabled = true
+alert_email      = ""
