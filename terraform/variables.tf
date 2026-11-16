@@ -77,26 +77,18 @@ variable "object_hourly_apply_budget" {
   }
 }
 
+# Deprecated and ignored: the plan rate limit was removed. Kept one release so existing
+# tfvars still plan; the check "deprecated_plan_rate" in main.tf warns while either is set.
 variable "plan_rate_limit" {
-  description = "Plans allowed per Deployment in plan_rate_window_seconds."
+  description = "Deprecated, ignored: the plan rate limit was removed. Remove it from your tfvars."
   type        = number
-  default     = 20
-
-  validation {
-    condition     = var.plan_rate_limit > 0 && floor(var.plan_rate_limit) == var.plan_rate_limit
-    error_message = "plan_rate_limit must be a positive integer."
-  }
+  default     = null
 }
 
 variable "plan_rate_window_seconds" {
-  description = "Window for plan_rate_limit."
+  description = "Deprecated, ignored: the plan rate limit was removed. Remove it from your tfvars."
   type        = number
-  default     = 600
-
-  validation {
-    condition     = var.plan_rate_window_seconds > 0 && floor(var.plan_rate_window_seconds) == var.plan_rate_window_seconds
-    error_message = "plan_rate_window_seconds must be a positive integer."
-  }
+  default     = null
 }
 
 variable "apply_cooldown_seconds" {

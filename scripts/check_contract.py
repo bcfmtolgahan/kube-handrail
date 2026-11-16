@@ -6,10 +6,12 @@ not exist, a write tool is not MUTATIVE, a full tool name is invalid, a plan_<x>
 tool has no apply_<x> tool or the reverse, terraform/main.tf does not load each
 target's tools.json under that target name, a target has the reserved name of the
 internal handlers or a tools.json names one of them, or AGENTS.md does not name
-every error code listed in mcp/CONTRACT.md.
+every error code listed in mcp/CONTRACT.md except the deprecated ones, which it must
+not name.
 Standard library only, so it runs before any dependency is installed.
 """
 
+import importlib.util
 import json
 import re
 import sys
@@ -78,8 +80,22 @@ def contract_error_codes(contract: str) -> list[str]:
     return CODE.findall(line.group(1)) if line else []
 
 
+def envelope_module(root: Path):
+    """handrail_common/envelope.py, loaded by path: it imports only the standard library."""
+    path = root / "mcp/common/handrail_common/envelope.py"
+    spec = importlib.util.spec_from_file_location("_kh_envelope", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def deprecated_error_codes(root: Path) -> frozenset[str]:
+    return envelope_module(root).DEPRECATED_ERROR_CODES
+
+
 def check_agents_md(root: Path) -> list[str]:
-    """AGENTS.md tells agents what to do on each error, so it must not miss one."""
+    """AGENTS.md tells agents what to do on each error, so it must not miss one. A
+    deprecated code is never returned, so it is left out to keep the agent's context small."""
     path = root / "AGENTS.md"
     if not path.is_file():
         return ["AGENTS.md is missing"]
@@ -87,8 +103,13 @@ def check_agents_md(root: Path) -> list[str]:
     codes = contract_error_codes((root / "mcp/CONTRACT.md").read_text())
     if not codes:
         return ["mcp/CONTRACT.md has no 'Error codes:' line"]
+    deprecated = deprecated_error_codes(root)
     named = set(CODE.findall(agents_md))
-    return [f"AGENTS.md does not mention {code}" for code in codes if code not in named]
+    return [
+        f"AGENTS.md does not mention {code}"
+        for code in codes
+        if code not in named and code not in deprecated
+    ] + [f"AGENTS.md mentions deprecated {code}" for code in sorted(deprecated & named)]
 
 
 def check_pairs(names: set[str]) -> list[str]:

@@ -72,7 +72,7 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 | `manual_change` | Someone changed replicas (`details.last_applied_to`, `current`) or, on a rollback, the pod template (`details.last_applied_template`, `current_template`) outside kube-handrail since its last apply. | Stop and ask the human; see Never. |
 | `cooldown` | Too soon after the last apply. | Wait until `details.retry_after` (epoch seconds), then re-plan. |
 | `flapping` | Would reverse direction a second time (`details.history`); a revert counts as a change. | Stop. |
-| `object_budget_exceeded`, `plan_rate_limited` | Per-object limits reached. | Stop. |
+| `object_budget_exceeded` | Per-object limit reached. | Stop. |
 | `global_budget_exceeded` | Hourly budget for all objects reached. | Stop; not before `details.retry_after`. |
 | `agent_budget_exceeded` | Your agent's hourly apply budget is spent (`details.limit`). | Wait until `details.retry_after`, or hand over to a human. |
 | `approval_required` | No valid server approval. `details.status` says why. | `planned` or `awaiting_approval`: call `request_approval` if not done, then wait. `rejected`, `approval_expired`, `approval_invalid`: stop. |

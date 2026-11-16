@@ -19,7 +19,6 @@ def test_settings_parse():
     assert (s.min_replicas, s.max_replicas, s.plan_ttl_seconds) == (0, 5, 300)
     assert s.remediation_enabled_param is None
     assert (s.flap_window_seconds, s.object_hourly_apply_budget) == (600, 6)
-    assert (s.plan_rate_limit, s.plan_rate_window_seconds) == (20, 600)
     assert (s.apply_cooldown_seconds, s.global_hourly_apply_budget) == (60, 30)
     assert s.max_replica_step_percent == 100
     # Without an explicit mode, apply requires a server approval.
@@ -136,15 +135,16 @@ def test_breaker_settings_parse():
         | {
             "FLAP_WINDOW_SECONDS": "900",
             "OBJECT_HOURLY_APPLY_BUDGET": "3",
-            "PLAN_RATE_LIMIT": "10",
-            "PLAN_RATE_WINDOW_SECONDS": "300",
+            "PLAN_RATE_LIMIT": "x",
+            "PLAN_RATE_WINDOW_SECONDS": "0",
             "APPLY_COOLDOWN_SECONDS": "0",
             "GLOBAL_HOURLY_APPLY_BUDGET": "12",
             "MAX_REPLICA_STEP_PERCENT": "250",
         }
     )
     assert (s.flap_window_seconds, s.object_hourly_apply_budget) == (900, 3)
-    assert (s.plan_rate_limit, s.plan_rate_window_seconds) == (10, 300)
+    # The plan rate limit was removed: its variables are ignored, even when invalid.
+    assert not hasattr(s, "plan_rate_limit")
     assert (s.apply_cooldown_seconds, s.global_hourly_apply_budget) == (0, 12)
     assert s.max_replica_step_percent == 250
 
@@ -160,8 +160,6 @@ def test_breaker_settings_parse():
         {"MAX_REPLICAS": ""},
         {"FLAP_WINDOW_SECONDS": "0"},
         {"OBJECT_HOURLY_APPLY_BUDGET": "-1"},
-        {"PLAN_RATE_LIMIT": "x"},
-        {"PLAN_RATE_WINDOW_SECONDS": "0"},
         {"APPLY_COOLDOWN_SECONDS": "-1"},
         {"GLOBAL_HOURLY_APPLY_BUDGET": "0"},
         {"MAX_REPLICA_STEP_PERCENT": "0"},

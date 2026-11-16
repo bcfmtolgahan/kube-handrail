@@ -521,18 +521,12 @@ def test_plan_budget_counts_applies_of_plans_created_before_the_window(clients, 
     assert plan_error(clients) == "object_budget_exceeded"
 
 
-def test_plan_rate_limit(clients, table):
-    for i in range(19):
+def test_plan_rate_is_no_longer_limited(clients, table):
+    # The plan rate limit was removed; its preflight entry stays, skipped, for one release.
+    for i in range(30):
         seed(table, 2, 3, NOW - 500 + i)
-    assert plan(clients)["ok"] is True  # the 20th plan in the window
-    assert plan_error(clients) == "plan_rate_limited"
-
-
-def test_plan_rate_limit_window_edge(clients, table):
-    seed(table, 2, 3, NOW - SETTINGS.plan_rate_window_seconds)
-    for i in range(19):
-        seed(table, 2, 3, NOW - 10 - i)
-    assert plan(clients)["ok"] is True
+    data = plan(clients)["data"]
+    assert {"check": "plan_rate", "passed": True, "skipped": True} in data["preflight"]
 
 
 def test_plan_rejects_manual_change(clients, table):
@@ -928,7 +922,7 @@ def test_request_approval_within_the_cooldown_notifies_once(approvals):
 
 
 def test_request_approval_global_limit(approvals):
-    settings = dataclasses.replace(APPROVAL_SETTINGS, approval_request_limit=1, plan_rate_limit=50)
+    settings = dataclasses.replace(APPROVAL_SETTINGS, approval_request_limit=1)
     first = plan(approvals)["data"]["plan_id"]
     second = plan(approvals)["data"]["plan_id"]
     request(approvals, first, settings=settings)
@@ -1951,13 +1945,13 @@ def test_identity_plan_reports_the_agent_checks_in_preflight(clients, caller):
     checks = [c["check"] for c in preflight]
     assert checks[:3] == ["arguments", "agent_enabled", "namespace_allowed"]
     assert checks[-2:] == ["global_budget", "agent_budget"]
-    assert all("skipped" not in c for c in preflight)
+    assert all("skipped" not in c for c in preflight if c["check"] != "plan_rate")
 
 
 def test_legacy_plan_reports_the_agent_checks_as_skipped(clients):
     preflight = plan(clients)["data"]["preflight"]
     skipped = [c["check"] for c in preflight if c.get("skipped")]
-    assert skipped == ["agent_enabled", "agent_budget"]
+    assert skipped == ["agent_enabled", "plan_rate", "agent_budget"]
     assert all(c["passed"] for c in preflight)
 
 

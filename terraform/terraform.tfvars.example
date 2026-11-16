@@ -12,8 +12,6 @@ plan_ttl_seconds = 300
 # Oscillation breaker (mcp/CONTRACT.md, History checks).
 flap_window_seconds        = 600
 object_hourly_apply_budget = 6
-plan_rate_limit            = 20
-plan_rate_window_seconds   = 600
 apply_cooldown_seconds     = 60
 global_hourly_apply_budget = 30
 

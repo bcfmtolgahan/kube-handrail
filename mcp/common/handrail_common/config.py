@@ -42,8 +42,6 @@ class Settings:
     region: str | None
     flap_window_seconds: int = 600
     object_hourly_apply_budget: int = 6
-    plan_rate_limit: int = 20
-    plan_rate_window_seconds: int = 600
     apply_cooldown_seconds: int = 60
     global_hourly_apply_budget: int = 30
     max_replica_step_percent: int = 100
@@ -170,8 +168,6 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         for key, default in (
             ("FLAP_WINDOW_SECONDS", 600),
             ("OBJECT_HOURLY_APPLY_BUDGET", 6),
-            ("PLAN_RATE_LIMIT", 20),
-            ("PLAN_RATE_WINDOW_SECONDS", 600),
             ("APPLY_COOLDOWN_SECONDS", 60),
             ("GLOBAL_HOURLY_APPLY_BUDGET", 30),
             ("MAX_REPLICA_STEP_PERCENT", 100),
@@ -228,8 +224,6 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         region=env.get("AWS_REGION") or None,
         flap_window_seconds=limits["FLAP_WINDOW_SECONDS"],
         object_hourly_apply_budget=limits["OBJECT_HOURLY_APPLY_BUDGET"],
-        plan_rate_limit=limits["PLAN_RATE_LIMIT"],
-        plan_rate_window_seconds=limits["PLAN_RATE_WINDOW_SECONDS"],
         apply_cooldown_seconds=limits["APPLY_COOLDOWN_SECONDS"],
         global_hourly_apply_budget=limits["GLOBAL_HOURLY_APPLY_BUDGET"],
         max_replica_step_percent=limits["MAX_REPLICA_STEP_PERCENT"],

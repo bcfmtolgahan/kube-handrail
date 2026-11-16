@@ -140,7 +140,7 @@ Every handler returns a JSON object (not wrapped in `statusCode`/`body`):
 
 `replicas.current` treats an unset `spec.replicas` as 1. For `conflict` because the Deployment was deleted and recreated since the plan was made, `details` is `{ "uid": { "planned": "...", "current": "..." } }`. For `conflict` because the Deployment's rollout is paused (restart and rollback, on plan and apply), `details` is `{ "paused": true }`. For `conflict` because the ReplicaSet a rollback plan pinned was replaced, `details` is `{ "replica_set": { "planned": "<uid>", "current": "<uid>" } }`, and because its template changed, `{ "template": { "planned": "sha256:...", "current": "sha256:..." } }`. `revision_not_found` has `details` `{ "revision": 3, "available": [5, 4, 2] }` on a plan and `{ "revision": 3, "replica_set": "<name>" }` on an apply ([Rollback](#rollback)). A `conflict` from a 409 that persists after all patch attempts has no `details`. `forbidden` from an agent check has `details` `{"reason": "agent_unknown" | "not_requester"}`, and `remediation_disabled` from an agent's own kill switch `{"scope": "agent", "agent": "<name>"}` (the global kill switch adds no `details`); see [Agent identity](#agent-identity). The history checks below also return `details`; every value in them is an integer or a string.
 
-Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited`, `manual_change`, `cooldown`, `global_budget_exceeded`, `agent_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `revision_not_found`, `forbidden`, `change_frozen`, `admission_denied`, `kubernetes_error`, `internal`.
+Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespace`, `out_of_bounds`, `gitops_managed`, `plan_not_found`, `plan_expired`, `plan_used`, `plan_mismatch`, `conflict`, `remediation_disabled`, `flapping`, `object_budget_exceeded`, `plan_rate_limited` (deprecated, never returned), `manual_change`, `cooldown`, `global_budget_exceeded`, `agent_budget_exceeded`, `blast_radius_exceeded`, `approval_required`, `approval_rate_limited`, `plan_decided`, `revision_not_found`, `forbidden`, `change_frozen`, `admission_denied`, `kubernetes_error`, `internal`.
 
 ## Untrusted output
 
@@ -277,7 +277,7 @@ Revision numbers last only until the next rollout. A rollback makes the Deployme
 | `object_key` | S | `<namespace>/<name>/<uid>`; partition key of the `object-history` index |
 | `created_at` | N | epoch seconds; sort key of the `object-history` index |
 | `expires_at` | N | epoch seconds, end of plan validity: `created_at + PLAN_TTL_SECONDS` (default 300 s); `created_at + APPROVAL_WAIT_TTL_SECONDS` once an approval is requested; `approved_at + APPLY_AFTER_APPROVAL_TTL_SECONDS` once approved; `rejected_at` once rejected |
-| `retain_until` | N | epoch seconds, the table TTL attribute: `created_at + max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60`, the longest window plus the longest a plan can stay valid, so a record stays readable as history after the plan expired; with `VERIFY_ENABLED`, plus `VERIFY_WINDOW_MAX_SECONDS + VERIFY_GRACE_SECONDS`, so it stays until its verification has run. A record without it is kept until deleted |
+| `retain_until` | N | epoch seconds, the table TTL attribute: `created_at + max(3600, FLAP_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60`, the longest window plus the longest a plan can stay valid, so a record stays readable as history after the plan expired; with `VERIFY_ENABLED`, plus `VERIFY_WINDOW_MAX_SECONDS + VERIFY_GRACE_SECONDS`, so it stays until its verification has run. A record without it is kept until deleted |
 | `used` | BOOL | apply sets it with one conditional update: `used = false AND expires_at > now AND args_hash = :h AND action = :a AND attribute_not_exists(rejected_by)`, extended in `server` and `both` mode (see [Server-side approval](#server-side-approval)) |
 | `requested_by` | S | the requesting principal: `agent:<name>` in identity mode, the constant `mcp-gateway` (the class of the gateway's machine identities) in legacy mode and on records made before identity mode ([Agent identity](#agent-identity)), and `system:revert` on a revert record ([Revert](#revert)). The approver refuses to decide on a record whose requester starts with `system:` |
 | `agent`, `requested_client_id` | S, S | identity mode only: the requesting agent's name and the verified OAuth `client_id` it planned with, kept as evidence because the name-to-client mapping can change; a revert record copies them from the plan it reverts |
@@ -315,7 +315,7 @@ Plan (`k8s_read`):
 4. Deployment exists and is not GitOps-managed. Fail closed: treat it as managed if it has the Argo CD `argocd.argoproj.io/tracking-id` annotation or the `app.kubernetes.io/instance` label (Argo CD label tracking; may also match Helm releases, which is acceptable).
 5. Deployment has no HorizontalPodAutoscaler targeting it; otherwise `conflict` without `details`.
 6. Blast-radius budget: `|replicas - current| <= max(1, ceil(current * MAX_REPLICA_STEP_PERCENT / 100))`, where `current` is `spec.replicas` (unset counts as 1); otherwise `blast_radius_exceeded`. It is enforced whatever the approval says.
-7. History checks: manual change, cooldown, flapping, object budget, then plan rate limit (below).
+7. History checks: manual change, cooldown, flapping, object budget (below).
 8. Global budget: the current hour's counter, read consistently, must be below `GLOBAL_HOURLY_APPLY_BUDGET`. Planning only reads it.
 9. Impact preview: list the PodDisruptionBudgets, Services and EndpointSlices in the namespace (below). Any error fails the plan with `kubernetes_error`, so the approver never sees a preview with gaps. Only then is the plan record written.
 
@@ -323,7 +323,7 @@ The optional `verify_window_seconds` and `revert_on_failure` are checked with ch
 
 In identity mode the caller is resolved to its agent right after checks 1-3, before the Deployment is read (`forbidden`, `agent_unknown`; [Agent identity](#agent-identity)), and the agent's kill switch must be on (`remediation_disabled`, `details.scope = "agent"`). After check 8, the agent's counter for the current hour, read consistently, must be below its budget (`agent_budget_exceeded`); planning only reads it.
 
-The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact`, `expires_at`, `requested_by`, `correlation_id` and, with `VERIFY_ENABLED`, `verification` ([Verification and revert](#verification-and-revert)). `preflight` lists the checks that passed, in this order: `arguments`, `agent_enabled`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `revert_target_in_bounds` (only with `revert_on_failure`), `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`, `agent_budget`. In legacy mode `agent_enabled` and `agent_budget` are `{"passed": true, "skipped": true}`, so a client can see that the per-agent checks did not run.
+The plan response `data` has `plan_id`, `diff`, `override_manual_change` (the value pinned in `args_hash`), `preflight`, `impact`, `expires_at`, `requested_by`, `correlation_id` and, with `VERIFY_ENABLED`, `verification` ([Verification and revert](#verification-and-revert)). `preflight` lists the checks that passed, in this order: `arguments`, `agent_enabled`, `namespace_allowed`, `replica_bounds`, `not_gitops_managed`, `no_hpa`, `blast_radius`, `revert_target_in_bounds` (only with `revert_on_failure`), `no_manual_change`, `cooldown`, `not_flapping`, `object_budget`, `plan_rate`, `global_budget`, `agent_budget`. In legacy mode `agent_enabled` and `agent_budget` are `{"passed": true, "skipped": true}`, so a client can see that the per-agent checks did not run. `plan_rate` is always `{"passed": true, "skipped": true}`: the plan rate limit was removed, and the entry stays for one release so clients that read it keep working.
 
 `blast_radius_exceeded` `details`:
 
@@ -340,7 +340,7 @@ Apply (`k8s_write`), all re-checked independently of the plan step:
 4. Read the Deployment. Its `metadata.uid` must equal the planned `uid` (a Deployment deleted and recreated under the same name starts again at generation 1), it must not be GitOps-managed (check 4 above, re-run because a label-only change does not bump `generation`), and its `metadata.generation` must equal the planned `generation` and its `spec.replicas` (unset counts as 1) must equal `replicas_from`; otherwise return `conflict` with `details`, or `gitops_managed`. The API server bumps a Deployment's `generation` on spec and annotation changes but not on status or label updates, so a rollout in progress does not block the apply. Patch `spec.replicas` with a `metadata.resourceVersion` precondition taken from that read. On 409, read again, re-run these checks and patch again, up to 3 attempts in total; a change found on a retry returns the error immediately, and a 409 on the last attempt returns `conflict`.
 5. Server-side dry run (`dryRun=All`) before each real patch. A plan is consumed before the dry run, so any failure after step 3 requires a new plan.
 6. The patch also sets the annotations `kube-handrail.io/last-plan-id` to the applied `plan_id` and `kube-handrail.io/correlation-id` to the apply's [correlation ID](#observability).
-7. History checks, after step 3 and after the first read in step 4 has passed: manual change, cooldown, flapping and object budget (not the plan rate limit), then the global budget: one conditional update adds 1 to the current hour's counter only if it is below `GLOBAL_HOURLY_APPLY_BUDGET`, so concurrent applies cannot overshoot it. The unit is taken before the patch and not returned if the patch then fails. They use the planned `replicas_from` and `replicas_to`; the check in step 4 has confirmed that `replicas_from` is the current count. A 409 retry re-runs step 4 but not the history checks. A rejection here leaves the plan consumed, with the error code as its `result`.
+7. History checks, after step 3 and after the first read in step 4 has passed: manual change, cooldown, flapping and object budget, then the global budget: one conditional update adds 1 to the current hour's counter only if it is below `GLOBAL_HOURLY_APPLY_BUDGET`, so concurrent applies cannot overshoot it. The unit is taken before the patch and not returned if the patch then fails. They use the planned `replicas_from` and `replicas_to`; the check in step 4 has confirmed that `replicas_from` is the current count. A 409 retry re-runs step 4 but not the history checks. A rejection here leaves the plan consumed, with the error code as its `result`.
 
 With `VERIFY_ENABLED`, step 3's conditional update also schedules the verification ([Verification and revert](#verification-and-revert)).
 
@@ -359,7 +359,7 @@ Plan, differences from the scale steps above:
 - Checks 1-2 only (`namespace`, `name`, the namespace allowlist); there are no replica bounds.
 - Check 4 as for a scale. Then a Deployment with `spec.paused: true` is refused with `conflict`, `details: {"paused": true}`: its rollout would not start, so the plan would replace no pod.
 - No HorizontalPodAutoscaler check (an autoscaler owns `spec.replicas`, which a restart does not touch) and no blast-radius budget (see [Guards](../docs/guards.md#blast-radius-budget)).
-- History checks: cooldown, flapping (never triggered: the change has no direction), object budget, plan rate limit. No manual-change check: a restart undoes no change. A later scale still compares against the count kube-handrail set before the restart (see Manual change in [History checks](#history-checks-oscillation-breaker)).
+- History checks: cooldown, flapping (never triggered: the change has no direction), object budget. No manual-change check: a restart undoes no change. A later scale still compares against the count kube-handrail set before the restart (see Manual change in [History checks](#history-checks-oscillation-breaker)).
 - The impact preview is the rollout preview ([Impact preview](#impact-preview)).
 - The record has `replicas_from = replicas_to = ` the current count, `template_to` as above, and `revision_from`.
 
@@ -394,7 +394,7 @@ Plan, differences from the scale steps above:
 - Check 4 as for a scale. Then a Deployment with `spec.paused: true` is refused with `conflict`, `details: {"paused": true}`, as kubectl refuses it.
 - No HorizontalPodAutoscaler check (a rollback leaves `spec.replicas` as it is) and no blast-radius budget, as for a restart.
 - The revision is resolved as above. A target template with the hash of the current template is `invalid_argument` ("revision N is the current template").
-- History checks: manual change (the template rule in [History checks](#history-checks-oscillation-breaker); the replica rule does not apply, because a rollback leaves the count as it is), cooldown, flapping (never triggered: the change has no direction), object budget, plan rate limit.
+- History checks: manual change (the template rule in [History checks](#history-checks-oscillation-breaker); the replica rule does not apply, because a rollback leaves the count as it is), cooldown, flapping (never triggered: the change has no direction), object budget.
 - The impact preview is the rollout preview, with two warnings only a rollback has ([Impact preview](#impact-preview)).
 - The record has `replicas_from = replicas_to = ` the current count, `template_to` as above, `revision_from`, `revision_to`, `target_rs_name`, `target_rs_uid`, `images`, `fields_changed` and `diff_truncated`.
 
@@ -512,7 +512,7 @@ The lists are read as raw JSON (`_preload_content=False`), because the Kubernete
 
 ## History checks (oscillation breaker)
 
-History is the set of plan records for one object, read through the `object-history` index for `created_at >= now - (max(3600, FLAP_WINDOW_SECONDS, PLAN_RATE_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60)`, the same span as `retain_until`. An object is `<namespace>/<name>/<uid>`, so a Deployment deleted and recreated under the same name starts with no history. An apply is a record with `result = "applied"`, ordered by `applied_at`; its direction is the sign of `replicas_to - replicas_from`. Windows exclude their start: an event exactly `W` seconds old is outside a window of `W` seconds. Any error reading the history or the last plan fails the request with `internal`; a check is never skipped.
+History is the set of plan records for one object, read through the `object-history` index for `created_at >= now - (max(3600, FLAP_WINDOW_SECONDS, APPLY_COOLDOWN_SECONDS) + max(PLAN_TTL_SECONDS, APPROVAL_WAIT_TTL_SECONDS) + APPLY_AFTER_APPROVAL_TTL_SECONDS + 60)`, the same span as `retain_until`. An object is `<namespace>/<name>/<uid>`, so a Deployment deleted and recreated under the same name starts with no history. An apply is a record with `result = "applied"`, ordered by `applied_at`; its direction is the sign of `replicas_to - replicas_from`. Windows exclude their start: an event exactly `W` seconds old is outside a window of `W` seconds. Any error reading the history or the last plan fails the request with `internal`; a check is never skipped.
 
 The last apply is also taken from the Deployment itself: the plan named by its `kube-handrail.io/last-plan-id` annotation, read with a consistent `GetItem`, counts as applied when it is in the table, was consumed (`used = true`) and carries the Deployment's `uid`, whatever its recorded `result`. The annotation is set by the apply's own patch and read from the API server, so the most recent apply is counted even when the index has not caught up with it or its result was never recorded; when no `applied_at` was recorded, the latest time the apply can have happened, `min(expires_at, now)`, is used.
 
@@ -523,7 +523,6 @@ The last apply is also taken from the Deployment itself: the plan named by its `
 | Cooldown | The most recent apply is less than `APPLY_COOLDOWN_SECONDS` old. `0` turns the check off. | `cooldown` |
 | Flapping | Among applies in the last `FLAP_WINDOW_SECONDS`, ignoring those that left the count unchanged, take the last two directions. Reject if the requested change reverses the last one and the last one reversed the one before it, i.e. a second reversal within the window. A single revert (up, then back down) is allowed. A request that keeps the count unchanged is never flapping. | `flapping` |
 | Object budget | Applies in the last 3600 s `>= OBJECT_HOURLY_APPLY_BUDGET`. The apply being made is not counted. | `object_budget_exceeded` |
-| Plan rate limit (plan only) | Plan records created in the last `PLAN_RATE_WINDOW_SECONDS` `>= PLAN_RATE_LIMIT`, whatever their result. Rejected plans are not stored and do not count. | `plan_rate_limited` |
 
 `details`, with `history` listing up to the 20 most recent applies in the check's window, oldest first:
 
@@ -532,7 +531,6 @@ The last apply is also taken from the Deployment itself: the plan named by its `
     "window_seconds": 600, "count": 2, "requested": { "from": 1, "to": 2 },
     "history": [ { "applied_at": 1700000000, "from": 1, "to": 2 }, { "applied_at": 1700000060, "from": 2, "to": 1 } ] } }
 { "code": "object_budget_exceeded", "details": { "window_seconds": 3600, "limit": 6, "count": 6, "history": [ ... ] } }
-{ "code": "plan_rate_limited", "details": { "window_seconds": 600, "limit": 20, "count": 20, "history": [ ... ] } }
 { "code": "manual_change", "details": { "last_applied_to": 2, "current": 3 } }
 { "code": "manual_change", "details": { "last_applied_template": "sha256:...", "current_template": "sha256:..." } }
 { "code": "cooldown", "details": { "cooldown_seconds": 60, "last_applied_at": 1700000060, "retry_after": 1700000120, "history": [ ... ] } }
@@ -540,7 +538,9 @@ The last apply is also taken from the Deployment itself: the plan named by its `
 { "code": "agent_budget_exceeded", "details": { "agent": "smoke_test", "limit": 10, "window_start": 1699999200, "retry_after": 1700002800 } }
 ```
 
-`count` is the number of applies in the window (flapping, budget) or of plans (rate limit).
+`count` is the number of applies in the window.
+
+There is no plan rate limit any more. A plan changes nothing and every apply still passes the cooldown, flapping and budget checks, so it limited only how often an agent could ask; `PLAN_RATE_LIMIT` and `PLAN_RATE_WINDOW_SECONDS` are ignored, and `plan_rate_limited` is never returned (it stays in the error code list for one release).
 
 `override_manual_change` is part of `args_hash`, so an approval pins it and apply must pass the same value as the plan (`plan_mismatch` otherwise). `false` and absent are the same.
 
@@ -549,9 +549,9 @@ Known limits:
 - Two applies of different plans for one object cannot both succeed: the first patch bumps `generation` (an annotation change alone does), so the second fails apply step 4 with `conflict`, on its read or after a 409. Concurrent applies therefore cannot race the budget or flapping checks; concurrent applies of one plan are serialised by the single-use conditional update.
 - The index is eventually consistent (normally well under a second). The last apply is always seen through the annotation; the apply before it is missed only if it is still absent from the index when the next plan and apply both run, which takes two complete plan/apply rounds inside the propagation delay.
 - A request that keeps the count unchanged is allowed, has no direction, and once applied counts toward the budget.
-- Rejected plans are not stored, so the plan rate limit does not bound requests refused by an earlier check. Each of those costs one Deployment read, one HPA list and two table reads, and changes nothing.
+- Plans are not rate limited. A refused plan is not stored; each costs one Deployment read, one HPA list and two table reads, and changes nothing.
 - Plans that are pending (created but not applied) do not count toward flapping, the cooldown or the budgets.
-- A revert ([Revert](#revert)) is an applied record in the history like any other, with its own direction: it counts toward the cooldown, flapping, the object budget and the plan rate limit of later plans, and the Deployment's annotation names it as the last apply. Planning the reverted change again right after the revert is therefore `cooldown`, and after the cooldown `flapping` (a second reversal within the window). The revert itself runs none of these checks and takes no global or agent budget unit.
+- A revert ([Revert](#revert)) is an applied record in the history like any other, with its own direction: it counts toward the cooldown, flapping, and the object budget of later plans, and the Deployment's annotation names it as the last apply. Planning the reverted change again right after the revert is therefore `cooldown`, and after the cooldown `flapping` (a second reversal within the window). The revert itself runs none of these checks and takes no global or agent budget unit.
 - The global and per-agent budgets count clock hours, not a sliding window, so up to twice the limit can be applied across an hour boundary.
 - The agent unit is taken before the global unit, as two separate conditional updates: an apply refused because the global budget is spent has already used a unit of its agent's budget, which is not given back (like the units of an apply whose patch fails).
 - The windows compare `applied_at` and `created_at`, written by one Lambda, with `now` on another; Lambda clocks are NTP-synchronised, so the skew is negligible against windows of minutes.
@@ -1061,8 +1061,6 @@ History checks, set on both Lambdas; each must be a positive integer, except tha
 |---|---|---|
 | `FLAP_WINDOW_SECONDS` | 600 | `flap_window_seconds` |
 | `OBJECT_HOURLY_APPLY_BUDGET` | 6 | `object_hourly_apply_budget` |
-| `PLAN_RATE_LIMIT` | 20 | `plan_rate_limit` |
-| `PLAN_RATE_WINDOW_SECONDS` | 600 | `plan_rate_window_seconds` |
 | `APPLY_COOLDOWN_SECONDS` | 60 (`0` turns it off) | `apply_cooldown_seconds` |
 | `GLOBAL_HOURLY_APPLY_BUDGET` | 30 | `global_hourly_apply_budget` |
 

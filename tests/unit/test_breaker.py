@@ -13,7 +13,6 @@ from handrail_common.breaker import (
     check_history,
     check_manual_change,
     check_object_budget,
-    check_plan_rate,
     check_template_manual_change,
     last_applied_plan,
     last_plan_id,
@@ -190,36 +189,6 @@ def test_budget_counts_only_applied():
     assert code_of(check_object_budget, history, NOW, 1) is None
 
 
-# --- Plan rate limit --------------------------------------------------------
-
-
-def test_plan_rate_below_limit_passes():
-    history = [planned(NOW - i, n=i) for i in range(19)]
-    assert code_of(check_plan_rate, history, NOW, WINDOW, 20) is None
-
-
-def test_plan_rate_at_limit_is_rejected():
-    history = [planned(NOW - i, n=i) for i in range(19)] + [applied(1, 2, NOW - 30)]
-    with pytest.raises(GuardError) as exc:
-        check_plan_rate(history, NOW, WINDOW, 20)
-    assert exc.value.code == "plan_rate_limited"
-    details = exc.value.details
-    assert (details["window_seconds"], details["limit"], details["count"]) == (WINDOW, 20, 20)
-    assert details["history"] == [{"applied_at": NOW - 30, "from": 1, "to": 2}]
-    assert only_ints_and_strings(details)
-
-
-@pytest.mark.parametrize(("age", "code"), [(WINDOW - 1, "plan_rate_limited"), (WINDOW, None)])
-def test_plan_rate_window_edge(age, code):
-    history = [planned(NOW - age)] + [planned(NOW - i, n=i) for i in range(19)]
-    assert code_of(check_plan_rate, history, NOW, WINDOW, 20) == code
-
-
-def test_plan_rate_counts_every_plan_whatever_its_result():
-    history = [planned(NOW - i, result="conflict", n=i) for i in range(3)]
-    assert code_of(check_plan_rate, history, NOW, WINDOW, 3) == "plan_rate_limited"
-
-
 # --- Manual change ----------------------------------------------------------
 
 
@@ -362,22 +331,14 @@ class FakeStore:
 
 def test_check_history_reads_far_enough_back():
     store = FakeStore()
-    check_history(store, "sandbox/web/u", NOW, SETTINGS, 1, 2, plan_rate=True)
+    check_history(store, "sandbox/web/u", NOW, SETTINGS, 1, 2)
     assert store.calls == [("sandbox/web/u", NOW - retention_seconds(SETTINGS))]
 
 
 def test_check_history_fails_closed_on_query_error():
     store = FakeStore(error=RuntimeError("throttled"))
     with pytest.raises(RuntimeError):
-        check_history(store, "k", NOW, SETTINGS, 1, 2, plan_rate=False)
-
-
-def test_check_history_rate_limit_only_when_asked():
-    store = FakeStore([planned(NOW - i, n=i) for i in range(20)])
-    check_history(store, "k", NOW, SETTINGS, 1, 2, plan_rate=False)
-    with pytest.raises(GuardError) as exc:
-        check_history(store, "k", NOW, SETTINGS, 1, 2, plan_rate=True)
-    assert exc.value.code == "plan_rate_limited"
+        check_history(store, "k", NOW, SETTINGS, 1, 2)
 
 
 # --- The last applied plan is merged into the history ------------------------
@@ -445,9 +406,9 @@ def test_with_last_applied_keeps_a_recorded_time_whatever_the_result():
 def test_check_history_sees_flapping_when_the_index_missed_the_last_apply():
     store = FakeStore([applied(1, 2, NOW - 120)])
     last = last_applied(2, 1, NOW - 60, "applied")
-    check_history(store, KEY, NOW, SETTINGS, 1, 2, plan_rate=False)
+    check_history(store, KEY, NOW, SETTINGS, 1, 2)
     with pytest.raises(GuardError) as exc:
-        check_history(store, KEY, NOW, SETTINGS, 1, 2, plan_rate=False, last_applied=last)
+        check_history(store, KEY, NOW, SETTINGS, 1, 2, last_applied=last)
     assert exc.value.code == "flapping"
     assert [h["to"] for h in exc.value.details["history"]] == [2, 1]
 
@@ -456,10 +417,10 @@ def test_check_history_counts_an_unrecorded_apply_toward_the_budget():
     store = FakeStore([applied(1, 2, NOW - 100 * i, i) for i in range(1, 6)])
     # The unrecorded apply counts as just applied, which the cooldown alone would refuse.
     settings = replace(SETTINGS, apply_cooldown_seconds=0)
-    check_history(store, KEY, NOW, settings, 1, 2, plan_rate=False)
+    check_history(store, KEY, NOW, settings, 1, 2)
     last = last_applied(1, 2, None, None)
     with pytest.raises(GuardError) as exc:
-        check_history(store, KEY, NOW, settings, 1, 2, plan_rate=False, last_applied=last)
+        check_history(store, KEY, NOW, settings, 1, 2, last_applied=last)
     assert exc.value.code == "object_budget_exceeded"
     assert exc.value.details["count"] == 6
 
@@ -468,7 +429,7 @@ def test_check_history_ignores_a_last_plan_for_another_object():
     store = FakeStore([applied(1, 2, NOW - 120)])
     other_key = "sandbox/web/8f7c1a2e-0000-4000-8000-000000000002"
     last = last_applied(2, 1, NOW - 60, "applied")
-    check_history(store, other_key, NOW, SETTINGS, 1, 2, plan_rate=False, last_applied=last)
+    check_history(store, other_key, NOW, SETTINGS, 1, 2, last_applied=last)
 
 
 # --- Cooldown ---------------------------------------------------------------
@@ -495,7 +456,7 @@ def test_cooldown_of_zero_is_off():
 def test_check_history_runs_the_cooldown_first():
     store = FakeStore([applied(1, 2, NOW - 200), applied(2, 1, NOW - 10)])
     with pytest.raises(GuardError) as exc:
-        check_history(store, KEY, NOW, SETTINGS, 1, 2, plan_rate=False)
+        check_history(store, KEY, NOW, SETTINGS, 1, 2)
     assert exc.value.code == "cooldown"
 
 

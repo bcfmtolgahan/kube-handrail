@@ -2691,7 +2691,6 @@ def test_replanning_the_reverted_change_is_cooldown_then_flapping(verify_rt):
             runtime_.settings,
             1,
             3,
-            plan_rate=False,
             last_applied=revert,
         )
 

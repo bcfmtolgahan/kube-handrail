@@ -580,7 +580,7 @@ def _plan(
     current = _desired_replicas(deployment)
     template = (raw.get("spec") or {}).get("template") or {}
     resolved = action.checks(clients, settings, deployment, template, current, request)
-    # History checks give early feedback; apply runs all but the plan rate limit again.
+    # History checks give early feedback; apply runs them all again.
     overridden = action.breaker(clients, settings, deployment, template, current, request, now)
     # Read only here; apply takes a unit of the budget atomically.
     if clients.store.global_applies(now) >= settings.global_hourly_apply_budget:
@@ -640,6 +640,9 @@ def _plan(
         preflight.append({"check": check, "passed": True})
         if overridden and check == "no_manual_change":
             preflight[-1]["overridden"] = True
+        # The plan rate limit was removed; the entry stays one release for clients that read it.
+        if check == "plan_rate":
+            preflight[-1]["skipped"] = True
         # The per-agent checks, after the checks they follow; skipped in legacy mode.
         follows = {"arguments": "agent_enabled", "global_budget": "agent_budget"}.get(check)
         if follows is not None:
@@ -743,7 +746,6 @@ def _scale_breaker(
         settings,
         current,
         args["replicas"],
-        plan_rate=True,
         last_applied=last_applied,
     )
     return overridden
@@ -829,7 +831,6 @@ def _restart_breaker(
         settings,
         current,
         current,
-        plan_rate=True,
         last_applied=last_applied_plan(clients.store, deployment),
     )
     return False
@@ -941,7 +942,6 @@ def _rollback_breaker(
         settings,
         current,
         current,
-        plan_rate=True,
         last_applied=last_applied,
     )
     return overridden

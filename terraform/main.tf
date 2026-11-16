@@ -53,8 +53,6 @@ locals {
 
     FLAP_WINDOW_SECONDS        = tostring(var.flap_window_seconds)
     OBJECT_HOURLY_APPLY_BUDGET = tostring(var.object_hourly_apply_budget)
-    PLAN_RATE_LIMIT            = tostring(var.plan_rate_limit)
-    PLAN_RATE_WINDOW_SECONDS   = tostring(var.plan_rate_window_seconds)
     APPLY_COOLDOWN_SECONDS     = tostring(var.apply_cooldown_seconds)
     GLOBAL_HOURLY_APPLY_BUDGET = tostring(var.global_hourly_apply_budget)
 
@@ -403,6 +401,13 @@ resource "aws_lambda_function" "this" {
       condition     = !var.create_vpc_endpoints || local.cluster_vpc_config.endpoint_private_access
       error_message = "create_vpc_endpoints needs private endpoint access on the cluster: no VPC endpoint carries Kubernetes API traffic, so the Lambdas could not reach the public endpoint without a NAT gateway."
     }
+  }
+}
+
+check "deprecated_plan_rate" {
+  assert {
+    condition     = var.plan_rate_limit == null && var.plan_rate_window_seconds == null
+    error_message = "plan_rate_limit and plan_rate_window_seconds are deprecated and ignored: the plan rate limit was removed. Remove them from your tfvars; they will be deleted in a later release."
   }
 }
 

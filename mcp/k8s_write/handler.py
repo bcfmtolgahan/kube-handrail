@@ -521,7 +521,6 @@ def _scale_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, now
         rt.settings,
         plan.replicas_from,
         plan.replicas_to,
-        plan_rate=False,
         last_applied=last_applied,
     )
 
@@ -574,7 +573,6 @@ def _restart_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, n
         rt.settings,
         plan.replicas_from,
         plan.replicas_to,
-        plan_rate=False,
         last_applied=last_applied_plan(rt.store, deployment),
     )
 
@@ -663,7 +661,6 @@ def _rollback_breaker(rt: Runtime, plan: Plan, deployment: Any, override: bool, 
         rt.settings,
         plan.replicas_from,
         plan.replicas_to,
-        plan_rate=False,
         last_applied=last_applied,
     )
 

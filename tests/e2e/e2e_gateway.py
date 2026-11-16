@@ -121,8 +121,8 @@ it (sent with an If-Match no object matches, so the probe cannot replace the ent
 the policy were missing) the bucket policy denies it (403). The operator needs
 s3:ListBucket, s3:GetObject and s3:PutObject on the bucket; nothing is written.
 
-The per-object and global hourly budgets and the plan rate limit are covered by
-unit tests only: reaching them here takes 6 or 30 applies or 20 plans. So are the
+The per-object and global hourly budgets are covered by unit tests only: reaching
+them here takes 6 or 30 applies. So are the
 scale_to_zero and service_without_endpoints warnings: they need a plan to 0
 replicas, which a sandbox with MIN_REPLICAS=1 refuses as out_of_bounds.
 """
