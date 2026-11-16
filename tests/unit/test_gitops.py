@@ -98,6 +98,11 @@ def test_plain_deployment_not_managed():
         deployment(annotations="bad"),
         deployment(labels=["kustomize.toolkit.fluxcd.io/name"]),
         {"metadata": {"labels": "bad"}},
+        {},
+        {"metadata": "x"},
+        {"metadata": None},
+        SimpleNamespace(metadata=None),
+        SimpleNamespace(),
     ],
 )
 def test_fails_closed(obj):

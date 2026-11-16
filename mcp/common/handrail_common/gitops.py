@@ -47,14 +47,20 @@ def valid_marker(key: Any) -> bool:
     return len(prefix) <= MAX_PREFIX_LENGTH
 
 
-def _metadata(deployment: Any) -> tuple[Any, Any]:
-    """Return (annotations, labels) from a client model or a plain dict."""
+_MALFORMED = object()
+
+
+def _metadata(deployment: Any) -> tuple[Any, Any] | object:
+    """Return (annotations, labels) from a client model or a plain dict, or _MALFORMED when
+    the object has no metadata to read."""
     if isinstance(deployment, Mapping):
         meta = deployment.get("metadata")
-        if isinstance(meta, Mapping):
-            return meta.get("annotations"), meta.get("labels")
-        return None, None
+        if not isinstance(meta, Mapping):
+            return _MALFORMED
+        return meta.get("annotations"), meta.get("labels")
     meta = getattr(deployment, "metadata", None)
+    if meta is None or isinstance(meta, (str, bytes)):
+        return _MALFORMED
     return getattr(meta, "annotations", None), getattr(meta, "labels", None)
 
 
@@ -66,7 +72,10 @@ def is_gitops_managed(deployment: Any, extra_markers: Iterable[str]) -> bool:
     leaving it out."""
     if deployment is None:
         return True
-    annotations, labels = _metadata(deployment)
+    metadata = _metadata(deployment)
+    if metadata is _MALFORMED:
+        return True
+    annotations, labels = metadata
     if annotations is not None and not isinstance(annotations, Mapping):
         return True
     if labels is not None and not isinstance(labels, Mapping):
