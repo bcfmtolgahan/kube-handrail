@@ -323,3 +323,13 @@ def test_outcome_view_reports_the_approval_mode():
     assert outcome_view(with_revert().to_item(), NOW, 300)[0]["approval_mode"] is None
     record = with_revert(approval_mode="server").to_item()
     assert outcome_view(record, NOW, 300)[0]["approval_mode"] == "server"
+
+
+def test_outcome_view_reports_the_approval_for_both_mode():
+    view = outcome_view(with_revert().to_item(), NOW, 300)[0]
+    assert view["approval"] == {"status": "planned", "approved_at": None}
+    record = with_revert(status="approved", approved_at=NOW - 30, approved_by="arn:x").to_item()
+    view = outcome_view(record, NOW, 300)[0]
+    assert view["approval"] == {"status": "approved", "approved_at": NOW - 30}
+    # Who approved stays with the approver's view, not the agent's.
+    assert "arn:x" not in str(view)

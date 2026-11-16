@@ -219,6 +219,8 @@ def outcome_view(record: Mapping[str, Any], now: int, grace: int) -> tuple[dict[
         "reverts_plan_id": plan.reverts_plan_id,
         "replicas": {"from": plan.replicas_from, "to": plan.replicas_to},
         "approval_mode": plan.approval_mode,
+        # Read-only: in both mode the agent waits for "approved" here before it applies.
+        "approval": {"status": plan.status or None, "approved_at": plan.approved_at},
         "plan_status": derived_status(record, now),
         "verification": verification,
         "revert": revert_view(plan, verification["status"]),
