@@ -994,3 +994,22 @@ def test_kubectl_commands_use_the_given_context():
         "build/k8s",
     ]
     assert calls[1][:3] == ["kubectl", "--context", "ctx"]
+
+
+def test_k8s_only_applies_the_deployed_manifests_without_terraform(world, tmp_path):
+    make, root = k8s_world(world, tmp_path)
+    upgrade_ = make(with_k8s=True)
+    outputs = dict(world.tf._outputs)
+    assert upgrade_.k8s_only(outputs) == 0
+    assert world.log == [("kubectl", "dry-run"), ("kubectl", "apply")]
+    assert (root / "build/k8s/rbac.yaml").read_text() == MANIFESTS["rbac.yaml"]
+    assert not world.state_path.exists()
+
+
+def test_k8s_only_asks_first(world, tmp_path):
+    make, _ = k8s_world(world, tmp_path)
+    upgrade_ = make(with_k8s=True, yes=False)
+    upgrade_.confirm = lambda question: False
+    with pytest.raises(upgrade.UpgradeError, match="not confirmed"):
+        upgrade_.k8s_only(dict(world.tf._outputs))
+    assert world.log == []

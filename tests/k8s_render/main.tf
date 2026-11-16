@@ -3,6 +3,9 @@
 
 terraform {
   required_version = ">= 1.5.0"
+
+  # render.sh points it at a temporary file (-backend-config=path=...).
+  backend "local" {}
 }
 
 variable "namespaces" {

@@ -21,7 +21,8 @@ Steps, in order (docs/deploy.md, Upgrading):
                 build/k8s and applied with kubectl, after a server-side dry run of all of
                 them; then the admission policy binding is checked against admission_mode,
                 and kube-handrail Roles the manifests no longer contain are listed (never
-                deleted). Without it, a warning when the manifests changed.
+                deleted). Without it, a warning when the manifests changed. --k8s-only runs
+                just this step against the deployed state (after a confirmation).
  6. enable-write  Only when the tool set changed and the DevOps Agent IDs are known.
  7. sentinel    Invoked at once; its result must be ok.
  8. kill switch Turned back on only if this script turned it off and nothing else wrote it
@@ -865,6 +866,18 @@ class Upgrade:
         if self.tf.apply_plan().returncode != 0:
             raise UpgradeError("terraform apply failed twice; fix the cause and run with --resume")
 
+    def k8s_only(self, outputs: dict[str, Any]) -> int:
+        """--k8s-only: the manifests of the deployed state, without a Terraform run."""
+        self.state = State.new()
+        self.outputs = outputs
+        say(f"build/k8s goes to kubectl context {self.kubectl.current_context()}")
+        if not self.options.yes and not self.confirmed("Apply build/k8s to this context?"):
+            raise UpgradeError("not confirmed; nothing was applied")
+        self.k8s()
+        for note in self.state.notes:
+            say(f"note: {note}")
+        return 0
+
     def k8s(self) -> None:
         """The cluster manifests of this release, after the apply that rendered them."""
         assert self.state is not None
@@ -879,7 +892,7 @@ class Upgrade:
                 say(
                     "WARNING: the cluster manifests changed and were not applied: plans are "
                     "refused (conflict) until they are. Run make upgrade UPGRADE_FLAGS="
-                    "'--resume --with-k8s' now, or kubectl apply -f build/k8s/ yourself"
+                    "--k8s-only now, or kubectl apply -f build/k8s/ yourself"
                 )
                 self.state.notes.append("cluster manifests changed: apply build/k8s")
             return
@@ -1108,6 +1121,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="after the apply, kubectl apply the cluster manifests (build/k8s), dry run first",
     )
     parser.add_argument(
+        "--k8s-only",
+        action="store_true",
+        help="only write and apply the cluster manifests of the deployed state (dry run first)",
+    )
+    parser.add_argument(
         "--kube-context", help="kubectl context for --with-k8s (default: the current one)"
     )
     return parser
@@ -1140,7 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
         smoke_namespace=args.smoke_namespace,
         smoke_name=args.smoke_name,
         yes=args.yes,
-        with_k8s=args.with_k8s,
+        with_k8s=args.with_k8s or args.k8s_only,
     )
     upgrade = Upgrade(terraform, clients, options, kubectl=Kubectl(args.kube_context))
     try:
@@ -1148,6 +1166,8 @@ def main(argv: list[str] | None = None) -> int:
             upgrade.outputs = outputs
             upgrade.smoke()
             return 0
+        if args.k8s_only:
+            return upgrade.k8s_only(outputs)
         return upgrade.run()
     except UpgradeError as exc:
         print(f"upgrade: {exc}", file=sys.stderr)

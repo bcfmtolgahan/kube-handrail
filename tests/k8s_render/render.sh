@@ -16,17 +16,14 @@ trap 'rm -rf "$work"' EXIT
 export TF_DATA_DIR="$work/tf"
 export TF_IN_AUTOMATION=1
 
-terraform -chdir="$here" init -backend=false -input=false >/dev/null
+terraform -chdir="$here" init -input=false -reconfigure -backend-config="path=$work/terraform.tfstate" >/dev/null
 
 render() {
   local vars=$1 out=$2
-  local state
-  state="$work/$(basename "$vars").tfstate"
-  terraform -chdir="$here" apply -auto-approve -input=false -state="$state" \
-    -var-file="$vars" >/dev/null
+  terraform -chdir="$here" apply -auto-approve -input=false -var-file="$vars" >/dev/null
   rm -rf "$out"
   mkdir -p "$out"
-  terraform -chdir="$here" output -state="$state" -json files |
+  terraform -chdir="$here" output -json files |
     python3 -c 'import json, pathlib, sys
 out = pathlib.Path(sys.argv[1])
 for name, text in json.load(sys.stdin).items():
