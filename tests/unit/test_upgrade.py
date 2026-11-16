@@ -177,6 +177,10 @@ class FakeTerraform:
         self.applies = list(applies or [upgrade.Result(0, "Apply complete!")])
         self._outputs = outputs if outputs is not None else default_outputs()
         self.log = log if log is not None else []
+        self.plan_removed = False
+
+    def remove_plan(self):
+        self.plan_removed = True
 
     def outputs(self):
         return dict(self._outputs)
@@ -783,3 +787,50 @@ def test_run_quiet_keeps_stderr_out_of_the_output():
     command = [sys.executable, "-c", "import sys; print('{}'); print('warn', file=sys.stderr)"]
     result = upgrade.run_quiet(command)
     assert (result.returncode, result.output.strip(), result.error.strip()) == (0, "{}", "warn")
+
+
+# --- Leftovers --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "setup, ok",
+    [
+        (lambda world: None, True),
+        (lambda world: world.options_.update(dry_run=True), True),
+        (lambda world: setattr(world, "smoke_result", 1), False),
+        (lambda world: world.tf.__setattr__("applies", [upgrade.Result(1, "boom")]), False),
+    ],
+)
+def test_the_saved_plan_is_removed_however_the_run_ends(world, setup, ok):
+    # The saved plan holds the caller key and client secrets in plain text.
+    world.options_ = {}
+    setup(world)
+    upgrade_ = world.make(**world.options_)
+    if ok:
+        assert upgrade_.run() == 0
+    else:
+        with pytest.raises(upgrade.UpgradeError):
+            upgrade_.run()
+    assert world.tf.plan_removed
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, EOFError])
+def test_an_interrupted_confirmation_is_a_no(world, interrupt):
+    upgrade_ = world.make(yes=False)
+
+    def confirm(question):
+        raise interrupt
+
+    upgrade_.confirm = confirm
+    with pytest.raises(upgrade.UpgradeError, match="not confirmed"):
+        upgrade_.run()
+    assert world.log == [("plan",)]
+    assert not world.state_path.exists()
+
+
+def test_terraform_removes_its_saved_plan(tmp_path):
+    (tmp_path / upgrade.PLAN_FILE).write_text("secret")
+    tf = upgrade.Terraform(tmp_path, [])
+    tf.remove_plan()
+    tf.remove_plan()
+    assert not (tmp_path / upgrade.PLAN_FILE).exists()

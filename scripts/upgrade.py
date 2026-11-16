@@ -338,6 +338,10 @@ class Terraform:
             raise UpgradeError("terraform show did not return JSON")
         return plan
 
+    def remove_plan(self) -> None:
+        """The saved plan holds the caller key and client secrets in plain text."""
+        (self.tf_dir / PLAN_FILE).unlink(missing_ok=True)
+
     def apply_plan(self) -> Result:
         return self.stream(self._base("apply", "-input=false", "-lock-timeout=60s", PLAN_FILE))
 
@@ -519,6 +523,9 @@ class Upgrade:
             # A run that failed before changing anything leaves no state behind.
             self.abandon_if_unchanged()
             raise
+        finally:
+            # A resume plans again before it applies, so the saved plan is never reused.
+            self.tf.remove_plan()
 
     def run_steps(self) -> int:
         assert self.state is not None
@@ -548,11 +555,18 @@ class Upgrade:
                 if self.options.dry_run:
                     self.dry_run_summary()
                     return 0
-                if not self.options.yes and not self.confirm("Apply this plan and upgrade?"):
+                if not self.options.yes and not self.confirmed("Apply this plan and upgrade?"):
                     raise UpgradeError("not confirmed; nothing was applied")
             self.done(step)
         self.finish()
         return 0
+
+    def confirmed(self, question: str) -> bool:
+        try:
+            return self.confirm(question)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return False
 
     def start(self) -> State:
         exists = self.state_path.exists()
@@ -659,12 +673,18 @@ class Upgrade:
         steps.append("apply")
         if self.state.tool_set_changed:
             steps.append(
-                "enable-write" if space and association else "enable-write (skipped: no IDs)"
+                "enable-write"
+                if space and association
+                else "enable-write (skipped unless the apply adds the DevOps Agent ID outputs)"
             )
         steps.append("invoke the sentinel")
         if self.state.tool_set_changed:
             steps.append("turn the kill switch on")
-        steps.append("install-guidance if the guidance differs" if space else "guidance (skipped)")
+        steps.append(
+            "install-guidance if the guidance differs"
+            if space
+            else "guidance (skipped unless the apply adds the DevOps Agent ID outputs)"
+        )
         steps.append("smoke test" + (" --read-only" if self.approval_mode() != "client" else ""))
         say("dry run: the plan passed the safety check; nothing was changed")
         say("would: " + "; ".join(steps))
