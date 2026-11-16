@@ -119,8 +119,8 @@ resource "aws_lambda_function" "approver" {
 
   lifecycle {
     precondition {
-      condition     = var.approval_mode == "client" || alltrue([for ns in values(local.namespaces) : length(ns.approvers) > 0 || length(var.approver_principals) > 0])
-      error_message = "approval_mode server or both needs an approver for every namespace: approver_principals, or the namespace's own approvers; otherwise nobody can approve its plans."
+      condition     = var.approval_mode == "client" || alltrue([for ns in values(local.namespaces) : length(ns.actions) == 0 || length(ns.approvers) > 0 || length(var.approver_principals) > 0])
+      error_message = "approval_mode server or both needs an approver for every namespace that allows an action: approver_principals, or the namespace's own approvers; otherwise nobody can approve its plans."
     }
     precondition {
       condition     = length(setintersection(toset(local.all_approver_principals), toset(local.machine_role_arns))) == 0

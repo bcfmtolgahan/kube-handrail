@@ -48,6 +48,8 @@ namespaces = {
 }
 ```
 
+A namespace's `approvers` take effect only with `approval_mode` `server` or `both`; in `client` mode Terraform warns that they are unused.
+
 Without `namespaces`, the deprecated `sandbox_namespace`, `min_replicas` and `max_replicas` still define one namespace, as before; Terraform warns while they are set and refuses them together with `namespaces`. To move, write their values into `namespaces` (the warning prints the entry) and remove them; the rendered policy stays the same.
 
 `terraform apply` writes the cluster side to `build/k8s/` (also the `k8s_manifests` output): `rbac.yaml` (in every namespace a reader Role, and a writer Role where an action is allowed, bound to the access entries' groups, whose names must stay as they are), `policy-reader.yaml` (the ClusterRole `kube-handrail-policy-reader`: `get` on the admission policy and its binding only, the reader's one cluster-scoped right) and `admission-policy.yaml`. Terraform does not talk to the cluster and creates no namespaces. With a kubeconfig that may create these objects (cluster-admin):

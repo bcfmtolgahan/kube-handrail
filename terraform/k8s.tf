@@ -75,6 +75,13 @@ check "deprecated_namespace_variables" {
   }
 }
 
+check "namespace_approvers_need_server_approval" {
+  assert {
+    condition     = var.approval_mode != "client" || alltrue([for ns in values(local.namespaces) : length(ns.approvers) == 0])
+    error_message = "A namespace lists approvers while approval_mode is client: they take effect only in server or both mode, where the approver checks them; in client mode the client's own approval decides."
+  }
+}
+
 check "admission_mode_and_check" {
   assert {
     condition     = var.admission_mode == "Deny" || !var.admission_check
