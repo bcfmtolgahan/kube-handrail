@@ -57,3 +57,28 @@ jobs:
         env:
           OTHER_NAMESPACE: kube-handrail-admission-other
         run: tests/admission/run.sh
+
+  # The guard scenarios end to end (tests/integration): the Lambda handlers in process against
+  # kind, impersonating the reader and writer groups, with moto for DynamoDB, SSM, SNS and S3.
+  # Same node image as the admission job; tests/integration/run.sh reads the first pin.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.31.0
+          node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
+          cluster_name: kube-handrail-integration
+      - name: Integration tests
+        env:
+          KH_INTEGRATION: "1"
+        # The runner's kubeconfig holds only the kind cluster; the harness refuses any
+        # context that kind did not create.
+        run: KUBECONFIG="$HOME/.kube/config" python -m pytest -q --durations=10 tests/integration

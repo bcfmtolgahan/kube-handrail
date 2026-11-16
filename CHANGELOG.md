@@ -4,7 +4,7 @@ All notable changes to kube-handrail are listed here. The format follows [Keep a
 
 ## [Unreleased]
 
-Milestone 3: implemented and tested on a test cluster, except the test profile and `--reset-counters`, which are implemented but not yet run. Milestone 4 (legacy mode and the verify switch removed, `make upgrade`): implemented and tested on a test cluster (`make upgrade` from Milestone 3 took 110 seconds; the plan showed only the 12 moves and package rebuilds). Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md` and both skills), so re-run `install-guidance` (`make upgrade` does).
+Milestone 3: implemented and tested on a test cluster, except the test profile and `--reset-counters`, which are implemented but not yet run. Milestone 4 (legacy mode and the verify switch removed, `make upgrade`): implemented and tested on a test cluster (`make upgrade` from Milestone 3 took 110 seconds; the plan showed only the 12 moves and package rebuilds). Milestone 5 (CI tier 1): implemented; the integration suite runs on kind in CI on every pull request (about 2.5 minutes), and `e2e_gateway.py --live-only` passed on a test deployment. Tool schemas: unchanged, so no `enable-write`. Agent guidance: changed (`AGENTS.md` and both skills), so re-run `install-guidance` (`make upgrade` does).
 
 ### Changed
 
@@ -18,6 +18,10 @@ Milestone 3: implemented and tested on a test cluster, except the test profile a
 - The per-release upgrade notes moved to [Upgrade notes before Milestone 4](docs/history/upgrading.md); [deploy](docs/deploy.md#upgrading) describes `make upgrade`.
 
 ### Added
+
+- **Integration suite on kind and moto** (`tests/integration`): the guard scenarios of the live end-to-end test, run with the Lambda handlers in process against a kind cluster, impersonating the `kube-handrail-reader` and `kube-handrail-writer` groups, with the admission policy in `Deny` and moto for DynamoDB (with the stream), SSM, SNS and S3 (with Object Lock). It covers the namespace and bounds, GitOps and HPA, single use and expiry, conflicts, kill switches, budgets, the breaker, blast radius, freezes, `admission_denied`, restart and rollback, forged callers, server approval, verification and revert, and the audit record ([coverage](tests/integration/README.md)). Skipped unless `KH_INTEGRATION` is set. `make integration` (`tests/integration/run.sh`) runs it on a throwaway `kh-int-*` cluster with its own kubeconfig.
+- CI job `integration`: the suite on every push and pull request, on kind with the admission job's node image.
+- `e2e_gateway.py --live-only`: only the cases the integration suite cannot cover (Cognito authentication, the gateway's schema check, applies through the real gateway, interceptor and EKS access entries, concurrent applies on real DynamoDB, the approval URL's IAM auth, and with `--with-identity` and `--with-audit` the identity and audit cases). Without it every case runs as before.
 
 - `make upgrade` (`scripts/upgrade.py`): one resumable upgrade command. It refuses to start while the kill switch is off unless it turned it off itself, refuses a plan that deletes or replaces the gateway, its targets, Cognito, the plan table, the audit bucket or the kill switch and freezes parameters, applies known two-step migrations first, turns the kill switch off while the tool set changes, retries an "inconsistent final plan" once, runs `enable-write` and `install-guidance` only when needed, requires a sentinel `ok`, and ends with the smoke test. `--dry-run` stops after the plan check. Also `make bootstrap`, `deploy`, `register`, `smoke` and `destroy` (`scripts/cleanup.sh`).
 - `scripts/smoke_test.py --read-only`: the read path only, for `server` and `both` mode.
