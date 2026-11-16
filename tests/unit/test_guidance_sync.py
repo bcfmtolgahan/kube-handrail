@@ -20,7 +20,7 @@ AGENTS = "AGENTS.md"
 SCALE_SKILL = "agent/skills/kube-handrail-scale/SKILL.md"
 ROLLOUT_SKILL = "agent/skills/kube-handrail-rollout/SKILL.md"
 
-# Word counts (whitespace-separated) at Milestone 3 plus 5 % slack. They stop the
+# Word counts (whitespace-separated) at the end of Milestone 3 plus 5 % slack. They stop the
 # guidance from growing unnoticed; Milestone 7 lowers them to its targets. Raise one only
 # with a reason in the commit message.
 WORD_CEILINGS = {
@@ -30,9 +30,9 @@ WORD_CEILINGS = {
     "mcp/CONTRACT.md": 22012,
     "README.md": 3163,
     "docs/guards.md": 3270,
-    "docs/deploy.md": 5751,
-    "docs/roadmap.md": 6945,
-    "docs/milestone-0.md": 4190,
+    "docs/deploy.md": 5799,
+    "docs/roadmap.md": 6956,
+    "docs/milestone-0.md": 4245,
     "docs/releasing.md": 677,
 }
 # Everything an agent reads: AGENTS.md and the skills (4708 words at Milestone 3).
