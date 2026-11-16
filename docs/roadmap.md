@@ -287,15 +287,14 @@ These move to "Later ideas":
 
 **Done when:** the sync tests pass with the new ceilings, and a before/after live chat comparison shows no change in behaviour.
 
-## Milestone 8: Tool schema release #1 (HPA, health checks, change reference)
+## Milestone 8: Tool schema release #1 (HPA, change reference)
 
-**Goal:** act on real workload capacity and verify changes by application health, in one schema release: one `enable-write`, one `install-guidance`.
+**Goal:** act on real workload capacity in one schema release: one `enable-write`, one `install-guidance`.
 
 - `plan_adjust_hpa` / `apply_adjust_hpa`, with its own record fields, blast radius on the resulting pod change, verification and automatic revert.
-- `health_check` v1, CloudWatch only: named checks the operator defines, pinned in the plan, with `degraded` and revert on a regression. SLO and burn-rate checks, planned earlier as Prometheus SLO tools, are checks in this catalog.
-- `change_ref`, an untrusted display-only reference; `both` mode gets a live chat test.
+- `change_ref`, an untrusted display-only reference pinned in the plan; `get_plan_outcome` reports the server approval, so `both` mode waits without a write tool, and gets a live chat test.
 
-**Done when:** on kind, HPA changes verify and revert; a regressed custom metric reverts a scale-down; the upgrade finishes with one `enable-write`.
+**Done when:** on kind, HPA changes verify and revert; the upgrade finishes with one `enable-write`.
 
 ## Milestone 9: Approver and executor identity, audit quality
 
@@ -322,7 +321,7 @@ Not committed; listed for discussion.
 - Moving the scheduled sentinel and sweeper to EventBridge Scheduler.
 - A signed, hash-chained audit ledger with write-once approval receipts, automatic detection of unexpected plan-record transitions, and offline verification of an export ([ADR 0007](adr/0007-durable-audit-record.md), alternative A).
 - A single policy file compiled to Cedar at the gateway and to the admission policy, with a CI check that the layers agree, and a break-glass path with a ticket and two approvers.
-- Prometheus and Amazon Managed Service for Prometheus as health check backends (after the CloudWatch catalog of Milestone 8 proves its value).
+- **Named health checks in the verification** (deferred from Milestone 8). Operator-defined CloudWatch checks, pinned in the plan, making a change `degraded` on a regression; Prometheus or Amazon Managed Service for Prometheus later. Deferred because observability is DevOps Agent's job, and the catalog, the `monitoring` VPC endpoint, a new error code and windows of at least 300 seconds cost more than they add now.
 - An Alertmanager-to-DevOps Agent webhook trigger with deduplication, signing, throttling and a sanitized snapshot. ([Webhook docs](https://docs.aws.amazon.com/devopsagent/latest/userguide/configuring-integrations-and-knowledge-invoking-devops-agent-through-webhook.html))
 - Node triage (unhealthy nodes, conditions, taints, pressure, failing pods) and change correlation (rollouts, image changes and GitOps history in one timeline).
 - StatefulSets; a stdio proxy and a second client guide; a nightly end-to-end run on real AWS; prebuilt Lambda packages; a fleet (multi-cluster) guide.
