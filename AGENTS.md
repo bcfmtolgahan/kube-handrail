@@ -57,7 +57,7 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 
 | Code | Meaning | Next |
 |---|---|---|
-| `invalid_argument` | Bad arguments (including a verification window out of range, `revert_on_failure` without a window or on a restart or rollback, or either while the server has verification off), a rollback to the revision that is already the current template, or `request_approval` in client mode. | Fix the arguments once (for a rollback, choose another revision with the human; without verification, plan without the window and revert); in client mode see Flow step 3. |
+| `invalid_argument` | Bad arguments (including a verification window out of range, or `revert_on_failure` without a window or on a restart or rollback), a rollback to the revision that is already the current template, or `request_approval` in client mode. | Fix the arguments once (for a rollback, choose another revision with the human); in client mode see Flow step 3. |
 | `unknown_tool` | Tool name not served. | Stop. |
 | `not_found` | The Deployment does not exist. | Check namespace and name with the human. |
 | `forbidden_namespace` | Namespace not allowed. | Stop. |
