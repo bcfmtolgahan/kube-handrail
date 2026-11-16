@@ -91,10 +91,10 @@ with the switch back on an approved plan of B's is applied and counted against
 B's budget. A must have a budget (smoke_test's hourly_apply_budget) of at least the
 applies of the whole run, 30 in the test setup.
 
-With --with-verify (the deployment has verify_enabled, the default, and a
-verify_window_min_seconds of at most 60), the verification cases also run, with
-windows of 60 and 90 seconds; they add about 15 minutes of waiting in client mode and
-about 6 in server mode. A window below the minimum, and revert_on_failure without a
+The verification cases run by default (the deployment needs a
+verify_window_min_seconds of at most 60; --skip-verify leaves them out, and
+--with-verify is accepted and does nothing), with windows of 60 and 90 seconds; they
+add about 15 minutes of waiting in client mode and about 6 in server mode. A window below the minimum, and revert_on_failure without a
 window, are refused. The degraded cases use BestEffort fixtures (no resource
 requests) under a ResourceQuota e2e-besteffort that admits one BestEffort pod, so
 scaling such a fixture from 1 to 2 leaves the second pod refused; web and the other
@@ -2413,9 +2413,14 @@ def main() -> None:
         help="also run the per-agent identity cases (needs CLIENT_ID_B and CLIENT_SECRET_B)",
     )
     parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="leave out the verification cases, which add 6 to 15 minutes of waiting",
+    )
+    parser.add_argument(
         "--with-verify",
         action="store_true",
-        help="also run the verification cases (needs verify_enabled, the default)",
+        help="deprecated, does nothing: the verification cases run unless --skip-verify",
     )
     parser.add_argument(
         "--with-freeze",
@@ -2446,6 +2451,8 @@ def main() -> None:
         help="Terraform directory whose outputs fill unset variables",
     )
     args = parser.parse_args()
+    # Every deployment verifies its applies, so the verification cases run by default.
+    args.with_verify = not args.skip_verify
     outputs, ignored = usable_outputs(terraform_outputs(args.tf_dir))
     if ignored:
         print(ignored, flush=True)

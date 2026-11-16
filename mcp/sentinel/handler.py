@@ -34,6 +34,7 @@ OK = "ok"
 DRIFT = "drift"
 UNKNOWN = "unknown"
 DISABLED = "false"
+ENABLED = "true"
 ALERT_SUBJECT = "kube-handrail: drift, remediation disabled"
 
 
@@ -47,8 +48,8 @@ class SentinelSettings:
     agent_space_id: str | None
     association_id: str | None
     expect_elevated_actions: bool
-    # The REQUEST interceptor's Lambda ARN; None when none is deployed (legacy mode).
-    expect_interceptor_arn: str | None = None
+    # The REQUEST interceptor's Lambda ARN, which the gateway must keep.
+    expect_interceptor_arn: str
     # The agents' OAuth clients: the only ones the gateway may allow.
     expect_allowed_clients: frozenset[str] = frozenset()
 
@@ -88,7 +89,7 @@ def load_sentinel_settings(env: Mapping[str, str] | None = None) -> SentinelSett
         agent_space_id=space,
         association_id=association,
         expect_elevated_actions=elevated == "true",
-        expect_interceptor_arn=env.get("EXPECT_INTERCEPTOR_ARN", "").strip() or None,
+        expect_interceptor_arn=_required(env, "EXPECT_INTERCEPTOR_ARN"),
         expect_allowed_clients=frozenset(clients),
     )
 
@@ -173,13 +174,17 @@ def describe_error(exc: Exception) -> str:
 
 
 def disable_remediation(ssm: Any, name: str) -> str:
-    """Set the kill switch to "false". It is never set back to "true" here."""
+    """Set the kill switch to "false". It is never set back to "true" here.
+
+    Any value other than "true" already disables remediation (KillSwitch.state) and is
+    left as it is: make upgrade turns the switch off with its own marker value and must
+    still recognise it afterwards."""
     try:
         current = ssm.get_parameter(Name=name)["Parameter"]["Value"]
     except Exception:
         logger.exception("cannot read kill switch parameter; writing it anyway")
         current = None
-    if current == DISABLED:
+    if current is not None and current != ENABLED:
         return "already_off"
     ssm.put_parameter(Name=name, Value=DISABLED, Type="String", Overwrite=True)
     return "turned_off"

@@ -1,7 +1,5 @@
 """Per-agent identity: resolving the verified caller and who may apply a plan."""
 
-import dataclasses
-
 import pytest
 
 from handrail_common.agents import (
@@ -18,7 +16,7 @@ from handrail_common.plans import SCALE_DEPLOYMENT, Plan
 from handrail_common.validation import GuardError
 
 SMOKE = Agent(name="smoke_test", client_id="client-a", hourly_apply_budget=3)
-LEGACY = Settings(
+IDENTITY = Settings(
     cluster_name="c",
     plans_table="t",
     allowed_namespaces=frozenset({"sandbox"}),
@@ -27,10 +25,6 @@ LEGACY = Settings(
     plan_ttl_seconds=300,
     remediation_enabled_param=None,
     region=None,
-)
-IDENTITY = dataclasses.replace(
-    LEGACY,
-    identity_required=True,
     agents={"client-a": SMOKE},
     agent_kill_switch_prefix="/kh/agents/",
 )
@@ -77,13 +71,6 @@ def plan(agent: str | None) -> Plan:
 
 def test_requester():
     assert requester(SMOKE) == "agent:smoke_test"
-    assert requester(None) == "mcp-gateway"
-
-
-def test_legacy_mode_names_nobody_whatever_the_caller(caller):
-    caller("client-a")
-    assert resolve_caller(LEGACY) is None
-    assert guard_apply(LEGACY) is None
 
 
 def test_identity_mode_resolves_a_listed_client(caller):
@@ -126,10 +113,10 @@ class Switches:
 SWITCH = "/kh/agents/smoke_test/enabled"
 
 
-def test_a_plan_must_name_its_agent_in_identity_mode():
+def test_a_plan_must_name_its_agent():
     on = Switches({SWITCH: "true"})
     check_plan_agent(IDENTITY, on, plan("smoke_test"))
-    check_plan_agent(LEGACY, Switches(error=True), plan(None))
+    # A record made before agent identity names the gateway class: plan again.
     assert forbidden(check_plan_agent, IDENTITY, on, plan(None)) == {"reason": "agent_unknown"}
 
 
@@ -158,13 +145,6 @@ def test_the_switch_is_read_on_every_call(caller):
     with pytest.raises(GuardError):
         guard_plan(IDENTITY, ssm)
     assert ssm.names == [SWITCH, SWITCH]
-
-
-def test_legacy_mode_reads_no_switch(caller):
-    caller("client-a")
-    ssm = Switches(error=True)
-    assert guard_plan(LEGACY, ssm) is None
-    assert ssm.names == []
 
 
 def test_an_agent_removed_from_agents_gets_the_default_budget():

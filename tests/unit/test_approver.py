@@ -14,6 +14,7 @@ from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from handrail_common.config import ConfigError, load_settings
+from handrail_common.dispatch import caller_signature
 from handrail_common.freezes import FreezeStore, format_time
 from handrail_common.killswitch import KillSwitch
 from handrail_common.plans import (
@@ -68,7 +69,17 @@ WRITE_ENV = {
     "REMEDIATION_ENABLED_PARAM": PARAM,
     "AWS_REGION": REGION,
     "APPROVAL_MODE": "server",
+    "AGENTS": '{"client-a": {"name": "smoke_test"}}',
+    "AGENT_KILL_SWITCH_PREFIX": "/handrail/agents/",
 }
+AGENT_SWITCH = "/handrail/agents/smoke_test/enabled"
+# The record fields of a plan made by agent smoke_test.
+AGENT_FIELDS = {
+    "requested_by": "agent:smoke_test",
+    "agent": "smoke_test",
+    "requested_client_id": "client-a",
+}
+CALLER_KEY = "test-caller-key"
 
 
 def settings(mode: str = "server", approvers=(ALICE, OPERATOR_ROLE, WRITE_ROLE)):
@@ -112,6 +123,7 @@ def env(monkeypatch, plans_table):
         plans_table(TABLE, REGION)
         ssm = boto3.client("ssm", region_name=REGION)
         ssm.put_parameter(Name=PARAM, Value="true", Type="String")
+        ssm.put_parameter(Name=AGENT_SWITCH, Value="true", Type="String")
         apps = MagicMock()
         apps.read_namespaced_deployment.return_value = SimpleNamespace(
             metadata=SimpleNamespace(
@@ -129,6 +141,7 @@ def env(monkeypatch, plans_table):
             store=store,
             apps=lambda: apps,
             clock=lambda: NOW,
+            ssm=ssm,
         )
         monkeypatch.setattr(write, "get_runtime", lambda: write_rt)
         lam = WriteLambda(write.lambda_handler)
@@ -153,6 +166,7 @@ def make_plan(store: PlanStore, replicas: int = 2, override: bool = False) -> Pl
         expires_at=NOW + 300,
         override_manual_change=override,
         impact={"pods": {"ready_now": 1, "from": 1, "to": replicas, "added": 1, "removed": 0}},
+        **AGENT_FIELDS,
     )
     store.create(plan)
     return plan
@@ -292,6 +306,7 @@ def test_approve_runs_the_restart_apply_with_the_plans_own_arguments(env):
         expires_at=NOW + 300,
         template_from="sha256:a",
         template_to="sha256:b",
+        **AGENT_FIELDS,
     )
     env.store.create(plan)
 
@@ -345,6 +360,7 @@ def test_approve_runs_the_rollback_apply_with_the_plans_own_arguments(env):
         revision_to=3,
         target_rs_name="web-h",
         target_rs_uid="rs-uid",
+        **AGENT_FIELDS,
     )
     env.store.create(plan)
 
@@ -416,7 +432,8 @@ def test_apply_payload_omits_a_false_override(env):
     assert "override_manual_change" not in json.loads(env.lam.calls[0]["Payload"])
 
 
-def test_no_apply_only_records_the_approval(env):
+def test_no_apply_only_records_the_approval(env, monkeypatch):
+    monkeypatch.setenv("CALLER_KEY", CALLER_KEY)
     plan = make_plan(env.store)
     status, body = approve(env, plan, apply=False)
     assert status == 200 and body["data"]["apply"] is None
@@ -429,7 +446,8 @@ def test_no_apply_only_records_the_approval(env):
         )
     )
     args = {"plan_id": plan.plan_id, "namespace": "sandbox", "name": "web", "replicas": 2}
-    assert write.lambda_handler(args, context)["ok"] is True
+    caller = f"client-a.{caller_signature(CALLER_KEY, 'client-a')}"
+    assert write.lambda_handler(args | {"_kube_handrail_caller": caller}, context)["ok"] is True
 
 
 def test_client_mode_records_the_approval_without_applying(env):
@@ -588,7 +606,7 @@ def test_show_renders_the_server_record(env):
     assert view["plan_id"] == plan.plan_id and view["status"] == "planned"
     assert view["replicas"] == {"from": 1, "to": 2}
     assert view["impact"]["pods"]["added"] == 1
-    assert view["requested_by"] == "mcp-gateway"
+    assert view["requested_by"] == "agent:smoke_test"
 
 
 def agent_plan(store: PlanStore) -> Plan:
@@ -612,21 +630,8 @@ def test_show_names_the_requesting_agent(env):
     )
 
 
-def test_identity_mode_apply_after_approval_runs_on_the_approval_channel(env, monkeypatch):
+def test_identity_mode_apply_after_approval_runs_on_the_approval_channel(env):
     # The write Lambda requires a verified caller on the gateway, never on this channel.
-    monkeypatch.setenv("CALLER_INTERCEPTOR", "true")
-    env.write_rt.settings = load_settings(
-        WRITE_ENV
-        | {
-            "CALLER_INTERCEPTOR": "true",
-            "AGENTS": '{"client-a": {"name": "smoke_test"}}',
-            "AGENT_KILL_SWITCH_PREFIX": "/handrail/agents/",
-        },
-        write=True,
-    )
-    env.write_rt.ssm = boto3.client("ssm", region_name=REGION)
-    switch = "/handrail/agents/smoke_test/enabled"
-    env.write_rt.ssm.put_parameter(Name=switch, Value="true", Type="String")
     plan = agent_plan(env.store)
     status, body = approve(env, plan)
     assert status == 200 and body["data"]["apply"]["ok"] is True
@@ -636,21 +641,8 @@ def test_identity_mode_apply_after_approval_runs_on_the_approval_channel(env, mo
     assert env.store.agent_applies("smoke_test", NOW) == 1
 
 
-def test_identity_mode_agent_switched_off_after_approval_consumes_the_plan(env, monkeypatch):
-    monkeypatch.setenv("CALLER_INTERCEPTOR", "true")
-    env.write_rt.settings = load_settings(
-        WRITE_ENV
-        | {
-            "CALLER_INTERCEPTOR": "true",
-            "AGENTS": '{"client-a": {"name": "smoke_test"}}',
-            "AGENT_KILL_SWITCH_PREFIX": "/handrail/agents/",
-        },
-        write=True,
-    )
-    env.write_rt.ssm = boto3.client("ssm", region_name=REGION)
-    env.write_rt.ssm.put_parameter(
-        Name="/handrail/agents/smoke_test/enabled", Value="false", Type="String"
-    )
+def test_identity_mode_agent_switched_off_after_approval_consumes_the_plan(env):
+    env.write_rt.ssm.put_parameter(Name=AGENT_SWITCH, Value="false", Type="String", Overwrite=True)
     plan = agent_plan(env.store)
     status, body = approve(env, plan)
     applied = body["data"]["apply"]
@@ -773,7 +765,6 @@ def test_settings_invalid(override):
 
 def test_approve_applies_a_plan_with_a_pinned_window_and_schedules_its_check(env):
     """The record's args carry the window, so the approval's apply matches its plan."""
-    env.write_rt.settings = load_settings(WRITE_ENV | {"VERIFY_ENABLED": "true"}, write=True)
     args = scale_args("sandbox", "web", 2, verify_window_seconds=90)
     plan = dataclasses.replace(
         make_plan(env.store),

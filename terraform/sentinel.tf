@@ -126,7 +126,7 @@ resource "aws_lambda_function" "sentinel" {
       AGENT_SPACE_ID            = local.devops_agent_checks ? var.devops_agent_space_id : ""
       ASSOCIATION_ID            = local.devops_agent_checks ? var.devops_agent_association_id : ""
       EXPECT_ELEVATED_ACTIONS   = tostring(var.expect_elevated_actions)
-      EXPECT_INTERCEPTOR_ARN    = var.caller_interceptor_enabled ? aws_lambda_function.interceptor[0].arn : ""
+      EXPECT_INTERCEPTOR_ARN    = aws_lambda_function.interceptor.arn
       EXPECT_ALLOWED_CLIENTS    = jsonencode(local.allowed_clients)
     }
   }

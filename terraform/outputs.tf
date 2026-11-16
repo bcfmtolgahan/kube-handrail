@@ -3,6 +3,31 @@ output "gateway_url" {
   value       = aws_bedrockagentcore_gateway.this.gateway_url
 }
 
+output "gateway_id" {
+  description = "ID of the AgentCore gateway (scripts/upgrade.py)."
+  value       = aws_bedrockagentcore_gateway.this.gateway_id
+}
+
+output "approval_mode" {
+  description = "The approval mode the Lambdas run with: client, server or both."
+  value       = var.approval_mode
+}
+
+output "devops_agent_space_id" {
+  description = "The DevOps Agent space the sentinel checks (devops_agent_space_id), or null when it is not set."
+  value       = var.devops_agent_space_id == "" ? null : var.devops_agent_space_id
+}
+
+output "devops_agent_association_id" {
+  description = "The DevOps Agent association the sentinel checks (devops_agent_association_id), or null when it is not set."
+  value       = var.devops_agent_association_id == "" ? null : var.devops_agent_association_id
+}
+
+output "tool_set_hash" {
+  description = "SHA-256 over the targets' tools.json files and mcp/classification.json as deployed. scripts/upgrade.py compares it with the working tree to decide whether enable-write is needed."
+  value       = local.tool_set_hash
+}
+
 output "cognito_token_endpoint" {
   description = "OAuth 2.0 token endpoint for the client credentials flow."
   value       = "https://${aws_cognito_user_pool_domain.this.domain}.auth.${local.region}.amazoncognito.com/oauth2/token"
@@ -11,6 +36,11 @@ output "cognito_token_endpoint" {
 output "cognito_scopes" {
   description = "Scopes to request, space-separated in the token request."
   value       = [for s in local.scopes : "${aws_cognito_resource_server.this.identifier}/${s}"]
+}
+
+output "cognito_user_pool_id" {
+  description = "ID of the Cognito user pool; scripts/upgrade.py reads the smoke test client's secret from it, without printing it."
+  value       = aws_cognito_user_pool.this.id
 }
 
 output "cognito_client_ids" {
@@ -48,7 +78,6 @@ output "guard_settings" {
     min_replicas               = var.min_replicas
     max_replicas               = var.max_replicas
     max_replica_step_percent   = var.max_replica_step_percent
-    verify_enabled             = var.verify_enabled
     verify_window_min_seconds  = var.verify_window_min_seconds
     gitops_markers             = var.gitops_markers
   }
@@ -80,8 +109,8 @@ output "sentinel_function_name" {
 }
 
 output "verifier_function_name" {
-  description = "Name of the verifier Lambda, or null when verification is disabled."
-  value       = one(aws_lambda_function.verifier[*].function_name)
+  description = "Name of the verifier Lambda."
+  value       = aws_lambda_function.verifier.function_name
 }
 
 output "alert_topic_arn" {

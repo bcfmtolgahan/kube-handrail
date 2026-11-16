@@ -32,7 +32,7 @@ Every response is `{ok, data, error, truncated}`; on failure `error` has `code`,
 3. Approval: call `request_approval(plan_id)`.
    - `ok` with `approval_mode: server`: you are done. A human approves outside MCP and the approval itself runs the apply. Do not call apply unless a human tells you the approval did not apply it. Report the `plan_id` and `expires_at`, then stop.
    - `ok` with `approval_mode: both`: wait until a human tells you the plan is approved, then apply (your client may ask for its own approval too).
-   - `invalid_argument` with the message "approval is handled by the client in client mode": the client's own approval (for example DevOps Agent chat approval) is the approval. Apply.
+   - `invalid_argument` with the message "client mode: apply directly, your client asks the human": the client's own approval (for example DevOps Agent chat approval) is the approval. Apply.
    - `ok` with `notified: false`: approvers were already notified; do not call it again before `retry_after`.
 4. Apply with the matching `apply_*` tool and exactly the plan's arguments plus its `plan_id`: for a scale the same `namespace`, `name`, `replicas` and `override_manual_change` (absent equals `false`), for a restart the same `namespace` and `name`, for a rollback the same `namespace`, `name`, `revision` and `override_manual_change`, and in every case `verify_window_seconds` and `revert_on_failure` exactly as planned (omit what the plan omitted). Never change a value between plan and apply; any difference is `plan_mismatch`, and the approval covers only the planned values.
 5. Verify: after the window (`verification.window_seconds`, counted from the apply), call `get_plan_outcome(plan_id)` until neither `verification.status` nor `revert.status` is `pending` (a revert of a degraded change can still follow its verdict), and report it. `healthy`: the change reached its target. `degraded`: it did not; with `revert.status` `reverted`, the server set replicas back (`revert.revert_plan_id` is the revert's own plan, which `get_plan_outcome` also reports), and `skipped` or `refused` means it did not, with `revert.reason`. `unknown`: the check cannot tell, usually because someone else changed the Deployment since; report `verification.reason` and do not act. Use `get_workload_status` for the live state.
@@ -57,7 +57,7 @@ Read `error.code`, then act as below. "Re-plan" means one new plan for the same 
 
 | Code | Meaning | Next |
 |---|---|---|
-| `invalid_argument` | Bad arguments (including a verification window out of range, `revert_on_failure` without a window or on a restart or rollback, or either while the server has verification off), a rollback to the revision that is already the current template, or `request_approval` in client mode. | Fix the arguments once (for a rollback, choose another revision with the human; without verification, plan without the window and revert); in client mode see Flow step 3. |
+| `invalid_argument` | Bad arguments (including a verification window out of range, or `revert_on_failure` without a window or on a restart or rollback), a rollback to the revision that is already the current template, or `request_approval` in client mode. | Fix the arguments once (for a rollback, choose another revision with the human); in client mode see Flow step 3. |
 | `unknown_tool` | Tool name not served. | Stop. |
 | `not_found` | The Deployment does not exist. | Check namespace and name with the human. |
 | `forbidden_namespace` | Namespace not allowed. | Stop. |

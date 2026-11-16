@@ -442,7 +442,7 @@ def _apply(action: Action, args: Mapping[str, Any]) -> Envelope:
         require_approval=s.approval_required,
         requester=expected_requester,
         channel=current_channel(),
-        verify_window=s.verify_window_default_seconds if s.verify_enabled else None,
+        verify_window=s.verify_window_default_seconds,
         pin_revert=request.get("revert_on_failure") is True,
     )
 
@@ -489,9 +489,7 @@ def _generation(deployment: Any) -> int | None:
 def _verify_request(
     args: Mapping[str, Any], settings: Settings, revert_allowed: bool = False
 ) -> tuple[int | None, bool]:
-    return require_verify_args(
-        args, settings.verify_enabled, settings.verify_window_bounds, revert_allowed
-    )
+    return require_verify_args(args, settings.verify_window_bounds, revert_allowed)
 
 
 # --- scale_deployment ---------------------------------------------------------

@@ -117,6 +117,8 @@ BASE = {
     "ALLOWED_NAMESPACES": "sandbox",
     "MIN_REPLICAS": "0",
     "MAX_REPLICAS": "5",
+    "AGENTS": '{"client-a": {"name": "smoke_test"}}',
+    "AGENT_KILL_SWITCH_PREFIX": "/kh/agents/",
 }
 
 

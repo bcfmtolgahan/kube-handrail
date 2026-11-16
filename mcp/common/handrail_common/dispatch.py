@@ -36,8 +36,8 @@ TARGET_DELIMITER = "___"
 INTERNAL_TARGET = "kh_internal"
 # Reserved argument the gateway request interceptor sets to the verified caller, signed with
 # CALLER_KEY (CONTRACT.md, Agent identity): "<client_id>.<hex HMAC-SHA256 of client_id>". It is
-# trusted only when CALLER_INTERCEPTOR is "true" and the signature matches; a client can send
-# the argument itself, but without the key it cannot sign it.
+# trusted only when CALLER_KEY is set and the signature matches; a client can send the
+# argument itself, but without the key it cannot sign it.
 CALLER_ARGUMENT = "_kube_handrail_caller"
 
 Handler = Callable[[dict[str, Any]], Envelope]
@@ -83,13 +83,14 @@ def caller_signature(key: str, caller: str) -> str:
 
 
 def pop_caller(args: dict[str, Any], env: Mapping[str, str] | None = None) -> str | None:
-    """Remove the reserved caller argument; return the caller only when the interceptor is
-    enabled and signed it. Anything else, including a gateway without its interceptor that
-    passes a client's own value through, gives None, which identity mode refuses."""
+    """Remove the reserved caller argument; return the caller only when the interceptor
+    signed it. Anything else, including a gateway without its interceptor that passes a
+    client's own value through, or a Lambda without CALLER_KEY, gives None, which is
+    refused."""
     env = os.environ if env is None else env
     value = args.pop(CALLER_ARGUMENT, None)
     key = env.get("CALLER_KEY", "")
-    if env.get("CALLER_INTERCEPTOR") != "true" or not key or not isinstance(value, str):
+    if not key or not isinstance(value, str):
         return None
     # Client IDs and signatures are ASCII; compare_digest raises on other text, outside the
     # handler's error handling, so such a value is no caller rather than a failed invocation.

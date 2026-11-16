@@ -1,0 +1,19 @@
+# Remote state for a shared deployment: copy this file to backend.tf, fill in the bucket,
+# then run `terraform -chdir=terraform init -migrate-state` once to move the local state
+# into the bucket. Everyone who runs `make upgrade` then works on the same state, and the
+# lock file stops two applies at once.
+#
+# use_lockfile (S3 native locking, no DynamoDB table) needs Terraform 1.10 or later.
+# The bucket should have versioning on (a previous state can be restored), default
+# encryption, Block Public Access, and access limited to the operators who deploy.
+# The state holds the caller key and the Cognito client secrets: treat it as a secret.
+
+terraform {
+  backend "s3" {
+    bucket       = "my-terraform-state-bucket"
+    key          = "kube-handrail/terraform.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}

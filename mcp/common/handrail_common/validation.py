@@ -133,7 +133,7 @@ def require_override_flag(args: Mapping[str, Any]) -> bool:
 
 
 def require_verify_args(
-    args: Mapping[str, Any], enabled: bool, window_bounds: tuple[int, int], revert_allowed: bool
+    args: Mapping[str, Any], window_bounds: tuple[int, int], revert_allowed: bool
 ) -> tuple[int | None, bool]:
     """Optional `verify_window_seconds` and `revert_on_failure` (mcp/CONTRACT.md, Verification
     and revert); returns (the window, or None when not given, and the revert flag)."""
@@ -155,8 +155,6 @@ def require_verify_args(
         raise GuardError(
             INVALID_ARGUMENT, "revert_on_failure needs an explicit verify_window_seconds"
         )
-    if (window is not None or revert) and not enabled:
-        raise GuardError(INVALID_ARGUMENT, "verification is not enabled on this server")
     return window, revert
 
 

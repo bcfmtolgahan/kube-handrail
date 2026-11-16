@@ -238,6 +238,8 @@ def test_settings_read_the_parameter_name():
         "ALLOWED_NAMESPACES": "sandbox",
         "MIN_REPLICAS": "0",
         "MAX_REPLICAS": "5",
+        "AGENTS": '{"client-a": {"name": "smoke_test"}}',
+        "AGENT_KILL_SWITCH_PREFIX": "/kh/agents/",
     }
     assert load_settings(base).freezes_param is None
     assert load_settings(base | {"FREEZES_PARAM": PARAM}).freezes_param == PARAM

@@ -132,7 +132,7 @@ class FakeSNS:
 
 
 def settings(
-    devops: bool = True, expect_elevated: bool = True, interceptor: str | None = INTERCEPTOR
+    devops: bool = True, expect_elevated: bool = True, interceptor: str = INTERCEPTOR
 ) -> handler.SentinelSettings:
     return handler.SentinelSettings(
         gateway_id="gw",
@@ -369,6 +369,7 @@ ENV = {
     "METRIC_NAMESPACE": "ns",
     "TOOL_CLASSIFICATION": json.dumps(CLASSIFICATION),
     "EXPECT_ALLOWED_CLIENTS": json.dumps(list(CLIENTS)),
+    "EXPECT_INTERCEPTOR_ARN": INTERCEPTOR,
 }
 
 
@@ -376,9 +377,7 @@ def test_settings_parse():
     s = handler.load_sentinel_settings(ENV)
     assert s.classification == CLASSIFICATION
     assert (s.agent_space_id, s.association_id, s.expect_elevated_actions) == (None, None, True)
-    assert (s.expect_interceptor_arn, s.expect_allowed_clients) == (None, frozenset(CLIENTS))
-    s = handler.load_sentinel_settings(ENV | {"EXPECT_INTERCEPTOR_ARN": INTERCEPTOR})
-    assert s.expect_interceptor_arn == INTERCEPTOR
+    assert (s.expect_interceptor_arn, s.expect_allowed_clients) == (INTERCEPTOR, frozenset(CLIENTS))
     s = handler.load_sentinel_settings(
         ENV | {"AGENT_SPACE_ID": "a", "ASSOCIATION_ID": "b", "EXPECT_ELEVATED_ACTIONS": "false"}
     )
@@ -389,6 +388,7 @@ def test_settings_parse():
     "override",
     [
         {"GATEWAY_ID": ""},
+        {"EXPECT_INTERCEPTOR_ARN": ""},
         {"AGENT_SPACE_ID": "a"},
         {"EXPECT_ELEVATED_ACTIONS": "yes"},
         {"TOOL_CLASSIFICATION": "{}"},
@@ -482,14 +482,6 @@ def test_a_client_missing_from_the_gateway_is_not_drift(ssm):
     assert handler.run(rt)["status"] == "ok"
 
 
-def test_without_an_expected_interceptor_only_the_clients_are_checked(ssm):
-    rt = runtime(ssm, interceptor=None)
-    rt.gateway.interceptors = []
-    assert handler.run(rt)["status"] == "ok"
-    rt.gateway.allowed_clients = [*CLIENTS, "client-z"]
-    assert handler.run(rt)["status"] == "drift"
-
-
 def test_a_get_gateway_error_is_unknown(ssm):
     rt = runtime(ssm)
     rt.gateway.config_error = throttled("GetGateway")
@@ -506,3 +498,15 @@ def test_an_unreadable_interceptor_configuration_is_unknown(ssm):
     rt = runtime(ssm)
     rt.gateway.interceptors = [{"interceptionPoints": ["REQUEST"]}]
     assert handler.run(rt)["status"] == "unknown"
+
+
+@pytest.mark.parametrize("value", ["false:upgrade:abc123", "off"])
+def test_drift_leaves_any_value_other_than_true_alone(ssm, value):
+    # make upgrade turns the switch off with its own marker; the sentinel must not
+    # overwrite it, or the upgrade can no longer tell that the switch is its own.
+    ssm.put_parameter(Name=PARAM, Value=value, Type="String", Overwrite=True)
+    devops = FakeDevOps()
+    devops.classifications[WRITE_TOOL] = "READ_ONLY"
+    result = handler.run(runtime(ssm, devops))
+    assert result["kill_switch"] == "already_off"
+    assert kill_switch(ssm)[0] == value

@@ -45,6 +45,9 @@ def _load_handler():
 
 handler = _load_handler()
 
+SMOKE = Agent(name="smoke_test", client_id="client-a", hourly_apply_budget=2)
+DEVOPS = Agent(name="devops_agent", client_id="client-b", hourly_apply_budget=10)
+SWITCHES = "/handrail/agents/"
 SETTINGS = Settings(
     cluster_name="test-cluster",
     plans_table=TABLE,
@@ -54,7 +57,24 @@ SETTINGS = Settings(
     plan_ttl_seconds=300,
     remediation_enabled_param=None,
     region=REGION,
+    agents={"client-a": SMOKE, "client-b": DEVOPS},
+    agent_kill_switch_prefix=SWITCHES,
 )
+
+
+@pytest.fixture(autouse=True)
+def default_caller(monkeypatch):
+    """Every call comes from the verified caller client-a (smoke_test) on the gateway
+    channel, as dispatch binds it; lambda_handler calls get the same caller."""
+
+    def pop_caller(args, env=None):
+        args.pop("_kube_handrail_caller", None)
+        return "client-a"
+
+    monkeypatch.setattr("handrail_common.dispatch.pop_caller", pop_caller)
+    tokens = bind_caller("client-a", "gateway")
+    yield
+    unbind_caller(tokens)
 
 
 def deployment(
@@ -154,8 +174,18 @@ def clients(table):
         core=core,
         discovery=discovery,
         store=PlanStore(table),
-        ssm=boto3.client("ssm", region_name=REGION),
+        ssm=_ssm_with_agent_switches(),
     )
+
+
+def _ssm_with_agent_switches():
+    """Both agents' kill switches on."""
+    ssm = boto3.client("ssm", region_name=REGION)
+    for agent in (SMOKE, DEVOPS):
+        ssm.put_parameter(
+            Name=f"{SWITCHES}{agent.name}/enabled", Value="true", Type="String", Overwrite=True
+        )
+    return ssm
 
 
 def plan(clients, **overrides):
@@ -908,7 +938,7 @@ def request(clients, plan_id: str, now: int = NOW, settings=APPROVAL_SETTINGS, *
 def test_plan_record_keeps_requester_status_override_and_impact(clients, table):
     data = plan(clients)["data"]
     item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
-    assert item["requested_by"] == "mcp-gateway"
+    assert item["requested_by"] == "agent:smoke_test"
     assert item["status"] == "planned"
     assert item["override_manual_change"] is False
     assert item["impact"]["pods"]["added"] == 1
@@ -967,6 +997,9 @@ def test_request_approval_is_refused_in_client_mode(approvals, table):
     with pytest.raises(GuardError) as exc:
         request(approvals, plan_id, settings=settings)
     assert exc.value.code == "invalid_argument"
+    # What to do, then the earlier message that guidance of earlier releases looks for.
+    assert exc.value.message.startswith("client mode: apply directly, your client asks the human")
+    assert "approval is handled by the client in client mode" in exc.value.message
     record = table.get_item(Key={"plan_id": plan_id})["Item"]
     assert (record["status"], record["expires_at"]) == ("planned", NOW + 300)
     assert approvals.sns.messages == []
@@ -1862,15 +1895,7 @@ def test_lambda_handler_plans_a_rollback_through_dispatch(wired):
 
 # --- Agent identity -----------------------------------------------------------
 
-SMOKE = Agent(name="smoke_test", client_id="client-a", hourly_apply_budget=2)
-DEVOPS = Agent(name="devops_agent", client_id="client-b", hourly_apply_budget=10)
-SWITCHES = "/handrail/agents/"
-IDENTITY_SETTINGS = dataclasses.replace(
-    APPROVAL_SETTINGS,
-    identity_required=True,
-    agents={"client-a": SMOKE, "client-b": DEVOPS},
-    agent_kill_switch_prefix=SWITCHES,
-)
+IDENTITY_SETTINGS = APPROVAL_SETTINGS
 
 
 def set_agent_switch(clients, name: str, value: str) -> None:
@@ -1906,14 +1931,6 @@ def test_identity_plan_records_the_agent_and_its_client(clients, table, caller):
     assert (item["agent"], item["requested_client_id"]) == ("smoke_test", "client-a")
     # The agent is bound by the consume condition, not by the approved arguments.
     assert item["args_hash"] == scale_args_hash("sandbox", "web", 3)
-
-
-def test_legacy_plan_names_the_gateway_and_no_agent(clients, table, caller):
-    caller("client-a")
-    data = plan(clients)["data"]
-    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
-    assert data["requested_by"] == item["requested_by"] == "mcp-gateway"
-    assert "agent" not in item and "requested_client_id" not in item
 
 
 @pytest.mark.parametrize("value", [None, "unknown", "client-z"])
@@ -1976,13 +1993,6 @@ def test_identity_plan_reports_the_agent_checks_in_preflight(clients, caller):
     assert all("skipped" not in c for c in preflight if c["check"] != "plan_rate")
 
 
-def test_legacy_plan_reports_the_agent_checks_as_skipped(clients):
-    preflight = plan(clients)["data"]["preflight"]
-    skipped = [c["check"] for c in preflight if c.get("skipped")]
-    assert skipped == ["agent_enabled", "plan_rate", "agent_budget"]
-    assert all(c["passed"] for c in preflight)
-
-
 def test_identity_plan_refuses_an_agent_switched_off_before_any_cluster_read(
     clients, table, caller
 ):
@@ -2043,7 +2053,7 @@ def test_identity_request_approval_refuses_an_agent_switched_off(approvals, tabl
 
 # --- Verification ---------------------------------------------------------------
 
-VERIFY_SETTINGS = dataclasses.replace(SETTINGS, verify_enabled=True)
+VERIFY_SETTINGS = SETTINGS
 
 
 def verified_plan(clients, **overrides):
@@ -2059,7 +2069,6 @@ def test_plan_records_the_default_window_without_hashing_it(clients, table):
     assert item["args_hash"] == scale_args_hash("sandbox", "web", 3)
     assert "verify_window_seconds" not in item["args"]
     assert item["retain_until"] == NOW + retention_seconds(VERIFY_SETTINGS)
-    assert retention_seconds(VERIFY_SETTINGS) == retention_seconds(SETTINGS) + 1800 + 300
 
 
 def test_plan_pins_a_window_it_was_given(clients, table):
@@ -2069,12 +2078,6 @@ def test_plan_pins_a_window_it_was_given(clients, table):
     assert item["verify_window_seconds"] == 60
     assert item["args"]["verify_window_seconds"] == 60
     assert item["args_hash"] == scale_args_hash("sandbox", "web", 3, verify_window_seconds=60)
-
-
-def test_plan_without_verification_has_no_verification_block(clients, table):
-    data = plan(clients)["data"]
-    assert "verification" not in data
-    assert "verify_window_seconds" not in table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
 
 
 @pytest.mark.parametrize(
@@ -2093,10 +2096,6 @@ def test_plan_refuses_bad_verify_arguments(clients, table, overrides):
     assert exc.value.code == "invalid_argument"
     assert table.scan()["Count"] == 0
     clients.apps.read_namespaced_deployment.assert_not_called()
-
-
-def test_plan_refuses_a_window_when_verification_is_off(clients):
-    assert plan_error(clients, verify_window_seconds=60) == "invalid_argument"
 
 
 def test_restart_and_rollback_plans_take_a_window(clients, table):
@@ -2244,12 +2243,6 @@ def test_plan_with_revert_needs_a_revert_target_within_bounds(clients, table):
         )
     assert exc.value.code == "out_of_bounds" and "revert target" in exc.value.message
     assert table.scan()["Count"] == 0
-
-
-def test_plan_with_revert_needs_verification_on_the_server(clients):
-    assert plan_error(clients, verify_window_seconds=60, revert_on_failure=True) == (
-        "invalid_argument"
-    )
 
 
 def test_plan_outcome_of_a_reverted_change_and_its_revert(clients):

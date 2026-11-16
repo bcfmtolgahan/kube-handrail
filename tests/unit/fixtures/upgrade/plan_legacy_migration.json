@@ -1,0 +1,474 @@
+{
+ "format_version": "1.2",
+ "terraform_version": "1.9.8",
+ "planned_values": {
+  "root_module": {}
+ },
+ "resource_changes": [
+  {
+   "address": "aws_bedrockagentcore_gateway.this",
+   "mode": "managed",
+   "type": "aws_bedrockagentcore_gateway",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "gateway_id": "gw-abc123",
+     "name": "kh-test",
+     "protocol_type": "MCP",
+     "interceptor_configuration": [
+      {
+       "interception_points": [
+        "REQUEST"
+       ],
+       "interceptor": [
+        {
+         "lambda": [
+          {
+           "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-interceptor"
+          }
+         ]
+        }
+       ],
+       "input_configuration": [
+        {
+         "pass_request_headers": true
+        }
+       ]
+      }
+     ]
+    },
+    "after": {
+     "gateway_id": "gw-abc123",
+     "name": "kh-test",
+     "protocol_type": "MCP",
+     "interceptor_configuration": [
+      {
+       "interception_points": [
+        "REQUEST"
+       ],
+       "interceptor": [
+        {
+         "lambda": [
+          {
+           "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-interceptor"
+          }
+         ]
+        }
+       ],
+       "input_configuration": [
+        {
+         "pass_request_headers": true
+        }
+       ]
+      }
+     ]
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_bedrockagentcore_gateway_target.this[\"k8s_read\"]",
+   "mode": "managed",
+   "type": "aws_bedrockagentcore_gateway_target",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "k8sr"
+    },
+    "after": {
+     "name": "k8sr"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "k8s_read"
+  },
+  {
+   "address": "aws_bedrockagentcore_gateway_target.this[\"k8s_write\"]",
+   "mode": "managed",
+   "type": "aws_bedrockagentcore_gateway_target",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "k8sw"
+    },
+    "after": {
+     "name": "k8sw"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "k8s_write"
+  },
+  {
+   "address": "aws_cognito_user_pool.this",
+   "mode": "managed",
+   "type": "aws_cognito_user_pool",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "kh-test"
+    },
+    "after": {
+     "name": "kh-test"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_cognito_user_pool_client.this[\"devops_agent\"]",
+   "mode": "managed",
+   "type": "aws_cognito_user_pool_client",
+   "name": "this",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "kh-test-devops-agent"
+    },
+    "after": {
+     "name": "kh-test-devops-agent"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "devops_agent"
+  },
+  {
+   "address": "aws_dynamodb_table.plans",
+   "mode": "managed",
+   "type": "aws_dynamodb_table",
+   "name": "plans",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "kh-test-plans"
+    },
+    "after": {
+     "name": "kh-test-plans"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_s3_bucket.audit[0]",
+   "mode": "managed",
+   "type": "aws_s3_bucket",
+   "name": "audit",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "bucket": "kh-test-audit-111122223333"
+    },
+    "after": {
+     "bucket": "kh-test-audit-111122223333"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": 0
+  },
+  {
+   "address": "aws_ssm_parameter.kill_switch",
+   "mode": "managed",
+   "type": "aws_ssm_parameter",
+   "name": "kill_switch",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "/kh-test/remediation-enabled"
+    },
+    "after": {
+     "name": "/kh-test/remediation-enabled"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_ssm_parameter.freezes",
+   "mode": "managed",
+   "type": "aws_ssm_parameter",
+   "name": "freezes",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "/kh-test/freezes"
+    },
+    "after": {
+     "name": "/kh-test/freezes"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_ssm_parameter.agent_enabled[\"devops_agent\"]",
+   "mode": "managed",
+   "type": "aws_ssm_parameter",
+   "name": "agent_enabled",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "before": {
+     "name": "/kh-test/agents/devops_agent/enabled"
+    },
+    "after": {
+     "name": "/kh-test/agents/devops_agent/enabled"
+    },
+    "after_unknown": {},
+    "before_sensitive": {},
+    "after_sensitive": {}
+   },
+   "index": "devops_agent"
+  },
+  {
+   "address": "terraform_data.caller_key",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "caller_key",
+   "provider_name": "terraform.io/builtin/terraform",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "caller_key"
+    },
+    "after_unknown": {
+     "arn": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_iam_role.interceptor",
+   "mode": "managed",
+   "type": "aws_iam_role",
+   "name": "interceptor",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "interceptor"
+    },
+    "after_unknown": {
+     "arn": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_cloudwatch_log_group.interceptor",
+   "mode": "managed",
+   "type": "aws_cloudwatch_log_group",
+   "name": "interceptor",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "interceptor"
+    },
+    "after_unknown": {
+     "arn": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_iam_role_policy.interceptor",
+   "mode": "managed",
+   "type": "aws_iam_role_policy",
+   "name": "interceptor",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "interceptor"
+    },
+    "after_unknown": {
+     "arn": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_lambda_function.interceptor",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "interceptor",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "interceptor"
+    },
+    "after_unknown": {
+     "arn": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_iam_role.verifier",
+   "mode": "managed",
+   "type": "aws_iam_role",
+   "name": "verifier",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "verifier"
+    },
+    "after_unknown": {
+     "arn": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_lambda_function.verifier",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "verifier",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "verifier"
+    },
+    "after_unknown": {
+     "arn": true
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  },
+  {
+   "address": "aws_lambda_function.approver",
+   "mode": "managed",
+   "type": "aws_lambda_function",
+   "name": "approver",
+   "provider_name": "registry.terraform.io/hashicorp/aws",
+   "change": {
+    "actions": [
+     "update"
+    ],
+    "before": {
+     "function_name": "kh-test-approver",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-approver",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "old",
+     "environment": [
+      {
+       "variables": {
+        "DENIED_PRINCIPALS": "arn:aws:iam::111122223333:role/kh-test-k8s-read"
+       }
+      }
+     ]
+    },
+    "after": {
+     "function_name": "kh-test-approver",
+     "arn": "arn:aws:lambda:eu-west-1:111122223333:function:kh-test-approver",
+     "runtime": "python3.12",
+     "handler": "handler.lambda_handler",
+     "source_code_hash": "old",
+     "environment": [
+      {
+       "variables": {}
+      }
+     ]
+    },
+    "after_unknown": {
+     "environment": [
+      {
+       "variables": {
+        "DENIED_PRINCIPALS": true
+       }
+      }
+     ]
+    },
+    "before_sensitive": {},
+    "after_sensitive": {}
+   }
+  }
+ ],
+ "output_changes": {},
+ "configuration": {
+  "root_module": {}
+ },
+ "timestamp": "2026-11-16T10:00:00Z",
+ "applyable": true,
+ "complete": true,
+ "errored": false
+}

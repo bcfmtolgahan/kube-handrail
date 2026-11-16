@@ -301,13 +301,16 @@ SETTINGS = load_settings(
         "ALLOWED_NAMESPACES": "sandbox",
         "MIN_REPLICAS": "0",
         "MAX_REPLICAS": "5",
+        "AGENTS": '{"client-a": {"name": "smoke_test"}}',
+        "AGENT_KILL_SWITCH_PREFIX": "/kh/agents/",
     }
 )
 
 
 def test_retention_covers_the_longest_window_plus_plan_lifetime():
-    # The longest a plan lives: the approval wait (900) plus the apply window after it (120).
-    assert retention_seconds(SETTINGS) == 3600 + 900 + 120 + APPLY_GRACE_SECONDS
+    # The longest a plan lives: the approval wait (900) plus the apply window after it (120),
+    # then the longest verification window (1800) and its grace period (300).
+    assert retention_seconds(SETTINGS) == 3600 + 900 + 120 + APPLY_GRACE_SECONDS + 1800 + 300
     assert max_plan_lifetime(SETTINGS) == 1020
 
 
@@ -462,7 +465,7 @@ def test_check_history_runs_the_cooldown_first():
 
 def test_retention_covers_a_long_cooldown():
     settings = replace(SETTINGS, apply_cooldown_seconds=7200)
-    assert retention_seconds(settings) == 7200 + 1020 + APPLY_GRACE_SECONDS
+    assert retention_seconds(settings) == 7200 + 1020 + APPLY_GRACE_SECONDS + 1800 + 300
 
 
 # --- Replica baseline -------------------------------------------------------

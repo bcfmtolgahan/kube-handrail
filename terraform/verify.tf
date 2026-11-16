@@ -7,17 +7,15 @@
 # itself has no access to the cluster or the kill switch.
 
 locals {
-  verify_count  = var.verify_enabled ? 1 : 0
   verifier_name = "${var.name_prefix}-verifier"
 
   verifier_metric_namespace = "${var.name_prefix}/verifier"
   # The alarms notify the alert topic, which the drift sentinel creates, so they need both.
-  verifier_alarm_count = var.verify_enabled && var.sentinel_enabled ? 1 : 0
+  verifier_alarm_count = var.sentinel_enabled ? 1 : 0
 
   # Written only by the write role: the schedule and the pinned revert target by the
   # consume, the rest by the verifier channel. Denied to the read role with the approval
-  # attributes, so a changed record cannot trigger or redirect a revert. Constant whether
-  # or not verification is enabled.
+  # attributes, so a changed record cannot trigger or redirect a revert.
   verify_attributes = [
     "verify_at",
     "verify_queue",
@@ -30,26 +28,20 @@ locals {
 }
 
 resource "aws_iam_role" "verifier" {
-  count = local.verify_count
-
   name               = local.verifier_name
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
 }
 
 resource "aws_cloudwatch_log_group" "verifier" {
-  count = local.verify_count
-
   name              = "/aws/lambda/${local.verifier_name}"
   retention_in_days = var.log_retention_days
 }
 
 data "aws_iam_policy_document" "verifier" {
-  count = local.verify_count
-
   statement {
     sid       = "Logs"
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["${aws_cloudwatch_log_group.verifier[0].arn}:*"]
+    resources = ["${aws_cloudwatch_log_group.verifier.arn}:*"]
   }
 
   statement {
@@ -66,18 +58,14 @@ data "aws_iam_policy_document" "verifier" {
 }
 
 resource "aws_iam_role_policy" "verifier" {
-  count = local.verify_count
-
   name   = "runtime"
-  role   = aws_iam_role.verifier[0].id
-  policy = data.aws_iam_policy_document.verifier[0].json
+  role   = aws_iam_role.verifier.id
+  policy = data.aws_iam_policy_document.verifier.json
 }
 
 resource "aws_lambda_function" "verifier" {
-  count = local.verify_count
-
   function_name = local.verifier_name
-  role          = aws_iam_role.verifier[0].arn
+  role          = aws_iam_role.verifier.arn
   runtime       = local.runtime
   architectures = [local.architecture]
   handler       = local.handler
@@ -103,28 +91,22 @@ resource "aws_lambda_function" "verifier" {
 
 # One minute is the shortest rate a scheduled rule supports.
 resource "aws_cloudwatch_event_rule" "verifier" {
-  count = local.verify_count
-
   name                = local.verifier_name
   description         = "Runs the kube-handrail verifier."
   schedule_expression = "rate(1 minute)"
 }
 
 resource "aws_cloudwatch_event_target" "verifier" {
-  count = local.verify_count
-
-  rule = aws_cloudwatch_event_rule.verifier[0].name
-  arn  = aws_lambda_function.verifier[0].arn
+  rule = aws_cloudwatch_event_rule.verifier.name
+  arn  = aws_lambda_function.verifier.arn
 }
 
 resource "aws_lambda_permission" "verifier" {
-  count = local.verify_count
-
   statement_id  = "AllowSchedule"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.verifier[0].function_name
+  function_name = aws_lambda_function.verifier.function_name
   principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.verifier[0].arn
+  source_arn    = aws_cloudwatch_event_rule.verifier.arn
 }
 
 # Every run emits Runs = 1, so no data means verifications are not running at all.
@@ -154,7 +136,7 @@ resource "aws_cloudwatch_metric_alarm" "verifier_errors" {
   alarm_description   = "The verifier failed (timeout or start-up error). Plans it did not reach stay due and are retried every minute until their grace period ends."
   namespace           = "AWS/Lambda"
   metric_name         = "Errors"
-  dimensions          = { FunctionName = aws_lambda_function.verifier[0].function_name }
+  dimensions          = { FunctionName = aws_lambda_function.verifier.function_name }
   statistic           = "Sum"
   period              = 300
   evaluation_periods  = 1
@@ -196,4 +178,41 @@ resource "aws_cloudwatch_metric_alarm" "verifier_reverts" {
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "notBreaching"
   alarm_actions       = [aws_sns_topic.alerts[0].arn]
+}
+
+# The resources had count = 1 while verify_enabled was optional; existing deployments keep
+# them under their new addresses. The alarms keep their count (sentinel_enabled).
+moved {
+  from = aws_iam_role.verifier[0]
+  to   = aws_iam_role.verifier
+}
+
+moved {
+  from = aws_cloudwatch_log_group.verifier[0]
+  to   = aws_cloudwatch_log_group.verifier
+}
+
+moved {
+  from = aws_iam_role_policy.verifier[0]
+  to   = aws_iam_role_policy.verifier
+}
+
+moved {
+  from = aws_lambda_function.verifier[0]
+  to   = aws_lambda_function.verifier
+}
+
+moved {
+  from = aws_cloudwatch_event_rule.verifier[0]
+  to   = aws_cloudwatch_event_rule.verifier
+}
+
+moved {
+  from = aws_cloudwatch_event_target.verifier[0]
+  to   = aws_cloudwatch_event_target.verifier
+}
+
+moved {
+  from = aws_lambda_permission.verifier[0]
+  to   = aws_lambda_permission.verifier
 }

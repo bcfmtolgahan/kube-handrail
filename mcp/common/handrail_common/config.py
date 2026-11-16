@@ -58,18 +58,15 @@ class Settings:
     # Read Lambda only: where request_approval notifies, and the URL shown in the message.
     approval_topic_arn: str | None = None
     approval_url: str | None = None
-    # CALLER_INTERCEPTOR is "true": callers are verified OAuth clients, and planning,
-    # request_approval and gateway applies need one listed in `agents`.
-    identity_required: bool = False
-    # client_id => Agent, from AGENTS; empty unless identity_required.
+    # client_id => Agent, from AGENTS: callers are verified OAuth clients (the gateway
+    # interceptor), and planning, request_approval and gateway applies need one listed here.
     agents: Mapping[str, Agent] = field(default_factory=dict)
     # Per-agent kill switches are SSM parameters <prefix><name>/enabled.
     agent_kill_switch_prefix: str | None = None
     # Applies per agent in one clock hour, unless AGENTS sets the agent's own.
     agent_hourly_apply_budget: int = 10
-    # VERIFY_ENABLED is "true": applies schedule a verification (mcp/CONTRACT.md,
-    # Verification and revert), and plans may pin a window and revert_on_failure.
-    verify_enabled: bool = False
+    # Every apply schedules a verification (mcp/CONTRACT.md, Verification and revert), and
+    # plans may pin a window and revert_on_failure.
     verify_window_default_seconds: int = 120
     verify_window_min_seconds: int = 60
     verify_window_max_seconds: int = 1800
@@ -226,13 +223,10 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
     if write and param is None:
         raise ConfigError("REMEDIATION_ENABLED_PARAM is required")
 
-    # Without the interceptor nobody is verified, so AGENTS would name nobody (legacy mode).
-    identity = env.get("CALLER_INTERCEPTOR") == "true"
+    # Every caller is an agent: without AGENTS or the switch prefix the Lambda does not start.
     default_budget = limits["AGENT_HOURLY_APPLY_BUDGET"]
-    agents = parse_agents(required_env(env, "AGENTS"), default_budget) if identity else {}
-    switch_prefix = env.get("AGENT_KILL_SWITCH_PREFIX", "").strip() or None
-    if identity and switch_prefix is None:
-        raise ConfigError("AGENT_KILL_SWITCH_PREFIX is required")
+    agents = parse_agents(required_env(env, "AGENTS"), default_budget)
+    switch_prefix = required_env(env, "AGENT_KILL_SWITCH_PREFIX")
 
     return Settings(
         cluster_name=required_env(env, "CLUSTER_NAME"),
@@ -255,11 +249,9 @@ def load_settings(env: Mapping[str, str] | None = None, *, write: bool = False) 
         approval_request_limit=limits["APPROVAL_REQUEST_LIMIT"],
         approval_topic_arn=env.get("APPROVAL_TOPIC_ARN", "").strip() or None,
         approval_url=env.get("APPROVAL_URL", "").strip() or None,
-        identity_required=identity,
         agents=agents,
         agent_kill_switch_prefix=switch_prefix,
         agent_hourly_apply_budget=default_budget,
-        verify_enabled=env.get("VERIFY_ENABLED") == "true",
         verify_window_default_seconds=limits["VERIFY_WINDOW_DEFAULT_SECONDS"],
         verify_window_min_seconds=limits["VERIFY_WINDOW_MIN_SECONDS"],
         verify_window_max_seconds=limits["VERIFY_WINDOW_MAX_SECONDS"],

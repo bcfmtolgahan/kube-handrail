@@ -41,7 +41,7 @@ Call `request_approval(plan_id)` and follow the result exactly as in AGENTS.md, 
 
 - `approval_mode: server`: approvers were notified and their approval runs the change; do not call apply. Report the `plan_id` and expiry and end the procedure here.
 - `approval_mode: both`: wait for a human to say the plan was approved, then go to Step 4.
-- `invalid_argument` ("approval is handled by the client in client mode"): go to Step 4; your client asks the human for approval of the apply call.
+- `invalid_argument` ("client mode: apply directly, your client asks the human"): go to Step 4; your client asks the human for approval of the apply call.
 
 If a human rejects the plan, or the approval expires, stop. Do not plan the change again unless a human asks for it.
 

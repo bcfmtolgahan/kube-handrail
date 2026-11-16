@@ -74,7 +74,6 @@ locals {
     AGENT_KILL_SWITCH_PREFIX  = local.agent_kill_switch_prefix
     AGENT_HOURLY_APPLY_BUDGET = tostring(var.agent_hourly_apply_budget)
 
-    VERIFY_ENABLED                = tostring(var.verify_enabled)
     VERIFY_WINDOW_DEFAULT_SECONDS = tostring(var.verify_window_default_seconds)
     VERIFY_WINDOW_MIN_SECONDS     = tostring(var.verify_window_min_seconds)
     VERIFY_WINDOW_MAX_SECONDS     = tostring(var.verify_window_max_seconds)
@@ -92,10 +91,17 @@ locals {
     { for fn in keys(local.functions) : fn => "requirements.txt" },
     var.sentinel_enabled ? { sentinel = "mcp/sentinel/requirements.txt" } : {},
     { approver = "mcp/approver/requirements.txt" },
-    var.caller_interceptor_enabled ? { interceptor = "mcp/interceptor/requirements.txt" } : {},
-    var.verify_enabled ? { verifier = "mcp/verifier/requirements.txt" } : {},
+    { interceptor = "mcp/interceptor/requirements.txt" },
+    { verifier = "mcp/verifier/requirements.txt" },
     var.audit_enabled ? { audit = "mcp/audit/requirements.txt" } : {},
   )
+
+  # The tool set as registered: the targets' tool schemas and their classification.
+  # scripts/upgrade.py computes the same hash (tool_set_hash) from the working tree.
+  tool_set_hash = sha256(join("", concat(
+    [filesha256("${local.repo_root}/mcp/classification.json")],
+    [for fn in sort(keys(local.functions)) : filesha256("${local.repo_root}/mcp/${fn}/tools.json")],
+  )))
 
   # Tolerates a function directory that has no Python sources yet.
   source_hashes = {
@@ -361,7 +367,6 @@ resource "aws_lambda_function" "this" {
     variables = merge(
       local.common_env,
       each.value.kill_switch ? { REMEDIATION_ENABLED_PARAM = aws_ssm_parameter.kill_switch.name } : {},
-      { CALLER_INTERCEPTOR = tostring(var.caller_interceptor_enabled) },
       local.caller_key_env,
       each.value.approval_requests ? {
         APPROVAL_TOPIC_ARN = aws_sns_topic.approvals.arn
@@ -414,6 +419,13 @@ check "deprecated_plan_rate" {
   assert {
     condition     = var.plan_rate_limit == null && var.plan_rate_window_seconds == null
     error_message = "plan_rate_limit and plan_rate_window_seconds are deprecated and ignored: the plan rate limit was removed. Remove them from your tfvars; they will be deleted in a later release."
+  }
+}
+
+check "deprecated_switches" {
+  assert {
+    condition     = var.caller_interceptor_enabled == null && var.verify_enabled == null
+    error_message = "caller_interceptor_enabled and verify_enabled are deprecated and ignored: the interceptor and the verifier are always deployed, so false no longer turns either off. Remove them from your tfvars; they will be deleted in a later release."
   }
 }
 
@@ -614,7 +626,7 @@ resource "aws_iam_role" "gateway" {
 data "aws_iam_policy_document" "gateway" {
   statement {
     actions   = ["lambda:InvokeFunction"]
-    resources = concat([for fn in aws_lambda_function.this : fn.arn], aws_lambda_function.interceptor[*].arn)
+    resources = concat([for fn in aws_lambda_function.this : fn.arn], [aws_lambda_function.interceptor.arn])
   }
 }
 
@@ -637,18 +649,15 @@ resource "aws_bedrockagentcore_gateway" "this" {
     }
   }
 
-  dynamic "interceptor_configuration" {
-    for_each = aws_lambda_function.interceptor
-    content {
-      interception_points = ["REQUEST"]
-      interceptor {
-        lambda {
-          arn = interceptor_configuration.value.arn
-        }
+  interceptor_configuration {
+    interception_points = ["REQUEST"]
+    interceptor {
+      lambda {
+        arn = aws_lambda_function.interceptor.arn
       }
-      input_configuration {
-        pass_request_headers = true
-      }
+    }
+    input_configuration {
+      pass_request_headers = true
     }
   }
 
