@@ -232,10 +232,22 @@ class State:
 
     @classmethod
     def load(cls, path: Path) -> "State":
-        data = json.loads(path.read_text())
+        unreadable = UpgradeError(
+            f"cannot read {path.name}; finish the upgrade by hand (docs/deploy.md, Upgrading) "
+            "and delete the file"
+        )
+        try:
+            data = json.loads(path.read_text())
+        except ValueError:
+            raise unreadable from None
+        if not isinstance(data, dict):
+            raise unreadable
         if data.pop("version", None) != STATE_VERSION:
             raise UpgradeError(f"{path.name} was written by another version of this script")
-        return cls(**data)
+        try:
+            return cls(**data)
+        except TypeError:
+            raise unreadable from None
 
     def save(self, path: Path) -> None:
         payload = {"version": STATE_VERSION, **self.__dict__}
@@ -251,6 +263,10 @@ class State:
 class Result:
     returncode: int
     output: str
+    error: str = ""  # stderr, when it was captured apart from the output
+
+    def text(self) -> str:
+        return self.output + self.error
 
 
 Runner = Callable[[list[str]], Result]
@@ -271,7 +287,8 @@ def run_streaming(command: list[str]) -> Result:
 
 def run_quiet(command: list[str]) -> Result:
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    return Result(completed.returncode, completed.stdout + completed.stderr)
+    # stdout only in the output: a warning on stderr must not break the JSON it carries.
+    return Result(completed.returncode, completed.stdout, completed.stderr)
 
 
 class Terraform:
@@ -296,7 +313,7 @@ class Terraform:
     def outputs(self) -> dict[str, Any]:
         result = self.quiet(self._base("output", "-json"))
         if result.returncode != 0:
-            raise UpgradeError(f"terraform output failed: {result.output.strip()[-500:]}")
+            raise UpgradeError(f"terraform output failed: {result.text().strip()[-500:]}")
         try:
             raw = json.loads(result.output or "{}")
         except ValueError:
@@ -312,8 +329,14 @@ class Terraform:
             raise UpgradeError("terraform plan failed")
         shown = self.quiet(self._base("show", "-json", PLAN_FILE))
         if shown.returncode != 0:
-            raise UpgradeError(f"terraform show failed: {shown.output.strip()[-500:]}")
-        return json.loads(shown.output)
+            raise UpgradeError(f"terraform show failed: {shown.text().strip()[-500:]}")
+        try:
+            plan = json.loads(shown.output)
+        except ValueError:
+            raise UpgradeError("terraform show did not return JSON") from None
+        if not isinstance(plan, dict):
+            raise UpgradeError("terraform show did not return JSON")
+        return plan
 
     def apply_plan(self) -> Result:
         return self.stream(self._base("apply", "-input=false", "-lock-timeout=60s", PLAN_FILE))

@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -746,3 +747,39 @@ def test_a_tool_change_seen_only_by_the_retry_plan_turns_the_kill_switch_off(wor
     [(_, marker)] = ssm_writes_before_apply(world)
     assert marker.startswith(upgrade.MARKER_PREFIX)
     assert world.ssm.values[PARAM] == "true"
+
+
+# --- Bad input is a clean error ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        json.dumps({"version": upgrade.STATE_VERSION, "run_id": "x", "started_at": 0, "x": 1}),
+        json.dumps({"version": upgrade.STATE_VERSION}),
+        "{not json",
+        json.dumps([1]),
+    ],
+)
+def test_an_unreadable_state_file_is_an_upgrade_error(world, content):
+    world.state_path.write_text(content)
+    with pytest.raises(upgrade.UpgradeError, match="cannot read .upgrade-state.json"):
+        world.make(resume=True).run()
+    assert world.state_path.read_text() == content
+
+
+def test_plan_json_that_is_not_json_is_an_upgrade_error(tmp_path):
+    tf = upgrade.Terraform(
+        tmp_path,
+        [],
+        stream=lambda command: upgrade.Result(0, ""),
+        quiet=lambda command: upgrade.Result(0, "Warning: something\n{"),
+    )
+    with pytest.raises(upgrade.UpgradeError, match="terraform show did not return JSON"):
+        tf.plan()
+
+
+def test_run_quiet_keeps_stderr_out_of_the_output():
+    command = [sys.executable, "-c", "import sys; print('{}'); print('warn', file=sys.stderr)"]
+    result = upgrade.run_quiet(command)
+    assert (result.returncode, result.output.strip(), result.error.strip()) == (0, "{}", "warn")
