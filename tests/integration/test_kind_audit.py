@@ -54,3 +54,18 @@ def test_plan_and_apply_reach_the_bucket_once(kh):
     assert response == {
         "batchItemFailures": [{"itemIdentifier": first["dynamodb"]["SequenceNumber"]}]
     }
+
+
+def test_the_api_server_sees_the_user_agent(kh):
+    """The API server derives a patch's default field manager from the User-Agent's product
+    (before the first `/`), so the Deployment's managed fields show that the header reached
+    it. The full header (plan and correlation id) is only in the API server's audit log,
+    which the kind cluster of this suite does not enable."""
+    target = kh.create(deployment_manifest(unique("it-agent")))
+    plan_id = kh.plan(target, 2)
+    assert kh.apply(target, plan_id, 2)["ok"] is True
+    managers = {
+        (entry.manager, entry.operation)
+        for entry in kh.deployment(target["name"]).metadata.managed_fields or []
+    }
+    assert ("kube-handrail", "Update") in managers

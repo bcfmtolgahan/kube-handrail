@@ -17,7 +17,13 @@ from moto import mock_aws
 from handrail_common.breaker import LAST_PLAN_ANNOTATION, retention_seconds
 from handrail_common.config import Agent, Settings
 from handrail_common.freezes import format_time
-from handrail_common.observability import bind_caller, unbind_caller
+from handrail_common.observability import (
+    bind_caller,
+    bind_plan_id,
+    current_plan_id,
+    unbind_caller,
+    unbind_plan_id,
+)
 from handrail_common.plans import (
     PlanStore,
     object_key,
@@ -2358,3 +2364,26 @@ def test_plan_records_the_approval_mode(clients, table, caller, mode):
     )["data"]
     item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
     assert item["approval_mode"] == mode
+
+
+def test_plan_binds_its_plan_id_before_reading_the_cluster(clients, table, caller, monkeypatch):
+    caller("client-a")
+    seen = []
+    read = handler._read_deployment_raw
+
+    def spy(*args, **kwargs):
+        seen.append(current_plan_id())
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(handler, "_read_deployment_raw", spy)
+    token = bind_plan_id(None)
+    try:
+        data = handler.plan_scale_deployment(
+            {"namespace": "sandbox", "name": "web", "replicas": 3},
+            IDENTITY_SETTINGS,
+            clients,
+            NOW,
+        )["data"]
+    finally:
+        unbind_plan_id(token)
+    assert seen == [data["plan_id"]]
