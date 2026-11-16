@@ -81,7 +81,11 @@ OUTPUTS = {
     "plan_ttl_seconds": 60,
     "audit_bucket_name": None,
     "agent_client_ids": {"smoke_test": "client-a", "e2e_peer": "client-b"},
-    "guard_settings": {"apply_cooldown_seconds": 20, "agent_budgets": {"e2e_peer": 2}},
+    "guard_settings": {
+        "apply_cooldown_seconds": 20,
+        "agent_budgets": {"e2e_peer": 2},
+        "gitops_markers": ["app.kubernetes.io/instance"],
+    },
 }
 
 
@@ -95,8 +99,27 @@ def test_outputs_fill_only_unset_variables():
         "CLIENT_ID": "client-a",
         "CLIENT_ID_B": "client-b",
         "AGENT_BUDGET_B": "2",
+        "GITOPS_MARKERS": '["app.kubernetes.io/instance"]',
     }
 
 
 def test_no_outputs_fill_nothing():
     assert e2e_gateway.env_from_outputs({}, {}) == {}
+
+
+@pytest.mark.parametrize(
+    ("raw", "markers"),
+    [
+        (None, []),
+        ("", []),
+        ("[]", []),
+        ('["app.kubernetes.io/instance"]', ["app.kubernetes.io/instance"]),
+        ('"app.kubernetes.io/instance"', []),
+    ],
+)
+def test_gitops_markers_from_the_environment(monkeypatch, raw, markers):
+    if raw is None:
+        monkeypatch.delenv("GITOPS_MARKERS", raising=False)
+    else:
+        monkeypatch.setenv("GITOPS_MARKERS", raw)
+    assert e2e_gateway.gitops_markers() == markers

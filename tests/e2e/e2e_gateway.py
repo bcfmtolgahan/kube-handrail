@@ -19,7 +19,8 @@ Values the deployment knows are read from `terraform output -json` in --tf-dir (
 the repository's terraform/ directory) when that works, so they need not be exported:
 GATEWAY_URL, TOKEN_URL, KILL_SWITCH_PARAM, PLANS_TABLE, APPROVAL_URL, FREEZES_PARAM,
 AUDIT_BUCKET, CLIENT_ID and CLIENT_ID_B (by agent name), PLAN_TTL_SECONDS,
-APPLY_COOLDOWN_SECONDS, AGENT_BUDGET_B and the approval mode. A variable that is set
+APPLY_COOLDOWN_SECONDS, AGENT_BUDGET_B, GITOPS_MARKERS (a JSON array, default none) and
+the approval mode. A variable that is set
 always wins. The client secrets are never output and stay in the environment.
 
 --reset-counters deletes the current clock hour's apply counters (the global one and
@@ -189,6 +190,8 @@ FREEZE_REASON = "e2e freeze"
 FIXTURES = (TARGET["name"], FLAP["name"], MANUAL["name"])
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
 RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
+FLUX_LABEL = "kustomize.toolkit.fluxcd.io/name"
+INSTANCE_LABEL = "app.kubernetes.io/instance"
 CORRELATION_ANNOTATION = "kube-handrail.io/correlation-id"
 # The plan history index is eventually consistent; give a just-recorded apply time to show up.
 HISTORY_SETTLE_SECONDS = 3
@@ -652,8 +655,9 @@ async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
 
     plan_id = await gw.plan(TARGET, 2)
     try:
-        # The GitOps marker is a label, so only the re-check at apply time catches it.
-        kubectl("label", "deploy/e2e-target", "app.kubernetes.io/instance=e2e", "--overwrite")
+        # A Flux kustomize-controller label, one of the default markers, added after the
+        # plan: only the re-check at apply time catches it.
+        kubectl("label", "deploy/e2e-target", f"{FLUX_LABEL}=e2e", "--overwrite")
         await expect(
             gw,
             "apply after a GitOps label was added",
@@ -662,8 +666,22 @@ async def plan_tests(gw: Gateway, with_expiry: bool) -> None:
             "gitops_managed",
         )
     finally:
-        kubectl("label", "deploy/e2e-target", "app.kubernetes.io/instance-")
+        kubectl("label", "deploy/e2e-target", f"{FLUX_LABEL}-")
         reset_target()
+
+    try:
+        # Helm sets app.kubernetes.io/instance on every chart; alone it is a GitOps marker
+        # only when the deployment lists it in gitops_markers (GITOPS_MARKERS here).
+        listed = INSTANCE_LABEL in gitops_markers()
+        kubectl("label", "deploy/e2e-target", f"{INSTANCE_LABEL}=e2e", "--overwrite")
+        envelope = await gw.call(PLAN, {**TARGET, "replicas": 2})
+        report(
+            "plan with only the Helm instance label is refused only when it is in gitops_markers",
+            (code(envelope) == "gitops_managed") == listed,
+            f"{code(envelope) or 'ok'}, listed={listed}",
+        )
+    finally:
+        kubectl("label", "deploy/e2e-target", f"{INSTANCE_LABEL}-")
 
     plan_id = await gw.plan(TARGET, 2)
     try:
@@ -818,6 +836,12 @@ def injection_event(name: str, uid: str) -> dict[str, Any]:
     }
 
 
+def gitops_markers() -> list[str]:
+    """The deployment's gitops_markers, from GITOPS_MARKERS (a JSON array); none when unset."""
+    value = json.loads(os.environ.get("GITOPS_MARKERS") or "[]")
+    return [key for key in value if isinstance(key, str)] if isinstance(value, list) else []
+
+
 def is_test_table(name: str) -> bool:
     return bool(TEST_TABLE.fullmatch(name))
 
@@ -883,6 +907,8 @@ def env_from_outputs(outputs: dict[str, Any], env: dict[str, str]) -> dict[str, 
     values: dict[str, Any] = {var: outputs.get(name) for name, var in OUTPUT_ENV.items()}
     settings = outputs.get("guard_settings") or {}
     values["APPLY_COOLDOWN_SECONDS"] = settings.get("apply_cooldown_seconds")
+    if settings.get("gitops_markers") is not None:
+        values["GITOPS_MARKERS"] = json.dumps(settings["gitops_markers"])
     clients = outputs.get("agent_client_ids") or {}
     agent_a = env.get("AGENT_NAME", "smoke_test")
     agent_b = env.get("AGENT_NAME_B", "e2e_peer")
