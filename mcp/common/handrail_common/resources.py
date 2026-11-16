@@ -183,6 +183,11 @@ def evaluate_hpa(plan: Plan, hpa: Mapping[str, Any], target: Any) -> tuple[str, 
         return verify.UNKNOWN, verify.NOT_FOUND
     if getattr(target.spec, "paused", None) is True:
         return verify.UNKNOWN, verify.PAUSED
+    # The HPA moves the target's replicas on its own; its conditions and counts say nothing
+    # until the Deployment controller has seen that spec.
+    generation = getattr(target.metadata, "generation", None) or 0
+    if (getattr(target.status, "observed_generation", None) or 0) < generation:
+        return verify.UNKNOWN, verify.NOT_OBSERVED
     conditions = {str(c.get("type")): c for c in hpa_conditions(hpa)}
     able = conditions.get("AbleToScale")
     if able is not None and able.get("status") == "False":
@@ -201,7 +206,10 @@ def evaluate_hpa(plan: Plan, hpa: Mapping[str, Any], target: Any) -> tuple[str, 
     desired = DEFAULT_REPLICAS if target.spec.replicas is None else target.spec.replicas
     available = getattr(target.status, "available_replicas", None) or 0
     in_bounds = current is not None and plan.min_to <= current <= plan.max_to
-    if not in_bounds or not plan.min_to <= desired <= plan.max_to or available < desired:
+    # Reached is judged on the floor the plan guarantees: above min_to the HPA may be scaling
+    # up for load, and pods still starting there are not the plan's doing.
+    floor = min(desired, plan.min_to)
+    if not in_bounds or not plan.min_to <= desired <= plan.max_to or available < floor:
         return verify.DEGRADED, verify.TARGET_NOT_REACHED
     return verify.HEALTHY, verify.TARGET_REACHED
 

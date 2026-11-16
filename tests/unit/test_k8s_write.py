@@ -3024,7 +3024,9 @@ class FakeAutoscaling:
         return SimpleNamespace(data=json.dumps(result).encode())
 
 
-def target_deployment(replicas=2, available=None, conditions=None, annotations=None):
+def target_deployment(
+    replicas=2, available=None, conditions=None, annotations=None, observed_generation=8
+):
     available = replicas if available is None else available
     return k8s_models.V1Deployment(
         metadata=k8s_models.V1ObjectMeta(
@@ -3036,7 +3038,7 @@ def target_deployment(replicas=2, available=None, conditions=None, annotations=N
             template=k8s_models.V1PodTemplateSpec(),
         ),
         status=k8s_models.V1DeploymentStatus(
-            observed_generation=8,
+            observed_generation=observed_generation,
             replicas=replicas,
             available_replicas=available,
             conditions=conditions
@@ -3300,6 +3302,46 @@ def test_a_healthy_hpa_adjust_is_verified(hpa_rt):
             ),
             "unknown",
             "superseded",
+        ),
+        # The HPA scaled up within the new bounds and a pod is still starting: the floor
+        # the plan guarantees (3) is available, so the adjust did what it was for.
+        (
+            lambda fake, apps: (
+                fake.hpa["status"].update(currentReplicas=5),
+                setattr(
+                    apps.read_namespaced_deployment,
+                    "return_value",
+                    target_deployment(replicas=5, available=4),
+                ),
+            ),
+            "healthy",
+            "target_reached",
+        ),
+        # Below the new minimum: not reached.
+        (
+            lambda fake, apps: (
+                fake.hpa["status"].update(currentReplicas=3),
+                setattr(
+                    apps.read_namespaced_deployment,
+                    "return_value",
+                    target_deployment(replicas=3, available=2),
+                ),
+            ),
+            "degraded",
+            "target_not_reached",
+        ),
+        # The Deployment controller has not seen the target's latest spec yet.
+        (
+            lambda fake, apps: (
+                fake.hpa["status"].update(currentReplicas=5),
+                setattr(
+                    apps.read_namespaced_deployment,
+                    "return_value",
+                    target_deployment(replicas=5, available=3, observed_generation=7),
+                ),
+            ),
+            "unknown",
+            "not_observed",
         ),
     ],
 )
