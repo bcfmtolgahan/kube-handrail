@@ -59,6 +59,32 @@ def check_namespace_allowed(namespace: str, allowed: Collection[str]) -> None:
         raise GuardError(FORBIDDEN_NAMESPACE, f"namespace {namespace!r} is not allowed")
 
 
+def check_action_allowed(namespace: str, action: str, allowed_actions: Collection[str]) -> None:
+    """The namespace is allowed, but its policy does not allow this action (scale, restart,
+    rollback). Same code as a namespace that is not allowed at all; details name the action."""
+    if action not in allowed_actions:
+        raise GuardError(
+            FORBIDDEN_NAMESPACE,
+            f"action {action!r} is not allowed in namespace {namespace!r}",
+            {"action": action, "allowed_actions": sorted(allowed_actions)},
+        )
+
+
+# (namespace) => the actions it allows; Settings.actions_for.
+ActionsFor = Callable[[str], Collection[str]]
+
+
+def _check_scope(
+    namespace: str,
+    allowed: Collection[str],
+    action: str | None,
+    actions_for: ActionsFor | None,
+) -> None:
+    check_namespace_allowed(namespace, allowed)
+    if action is not None and actions_for is not None:
+        check_action_allowed(namespace, action, actions_for(namespace))
+
+
 def check_replica_bounds(replicas: int, minimum: int, maximum: int) -> None:
     if not minimum <= replicas <= maximum:
         raise GuardError(OUT_OF_BOUNDS, f"replicas must be between {minimum} and {maximum}")
@@ -86,13 +112,19 @@ def check_replica_step(replicas_from: int, replicas_to: int, percent: int) -> No
         )
 
 
-def validate_target_args(args: Mapping[str, Any], allowed: Collection[str]) -> tuple[str, str]:
-    """Guard checks 1-2 for a request that names only a Deployment; returns (namespace, name)."""
+def validate_target_args(
+    args: Mapping[str, Any],
+    allowed: Collection[str],
+    action: str | None = None,
+    actions_for: ActionsFor | None = None,
+) -> tuple[str, str]:
+    """Guard checks 1-2 for a request that names only a Deployment; returns (namespace, name).
+    With `action` and `actions_for`, the namespace must also allow that action."""
     if not isinstance(args, Mapping):
         raise GuardError(INVALID_ARGUMENT, "arguments must be an object")
     namespace = require_namespace(args.get("namespace"))
     name = require_name(args.get("name"))
-    check_namespace_allowed(namespace, allowed)
+    _check_scope(namespace, allowed, action, actions_for)
     return namespace, name
 
 
@@ -109,17 +141,19 @@ def validate_scale_args(
     args: Mapping[str, Any],
     allowed: Collection[str],
     bounds_for: Callable[[str], tuple[int, int]],
+    actions_for: ActionsFor | None = None,
 ) -> tuple[str, str, int]:
     """Guard checks 1-3 for a scale request; returns (namespace, name, replicas).
 
-    `bounds_for` gives the (minimum, maximum) replicas of an allowed namespace.
+    `bounds_for` gives the (minimum, maximum) replicas of an allowed namespace; with
+    `actions_for`, the namespace must also allow scale, which is checked before the bounds.
     """
     if not isinstance(args, Mapping):
         raise GuardError(INVALID_ARGUMENT, "arguments must be an object")
     namespace = require_namespace(args.get("namespace"))
     name = require_name(args.get("name"))
     replicas = require_int(args.get("replicas"), "replicas")
-    check_namespace_allowed(namespace, allowed)
+    _check_scope(namespace, allowed, "scale", actions_for)
     check_replica_bounds(replicas, *bounds_for(namespace))
     return namespace, name, replicas
 
