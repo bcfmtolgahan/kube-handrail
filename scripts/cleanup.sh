@@ -167,8 +167,15 @@ else
   if ! compgen -G "$k8s_dir/*.yaml" >/dev/null; then
     echo "skip: rendered manifests (no build/k8s; delete the kube-handrail Roles, the ClusterRole kube-handrail-policy-reader and the policy kube-handrail-writer-bounds by hand)"
   elif confirm "Delete the rendered manifests in build/k8s (RBAC in every policy namespace, ClusterRole kube-handrail-policy-reader, admission policy) from context ${context}?"; then
-    kubectl delete -f "$k8s_dir" --ignore-not-found
-    kubectl label namespace -l kube-handrail.io/managed=true kube-handrail.io/managed- || true
+    # The rendered files by name, and the label only on the namespaces they name: another
+    # deployment's namespaces on a shared cluster keep theirs.
+    files=()
+    for f in "$k8s_dir"/*.yaml; do files+=(-f "$f"); done
+    namespaces="$(sed -n 's/^  namespace: //p' "$k8s_dir"/*.yaml | sort -u)"
+    kubectl delete "${files[@]}" --ignore-not-found
+    for ns in $namespaces; do
+      kubectl label namespace "$ns" kube-handrail.io/managed- 2>/dev/null || true
+    done
     rm -rf "$k8s_dir"
   fi
   if confirm "Delete k8s/sandbox (namespace kube-handrail-sandbox and its web Deployment) from context ${context}?"; then
