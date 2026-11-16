@@ -2342,8 +2342,9 @@ def set_binding_actions(actions: list[str]) -> None:
 
 
 def namespace_preconditions() -> bool:
-    """SECOND_NAMESPACE allows restart only and does not list the operator, as far as the
-    namespaces output tells; without it the cases run and say what they find."""
+    """SECOND_NAMESPACE allows restart only, as far as the namespaces output tells; without
+    it the cases run and say what they find. That the operator is not one of its approvers
+    is not checked here: if it is, the server-mode case fails, which shows it."""
     policy = namespace_policy().get(second_namespace())
     if not namespace_policy():
         print("namespaces output unknown: the preconditions are not checked", flush=True)
