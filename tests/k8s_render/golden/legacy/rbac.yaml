@@ -1,0 +1,86 @@
+# Rendered by Terraform (terraform/modules/namespace-policy) from var.namespaces; do not
+# edit. Bound to the kubernetes_groups of the two EKS access entries (mcp/CONTRACT.md,
+# Identity). Every namespace gets the reader Role; the writer Role only where the policy
+# allows an action. The Lambdas tell scale, restart and rollback apart (all three patch
+# the Deployment); RBAC only drops the ReplicaSet read where rollback is not allowed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-handrail-reader
+  namespace: kube-handrail-sandbox
+  labels:
+    app.kubernetes.io/part-of: kube-handrail
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list"]
+  # Impact preview. No pods: ready counts come from the Deployment status and EndpointSlices.
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list"]
+  # get_workload_events, get_rollout_history and plan_rollback_deployment. Events name
+  # Pods; the reader still cannot read them.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kube-handrail-reader
+  namespace: kube-handrail-sandbox
+  labels:
+    app.kubernetes.io/part-of: kube-handrail
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kube-handrail-reader
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: kube-handrail-reader
+---
+# Actions allowed in kube-handrail-sandbox: restart, rollback, scale.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-handrail-writer
+  namespace: kube-handrail-sandbox
+  labels:
+    app.kubernetes.io/part-of: kube-handrail
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+  # apply_rollback_deployment re-reads the ReplicaSet the plan pinned.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kube-handrail-writer
+  namespace: kube-handrail-sandbox
+  labels:
+    app.kubernetes.io/part-of: kube-handrail
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kube-handrail-writer
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: kube-handrail-writer

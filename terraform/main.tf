@@ -47,12 +47,14 @@ locals {
   # it in the chat within this TTL alone. Not a guard: apply re-checks everything.
   plan_ttl = coalesce(var.plan_ttl_seconds, var.approval_mode == "client" ? 900 : 300)
 
+  # ALLOWED_NAMESPACES: the namespaces of the policy (k8s.tf), whose content is in the
+  # package. Known when the existing Lambdas are planned: it comes from variables only.
   common_env = {
     CLUSTER_NAME       = var.cluster_name
     PLANS_TABLE        = aws_dynamodb_table.plans.name
-    ALLOWED_NAMESPACES = var.sandbox_namespace
-    MIN_REPLICAS       = tostring(var.min_replicas)
-    MAX_REPLICAS       = tostring(var.max_replicas)
+    ALLOWED_NAMESPACES = module.namespace_policy.allowed_namespaces
+    MIN_REPLICAS       = tostring(local.legacy_min_replicas)
+    MAX_REPLICAS       = tostring(local.legacy_max_replicas)
     PLAN_TTL_SECONDS   = tostring(local.plan_ttl)
     # From a variable, so it is known when the existing Lambdas are planned.
     GITOPS_MARKERS = jsonencode(var.gitops_markers)
@@ -103,9 +105,14 @@ locals {
     [for fn in sort(keys(local.functions)) : filesha256("${local.repo_root}/mcp/${fn}/tools.json")],
   )))
 
-  # Tolerates a function directory that has no Python sources yet.
+  # The packages that carry namespace_policy.json (k8s.tf): the tool Lambdas and the approver.
+  policy_packages = ["k8s_read", "k8s_write", "approver"]
+
+  # Tolerates a function directory that has no Python sources yet. The policy is hashed as
+  # content: the file only exists once the build has run.
   source_hashes = {
     for fn, requirements in local.packages : fn => sha256(join("", concat(
+      contains(local.policy_packages, fn) ? [sha256(local.namespace_policy_json)] : [],
       [filesha256("${local.repo_root}/${requirements}")],
       [for f in sort(fileset(local.common_dir, "**/*.py")) : filesha256("${local.common_dir}/${f}")],
       [for f in sort(fileset("${local.repo_root}/mcp/${fn}", "**/*.py")) : filesha256("${local.repo_root}/mcp/${fn}/${f}")],
@@ -156,6 +163,7 @@ resource "terraform_data" "build" {
       FN           = each.key
       PYTHON       = var.python
       REQUIREMENTS = each.value
+      POLICY       = contains(local.policy_packages, each.key) ? local.namespace_policy_json : ""
     }
     command = <<-EOT
       set -euo pipefail
@@ -170,6 +178,7 @@ resource "terraform_data" "build" {
         -r "$REQUIREMENTS"
       cp -R mcp/common/handrail_common "$OUT/"
       find "mcp/$FN" -maxdepth 1 -name '*.py' -exec cp {} "$OUT/" \;
+      if [ -n "$POLICY" ]; then printf '%s' "$POLICY" > "$OUT/namespace_policy.json"; fi
       find "$OUT" -name '__pycache__' -type d -prune -exec rm -rf {} +
     EOT
   }
@@ -372,6 +381,8 @@ resource "aws_lambda_function" "this" {
         APPROVAL_TOPIC_ARN = aws_sns_topic.approvals.arn
         APPROVAL_URL       = aws_lambda_function_url.approver.function_url
       } : {},
+      # From a variable, so it is known when the existing read Lambda is planned.
+      each.value.approval_requests ? { ADMISSION_CHECK = tostring(var.admission_check) } : {},
     )
   }
 
@@ -387,7 +398,7 @@ resource "aws_lambda_function" "this" {
 
   lifecycle {
     precondition {
-      condition     = var.min_replicas >= 0 && var.min_replicas <= var.max_replicas
+      condition     = local.legacy_min_replicas >= 0 && local.legacy_min_replicas <= local.legacy_max_replicas
       error_message = "Require 0 <= min_replicas <= max_replicas."
     }
     precondition {

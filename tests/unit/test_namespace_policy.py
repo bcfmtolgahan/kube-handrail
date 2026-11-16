@@ -2,10 +2,12 @@
 admission policy check (mcp/CONTRACT.md, Namespace policy and Admission policy)."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import yaml
 from kubernetes.client.rest import ApiException
 
 from handrail_common import admission
@@ -361,3 +363,53 @@ def test_the_cluster_message_is_never_returned():
 )
 def test_namespace_selectors(value, selected):
     assert admission.selects(value, "team-a") is selected
+
+
+# --- The rendered manifests and the Lambdas agree --------------------------------------
+
+GOLDEN = Path(__file__).resolve().parents[1] / "k8s_render" / "golden"
+
+
+@pytest.mark.parametrize("fixture", sorted(p.name for p in GOLDEN.iterdir()))
+def test_the_rendered_policy_backs_every_namespace_of_the_rendered_policy_file(fixture):
+    """What terraform/modules/namespace-policy renders (tests/k8s_render/golden) passes the
+    read Lambda's check for each namespace with the bounds of the packaged policy file, in
+    Deny, and is a conflict in Warn."""
+    policy = parse_namespace_policy((GOLDEN / fixture / "namespace_policy.json").read_text())
+    docs = list(yaml.safe_load_all((GOLDEN / fixture / "admission-policy.yaml").read_text()))
+    vap = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicy")
+    vapb = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicyBinding")
+    allowed = (GOLDEN / fixture / "allowed_namespaces.txt").read_text().strip().split(",")
+    assert sorted(policy) == allowed
+    for namespace, entry in policy.items():
+        bounds = (entry.min_replicas, entry.max_replicas)
+        if vapb["spec"]["validationActions"] == ["Deny"]:
+            admission.check_admission_policy(api(vap, vapb), namespace, bounds)
+        else:
+            assert refusal(api(vap, vapb), namespace, bounds).details["reason"] == (
+                "binding_not_deny"
+            )
+        with pytest.raises(GuardError):
+            admission.check_admission_policy(
+                api(vap, {**vapb, "spec": {**vapb["spec"], "validationActions": ["Deny"]}}),
+                namespace,
+                (bounds[0], bounds[1] + 1),
+            )
+
+
+def test_the_rendered_rbac_gives_the_writer_only_where_an_action_is_allowed():
+    docs = list(yaml.safe_load_all((GOLDEN / "two-namespaces" / "rbac.yaml").read_text()))
+    roles = {
+        (d["metadata"]["namespace"], d["metadata"]["name"]): d for d in docs if d["kind"] == "Role"
+    }
+    assert set(roles) == {
+        ("kube-handrail-sandbox", "kube-handrail-reader"),
+        ("kube-handrail-sandbox", "kube-handrail-writer"),
+        ("kube-handrail-sandbox-2", "kube-handrail-reader"),
+        ("kube-handrail-sandbox-2", "kube-handrail-writer"),
+    }
+    # Restart only: no ReplicaSet read for the writer.
+    restart_only = roles[("kube-handrail-sandbox", "kube-handrail-writer")]["rules"]
+    assert [r["resources"] for r in restart_only] == [["deployments"]]
+    every_action = roles[("kube-handrail-sandbox-2", "kube-handrail-writer")]["rules"]
+    assert [r["resources"] for r in every_action] == [["deployments"], ["replicasets"]]

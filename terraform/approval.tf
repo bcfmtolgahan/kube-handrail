@@ -39,8 +39,9 @@ locals {
     "decision_correlation_id",
   ]
 
-  # Statement IDs allow only [A-Za-z0-9_-]; ARNs do not fit.
-  approver_statements = { for arn in var.approver_principals : substr(sha256(arn), 0, 16) => arn }
+  # Statement IDs allow only [A-Za-z0-9_-]; ARNs do not fit. Every principal that decides
+  # in some namespace (k8s.tf); the approver checks the plan's namespace itself.
+  approver_statements = { for arn in local.all_approver_principals : substr(sha256(arn), 0, 16) => arn }
 }
 
 resource "aws_sns_topic" "approvals" {
@@ -118,12 +119,12 @@ resource "aws_lambda_function" "approver" {
 
   lifecycle {
     precondition {
-      condition     = var.approval_mode == "client" || length(var.approver_principals) > 0
-      error_message = "approval_mode server or both needs at least one approver_principals entry; otherwise nobody can approve."
+      condition     = var.approval_mode == "client" || alltrue([for ns in values(local.namespaces) : length(ns.approvers) > 0 || length(var.approver_principals) > 0])
+      error_message = "approval_mode server or both needs an approver for every namespace: approver_principals, or the namespace's own approvers; otherwise nobody can approve its plans."
     }
     precondition {
-      condition     = length(setintersection(toset(var.approver_principals), toset(local.machine_role_arns))) == 0
-      error_message = "approver_principals must not list the kube-handrail Lambda or gateway roles; machine identities can never approve."
+      condition     = length(setintersection(toset(local.all_approver_principals), toset(local.machine_role_arns))) == 0
+      error_message = "approver_principals and the namespaces' approvers must not list the kube-handrail Lambda or gateway roles; machine identities can never approve."
     }
     precondition {
       condition     = var.approval_wait_ttl_seconds >= local.plan_ttl
