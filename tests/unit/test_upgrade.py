@@ -860,13 +860,19 @@ class FakeKubectl:
         self.labeled = labeled
         self.fail = fail
         self.applied: list = []
+        self.context = None
+        self.current = "test-context"
 
     def current_context(self):
-        return "test-context"
+        return self.context or self.current
 
-    def apply(self, directory, dry_run):
-        self.log.append(("kubectl", "dry-run" if dry_run else "apply"))
-        self.applied.append(sorted(p.name for p in directory.glob("*.yaml")))
+    def pin(self):
+        self.context = self.current_context()
+        return self.context
+
+    def apply(self, files, dry_run):
+        self.log.append(("kubectl", "dry-run" if dry_run else "apply", self.context))
+        self.applied.append(sorted(p.name for p in files))
         failed = self.fail == ("dry-run" if dry_run else "apply")
         return upgrade.Result(1 if failed else 0, "")
 
@@ -908,7 +914,12 @@ def test_with_k8s_writes_and_applies_the_manifests_after_a_dry_run(world, tmp_pa
         labeled=["team-a/Role/kube-handrail-reader", "team-a/RoleBinding/kube-handrail-reader"],
     )
     assert make(with_k8s=True).run() == 0
-    assert world.log[:4] == [("plan",), ("apply",), ("kubectl", "dry-run"), ("kubectl", "apply")]
+    assert world.log[:4] == [
+        ("plan",),
+        ("apply",),
+        ("kubectl", "dry-run", "test-context"),
+        ("kubectl", "apply", "test-context"),
+    ]
     assert sorted(p.name for p in (root / "build/k8s").glob("*.yaml")) == sorted(MANIFESTS)
     assert (root / "build/k8s/rbac.yaml").read_text() == MANIFESTS["rbac.yaml"]
 
@@ -917,8 +928,47 @@ def test_a_failed_dry_run_applies_nothing(world, tmp_path):
     make, _ = k8s_world(world, tmp_path, fail="dry-run")
     with pytest.raises(upgrade.UpgradeError, match="nothing was applied"):
         make(with_k8s=True).run()
-    assert ("kubectl", "apply") not in world.log
+    assert not any(entry[:2] == ("kubectl", "apply") for entry in world.log)
     assert world.state()["done"][-1] == "apply"
+
+
+def test_a_resume_after_a_failed_k8s_step_still_applies_the_manifests(world, tmp_path):
+    make, _ = k8s_world(world, tmp_path, fail="dry-run")
+    with pytest.raises(upgrade.UpgradeError, match="--resume"):
+        make(with_k8s=True).run()
+    world.kubectl.fail = None
+    # The operator resumes without repeating --with-k8s, from another current context.
+    world.kubectl.current = "another-context"
+    world.kubectl.context = None
+    assert make(resume=True).run() == 0
+    assert ("kubectl", "apply", "test-context") in world.log
+    assert not world.state_path.exists()
+
+
+def test_a_resume_with_another_kube_context_is_refused(world, tmp_path):
+    make, _ = k8s_world(world, tmp_path, fail="dry-run")
+    with pytest.raises(upgrade.UpgradeError):
+        make(with_k8s=True).run()
+    world.kubectl.context = "another-context"
+    with pytest.raises(upgrade.UpgradeError, match="applies to context test-context"):
+        make(resume=True).run()
+
+
+def test_a_resume_after_the_apply_still_reports_changed_manifests(world, tmp_path, capsys):
+    make, _ = k8s_world(world, tmp_path, manifests_before={"rbac.yaml": "older"})
+    upgrade_ = make()
+
+    def interrupted():
+        raise upgrade.UpgradeError("interrupted")
+
+    # The run stops right after the apply, before the k8s step.
+    upgrade_.k8s = interrupted
+    with pytest.raises(upgrade.UpgradeError, match="interrupted"):
+        upgrade_.run()
+    capsys.readouterr()
+    # On resume the outputs already hold the new manifests.
+    assert make(resume=True).run() == 0
+    assert "the cluster manifests changed and were not applied" in capsys.readouterr().out
 
 
 def test_a_binding_left_in_warn_fails_the_step(world, tmp_path):
@@ -982,7 +1032,7 @@ def test_kubectl_commands_use_the_given_context():
 
     kubectl = upgrade.Kubectl("ctx", stream=run, quiet=run)
     assert kubectl.current_context() == "ctx"
-    kubectl.apply(Path("build/k8s"), dry_run=True)
+    kubectl.apply([Path("build/k8s/a.yaml"), Path("build/k8s/b.yaml")], dry_run=True)
     assert kubectl.binding_actions() == ["Deny"]
     assert calls[0] == [
         "kubectl",
@@ -991,9 +1041,40 @@ def test_kubectl_commands_use_the_given_context():
         "apply",
         "--dry-run=server",
         "-f",
-        "build/k8s",
+        "build/k8s/a.yaml",
+        "-f",
+        "build/k8s/b.yaml",
     ]
     assert calls[1][:3] == ["kubectl", "--context", "ctx"]
+
+
+def test_a_pinned_context_is_named_on_every_later_command():
+    calls = []
+    current = ["first"]
+
+    def run(command):
+        calls.append(command)
+        if command[1:3] == ["config", "current-context"]:
+            return upgrade.Result(0, current[0] + "\n")
+        return upgrade.Result(0, '["Deny"]')
+
+    kubectl = upgrade.Kubectl(stream=run, quiet=run)
+    assert kubectl.pin() == "first"
+    current[0] = "second"
+    kubectl.apply([Path("x.yaml")], dry_run=False)
+    kubectl.binding_actions()
+    assert calls[-2][:3] == ["kubectl", "--context", "first"]
+    assert calls[-1][:3] == ["kubectl", "--context", "first"]
+
+
+def test_only_the_rendered_files_are_applied(world, tmp_path):
+    make, root = k8s_world(world, tmp_path)
+    stray = root / "build/k8s"
+    stray.mkdir(parents=True)
+    (stray / "extra.json").write_text("{}")
+    (stray / "extra.yml").write_text("kind: ConfigMap\n")
+    assert make(with_k8s=True).run() == 0
+    assert world.kubectl.applied[0] == sorted(MANIFESTS)
 
 
 def test_k8s_only_applies_the_deployed_manifests_without_terraform(world, tmp_path):
@@ -1001,7 +1082,10 @@ def test_k8s_only_applies_the_deployed_manifests_without_terraform(world, tmp_pa
     upgrade_ = make(with_k8s=True)
     outputs = dict(world.tf._outputs)
     assert upgrade_.k8s_only(outputs) == 0
-    assert world.log == [("kubectl", "dry-run"), ("kubectl", "apply")]
+    assert world.log == [
+        ("kubectl", "dry-run", "test-context"),
+        ("kubectl", "apply", "test-context"),
+    ]
     assert (root / "build/k8s/rbac.yaml").read_text() == MANIFESTS["rbac.yaml"]
     assert not world.state_path.exists()
 

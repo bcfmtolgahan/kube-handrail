@@ -240,6 +240,13 @@ class State:
     kill_switch_disabled: bool = False
     sentinel: str | None = None
     notes: list[str] = field(default_factory=list)
+    # --with-k8s and the kubectl context it resolved to, kept so a --resume applies the
+    # cluster manifests to the same context even without the flag.
+    with_k8s: bool = False
+    kube_context: str | None = None
+    # Hash of the k8s_manifests output before the apply, so a resume after the apply can
+    # still tell that the manifests changed.
+    k8s_manifests_before: str | None = None
 
     @classmethod
     def new(cls) -> "State":
@@ -404,9 +411,17 @@ class Kubectl:
             )
         return result.output.strip()
 
-    def apply(self, directory: Path, dry_run: bool) -> Result:
+    def pin(self) -> str:
+        """Resolve the context once, so every later command names it with --context even
+        if the kubeconfig's current context changes during the run."""
+        self.context = self.current_context()
+        return self.context
+
+    def apply(self, files: list[Path], dry_run: bool) -> Result:
+        """Apply the named files only, so nothing else in the directory is applied."""
         extra = ["--dry-run=server"] if dry_run else []
-        return self.stream(self._base("apply", *extra, "-f", str(directory)))
+        names = [arg for path in files for arg in ("-f", str(path))]
+        return self.stream(self._base("apply", *extra, *names))
 
     def binding_actions(self) -> list[str] | None:
         result = self.quiet(
@@ -465,15 +480,24 @@ def rendered_roles(manifests: Mapping[str, str]) -> set[str]:
     return found
 
 
-def write_manifests(manifests: Mapping[str, str], directory: Path) -> None:
-    """Replace the YAML files in `directory` with the rendered manifests."""
+def write_manifests(manifests: Mapping[str, str], directory: Path) -> list[Path]:
+    """Replace the YAML files in `directory` with the rendered manifests; return their
+    paths, which are what gets applied."""
+    for name in manifests:
+        if "/" in name or not name.endswith(".yaml"):
+            raise UpgradeError(f"unexpected manifest name {name!r} in the k8s_manifests output")
     directory.mkdir(parents=True, exist_ok=True)
     for old in directory.glob("*.yaml"):
         old.unlink()
-    for name, text in manifests.items():
-        if "/" in name or not name.endswith(".yaml"):
-            raise UpgradeError(f"unexpected manifest name {name!r} in the k8s_manifests output")
+    written = []
+    for name, text in sorted(manifests.items()):
         (directory / name).write_text(text)
+        written.append(directory / name)
+    return written
+
+
+def manifests_hash(manifests: Any) -> str:
+    return hashlib.sha256(json.dumps(manifests, sort_keys=True).encode()).hexdigest()
 
 
 # --- Guidance ---------------------------------------------------------------------------
@@ -705,6 +729,10 @@ class Upgrade:
                 raise UpgradeError(f"--resume: no {self.state_path.name}; run without --resume")
             state = State.load(self.state_path)
             say(f"resuming run {state.run_id} after {', '.join(state.done) or 'nothing'}")
+            if state.with_k8s and not self.options.with_k8s:
+                say("--with-k8s from the run being resumed")
+                self.options.with_k8s = True
+            state.with_k8s = self.options.with_k8s
             return state
         if exists:
             raise UpgradeError(
@@ -712,6 +740,7 @@ class Upgrade:
                 "--resume to continue it, or delete the file if you finished it by hand."
             )
         state = State.new()
+        state.with_k8s = self.options.with_k8s
         state.save(self.state_path)
         return state
 
@@ -726,9 +755,12 @@ class Upgrade:
     def preflight(self) -> None:
         assert self.state is not None
         self.outputs = self.tf.outputs()
+        if "apply" not in self.state.done and self.state.k8s_manifests_before is None:
+            self.state.k8s_manifests_before = manifests_hash(self.outputs.get("k8s_manifests"))
         if self.options.with_k8s:
+            self.pin_context()
             # Shown before the confirmation, so the operator sees which cluster it is.
-            say(f"--with-k8s: build/k8s goes to kubectl context {self.kubectl.current_context()}")
+            say(f"--with-k8s: build/k8s goes to kubectl context {self.kubectl.context}")
         value = self.kill_switch_value()
         ours = self.state.kill_switch_marker
         if value == "true":
@@ -870,7 +902,7 @@ class Upgrade:
         """--k8s-only: the manifests of the deployed state, without a Terraform run."""
         self.state = State.new()
         self.outputs = outputs
-        say(f"build/k8s goes to kubectl context {self.kubectl.current_context()}")
+        say(f"build/k8s goes to kubectl context {self.kubectl.pin()}")
         if not self.options.yes and not self.confirmed("Apply build/k8s to this context?"):
             raise UpgradeError("not confirmed; nothing was applied")
         self.k8s()
@@ -878,17 +910,31 @@ class Upgrade:
             say(f"note: {note}")
         return 0
 
+    def pin_context(self) -> None:
+        """The kubectl context of the run: the one a resumed run used, unless
+        --kube-context names another, which is refused."""
+        assert self.state is not None
+        saved = self.state.kube_context
+        if saved and self.kubectl.context and self.kubectl.context != saved:
+            raise UpgradeError(
+                f"--kube-context {self.kubectl.context}: the run being resumed applies to "
+                f"context {saved}; resume without --kube-context or with that one"
+            )
+        if saved:
+            self.kubectl.context = saved
+        self.state.kube_context = self.kubectl.pin()
+
     def k8s(self) -> None:
         """The cluster manifests of this release, after the apply that rendered them."""
         assert self.state is not None
-        before = self.output("k8s_manifests")
+        before = self.state.k8s_manifests_before or manifests_hash(self.output("k8s_manifests"))
         self.outputs = self.tf.outputs()
         manifests = self.output("k8s_manifests")
         if not isinstance(manifests, dict) or not manifests:
             say("WARNING: no k8s_manifests output; the cluster manifests were not checked")
             return
         if not self.options.with_k8s:
-            if manifests != before:
+            if manifests_hash(manifests) != before:
                 say(
                     "WARNING: the cluster manifests changed and were not applied: plans are "
                     "refused (conflict) until they are. Run make upgrade UPGRADE_FLAGS="
@@ -896,17 +942,18 @@ class Upgrade:
                 )
                 self.state.notes.append("cluster manifests changed: apply build/k8s")
             return
-        directory = self.k8s_dir
-        write_manifests(manifests, directory)
-        say(f"kubectl apply --dry-run=server -f {K8S_DIR}")
-        if self.kubectl.apply(directory, dry_run=True).returncode != 0:
+        files = write_manifests(manifests, self.k8s_dir)
+        say(f"kubectl apply --dry-run=server of {', '.join(p.name for p in files)} in {K8S_DIR}")
+        if self.kubectl.apply(files, dry_run=True).returncode != 0:
             raise UpgradeError(
                 "the server-side dry run of build/k8s failed, nothing was applied to the "
-                "cluster: fix the cause (a missing namespace, RBAC) and run with --resume"
+                "cluster: fix the cause (a missing namespace, RBAC) and run with --resume "
+                "(it keeps --with-k8s)"
             )
-        if self.kubectl.apply(directory, dry_run=False).returncode != 0:
+        if self.kubectl.apply(files, dry_run=False).returncode != 0:
             raise UpgradeError(
-                "kubectl apply of build/k8s failed; fix the cause and run with --resume"
+                "kubectl apply of build/k8s failed; fix the cause and run with --resume "
+                "(it keeps --with-k8s)"
             )
         mode = (self.output("guard_settings") or {}).get("admission_mode", "Deny")
         expected = ["Deny"] if mode == "Deny" else ["Warn", "Audit"]
