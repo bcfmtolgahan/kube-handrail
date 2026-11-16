@@ -149,8 +149,8 @@ out_of_bounds.
 --live-only runs only the cases the kind and moto integration suite (tests/integration)
 cannot cover, listed in LIVE_ONLY_CASES and docs/milestone-0.md: authentication, the
 gateway's schema check, one apply and concurrent applies through the gateway in client mode,
-the approval URL cases in server mode, and, with --with-identity and --with-audit, the
-identity and audit cases. --with-rollout, --with-freeze, --with-expiry and the verification
+every approval case in server mode (for the approval URL), and, with --with-identity and
+--with-audit, the identity and audit cases. --with-rollout, --with-freeze, --with-expiry and the verification
 cases are ignored with it. Without the flag every case runs as before.
 """
 
@@ -2331,7 +2331,7 @@ LIVE_ONLY_CASES = (
     "argument types rejected by the gateway's tool schema",
     "client: a plan and apply through the gateway (interceptor, access entries, network)",
     "client: concurrent applies of one plan (conditional write on DynamoDB)",
-    "server: the approval URL refuses a Cognito token and an unsigned request, and a SigV4-signed approval applies",
+    "server: all approval cases, mainly the approval URL refusing a Cognito token and an unsigned request and applying a SigV4-signed approval",
     "--with-identity: identity cases through the real interceptor and the agent budget counter",
     "--with-audit: the audit record from the real stream, and the bucket policy",
 )
