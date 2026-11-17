@@ -1,6 +1,6 @@
 # Change reference
 
-Appendix to [the contract](../CONTRACT.md#plan-record-dynamodb). Status: implemented, not yet tested on a cluster.
+Appendix to [the contract](../CONTRACT.md#plan-record-dynamodb). Status: tested on a test cluster.
 
 `change_ref` is an optional argument of every `plan_*` and `apply_*` tool: a ticket, incident or change reference for the humans who approve and audit the change. It changes nothing else. Below are the differences from an argument such as `verify_window_seconds`.
 
