@@ -2,8 +2,6 @@
 
 Appendix to [the contract](../CONTRACT.md).
 
-Status: implemented and tested on a test cluster.
-
 A change freeze is a window in which no change is planned or applied in the namespaces it names, for example over a release or a holiday. Operators set freezes; nothing in the tool surface can. There is no break-glass path: to make a change during a freeze, an operator removes or shortens it ([ADR 0005](../../docs/adr/0005-change-freezes.md)).
 
 ## Configuration

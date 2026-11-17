@@ -1,6 +1,6 @@
 # Adjust HPA
 
-Appendix to [the contract](../CONTRACT.md). Status: tested on a test cluster without metrics-server; the findings below come from kind (Kubernetes 1.31.4, metrics-server v0.7.2).
+Appendix to [the contract](../CONTRACT.md).
 
 `plan_adjust_hpa(namespace, name, min_replicas?, max_replicas?, override_manual_change?, verify_window_seconds?, revert_on_failure?)` and `apply_adjust_hpa(plan_id, ...the same)` change a HorizontalPodAutoscaler's `minReplicas` and `maxReplicas`. `name` is the HPA's. The action is `adjust_hpa`; a namespace allows it only when its `actions` list it (it is never a default). Below are the differences from a scale ([Guard checks](../CONTRACT.md#guard-checks)).
 

@@ -17,7 +17,7 @@ The ID is carried to:
 - the plan record: `plan_correlation_id` (plan), `approval_request_correlation_id` (the `request_approval` call that notified), `decision_correlation_id` (the approver's request that approved or rejected), `apply_correlation_id` (the apply that recorded its `result`, whether it succeeded or not) and `verification.correlation_id` (the verifier run that checked it). See [Plan record](../CONTRACT.md#plan-record-dynamodb);
 - the Deployment: the apply's patch sets the annotation `kube-handrail.io/correlation-id` to the apply's ID, next to `kube-handrail.io/last-plan-id`. Both are set by the same patch, which bumps `generation` once, as before;
 - `data.correlation_id` in successful `plan_*`, `request_approval` and `apply_*` responses (`null` only outside a Lambda).
-- the Kubernetes API: the User-Agent `kube-handrail/<version> plan/<plan_id> corr/<correlation_id>` (each part when known; `<version>` is `handrail_common.__version__`), for matching EKS audit log entries. The plan is the one being made (a refused plan names an ID never stored), applied, verified or reverted. Tested on a test cluster.
+- the Kubernetes API: the User-Agent `kube-handrail/<version> plan/<plan_id> corr/<correlation_id>` (each part when known; `<version>` is `handrail_common.__version__`), for matching EKS audit log entries. The plan is the one being made (a refused plan names an ID never stored), applied, verified or reverted.
 
 In `server` mode the approver passes its own request ID to the write Lambda as `kubeHandrailCorrelationId`, so the decision, the apply it runs, `apply_correlation_id` and the annotation share one ID, also when the apply fails.
 

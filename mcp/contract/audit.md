@@ -2,7 +2,7 @@
 
 Appendix to [the contract](../CONTRACT.md).
 
-With `audit_enabled` (Terraform, default `true`), every change to a plan record is written once, as one JSON object, to an S3 bucket with Object Lock, where the tool Lambdas cannot change or delete it. Implemented and tested on a test cluster.
+With `audit_enabled` (Terraform, default `true`), every change to a plan record is written once, as one JSON object, to an S3 bucket with Object Lock, where the tool Lambdas cannot change or delete it.
 
 The record detects after the fact and blocks nothing: the apply path does not depend on it, so an audit failure alarms instead of refusing a change. It is a record of plan-record state: a call refused before a record is written or changed is only in the [tool record](observability.md#tool-record) (CloudWatch Logs). A signed hash chain, approval receipts and anomaly detection are not part of it ([ADR 0007](../../docs/adr/0007-durable-audit-record.md)).
 
@@ -62,7 +62,7 @@ Under `GOVERNANCE`, a principal allowed `s3:BypassGovernanceRetention` can still
 `scripts/audit.py`, with the operator's credentials (`s3:ListBucket` and `s3:GetObject`; `--bucket`, else `AUDIT_BUCKET`, else `terraform output -raw audit_bucket_name` in `TF_DIR`). Its docstring and `--help` give the fields and finding codes.
 
 - `export <plan_id> [--out FILE] [--no-links]` prints one JSON bundle: every entry in order, `malformed` keys (not read further), a `summary` (the latest image, every approver, `status_history`, verification and revert, `has_creation`) and `linked` (the revert record or reverted plan). For a consumed plan, `executed_by` holds the attribution above and CloudWatch Logs Insights templates: the Lambda logs by plan and correlation IDs, and the EKS audit log by the User-Agent. Exit status 1 without entries.
-- `verify (<plan_id> | --since SECONDS | --all) [--json] [--approval-mode MODE]` exits 1 when a plan's entries show what no writer of the record produces: rewrites before, at or after the consume, an impossible consume, gaps, or a channel or missing server approval wrong for the plan's `approval_mode`. A `client`-mode apply is information, with a time window for CloudTrail. Tested on a test cluster.
+- `verify (<plan_id> | --since SECONDS | --all) [--json] [--approval-mode MODE]` exits 1 when a plan's entries show what no writer of the record produces: rewrites before, at or after the consume, an impossible consume, gaps, or a channel or missing server approval wrong for the plan's `approval_mode`. A `client`-mode apply is information, with a time window for CloudTrail.
 - `list [--limit N]` lists plans by their latest entry, newest first, reading every key in the bucket.
 
 ## Alarms and metrics

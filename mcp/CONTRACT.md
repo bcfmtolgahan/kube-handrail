@@ -62,7 +62,7 @@ Error codes: `invalid_argument`, `unknown_tool`, `not_found`, `forbidden_namespa
 | `unknown_tool` | The tool is not served, or an internal handler is called outside the `verifier` channel ([Dispatch](#dispatch)). | none |
 | `not_found` | The Deployment (or HPA) does not exist. | none |
 | `forbidden_namespace` | The namespace is not allowed, or its policy does not allow the action ([Namespace policy](#namespace-policy)). | none for a namespace not allowed at all; `{"action": "scale" \| "restart" \| "rollback" \| "adjust_hpa", "allowed_actions": [...]}` otherwise |
-| `out_of_bounds` | `replicas`, an HPA bound, or the revert target of `revert_on_failure` is outside the namespace's bounds. | names the bound or revert target |
+| `out_of_bounds` | `replicas`, an HPA bound, or the revert target of `revert_on_failure` is outside the namespace's bounds. | none; for an HPA bound `{"min_replicas" \| "max_replicas": N, "bounds": {"min_replicas", "max_replicas"}}` |
 | `gitops_managed` | The object has a GitOps marker ([guard check 4](#guard-checks)). | none |
 | `plan_not_found` | No plan with that `plan_id`. | none |
 | `plan_expired` | `expires_at <= now`, or the record has no `args`. | none |

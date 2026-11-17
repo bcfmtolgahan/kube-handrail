@@ -4,7 +4,6 @@ Appendix to [the contract](../CONTRACT.md).
 
 ## Admission policy
 
-Status: the rendered two-namespace policy is checked in CI on kind (Kubernetes 1.31) by `tests/admission/run.sh`; the denial handling and the plan-time check have unit tests. The multi-namespace policy and the plan-time check are tested on a test cluster with two namespaces.
 
 Terraform renders `build/k8s/admission-policy.yaml` (`terraform/modules/namespace-policy`, from `namespaces` and `admission_mode`): a ValidatingAdmissionPolicy and a ValidatingAdmissionPolicyBinding, both named `kube-handrail-writer-bounds` (`admissionregistration.k8s.io/v1`, Kubernetes 1.30 or later). It is a second check of the replica bounds in the cluster, for the case that the guard in the write Lambda is wrong or bypassed; the guard stays authoritative ([ADR 0006](../../docs/adr/0006-admission-policy.md)).
 
