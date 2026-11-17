@@ -3,7 +3,6 @@ check_guidance), and the guidance does not grow past its word-count ceilings."""
 
 import importlib.util
 import json
-import math
 import shutil
 from pathlib import Path
 
@@ -20,30 +19,29 @@ AGENTS = "AGENTS.md"
 SCALE_SKILL = "agent/skills/kube-handrail-scale/SKILL.md"
 ROLLOUT_SKILL = "agent/skills/kube-handrail-rollout/SKILL.md"
 
-# Word counts (whitespace-separated) at the end of Milestone 3 plus 5 % slack. They stop the
-# guidance from growing unnoticed; Milestone 7 lowers them to its targets. Raise one only
-# with a reason in the commit message. Milestone 8 (HPA adjust, a new action) raised AGENTS
-# by the 80 words it may add to 1981 and the scale skill, where the HPA procedure lives, by
-# its new section; the contract by the HPA adjust entries and a short section (the
-# definition is in the appendix mcp/contract/adjust-hpa.md).
-M8_AGENTS_WORDS = 80
-M8_SCALE_SKILL_WORDS = 130
-M8_CONTRACT_WORDS = 260
+# Word counts (whitespace-separated) after Milestone 7, which cut the docs down: each ceiling
+# is the final size plus 5 %, capped at the Milestone 7 target where one exists (AGENTS.md
+# 1,200, each skill 800, the contract 6,500). They stop the guidance from growing unnoticed.
+# Lower one freely; raise one only with a reason in the commit message.
 WORD_CEILINGS = {
-    AGENTS: 1981 + M8_AGENTS_WORDS,
-    SCALE_SKILL: 1224 + M8_SCALE_SKILL_WORDS,
-    ROLLOUT_SKILL: 1671,
-    "mcp/CONTRACT.md": 22012 + M8_CONTRACT_WORDS,
-    "README.md": 3163,
-    "docs/guards.md": 3270,
-    "docs/deploy.md": 5799,
-    "docs/roadmap.md": 6956,
-    "docs/milestone-0.md": 4245,
+    AGENTS: 1200,
+    SCALE_SKILL: 800,
+    ROLLOUT_SKILL: 800,
+    "mcp/CONTRACT.md": 6500,
+    "mcp/contract/adjust-hpa.md": 1560,
+    "README.md": 1162,
+    "docs/guards.md": 1475,
+    "docs/deploy.md": 2750,
+    "docs/roadmap.md": 643,
+    "docs/quickstart.md": 628,
+    "docs/milestone-0.md": 1239,
+    "docs/history/milestones.md": 1371,
     "docs/releasing.md": 677,
 }
-# Everything an agent reads: AGENTS.md and the skills (4708 words at Milestone 3).
+# Everything an agent reads: AGENTS.md and the skills (4708 words at Milestone 3, 2779 after
+# Milestone 7).
 AGENT_CONTEXT = (AGENTS, SCALE_SKILL, ROLLOUT_SKILL)
-AGENT_CONTEXT_CEILING = math.ceil(4708 * 1.05) + M8_AGENTS_WORDS + M8_SCALE_SKILL_WORDS
+AGENT_CONTEXT_CEILING = 2800
 
 
 def words(rel: str) -> int:
