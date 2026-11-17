@@ -88,3 +88,85 @@ spec:
         - key: kubernetes.io/metadata.name
           operator: In
           values: ["kube-handrail-sandbox"]
+---
+# The same bounds for HorizontalPodAutoscalers (mcp/contract/adjust-hpa.md): the writer may
+# change minReplicas and maxReplicas only within the namespace's bounds, and never
+# scaleTargetRef, metrics or behavior. RBAC lets the writer patch HPAs only in namespaces
+# whose actions include adjust_hpa; this policy covers every namespace of the policy, so a
+# wider Role cannot bypass it. The read Lambda checks it, like the policy above, on every
+# plan_adjust_hpa.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-handrail-writer-hpa-bounds
+  labels:
+    app.kubernetes.io/part-of: kube-handrail
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["kube-handrail-sandbox"]
+    # matchPolicy Equivalent (the default) also sends autoscaling/v1 requests here,
+    # converted to v2.
+    resourceRules:
+      - apiGroups: ["autoscaling"]
+        apiVersions: ["v2"]
+        operations: ["UPDATE"]
+        resources: ["horizontalpodautoscalers"]
+  matchConditions:
+    - name: kube-handrail-writer
+      expression: "has(request.userInfo.groups) && 'kube-handrail-writer' in request.userInfo.groups"
+  variables:
+    - name: minReplicas
+      expression: '{"kube-handrail-sandbox":1}'
+    - name: maxReplicas
+      expression: '{"kube-handrail-sandbox":3}'
+    - name: bounded
+      expression: "request.namespace in variables.minReplicas && request.namespace in variables.maxReplicas"
+    # minReplicas is optional in the API and defaults to 1.
+    - name: hpaMin
+      expression: "has(object.spec.minReplicas) ? object.spec.minReplicas : 1"
+    - name: oldHpaMin
+      expression: "has(oldObject.spec.minReplicas) ? oldObject.spec.minReplicas : 1"
+  validations:
+    # Only a change of the bounds is bounded, as for a Deployment's count. The API server
+    # already refuses minReplicas above maxReplicas.
+    - expression: >-
+        (variables.hpaMin == variables.oldHpaMin &&
+        object.spec.maxReplicas == oldObject.spec.maxReplicas) ||
+        (variables.bounded &&
+        variables.hpaMin >= variables.minReplicas[request.namespace] &&
+        object.spec.maxReplicas <= variables.maxReplicas[request.namespace])
+      messageExpression: >-
+        'kube-handrail writer: HorizontalPodAutoscaler bounds [' + string(variables.hpaMin) +
+        ', ' + string(object.spec.maxReplicas) + ']' +
+        (variables.bounded ?
+        ' are outside [' + string(variables.minReplicas[request.namespace]) + ', ' +
+        string(variables.maxReplicas[request.namespace]) + ']' :
+        ' have no bounds') + ' in namespace ' + request.namespace
+    - expression: >-
+        object.spec.scaleTargetRef == oldObject.spec.scaleTargetRef &&
+        has(object.spec.metrics) == has(oldObject.spec.metrics) &&
+        (!has(object.spec.metrics) || object.spec.metrics == oldObject.spec.metrics) &&
+        has(object.spec.behavior) == has(oldObject.spec.behavior) &&
+        (!has(object.spec.behavior) || object.spec.behavior == oldObject.spec.behavior)
+      message: "kube-handrail writer: the scaleTargetRef, metrics and behavior of a HorizontalPodAutoscaler cannot change"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-handrail-writer-hpa-bounds
+  labels:
+    app.kubernetes.io/part-of: kube-handrail
+spec:
+  policyName: kube-handrail-writer-hpa-bounds
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["kube-handrail-sandbox"]

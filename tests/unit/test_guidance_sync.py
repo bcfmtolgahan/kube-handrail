@@ -22,12 +22,18 @@ ROLLOUT_SKILL = "agent/skills/kube-handrail-rollout/SKILL.md"
 
 # Word counts (whitespace-separated) at the end of Milestone 3 plus 5 % slack. They stop the
 # guidance from growing unnoticed; Milestone 7 lowers them to its targets. Raise one only
-# with a reason in the commit message.
+# with a reason in the commit message. Milestone 8 (HPA adjust, a new action) raised AGENTS
+# by the 80 words it may add to 1981 and the scale skill, where the HPA procedure lives, by
+# its new section; the contract by the HPA adjust entries and a short section (the
+# definition is in the appendix mcp/contract/adjust-hpa.md).
+M8_AGENTS_WORDS = 80
+M8_SCALE_SKILL_WORDS = 130
+M8_CONTRACT_WORDS = 260
 WORD_CEILINGS = {
-    AGENTS: 2028,
-    SCALE_SKILL: 1246,
+    AGENTS: 1981 + M8_AGENTS_WORDS,
+    SCALE_SKILL: 1224 + M8_SCALE_SKILL_WORDS,
     ROLLOUT_SKILL: 1671,
-    "mcp/CONTRACT.md": 22012,
+    "mcp/CONTRACT.md": 22012 + M8_CONTRACT_WORDS,
     "README.md": 3163,
     "docs/guards.md": 3270,
     "docs/deploy.md": 5799,
@@ -37,7 +43,7 @@ WORD_CEILINGS = {
 }
 # Everything an agent reads: AGENTS.md and the skills (4708 words at Milestone 3).
 AGENT_CONTEXT = (AGENTS, SCALE_SKILL, ROLLOUT_SKILL)
-AGENT_CONTEXT_CEILING = math.ceil(4708 * 1.05)
+AGENT_CONTEXT_CEILING = math.ceil(4708 * 1.05) + M8_AGENTS_WORDS + M8_SCALE_SKILL_WORDS
 
 
 def words(rel: str) -> int:

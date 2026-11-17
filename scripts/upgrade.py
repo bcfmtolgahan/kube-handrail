@@ -111,6 +111,8 @@ MARKER_PREFIX = "false:upgrade:"
 # checks, and the label of the objects it rendered (and of the earlier static manifests).
 K8S_DIR = Path("build") / "k8s"
 BINDING = "kube-handrail-writer-bounds"
+HPA_BINDING = "kube-handrail-writer-hpa-bounds"
+BINDINGS = (BINDING, HPA_BINDING)
 PART_OF_SELECTOR = "app.kubernetes.io/part-of in (kube-handrail,kube-handrail-sandbox)"
 # DevOps Agent may keep serving the previous skill text to running sessions for a while.
 STALE_SKILL_MINUTES = 35
@@ -423,12 +425,12 @@ class Kubectl:
         names = [arg for path in files for arg in ("-f", str(path))]
         return self.stream(self._base("apply", *extra, *names))
 
-    def binding_actions(self) -> list[str] | None:
+    def binding_actions(self, name: str = BINDING) -> list[str] | None:
         result = self.quiet(
             self._base(
                 "get",
                 "validatingadmissionpolicybinding",
-                BINDING,
+                name,
                 "-o",
                 "jsonpath={.spec.validationActions}",
             )
@@ -936,9 +938,9 @@ class Upgrade:
         if not self.options.with_k8s:
             if manifests_hash(manifests) != before:
                 say(
-                    "WARNING: the cluster manifests changed and were not applied: plans are "
-                    "refused (conflict) until they are. Run make upgrade UPGRADE_FLAGS="
-                    "--k8s-only now, or kubectl apply -f build/k8s/ yourself"
+                    "WARNING: the cluster manifests changed and were not applied: plans that "
+                    "need them are refused (conflict) until they are. Run make upgrade "
+                    "UPGRADE_FLAGS=--k8s-only now, or kubectl apply -f build/k8s/ yourself"
                 )
                 self.state.notes.append("cluster manifests changed: apply build/k8s")
             return
@@ -957,13 +959,14 @@ class Upgrade:
             )
         mode = (self.output("guard_settings") or {}).get("admission_mode", "Deny")
         expected = ["Deny"] if mode == "Deny" else ["Warn", "Audit"]
-        actions = self.kubectl.binding_actions()
-        if actions != expected:
-            raise UpgradeError(
-                f"the admission policy binding has validationActions {actions}, not {expected} "
-                "after the apply; check it with kubectl and run with --resume"
-            )
-        say(f"admission policy binding: {actions}")
+        for binding in BINDINGS:
+            actions = self.kubectl.binding_actions(binding)
+            if actions != expected:
+                raise UpgradeError(
+                    f"the admission policy binding {binding} has validationActions {actions}, "
+                    f"not {expected} after the apply; check it with kubectl and run with --resume"
+                )
+            say(f"admission policy binding {binding}: {actions}")
         labeled = self.kubectl.labeled_roles()
         if labeled is None:
             say("note: could not list kube-handrail Roles cluster-wide; stale ones not checked")

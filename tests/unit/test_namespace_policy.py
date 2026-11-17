@@ -3,6 +3,7 @@ admission policy check (mcp/CONTRACT.md, Namespace policy and Admission policy).
 
 import copy
 import json
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -14,6 +15,7 @@ from kubernetes.client.rest import ApiException
 from handrail_common import admission
 from handrail_common.config import (
     ACTIONS,
+    DEFAULT_ACTIONS,
     ConfigError,
     NamespacePolicy,
     Settings,
@@ -51,7 +53,7 @@ POLICY = {
         "team-b": {
             "min_replicas": 0,
             "max_replicas": 8,
-            "actions": ["restart", "rollback", "scale"],
+            "actions": ["adjust_hpa", "restart", "rollback", "scale"],
             "approvers": [],
             "gitops_markers": [],
         },
@@ -84,12 +86,13 @@ def test_policy_gives_each_namespace_its_bounds_actions_and_markers(tmp_path):
     assert s.namespace_policy["team-a"].approvers == (ROLE,)
 
 
-def test_without_a_policy_file_every_namespace_gets_the_legacy_bounds_and_every_action():
-    """An older package, or a test harness: the environment alone, as before."""
+def test_without_a_policy_file_every_namespace_gets_the_legacy_bounds_and_actions():
+    """An older package, or a test harness: the environment alone, as before. adjust_hpa
+    is never a default."""
     s = load_settings(BASE)
     assert s.namespace_policy == {}
     assert s.bounds_for("team-a") == (0, 5)
-    assert s.actions_for("team-b") == set(ACTIONS)
+    assert s.actions_for("team-b") == set(DEFAULT_ACTIONS) == set(ACTIONS) - {"adjust_hpa"}
     assert s.markers_for("team-a") == ()
 
 
@@ -539,4 +542,130 @@ def test_the_rendered_rbac_gives_the_writer_only_where_an_action_is_allowed():
     restart_only = roles[("kube-handrail-sandbox", "kube-handrail-writer")]["rules"]
     assert [r["resources"] for r in restart_only] == [["deployments"]]
     every_action = roles[("kube-handrail-sandbox-2", "kube-handrail-writer")]["rules"]
-    assert [r["resources"] for r in every_action] == [["deployments"], ["replicasets"]]
+    assert [r["resources"] for r in every_action] == [
+        ["deployments"],
+        ["horizontalpodautoscalers"],
+        ["replicasets"],
+    ]
+    # adjust_hpa: get and patch on HPAs, nothing else of autoscaling.
+    assert every_action[1] == {
+        "apiGroups": ["autoscaling"],
+        "resources": ["horizontalpodautoscalers"],
+        "verbs": ["get", "patch"],
+    }
+
+
+# --- The HPA policy (plan_adjust_hpa) ---------------------------------------------------
+
+
+def rendered_hpa(fixture="two-namespaces"):
+    docs = list(yaml.safe_load_all((GOLDEN / fixture / "admission-policy.yaml").read_text()))
+    named = [d for d in docs if d["metadata"]["name"] == admission.HPA_POLICY_NAME]
+    vap = next(d for d in named if d["kind"] == "ValidatingAdmissionPolicy")
+    vapb = next(d for d in named if d["kind"] == "ValidatingAdmissionPolicyBinding")
+    return copy.deepcopy(vap), copy.deepcopy(vapb)
+
+
+def hpa_api(policy_obj, binding_obj):
+    def serve(value):
+        def read(name, _preload_content=True):
+            assert name == admission.HPA_POLICY_NAME
+            return SimpleNamespace(data=json.dumps(value).encode())
+
+        return read
+
+    fake = MagicMock()
+    fake.read_validating_admission_policy.side_effect = serve(policy_obj)
+    fake.read_validating_admission_policy_binding.side_effect = serve(binding_obj)
+    return fake
+
+
+@pytest.mark.parametrize("fixture", sorted(p.name for p in GOLDEN.iterdir()))
+def test_the_rendered_hpa_policy_backs_every_namespace(fixture):
+    policy = parse_namespace_policy((GOLDEN / fixture / "namespace_policy.json").read_text())
+    vap, vapb = rendered_hpa(fixture)
+    vapb["spec"]["validationActions"] = ["Deny"]
+    for namespace, entry in policy.items():
+        bounds = (entry.min_replicas, entry.max_replicas)
+        admission.check_admission_policy(
+            hpa_api(vap, vapb), namespace, bounds, admission.HPA_POLICY
+        )
+        with pytest.raises(GuardError) as exc:
+            admission.check_admission_policy(
+                hpa_api(vap, vapb), namespace, (bounds[0], bounds[1] + 1), admission.HPA_POLICY
+            )
+        assert exc.value.details["policy"] == admission.HPA_POLICY_NAME
+
+
+def test_the_deployment_policy_does_not_pass_as_the_hpa_policy():
+    """Each shape needs its own validations and resources: one policy cannot stand in for
+    the other."""
+    vap, vapb = rendered_hpa()
+    deployment_vap = rendered("ValidatingAdmissionPolicy")
+    deployment_vap["metadata"]["name"] = admission.HPA_POLICY_NAME
+    with pytest.raises(GuardError) as exc:
+        admission.check_admission_policy(
+            hpa_api(deployment_vap, vapb), "kube-handrail-sandbox-2", (0, 6), admission.HPA_POLICY
+        )
+    assert exc.value.details["reason"] == "policy_modified"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # The frozen fields dropped: the writer could retarget the HPA.
+        lambda spec: spec["validations"].pop(1),
+        # Only Deployments covered.
+        lambda spec: spec["matchConstraints"].update(
+            resourceRules=[
+                {
+                    "apiGroups": ["apps"],
+                    "apiVersions": ["v1"],
+                    "operations": ["UPDATE"],
+                    "resources": ["deployments"],
+                }
+            ]
+        ),
+        lambda spec: spec["variables"][3].update(expression="1"),
+    ],
+)
+def test_an_hpa_policy_switched_off_is_a_conflict(change):
+    vap, vapb = rendered_hpa()
+    change(vap["spec"])
+    with pytest.raises(GuardError) as exc:
+        admission.check_admission_policy(
+            hpa_api(vap, vapb), "kube-handrail-sandbox-2", (0, 6), admission.HPA_POLICY
+        )
+    assert exc.value.details["reason"] == "policy_modified"
+
+
+@pytest.mark.parametrize(
+    ("target", "match_policy", "reason"),
+    [
+        # Exact stops autoscaling/v1 requests reaching a policy that names only v2.
+        ("policy", "Exact", "policy_modified"),
+        ("binding", "Exact", "binding_modified"),
+        ("policy", "Equivalent", None),
+        ("binding", "Equivalent", None),
+    ],
+)
+def test_a_match_policy_other_than_equivalent_is_a_conflict(target, match_policy, reason):
+    vap, vapb = rendered_hpa()
+    vapb["spec"]["validationActions"] = ["Deny"]
+    if target == "policy":
+        vap["spec"]["matchConstraints"]["matchPolicy"] = match_policy
+    else:
+        vapb["spec"].setdefault("matchResources", {})["matchPolicy"] = match_policy
+    check = partial(
+        admission.check_admission_policy,
+        hpa_api(vap, vapb),
+        "kube-handrail-sandbox-2",
+        (0, 6),
+        admission.HPA_POLICY,
+    )
+    if reason is None:
+        check()
+        return
+    with pytest.raises(GuardError) as exc:
+        check()
+    assert exc.value.details["reason"] == reason

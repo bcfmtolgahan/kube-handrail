@@ -556,3 +556,57 @@ def test_template_rule_with_the_override_reports_it():
 )
 def test_template_rule_is_skipped(last):
     assert check_template_manual_change(last, "sha256:b", False) is False
+
+
+# --- HPA adjust: the direction adapter and the bounds manual-change rule ------------------
+
+
+def test_bounds_direction_follows_the_bound_that_moves():
+    from handrail_common.plans import bounds_direction, plan_direction
+
+    assert bounds_direction(1, 2, 5, 5) == 1
+    assert bounds_direction(2, 2, 5, 3) == -1
+    assert bounds_direction(1, 2, 5, 6) == 1
+    assert bounds_direction(2, 2, 5, 5) == 0
+    # The pods of an HPA adjust do not count: the bounds rose though no pod was added.
+    item = {
+        "replicas_from": 3,
+        "replicas_to": 3,
+        "min_from": 1,
+        "min_to": 2,
+        "max_from": 5,
+        "max_to": 5,
+    }
+    assert plan_direction(item) == 1
+    assert plan_direction({"replicas_from": 3, "replicas_to": 1}) == -1
+
+
+def test_flapping_uses_the_bounds_direction_of_hpa_entries():
+    from handrail_common.breaker import check_flapping
+    from handrail_common.plans import HistoryEntry
+
+    def entry(i, direction):
+        return HistoryEntry(f"p{i}", 2, 2, 100 + i, "applied", 100 + i, direction)
+
+    entries = [entry(1, 1), entry(2, -1)]
+    with pytest.raises(GuardError) as exc:
+        check_flapping(entries, 200, 600, 2, 2, direction=1)
+    assert exc.value.code == "flapping"
+    # Without the adapter the unchanged pod count would have no direction at all.
+    check_flapping(entries, 200, 600, 2, 2)
+
+
+def test_bounds_manual_change():
+    from handrail_common.breaker import check_bounds_manual_change
+
+    last = replace(last_plan(), min_from=1, min_to=2, max_from=5, max_to=5)
+    assert check_bounds_manual_change(None, (1, 5), False) is False
+    assert check_bounds_manual_change(last, (2, 5), False) is False
+    assert check_bounds_manual_change(last, (3, 5), True) is True
+    with pytest.raises(GuardError) as exc:
+        check_bounds_manual_change(last, (3, 5), False)
+    assert exc.value.code == "manual_change"
+    assert exc.value.details == {
+        "last_applied_to": {"min_replicas": 2, "max_replicas": 5},
+        "current": {"min_replicas": 3, "max_replicas": 5},
+    }

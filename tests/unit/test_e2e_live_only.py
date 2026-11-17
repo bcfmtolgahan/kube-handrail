@@ -28,6 +28,7 @@ def test_live_only_drops_the_cases_the_integration_suite_covers():
             "--with-expiry",
             "--with-identity",
             "--with-namespaces",
+            "--with-hpa",
         ]
     )
     assert args.live_only is True
@@ -39,6 +40,7 @@ def test_live_only_drops_the_cases_the_integration_suite_covers():
     )
     assert args.with_identity is True
     assert args.with_namespaces is False
+    assert args.with_hpa is False
 
 
 def _run(monkeypatch, live_only, with_identity=False, with_audit=False):

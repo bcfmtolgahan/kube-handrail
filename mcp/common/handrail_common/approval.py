@@ -1,5 +1,6 @@
 """What an approver sees: a plan rendered from the server's own record (mcp/CONTRACT.md,
-Server-side approval). Nothing here comes from text an agent supplied.
+Server-side approval). The only text an agent supplied is `change_ref`, shown as untrusted
+text.
 """
 
 import unicodedata
@@ -9,12 +10,14 @@ from typing import Any
 
 from handrail_common.envelope import INVALID_ARGUMENT
 from handrail_common.plans import (
+    ADJUST_HPA,
     RESTART_ANNOTATION,
     RESTART_DEPLOYMENT,
     ROLLBACK_DEPLOYMENT,
     STATUS_PLANNED,
     STATUS_REJECTED,
 )
+from handrail_common.untrusted import untrusted_text
 from handrail_common.validation import GuardError
 
 STATUS_APPLIED = "applied"
@@ -50,6 +53,15 @@ def derived_status(item: Mapping[str, Any], now: int) -> str:
 
 def change_view(record: Mapping[str, Any]) -> dict[str, Any]:
     """What the plan changes, per action, in the shape of the plan response's `diff`."""
+    if record.get("action") == ADJUST_HPA:
+        return {
+            "hpa": {
+                "min_replicas": {"from": record.get("min_from"), "to": record.get("min_to")},
+                "max_replicas": {"from": record.get("max_from"), "to": record.get("max_to")},
+                "scale_target": record.get("hpa_target"),
+            },
+            "replicas": {"from": record.get("replicas_from"), "to": record.get("replicas_to")},
+        }
     if record.get("action") == RESTART_DEPLOYMENT:
         return {
             "restart": {"pods_replaced": record.get("replicas_from")},
@@ -75,8 +87,19 @@ def verification_view(record: Mapping[str, Any]) -> dict[str, Any] | None:
     revert = (record.get("args") or {}).get("revert_on_failure") is True
     view: dict[str, Any] = {"window_seconds": window, "revert_on_failure": revert}
     if revert:
-        view["revert_to"] = record.get("replicas_from")
+        view["revert_to"] = (
+            {"min_replicas": record.get("min_from"), "max_replicas": record.get("max_from")}
+            if record.get("action") == ADJUST_HPA
+            else record.get("replicas_from")
+        )
     return view
+
+
+def change_ref_view(record: Mapping[str, Any]) -> str | None:
+    """The plan's `change_ref` argument as untrusted text, None when it has none. The agent
+    chose it, so it is cleaned and wrapped like event text."""
+    value = (record.get("args") or {}).get("change_ref")
+    return untrusted_text(value)[0] if isinstance(value, str) else None
 
 
 def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
@@ -100,6 +123,9 @@ def plan_view(item: Mapping[str, Any], now: int) -> dict[str, Any]:
     verification = verification_view(record)
     if verification is not None:
         view["verification"] = verification
+    change_ref = change_ref_view(record)
+    if change_ref is not None:
+        view["change_ref"] = change_ref
     if "approved_by" in record:
         view["approval"] = {
             key: record.get(key)
@@ -186,11 +212,17 @@ def _rollback_lines(change: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _revert_target(target: Any) -> str:
+    if isinstance(target, Mapping):
+        return f"bounds {target.get('min_replicas')} to {target.get('max_replicas')}"
+    return f"{target} replica(s)"
+
+
 def _verification_lines(verification: Mapping[str, Any] | None) -> list[str]:
     if verification is None:
         return []
     revert = (
-        f"yes, back to {verification.get('revert_to')} replica(s) if the change is degraded"
+        f"yes, back to {_revert_target(verification.get('revert_to'))} if the change is degraded"
         if verification.get("revert_on_failure")
         else "no"
     )
@@ -205,7 +237,20 @@ def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
     plan_id = view["plan_id"]
     url = approval_url or "<approval_url output>"
     replicas = view["replicas"]
-    if view.get("action") == RESTART_DEPLOYMENT:
+    target = f"Deployment: {view['namespace']}/{view['name']}"
+    if view.get("action") == ADJUST_HPA:
+        hpa = (view.get("change") or {}).get("hpa") or {}
+        low, high = hpa.get("min_replicas") or {}, hpa.get("max_replicas") or {}
+        target = (
+            f"HorizontalPodAutoscaler: {view['namespace']}/{view['name']} "
+            f"(scales Deployment {hpa.get('scale_target')})"
+        )
+        change = [
+            f"Min replicas: {low.get('from')} -> {low.get('to')}",
+            f"Max replicas: {high.get('from')} -> {high.get('to')}",
+            f"Pods: {replicas['from']} -> {replicas['to']} (clamped to the new bounds at once)",
+        ]
+    elif view.get("action") == RESTART_DEPLOYMENT:
         change = [
             f"Restart: every pod replaced, replicas stay at {replicas['from']}; "
             f"pods get the annotation {RESTART_ANNOTATION}={plan_id}"
@@ -220,12 +265,18 @@ def notification(view: Mapping[str, Any], approval_url: str | None) -> str:
             "",
             f"Plan: {plan_id}",
             f"Cluster: {view.get('cluster') or 'not recorded'}",
-            f"Deployment: {view['namespace']}/{view['name']}",
+            target,
             *change,
             f"Override manual change: {'yes' if view['override_manual_change'] else 'no'}",
             *_verification_lines(view.get("verification")),
             f"Requested by: {view['requested_by']}",
             f"Expires at (epoch seconds): {view['expires_at']}",
+            # Last, after every line the server writes, so it cannot pose as one of them.
+            *(
+                [f"Change reference (from the agent): {view['change_ref']}"]
+                if "change_ref" in view
+                else []
+            ),
             "",
             *_impact_lines(view.get("impact")),
             "",

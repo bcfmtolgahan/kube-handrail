@@ -30,6 +30,8 @@ from handrail_common.validation import GuardError
 SCALE_DEPLOYMENT = "scale_deployment"
 RESTART_DEPLOYMENT = "restart_deployment"
 ROLLBACK_DEPLOYMENT = "rollback_deployment"
+# Changes a HorizontalPodAutoscaler's minReplicas and maxReplicas (mcp/contract/adjust-hpa.md).
+ADJUST_HPA = "adjust_hpa"
 # Pod-template annotation a restart sets to its plan id: the template it leaves is known when
 # the plan is made, and every pod it creates names the plan.
 RESTART_ANNOTATION = "kube-handrail.io/restart-plan-id"
@@ -114,6 +116,14 @@ def _verify_args(
     return args
 
 
+def with_change_ref(args: dict[str, Any], change_ref: str | None) -> dict[str, Any]:
+    """Every action's payload gains `change_ref` only when given, so hashes without it are
+    unchanged; args_hash then pins it like any other argument."""
+    if change_ref is not None:
+        args["change_ref"] = change_ref
+    return args
+
+
 def scale_args(
     namespace: str,
     name: str,
@@ -170,6 +180,27 @@ def rollback_args(
     if override_manual_change:
         args["override_manual_change"] = True
     return _verify_args(args, verify_window_seconds)
+
+
+def adjust_hpa_args(
+    namespace: str,
+    name: str,
+    min_replicas: int | None,
+    max_replicas: int | None,
+    override_manual_change: bool = False,
+    revert_on_failure: bool = False,
+    verify_window_seconds: int | None = None,
+) -> dict[str, Any]:
+    """The argument payload of an HPA adjust plan: the apply arguments without plan_id.
+    Each bound enters it only when given; an omitted one stays as it is."""
+    args: dict[str, Any] = {"namespace": namespace, "name": name}
+    if min_replicas is not None:
+        args["min_replicas"] = min_replicas
+    if max_replicas is not None:
+        args["max_replicas"] = max_replicas
+    if override_manual_change:
+        args["override_manual_change"] = True
+    return _verify_args(args, verify_window_seconds, revert_on_failure)
 
 
 def template_hash(template: Mapping[str, Any]) -> str:
@@ -288,6 +319,23 @@ class Plan:
     # The cluster the plan is for (CLUSTER_NAME of the read Lambda), so an approver sees
     # where the change goes. Absent on plans made before it was recorded.
     cluster: str | None = None
+    # The kind of the object the plan changes; absent means Deployment (every plan made
+    # before HPA adjust). handrail_common.resources selects the operations by it.
+    target_kind: str | None = None
+    # HPA adjust only: the Deployment the HPA scales (its scaleTargetRef name), the bounds
+    # before and after, and the hash of the HPA's spec before and after (spec_hash).
+    # replicas_from and replicas_to are the target's pods now and clamped to the new bounds.
+    hpa_target: str | None = None
+    min_from: int | None = None
+    min_to: int | None = None
+    max_from: int | None = None
+    max_to: int | None = None
+    spec_from: str | None = None
+    spec_to: str | None = None
+    # HPA adjust with revert_on_failure: min_from and max_from, copied by the consume like
+    # revert_to. The read role cannot write them (terraform: NeverApprove).
+    revert_min_to: int | None = None
+    revert_max_to: int | None = None
 
     @property
     def object_key(self) -> str:
@@ -388,6 +436,12 @@ _OPTIONAL_INTS = (
     "verify_at",
     "applied_generation",
     "revert_to",
+    "min_from",
+    "min_to",
+    "max_from",
+    "max_to",
+    "revert_min_to",
+    "revert_max_to",
 )
 _OPTIONAL_STRS = (
     "cluster",
@@ -411,6 +465,10 @@ _OPTIONAL_STRS = (
     "channel",
     "kind",
     "reverts_plan_id",
+    "target_kind",
+    "hpa_target",
+    "spec_from",
+    "spec_to",
 )
 
 
@@ -448,6 +506,28 @@ def _with_correlation(
     return f"{update}, {attribute} = :cid", {**values, ":cid": correlation_id}
 
 
+def _sign(value: int) -> int:
+    return (value > 0) - (value < 0)
+
+
+def bounds_direction(min_from: int, min_to: int, max_from: int, max_to: int) -> int:
+    """The direction of an HPA adjust for the breaker: +1 when it raises a bound, -1 when it
+    lowers one, 0 when it changes neither. A plan never moves the two bounds in opposite
+    directions (handrail_common.resources refuses it)."""
+    moves = {_sign(min_to - min_from), _sign(max_to - max_from)} - {0}
+    return moves.pop() if len(moves) == 1 else 0
+
+
+def plan_direction(record: Mapping[str, Any]) -> int:
+    """The breaker's direction input for one plan record (a stored item or Plan.to_item()):
+    the direction of the bounds for an HPA adjust, of the replica count otherwise. The
+    replica fields of an HPA adjust are the target's pods, which the HPA moves on its own."""
+    bounds = [record.get(key) for key in ("min_from", "min_to", "max_from", "max_to")]
+    if all(value is not None for value in bounds):
+        return bounds_direction(*(int(value) for value in bounds))
+    return _sign(int(record["replicas_to"]) - int(record["replicas_from"]))
+
+
 @dataclass(frozen=True)
 class HistoryEntry:
     """One plan record for an object, as read from the history index."""
@@ -458,10 +538,18 @@ class HistoryEntry:
     created_at: int
     result: str | None
     applied_at: int | None
+    # The breaker's direction (plan_direction); None means the replica count's.
+    direction: int | None = None
 
     @property
     def applied(self) -> bool:
         return self.result == RESULT_APPLIED and self.applied_at is not None
+
+    @property
+    def sign(self) -> int:
+        if self.direction is not None:
+            return self.direction
+        return _sign(self.replicas_to - self.replicas_from)
 
     @classmethod
     def from_item(cls, item: Mapping[str, Any]) -> "HistoryEntry":
@@ -474,6 +562,7 @@ class HistoryEntry:
             created_at=int(item["created_at"]),
             result=str(result) if result is not None else None,
             applied_at=int(applied_at) if applied_at is not None else None,
+            direction=plan_direction(item),
         )
 
 
@@ -506,6 +595,7 @@ class PlanStore:
         channel: str | None = None,
         verify_window: int | None = None,
         pin_revert: bool = False,
+        revert_pins: Sequence[tuple[str, str]] = (("revert_to", "replicas_from"),),
     ) -> Plan:
         """Atomically mark the plan used; raise GuardError with the precise reason otherwise.
 
@@ -515,7 +605,9 @@ class PlanStore:
         `channel` is recorded in the same write. With `verify_window` (the default window),
         the same write also schedules the verification, `verify_window_seconds` after now, or
         `verify_window` for a plan made before it had one. With `pin_revert` (the request
-        has revert_on_failure), it copies replicas_from to revert_to.
+        has revert_on_failure), it copies each (target, source) pair of `revert_pins`:
+        replicas_from to revert_to, or for an HPA adjust min_from and max_from to
+        revert_min_to and revert_max_to.
         """
         # A rejection also ends the plan's validity; this holds even if clocks disagree.
         condition = (
@@ -555,9 +647,12 @@ class PlanStore:
             values[":window"] = verify_window
             values[":due"] = VERIFY_DUE
         if pin_revert:
-            # The returned record's replicas_from is what the apply then checks against the
-            # cluster; a later change to it cannot move the revert.
-            update += ", revert_to = replicas_from"
+            # The returned record's sources are what the apply then checks against the
+            # cluster; a later change to them cannot move the revert.
+            for target, source in revert_pins:
+                update += f", #pin_{target} = #pin_{source}"
+                names[f"#pin_{target}"] = target
+                names[f"#pin_{source}"] = source
         try:
             response = self._table.update_item(
                 Key={"plan_id": plan_id},

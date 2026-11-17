@@ -854,9 +854,11 @@ MANIFESTS = {
 
 
 class FakeKubectl:
-    def __init__(self, log, actions=("Deny",), labeled=None, fail=None) -> None:
+    def __init__(self, log, actions=("Deny",), labeled=None, fail=None, by_binding=None) -> None:
         self.log = log
         self.actions = list(actions)
+        self.by_binding = by_binding or {}
+        self.bindings_read: list[str] = []
         self.labeled = labeled
         self.fail = fail
         self.applied: list = []
@@ -876,8 +878,9 @@ class FakeKubectl:
         failed = self.fail == ("dry-run" if dry_run else "apply")
         return upgrade.Result(1 if failed else 0, "")
 
-    def binding_actions(self):
-        return self.actions
+    def binding_actions(self, name=upgrade.BINDING):
+        self.bindings_read.append(name)
+        return list(self.by_binding.get(name, self.actions))
 
     def labeled_roles(self):
         return self.labeled
@@ -975,6 +978,23 @@ def test_a_binding_left_in_warn_fails_the_step(world, tmp_path):
     make, _ = k8s_world(world, tmp_path, actions=("Warn", "Audit"))
     with pytest.raises(upgrade.UpgradeError, match="validationActions"):
         make(with_k8s=True).run()
+
+
+def test_the_hpa_binding_is_checked_too(world, tmp_path):
+    make, _ = k8s_world(
+        world, tmp_path, by_binding={"kube-handrail-writer-hpa-bounds": ["Warn", "Audit"]}
+    )
+    with pytest.raises(upgrade.UpgradeError, match="kube-handrail-writer-hpa-bounds"):
+        make(with_k8s=True).run()
+
+
+def test_both_bindings_are_read_after_the_apply(world, tmp_path):
+    make, _ = k8s_world(world, tmp_path)
+    assert make(with_k8s=True).run() == 0
+    assert world.kubectl.bindings_read == [
+        "kube-handrail-writer-bounds",
+        "kube-handrail-writer-hpa-bounds",
+    ]
 
 
 def test_stale_roles_are_listed_not_deleted(world, tmp_path, capsys):

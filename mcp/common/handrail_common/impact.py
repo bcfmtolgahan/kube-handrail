@@ -17,6 +17,7 @@ RECREATE_STRATEGY = "recreate_strategy"
 ROLLOUT_IN_PROGRESS = "rollout_in_progress"
 NO_PODS = "no_pods"
 REVERT_BASELINE_UNHEALTHY = "revert_baseline_unhealthy"
+HPA_METRICS_UNAVAILABLE = "hpa_metrics_unavailable"
 RECREATE = "Recreate"
 ROLLING_UPDATE = "RollingUpdate"
 # The API server's defaults for a RollingUpdate Deployment.
@@ -126,6 +127,30 @@ def revert_warnings(available_now: int, replicas: int) -> list[dict[str, str]]:
             "revert would then undo it",
         }
     ]
+
+
+def hpa_warnings(conditions: Sequence[Obj]) -> list[dict[str, str]]:
+    """For an HPA adjust: the HPA cannot compute a replica count from its metrics now
+    (ScalingActive False, except ScalingDisabled for a target scaled to 0). The controller
+    still applies minReplicas and maxReplicas without metrics, so the plan goes on; above
+    the new minimum it will not scale until the metrics come back. The condition's reason
+    and message are not returned: anyone who can write the HPA's status sets them."""
+    for condition in conditions:
+        if (
+            isinstance(condition, Mapping)
+            and condition.get("type") == "ScalingActive"
+            and condition.get("status") == "False"
+            and condition.get("reason") != "ScalingDisabled"
+        ):
+            return [
+                {
+                    "code": HPA_METRICS_UNAVAILABLE,
+                    "message": "the HorizontalPodAutoscaler cannot read its metrics now "
+                    "(ScalingActive is False); it still keeps the pods within the new bounds, "
+                    "but does not scale within them until its metrics are back",
+                }
+            ]
+    return []
 
 
 def scale_impact(

@@ -2,6 +2,8 @@
 reports for a SigV4-signed request (tests/e2e/e2e_gateway.py: approval_tests,
 identity_approval_tests). The approval's apply runs the write Lambda in process."""
 
+import json
+
 from harness import (
     AGENT_B,
     AGENT_SWITCHES,
@@ -27,6 +29,13 @@ def audit_findings(kh, plan_id):
     """audit.py verify of the plan, after the audit Lambda wrote the stream so far."""
     assert kh.run_audit(stream_records(kh.stream_arn())) == {"batchItemFailures": []}
     return load_script("audit").verify_plan(kh.s3, BUCKET, plan_id)["findings"]
+
+
+def outcome_approval(kh, plan_id):
+    envelope = kh.call("k8sr___get_plan_outcome", {"plan_id": plan_id})
+    assert envelope["ok"], envelope
+    assert APPROVER not in json.dumps(envelope)
+    return envelope["data"]["approval"]
 
 
 def decide(kh, plan_id, decision, caller=APPROVER, **extra):
@@ -81,6 +90,7 @@ def test_rejected_plan_cannot_be_applied(kh):
     plan_id = kh.plan(target, 2)
     status, envelope = decide(kh, plan_id, "reject", reason="it rejection", apply=False)
     assert status == 200 and envelope["data"]["plan"]["status"] == "rejected"
+    assert outcome_approval(kh, plan_id) == {"status": "rejected", "approved_at": None}
     envelope = kh.apply(target, plan_id, 2)
     assert code(envelope) == "approval_required" and details(envelope) == {"status": "rejected"}
     status, envelope = decide(kh, plan_id, "approve")
@@ -92,8 +102,12 @@ def test_both_mode_approval_does_not_apply(kh):
     target = kh.create(deployment_manifest(unique("it-both")))
     plan_id = kh.plan(target, 2)
     kh.call(REQUEST_APPROVAL, {"plan_id": plan_id})
+    # The agent waits on get_plan_outcome, a read tool, for the approval.
+    assert outcome_approval(kh, plan_id) == {"status": "awaiting_approval", "approved_at": None}
     status, envelope = decide(kh, plan_id, "approve")
     assert status == 200 and envelope["data"]["apply"] is None
+    approval = outcome_approval(kh, plan_id)
+    assert approval["status"] == "approved" and approval["approved_at"]
     assert kh.deployment(target["name"]).spec.replicas == 1
     assert kh.apply(target, plan_id, 2)["ok"] is True
     assert audit_findings(kh, plan_id) == []

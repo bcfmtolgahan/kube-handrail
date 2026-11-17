@@ -540,3 +540,29 @@ def test_main_reports_prefixes_that_are_not_plans(s3, monkeypatch, capsys):
     assert [p["plan_id"] for p in report["plans"]] == [plan_id]
     assert audit.main(["verify", "--all"], s3=s3) == 1
     assert "not_plan" in capsys.readouterr().out
+
+
+def test_an_hpa_adjust_consume_pins_its_revert_bounds_without_a_finding(s3):
+    plan_id = new_id()
+    plan = {
+        **planned(plan_id, "client"),
+        "action": "adjust_hpa",
+        "target_kind": "HorizontalPodAutoscaler",
+        "hpa_target": "web",
+        "min_from": 1,
+        "min_to": 2,
+        "max_from": 5,
+        "max_to": 5,
+        "spec_from": "sha256:a",
+        "spec_to": "sha256:b",
+    }
+    used = {**consumed(plan, "gateway"), "revert_min_to": 1, "revert_max_to": 5}
+    result = resulted(used)
+    write(s3, plan_id, [None, plan, used, result, verified(result)])
+    report = audit.verify_plan(s3, BUCKET, plan_id)
+    assert [code for _, code in codes(report)] == ["client_unobserved"]
+    # Its bounds are fixed when the plan is made, like replicas_to.
+    forged = {**plan, "min_to": 9}
+    other = new_id()
+    write(s3, other, [None, {**plan, "plan_id": other}, {**forged, "plan_id": other}])
+    assert codes(audit.verify_plan(s3, BUCKET, other)) == [("finding", "pre_consume_rewrite")]

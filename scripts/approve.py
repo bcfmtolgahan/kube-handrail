@@ -95,7 +95,11 @@ def emit(envelope: dict[str, Any]) -> None:
 def summary(view: dict[str, Any]) -> str:
     """One line naming the action, the Deployment and what changes, from the server's view,
     and the verification the apply schedules."""
-    return change_summary(view) + verification_summary(view.get("verification"))
+    text = change_summary(view) + verification_summary(view.get("verification"))
+    if view.get("change_ref"):
+        # Agent-supplied and untrusted; the server sends it already wrapped.
+        text += f"; change reference {view['change_ref']}"
+    return text
 
 
 def change_summary(view: dict[str, Any]) -> str:
@@ -117,6 +121,14 @@ def change_summary(view: dict[str, Any]) -> str:
             "replicas unchanged"
         )
     replicas = change.get("replicas") or view.get("replicas") or {}
+    if "hpa" in change:
+        hpa = change["hpa"]
+        low, high = hpa.get("min_replicas") or {}, hpa.get("max_replicas") or {}
+        return (
+            f"{target}: HPA bounds {low.get('from')}-{high.get('from')} -> "
+            f"{low.get('to')}-{high.get('to')} (Deployment {hpa.get('scale_target')}: "
+            f"pods {replicas.get('from')} -> {replicas.get('to')})"
+        )
     return f"{target}: replicas {replicas.get('from')} -> {replicas.get('to')}"
 
 
@@ -125,7 +137,12 @@ def verification_summary(verification: dict[str, Any] | None) -> str:
         return ""
     text = f"; verified {verification.get('window_seconds')} s after the apply"
     if verification.get("revert_on_failure"):
-        text += f", reverted to {verification.get('revert_to')} replica(s) if degraded"
+        target = verification.get("revert_to")
+        if isinstance(target, dict):
+            target = f"bounds {target.get('min_replicas')}-{target.get('max_replicas')}"
+        else:
+            target = f"{target} replica(s)"
+        text += f", reverted to {target} if degraded"
     return text
 
 

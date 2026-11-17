@@ -83,7 +83,9 @@ def test_deployment_targeted_by_an_hpa_is_conflict(kh):
     autoscaling.create_namespaced_horizontal_pod_autoscaler(NAMESPACE, hpa)
     kh.created.append(("hpa", target["name"], NAMESPACE))
     envelope = kh.call(PLAN, {**target, "replicas": 2})
-    assert code(envelope) == "conflict" and not details(envelope)
+    # The refusal names the HPA, which plan_adjust_hpa changes instead (test_kind_hpa.py).
+    assert code(envelope) == "conflict"
+    assert details(envelope)["hpa"] == [target["name"]]
 
 
 def test_plan_is_single_use_and_carries_correlation_ids(kh):

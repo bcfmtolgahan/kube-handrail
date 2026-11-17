@@ -30,6 +30,7 @@ from handrail_common.plans import (
     scale_args,
     scale_args_hash,
     template_hash,
+    with_change_ref,
 )
 from handrail_common.validation import GuardError
 
@@ -2954,3 +2955,529 @@ def test_a_revert_record_keeps_the_cluster_of_its_plan(verify_rt):
     )
     assert verify(plan.plan_id)["data"]["revert"] == "reverted"
     assert item(handler.revert_plan_id(plan.plan_id))["cluster"] == "test-cluster"
+
+
+# --- apply_adjust_hpa -------------------------------------------------------------------
+
+HPA_UID = "8f7c1a2e-0000-4000-8000-0000000000aa"
+HPA_CONTEXT = SimpleNamespace(
+    client_context=SimpleNamespace(custom={"bedrockAgentCoreToolName": "k8sw___apply_adjust_hpa"}),
+    aws_request_id="lambda-request-id",
+)
+HPA_METRICS = [
+    {
+        "type": "Resource",
+        "resource": {"name": "cpu", "target": {"type": "Utilization", "averageUtilization": 80}},
+    }
+]
+
+
+def hpa_raw(minimum=1, maximum=5, rv="900", annotations=None, current=2, able="True") -> dict:
+    return {
+        "metadata": {
+            "name": "web-hpa",
+            "namespace": "sandbox",
+            "uid": HPA_UID,
+            "resourceVersion": rv,
+            "annotations": dict(annotations or {}),
+        },
+        "spec": {
+            "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "web"},
+            "minReplicas": minimum,
+            "maxReplicas": maximum,
+            "metrics": json.loads(json.dumps(HPA_METRICS)),
+        },
+        "status": {
+            "currentReplicas": current,
+            "desiredReplicas": current,
+            "conditions": [{"type": "AbleToScale", "status": able, "reason": "ReadyForNewScale"}],
+        },
+    }
+
+
+class FakeAutoscaling:
+    """AutoscalingV2Api serving one HPA as raw JSON; a real patch merges the bounds and
+    annotations and bumps resourceVersion, a dry run changes nothing."""
+
+    def __init__(self, hpa: dict) -> None:
+        self.hpa = hpa
+        self.patches: list[tuple[dict, bool]] = []
+        self.errors: list[Exception] = []
+
+    def read_namespaced_horizontal_pod_autoscaler(self, name, namespace, _preload_content=True):
+        assert (name, namespace, _preload_content) == ("web-hpa", "sandbox", False)
+        return SimpleNamespace(data=json.dumps(self.hpa).encode())
+
+    def patch_namespaced_horizontal_pod_autoscaler(
+        self, name, namespace, body, _preload_content=True, dry_run=None
+    ):
+        assert (name, namespace, _preload_content) == ("web-hpa", "sandbox", False)
+        self.patches.append((body, dry_run == "All"))
+        if self.errors:
+            raise self.errors.pop(0)
+        result = json.loads(json.dumps(self.hpa))
+        result["spec"].update(body["spec"])
+        result["metadata"]["annotations"].update(body["metadata"]["annotations"])
+        result["metadata"]["resourceVersion"] = str(int(result["metadata"]["resourceVersion"]) + 1)
+        if dry_run != "All":
+            self.hpa = result
+        return SimpleNamespace(data=json.dumps(result).encode())
+
+
+def target_deployment(
+    replicas=2, available=None, conditions=None, annotations=None, observed_generation=8
+):
+    available = replicas if available is None else available
+    return k8s_models.V1Deployment(
+        metadata=k8s_models.V1ObjectMeta(
+            name="web", generation=8, uid=UID, resource_version="555", annotations=annotations
+        ),
+        spec=k8s_models.V1DeploymentSpec(
+            replicas=replicas,
+            selector=k8s_models.V1LabelSelector(),
+            template=k8s_models.V1PodTemplateSpec(),
+        ),
+        status=k8s_models.V1DeploymentStatus(
+            observed_generation=observed_generation,
+            replicas=replicas,
+            available_replicas=available,
+            conditions=conditions
+            or [k8s_models.V1DeploymentCondition(type="Available", status="True")],
+        ),
+    )
+
+
+@pytest.fixture
+def hpa_rt(rt):
+    from handrail_common.config import ACTIONS
+
+    runtime_, apps = rt
+    runtime_.settings = dataclasses.replace(
+        runtime_.settings, namespace_policy={"sandbox": NamespacePolicy(0, 5, frozenset(ACTIONS))}
+    )
+    fake = FakeAutoscaling(hpa_raw())
+    runtime_.autoscaling = lambda: fake
+    apps.read_namespaced_deployment.return_value = target_deployment()
+    return runtime_, apps, fake
+
+
+def create_hpa_plan(
+    store: PlanStore, min_to=3, max_to=None, window=None, revert=False, override=False
+) -> Plan:
+    from handrail_common.plans import ADJUST_HPA, adjust_hpa_args
+    from handrail_common.resources import spec_hash, with_bounds
+
+    args = adjust_hpa_args("sandbox", "web-hpa", min_to, max_to, override, revert, window)
+    spec = hpa_raw()["spec"]
+    new_min, new_max = (1 if min_to is None else min_to), (5 if max_to is None else max_to)
+    plan = Plan(
+        plan_id=str(uuid.uuid4()),
+        action=ADJUST_HPA,
+        namespace="sandbox",
+        name="web-hpa",
+        replicas_from=2,
+        replicas_to=max(new_min, min(2, new_max)),
+        args_hash=plan_args_hash(ADJUST_HPA, args),
+        args=args,
+        override_manual_change=override,
+        resource_version="900",
+        generation=-1,
+        uid=HPA_UID,
+        created_at=NOW,
+        expires_at=NOW + 300,
+        verify_window_seconds=window or 120,
+        target_kind="HorizontalPodAutoscaler",
+        hpa_target="web",
+        min_from=1,
+        min_to=new_min,
+        max_from=5,
+        max_to=new_max,
+        spec_from=spec_hash(spec),
+        spec_to=spec_hash(with_bounds(spec, new_min, new_max)),
+        **AGENT_FIELDS,
+    )
+    store.create(plan)
+    return plan
+
+
+def apply_hpa(plan_id: str, **args) -> dict:
+    event = {"plan_id": plan_id, "namespace": "sandbox", "name": "web-hpa", **args}
+    return handler.lambda_handler({**event, **signed()}, HPA_CONTEXT)
+
+
+def test_apply_adjust_hpa_patches_the_bounds_only(hpa_rt):
+    runtime_, apps, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store)
+    response = apply_hpa(plan.plan_id, min_replicas=3)
+    assert response["ok"] is True, response
+    assert response["data"]["min_replicas"] == {"from": 1, "to": 3}
+    assert response["data"]["max_replicas"] == {"from": 5, "to": 5}
+    assert response["data"]["resource_version"] == "901"
+    (dry, is_dry), (real, is_real_dry) = fake.patches
+    assert (is_dry, is_real_dry) == (True, False) and dry == real
+    assert real == {
+        "metadata": {
+            "resourceVersion": "900",
+            "annotations": {
+                handler.LAST_PLAN_ANNOTATION: plan.plan_id,
+                "kube-handrail.io/correlation-id": "lambda-request-id",
+                handler.REQUESTED_BY_ANNOTATION: "agent:smoke_test",
+            },
+        },
+        "spec": {"minReplicas": 3, "maxReplicas": 5},
+    }
+    apps.patch_namespaced_deployment.assert_not_called()
+    record = item(plan.plan_id)
+    assert record["result"] == "applied" and "applied_generation" not in record
+
+
+def test_apply_adjust_hpa_pins_both_revert_bounds(hpa_rt):
+    runtime_, _, _ = hpa_rt
+    plan = create_hpa_plan(runtime_.store, window=60, revert=True)
+    assert apply_hpa(
+        plan.plan_id, min_replicas=3, verify_window_seconds=60, revert_on_failure=True
+    )["ok"]
+    record = item(plan.plan_id)
+    assert (record["revert_min_to"], record["revert_max_to"]) == (1, 5)
+    assert "revert_to" not in record
+
+
+def test_apply_adjust_hpa_with_other_bounds_is_plan_mismatch(hpa_rt):
+    runtime_, _, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store)
+    assert error_code(apply_hpa(plan.plan_id, min_replicas=4)) == "plan_mismatch"
+    assert error_code(apply_hpa(plan.plan_id, min_replicas=3, max_replicas=5)) == "plan_mismatch"
+    assert fake.patches == []
+
+
+def test_a_record_whose_bounds_do_not_match_its_arguments_is_plan_mismatch(hpa_rt):
+    runtime_, _, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store)
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET min_to = :v",
+        ExpressionAttributeValues={":v": 5},
+    )
+    assert error_code(apply_hpa(plan.plan_id, min_replicas=3)) == "plan_mismatch"
+    assert fake.patches == []
+
+
+def test_apply_adjust_hpa_refuses_a_changed_spec(hpa_rt):
+    runtime_, _, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store)
+    fake.hpa["spec"]["metrics"][0]["resource"]["target"]["averageUtilization"] = 50
+    response = apply_hpa(plan.plan_id, min_replicas=3)
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"]["spec"]["planned"] == plan.spec_from
+    assert fake.patches == []
+
+
+def test_a_status_update_between_read_and_patch_is_retried(hpa_rt):
+    """The HPA controller writes its status every sync: a 409 on an unchanged spec retries."""
+    runtime_, _, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store)
+    fake.errors = [conflict()]
+    assert apply_hpa(plan.plan_id, min_replicas=3)["ok"] is True
+    assert len(fake.patches) == 3
+
+
+def test_a_denial_by_the_hpa_policy_is_admission_denied(hpa_rt):
+    runtime_, _, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store)
+    body = json.loads(json.dumps(VAP_BODY))
+    denial = VAP_DENIAL.replace("writer-bounds", "writer-hpa-bounds")
+    body["message"] = denial
+    body["details"]["causes"] = [{"message": denial}]
+    fake.errors = [api_error(422, json.dumps(body))]
+    response = apply_hpa(plan.plan_id, min_replicas=3)
+    assert error_code(response) == "admission_denied"
+    assert response["error"]["details"]["policy"] == "kube-handrail-writer-hpa-bounds"
+    # The Deployment policy's text is not this policy's denial.
+    plan = create_hpa_plan(runtime_.store)
+    fake.errors = [admission_denied()]
+    at(runtime_, NOW + 120)
+    assert error_code(apply_hpa(plan.plan_id, min_replicas=3)) == "kubernetes_error"
+
+
+def test_apply_adjust_hpa_recomputes_the_blast_radius_on_the_pods_now(hpa_rt):
+    runtime_, apps, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store, min_to=5)
+    # Planned on 2 pods (step to 5 is 3 within 200 %); the target now has 1 (step 4 > 2).
+    apps.read_namespaced_deployment.return_value = target_deployment(replicas=1)
+    response = apply_hpa(plan.plan_id, min_replicas=5)
+    assert error_code(response) == "blast_radius_exceeded"
+    assert (response["error"]["details"]["from"], response["error"]["details"]["to"]) == (1, 5)
+    assert fake.patches == []
+
+
+@pytest.mark.parametrize(("min_to", "max_to"), [(None, 4), (2, None)])
+def test_apply_adjust_hpa_refuses_a_target_scaled_to_zero(hpa_rt, min_to, max_to):
+    """The HPA controller does nothing while its target is at 0, as at plan time."""
+    runtime_, apps, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store, min_to=min_to, max_to=max_to)
+    apps.read_namespaced_deployment.return_value = target_deployment(replicas=0)
+    args = {k: v for k, v in (("min_replicas", min_to), ("max_replicas", max_to)) if v}
+    response = apply_hpa(plan.plan_id, **args)
+    assert error_code(response) == "conflict"
+    assert response["error"]["details"] == {"reason": "scaling_disabled"}
+    assert fake.patches == []
+
+
+def test_apply_adjust_hpa_refuses_a_gitops_managed_target(hpa_rt):
+    runtime_, apps, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store)
+    apps.read_namespaced_deployment.return_value = target_deployment(
+        annotations={"argocd.argoproj.io/tracking-id": "x"}
+    )
+    assert error_code(apply_hpa(plan.plan_id, min_replicas=3)) == "gitops_managed"
+    assert fake.patches == []
+
+
+def test_apply_adjust_hpa_needs_the_action(hpa_rt):
+    runtime_, _, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store)
+    runtime_.settings = dataclasses.replace(runtime_.settings, namespace_policy={})
+    response = apply_hpa(plan.plan_id, min_replicas=3)
+    assert error_code(response) == "forbidden_namespace"
+    assert response["error"]["details"]["action"] == "adjust_hpa"
+
+
+def test_apply_adjust_hpa_refuses_bounds_the_namespace_no_longer_allows(hpa_rt):
+    runtime_, _, fake = hpa_rt
+    plan = create_hpa_plan(runtime_.store, min_to=3)
+    runtime_.settings = dataclasses.replace(
+        runtime_.settings,
+        namespace_policy={
+            "sandbox": NamespacePolicy(0, 2, runtime_.settings.actions_for("sandbox"))
+        },
+    )
+    assert error_code(apply_hpa(plan.plan_id, min_replicas=3)) == "out_of_bounds"
+    assert fake.patches == []
+
+
+def applied_hpa(runtime_, revert=False) -> Plan:
+    plan = create_hpa_plan(runtime_.store, window=60, revert=revert)
+    extra = {"revert_on_failure": True} if revert else {}
+    assert apply_hpa(plan.plan_id, min_replicas=3, verify_window_seconds=60, **extra)["ok"]
+    at(runtime_, NOW + 61)
+    return Plan.from_item(item(plan.plan_id))
+
+
+def test_a_healthy_hpa_adjust_is_verified(hpa_rt):
+    runtime_, apps, fake = hpa_rt
+    plan = applied_hpa(runtime_)
+    fake.hpa["status"]["currentReplicas"] = 3
+    apps.read_namespaced_deployment.return_value = target_deployment(replicas=3)
+    data = verify(plan.plan_id)["data"]
+    assert (data["outcome"], data["reason"]) == ("healthy", "target_reached")
+    observed = item(plan.plan_id)["verification"]["observed"]
+    assert (observed["min_replicas"], observed["max_replicas"], observed["current_replicas"]) == (
+        3,
+        5,
+        3,
+    )
+    assert observed["target"]["available"] == 3
+
+
+@pytest.mark.parametrize(
+    ("change", "outcome", "reason"),
+    [
+        # The pods are not yet within the new bounds.
+        (lambda fake, apps: None, "degraded", "target_not_reached"),
+        (
+            lambda fake, apps: fake.hpa["status"]["conditions"][0].update(status="False"),
+            "degraded",
+            "not_able_to_scale",
+        ),
+        (
+            lambda fake, apps: setattr(
+                apps.read_namespaced_deployment,
+                "return_value",
+                target_deployment(
+                    replicas=3,
+                    available=2,
+                    conditions=[
+                        k8s_models.V1DeploymentCondition(type="ReplicaFailure", status="True")
+                    ],
+                ),
+            ),
+            "degraded",
+            "replica_failure",
+        ),
+        (
+            lambda fake, apps: fake.hpa["spec"].update(maxReplicas=4),
+            "unknown",
+            "spec_changed",
+        ),
+        (
+            lambda fake, apps: fake.hpa["metadata"]["annotations"].update(
+                {handler.LAST_PLAN_ANNOTATION: str(uuid.uuid4())}
+            ),
+            "unknown",
+            "superseded",
+        ),
+        # The HPA scaled up within the new bounds and a pod is still starting: the floor
+        # the plan guarantees (3) is available, so the adjust did what it was for.
+        (
+            lambda fake, apps: (
+                fake.hpa["status"].update(currentReplicas=5),
+                setattr(
+                    apps.read_namespaced_deployment,
+                    "return_value",
+                    target_deployment(replicas=5, available=4),
+                ),
+            ),
+            "healthy",
+            "target_reached",
+        ),
+        # Below the new minimum: not reached.
+        (
+            lambda fake, apps: (
+                fake.hpa["status"].update(currentReplicas=3),
+                setattr(
+                    apps.read_namespaced_deployment,
+                    "return_value",
+                    target_deployment(replicas=3, available=2),
+                ),
+            ),
+            "degraded",
+            "target_not_reached",
+        ),
+        # The Deployment controller has not seen the target's latest spec yet.
+        (
+            lambda fake, apps: (
+                fake.hpa["status"].update(currentReplicas=5),
+                setattr(
+                    apps.read_namespaced_deployment,
+                    "return_value",
+                    target_deployment(replicas=5, available=3, observed_generation=7),
+                ),
+            ),
+            "unknown",
+            "not_observed",
+        ),
+    ],
+)
+def test_hpa_adjust_verification_outcomes(hpa_rt, change, outcome, reason):
+    runtime_, apps, fake = hpa_rt
+    plan = applied_hpa(runtime_)
+    change(fake, apps)
+    data = verify(plan.plan_id)["data"]
+    assert (data["outcome"], data["reason"]) == (outcome, reason)
+
+
+def test_a_degraded_hpa_adjust_with_revert_restores_both_bounds(hpa_rt):
+    runtime_, apps, fake = hpa_rt
+    plan = applied_hpa(runtime_, revert=True)
+    fake.patches.clear()
+    revert_id = handler.revert_plan_id(plan.plan_id)
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET approval_mode = :m",
+        ExpressionAttributeValues={":m": "both"},
+    )
+    data = verify(plan.plan_id)["data"]
+    assert (data["outcome"], data["revert"]) == ("degraded", "reverted")
+    (dry, _), (real, _) = fake.patches
+    assert real["spec"] == {"minReplicas": 1, "maxReplicas": 5}
+    assert real["metadata"]["annotations"][handler.LAST_PLAN_ANNOTATION] == revert_id
+    assert fake.hpa["spec"]["minReplicas"] == 1
+    record = Plan.from_item(item(revert_id))
+    assert (record.action, record.target_kind, record.kind) == (
+        "adjust_hpa",
+        "HorizontalPodAutoscaler",
+        "revert",
+    )
+    assert (record.min_from, record.min_to, record.max_from, record.max_to) == (3, 1, 5, 5)
+    assert record.approval_mode == "both"
+    assert record.spec_from == plan.spec_to and record.spec_to == plan.spec_from
+    assert record.args == {
+        "namespace": "sandbox",
+        "name": "web-hpa",
+        "min_replicas": 1,
+        "max_replicas": 5,
+    }
+    assert record.result == "applied"
+    # The revert is verified like any adjust (the pods are within 1 to 5), never reverted.
+    at(runtime_, NOW + 61 + 61)
+    data = verify(revert_id)["data"]
+    assert (data["outcome"], data["revert"]) == ("healthy", None)
+
+
+def test_an_hpa_revert_without_its_pinned_bounds_is_refused(hpa_rt):
+    runtime_, apps, fake = hpa_rt
+    plan = applied_hpa(runtime_, revert=True)
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id}, UpdateExpression="REMOVE revert_min_to"
+    )
+    data = verify(plan.plan_id)["data"]
+    assert data["revert"] == "refused"
+    assert item(plan.plan_id)["revert"]["reason"] == "plan_mismatch"
+
+
+def test_an_hpa_changed_after_the_apply_is_not_reverted(hpa_rt):
+    runtime_, apps, fake = hpa_rt
+    plan = applied_hpa(runtime_, revert=True)
+    fake.hpa["spec"]["metrics"] = []
+    data = verify(plan.plan_id)["data"]
+    # unknown, never degraded: nothing to revert.
+    assert (data["outcome"], data["revert"]) == ("unknown", None)
+    assert len(fake.patches) == 2  # the apply's dry run and patch only
+
+
+def test_every_pinned_revert_attribute_is_denied_to_the_read_role():
+    """terraform/verify.tf local.verify_attributes lists what the consume pins, so the read
+    role cannot write a revert target (NeverApprove)."""
+    text = (Path(__file__).parents[2] / "terraform" / "verify.tf").read_text()
+    block = text[
+        text.index("verify_attributes = [") : text.index("]", text.index("verify_attributes"))
+    ]
+    for action in (handler.SCALE, handler.ADJUST):
+        for target, _ in action.revert_pins:
+            assert f'"{target}"' in block, target
+
+
+def test_a_scale_record_given_another_target_kind_is_plan_mismatch(rt):
+    """The verification and revert read the object of the record's target_kind, so a
+    record altered to name another kind is never applied."""
+    runtime_, apps = rt
+    plan = create_plan(runtime_.store)
+    runtime_.store._table.update_item(
+        Key={"plan_id": plan.plan_id},
+        UpdateExpression="SET target_kind = :k",
+        ExpressionAttributeValues={":k": "HorizontalPodAutoscaler"},
+    )
+    assert error_code(apply(plan.plan_id)) == "plan_mismatch"
+    apps.patch_namespaced_deployment.assert_not_called()
+
+
+def create_plan_with_ref(store: PlanStore, change_ref: str) -> Plan:
+    args = with_change_ref(scale_args("sandbox", "web", 3), change_ref)
+    plan = dataclasses.replace(
+        create_plan(store),
+        plan_id=str(uuid.uuid4()),
+        args=args,
+        args_hash=plan_args_hash(SCALE_DEPLOYMENT, args),
+    )
+    store.create(plan)
+    return plan
+
+
+def test_change_ref_is_pinned_like_any_argument(rt):
+    runtime_, apps = rt
+    plan = create_plan_with_ref(runtime_.store, "INC-42")
+    assert error_code(apply(plan.plan_id)) == "plan_mismatch"
+    assert error_code(apply(plan.plan_id, change_ref="INC-43")) == "plan_mismatch"
+    apps.patch_namespaced_deployment.assert_not_called()
+    assert apply(plan.plan_id, change_ref="INC-42")["ok"] is True
+    # A plan without one refuses an apply that adds one.
+    other = create_plan(runtime_.store)
+    assert error_code(apply(other.plan_id, change_ref="INC-42")) == "plan_mismatch"
+
+
+@pytest.mark.parametrize("value", ["", "  ", "x" * 129, "INC\n42", "INC‮42", 42])
+def test_a_bad_change_ref_is_refused_before_the_consume(rt, value):
+    runtime_, apps = rt
+    plan = create_plan_with_ref(runtime_.store, "INC-42")
+    assert error_code(apply(plan.plan_id, change_ref=value)) == "invalid_argument"
+    assert item(plan.plan_id)["used"] is False

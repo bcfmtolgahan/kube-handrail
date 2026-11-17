@@ -16,7 +16,7 @@ from handrail_common.envelope import (
     MANUAL_CHANGE,
     OBJECT_BUDGET_EXCEEDED,
 )
-from handrail_common.plans import RESULT_APPLIED, HistoryEntry, Plan, PlanStore
+from handrail_common.plans import RESULT_APPLIED, HistoryEntry, Plan, PlanStore, plan_direction
 from handrail_common.validation import GuardError
 
 LAST_PLAN_ANNOTATION = "kube-handrail.io/last-plan-id"
@@ -71,15 +71,23 @@ def _history(applied: Sequence[HistoryEntry]) -> list[dict[str, int]]:
 
 
 def check_flapping(
-    entries: Sequence[HistoryEntry], now: int, window: int, replicas_from: int, replicas_to: int
+    entries: Sequence[HistoryEntry],
+    now: int,
+    window: int,
+    replicas_from: int,
+    replicas_to: int,
+    direction: int | None = None,
 ) -> None:
     """Reject a second reversal of direction within the window. A single revert is allowed.
 
-    Applies that left the replica count unchanged have no direction and are skipped.
+    Applies without a direction (the replica count, or for an HPA adjust its bounds,
+    unchanged) are skipped. `direction` overrides the replica count's (an HPA adjust:
+    plans.bounds_direction).
     """
-    direction = _sign(replicas_to - replicas_from)
+    if direction is None:
+        direction = _sign(replicas_to - replicas_from)
     applied = applied_within(entries, now, window)
-    directions = [d for d in (_sign(e.replicas_to - e.replicas_from) for e in applied) if d]
+    directions = [d for d in (e.sign for e in applied) if d]
     if direction == 0 or len(directions) < 2:
         return
     last, before = directions[-1], directions[-2]
@@ -145,6 +153,7 @@ def with_last_applied(entries: Sequence[HistoryEntry], plan: Plan, now: int) -> 
         created_at=plan.created_at,
         result=RESULT_APPLIED,
         applied_at=applied_at,
+        direction=plan_direction(plan.to_item()),
     )
     return [e for e in entries if e.plan_id != plan.plan_id] + [last]
 
@@ -158,23 +167,33 @@ def check_history(
     replicas_to: int,
     *,
     last_applied: Plan | None = None,
+    direction: int | None = None,
 ) -> None:
     """Cooldown, flapping and the hourly budget, on plan and on apply.
 
-    `last_applied` is the plan named by the Deployment's annotation (last_applied_plan); it
-    is merged into the history so the most recent apply is never missed.
+    `last_applied` is the plan named by the object's annotation (last_applied_plan); it
+    is merged into the history so the most recent apply is never missed. `direction`
+    overrides the replica count's for the flapping check (check_flapping).
     """
     entries = store.history(key, now - retention_seconds(settings))
     if last_applied is not None and last_applied.object_key == key:
         entries = with_last_applied(entries, last_applied, now)
     check_cooldown(entries, now, settings.apply_cooldown_seconds)
-    check_flapping(entries, now, settings.flap_window_seconds, replicas_from, replicas_to)
+    check_flapping(
+        entries, now, settings.flap_window_seconds, replicas_from, replicas_to, direction
+    )
     check_object_budget(entries, now, settings.object_hourly_apply_budget)
 
 
 def last_plan_id(deployment: Any) -> str | None:
     """The plan id kube-handrail last applied to this object, if the annotation holds one."""
     annotations = getattr(getattr(deployment, "metadata", None), "annotations", None) or {}
+    return plan_id_in(annotations)
+
+
+def plan_id_in(annotations: Any) -> str | None:
+    """The plan id in an object's annotations (a mapping), if the last-plan annotation holds
+    one: last_plan_id for raw JSON objects."""
     value = annotations.get(LAST_PLAN_ANNOTATION) if isinstance(annotations, Mapping) else None
     try:
         canonical = str(uuid.UUID(value)) if isinstance(value, str) else None
@@ -190,11 +209,15 @@ def last_applied_plan(store: PlanStore, deployment: Any) -> Plan | None:
     was never consumed, or it was made for another object with the same name (other uid).
     A read error propagates: the checks that need the plan must not run without it.
     """
-    plan_id = last_plan_id(deployment)
+    return last_applied_plan_by(store, last_plan_id(deployment), str(deployment.metadata.uid))
+
+
+def last_applied_plan_by(store: PlanStore, plan_id: str | None, uid: str) -> Plan | None:
+    """last_applied_plan from the annotation's plan id and the object's uid."""
     if plan_id is None:
         return None
     plan = store.consumed_plan(plan_id)
-    if plan is None or plan.uid != str(deployment.metadata.uid):
+    if plan is None or plan.uid != uid:
         return None
     return plan
 
@@ -269,4 +292,29 @@ def check_template_manual_change(
         "the pod template was changed outside kube-handrail since its last apply; "
         "plan with override_manual_change=true to roll back anyway",
         {"last_applied_template": last_applied.template_to, "current_template": current_template},
+    )
+
+
+def check_bounds_manual_change(
+    last_applied: Plan | None, current: tuple[int, int], override: bool
+) -> bool:
+    """Reject changing an HPA's bounds after someone changed them outside kube-handrail
+    since its last apply to that HPA. `last_applied` is the plan the HPA's annotation names;
+    `current` is the live (minReplicas, maxReplicas). Returns True when a change was found
+    and `override` allowed it."""
+    if last_applied is None or last_applied.min_to is None or last_applied.max_to is None:
+        return False
+    applied = (last_applied.min_to, last_applied.max_to)
+    if applied == tuple(current):
+        return False
+    if override:
+        return True
+    raise GuardError(
+        MANUAL_CHANGE,
+        "the HorizontalPodAutoscaler's bounds were changed outside kube-handrail since its "
+        "last apply; plan with override_manual_change=true to change them anyway",
+        {
+            "last_applied_to": {"min_replicas": applied[0], "max_replicas": applied[1]},
+            "current": {"min_replicas": current[0], "max_replicas": current[1]},
+        },
     )

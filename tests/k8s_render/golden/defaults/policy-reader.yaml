@@ -1,7 +1,8 @@
 # Rendered by Terraform (terraform/modules/namespace-policy); do not edit.
 # The read Lambda compares the admission policy with its own bounds on every plan
-# (mcp/CONTRACT.md, Admission policy). Both objects are cluster-scoped, so this is the
-# reader's only cluster-scoped permission: get, on these two names only.
+# (mcp/CONTRACT.md, Admission policy). The objects are cluster-scoped, so this is the
+# reader's only cluster-scoped permission: get, on these names only (the HPA policy and
+# its binding for plan_adjust_hpa).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -11,11 +12,11 @@ metadata:
 rules:
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["validatingadmissionpolicies"]
-    resourceNames: ["kube-handrail-writer-bounds"]
+    resourceNames: ["kube-handrail-writer-bounds", "kube-handrail-writer-hpa-bounds"]
     verbs: ["get"]
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["validatingadmissionpolicybindings"]
-    resourceNames: ["kube-handrail-writer-bounds"]
+    resourceNames: ["kube-handrail-writer-bounds", "kube-handrail-writer-hpa-bounds"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

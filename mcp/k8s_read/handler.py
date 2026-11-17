@@ -15,10 +15,16 @@ from kubernetes import client as k8s
 from kubernetes.client.rest import ApiException
 
 from handrail_common.admission import CHECK as ADMISSION_POLICY_MATCH
-from handrail_common.admission import check_admission_policy
+from handrail_common.admission import (
+    DEPLOYMENT_POLICY,
+    HPA_POLICY,
+    PolicyShape,
+    check_admission_policy,
+)
 from handrail_common.agents import check_agent_budget, guard_plan, requester
 from handrail_common.approval import notification, plain, plan_view
 from handrail_common.breaker import (
+    check_bounds_manual_change,
     check_history,
     check_manual_change,
     check_template_manual_change,
@@ -43,9 +49,10 @@ from handrail_common.envelope import (
 )
 from handrail_common.freezes import check_not_frozen, freeze_store
 from handrail_common.gitops import is_gitops_managed
-from handrail_common.impact import revert_warnings, rollout_impact, scale_impact
+from handrail_common.impact import hpa_warnings, revert_warnings, rollout_impact, scale_impact
 from handrail_common.observability import bind_plan_id, current_correlation_id
 from handrail_common.plans import (
+    ADJUST_HPA,
     GLOBAL_BUDGET_WINDOW_SECONDS,
     RESTART_DEPLOYMENT,
     ROLLBACK_DEPLOYMENT,
@@ -54,6 +61,8 @@ from handrail_common.plans import (
     STATUS_PLANNED,
     Plan,
     PlanStore,
+    adjust_hpa_args,
+    bounds_direction,
     global_budget_error,
     object_key,
     plan_args_hash,
@@ -62,6 +71,19 @@ from handrail_common.plans import (
     rollback_args,
     scale_args,
     template_hash,
+    with_change_ref,
+)
+from handrail_common.resources import (
+    HORIZONTAL_POD_AUTOSCALER,
+    NO_GENERATION,
+    clamp,
+    hpa_bounds,
+    hpa_conditions,
+    hpa_spec,
+    resolve_bounds,
+    scale_target,
+    spec_hash,
+    with_bounds,
 )
 from handrail_common.rollout import (
     CHANGE_CAUSE_ANNOTATION,
@@ -82,6 +104,7 @@ from handrail_common.validation import (
     check_namespace_allowed,
     check_not_paused,
     check_replica_step,
+    require_change_ref,
     require_int,
     require_name,
     require_namespace,
@@ -537,9 +560,33 @@ class Resolved:
     truncated: bool = False
     # Warnings the checks found for the impact preview (scale: revert_baseline_unhealthy).
     warnings: tuple[dict[str, str], ...] = ()
+    # The resulting replica count when the checks computed it (HPA adjust: the pods clamped
+    # to the new bounds); None means PlanAction.replicas_to.
+    replicas_to: int | None = None
 
 
 NOTHING = Resolved()
+
+
+@dataclass(frozen=True)
+class Target:
+    """What a plan reads first: the object it changes (a client model) and its raw JSON, and
+    the Deployment whose pods change (the object itself, or the HPA's scale target)."""
+
+    obj: Any
+    raw: Mapping[str, Any]
+    pods: Any
+    # The target Deployment's raw JSON (the object's own raw for a Deployment).
+    pods_raw: Mapping[str, Any]
+
+
+def _deployment_target(clients: "Clients", settings: Settings, namespace: str, name: str) -> Target:
+    deployment, raw = _read_deployment_raw(clients.apps, namespace, name)
+    return Target(deployment, raw, deployment, raw)
+
+
+def _pod_template(target: Target) -> dict[str, Any] | None:
+    return (target.raw.get("spec") or {}).get("template") or {}
 
 
 @dataclass(frozen=True)
@@ -571,6 +618,19 @@ class PlanAction:
     # The impact preview, given the raw Deployment, the current and the resulting replicas
     # and what the checks resolved.
     impact: Callable[[Mapping[str, Any], int, int, Resolved], Preview]
+    # Reads the object the plan changes (handrail_common.resources selects the same kind on
+    # apply by the record's target_kind).
+    read: Callable[["Clients", Settings, str, str], Target] = _deployment_target
+    # The current replica count the plan starts from.
+    current: Callable[[Target], int] = lambda target: _desired_replicas(target.pods)
+    # The raw pod template the plan pins (template_from); None for an HPA adjust.
+    template: Callable[[Target], dict[str, Any] | None] = _pod_template
+    # The admission policy the plan-time check reads.
+    admission_policy: PolicyShape = DEPLOYMENT_POLICY
+
+
+def _kind_noun(action: PlanAction) -> str:
+    return HORIZONTAL_POD_AUTOSCALER if action.name == ADJUST_HPA else "deployment"
 
 
 def _plan(
@@ -582,39 +642,58 @@ def _plan(
     bind_plan_id(plan_id)
 
     namespace, name, request = action.validate(args, settings)
+    request = with_change_ref(request, require_change_ref(args))
     agent = guard_plan(settings, clients.ssm)
     # Before the Deployment is read; apply checks again with its own clock.
     check_not_frozen(freeze_store(clients.ssm, settings.freezes_param), namespace, action.name, now)
     # The cluster's backstop must hold the same bounds before anything is planned against it.
     if settings.admission_check:
-        check_admission_policy(clients.admission, namespace, settings.bounds_for(namespace))
+        check_admission_policy(
+            clients.admission, namespace, settings.bounds_for(namespace), action.admission_policy
+        )
     override = request.get("override_manual_change", False) is True
-    deployment, raw = _read_deployment_raw(clients.apps, namespace, name)
+    target = action.read(clients, settings, namespace, name)
+    deployment = target.obj
     if is_gitops_managed(deployment, settings.markers_for(namespace)):
-        raise GuardError(GITOPS_MANAGED, "deployment is managed by GitOps; change it in Git")
-    current = _desired_replicas(deployment)
-    template = (raw.get("spec") or {}).get("template") or {}
-    resolved = action.checks(clients, settings, deployment, template, current, request)
+        raise GuardError(
+            GITOPS_MANAGED, f"{_kind_noun(action)} is managed by GitOps; change it in Git"
+        )
+    current = action.current(target)
+    template = action.template(target)
+    resolved = action.checks(clients, settings, target, template or {}, current, request)
     # History checks give early feedback; apply runs them all again.
-    overridden = action.breaker(clients, settings, deployment, template, current, request, now)
+    overridden = action.breaker(clients, settings, target, template or {}, current, request, now)
     # Read only here; apply takes a unit of the budget atomically.
     if clients.store.global_applies(now) >= settings.global_hourly_apply_budget:
         raise global_budget_error(
             now - now % GLOBAL_BUDGET_WINDOW_SECONDS, settings.global_hourly_apply_budget
         )
     check_agent_budget(clients.store, agent, now)
-    replicas_to = action.replicas_to(current, request)
+    replicas_to = (
+        action.replicas_to(current, request)
+        if resolved.replicas_to is None
+        else resolved.replicas_to
+    )
     # Last, after every check has passed, and before the plan is stored.
     impact = _impact(
-        clients, namespace, deployment, action.impact(raw, current, replicas_to, resolved)
+        clients,
+        namespace,
+        target.pods,
+        action.impact(target.pods_raw, current, replicas_to, resolved),
     )
     correlation_id = current_correlation_id()
-    template_from = template_hash(template)
-    template_to = template_hash(action.template_to(plan_id, template, resolved))
+    template_from = template_hash(template) if template is not None else None
+    template_to = (
+        template_hash(action.template_to(plan_id, template, resolved))
+        if template is not None
+        else None
+    )
     window = request.get("verify_window_seconds")
     if window is None:
         # The default is recorded, not hashed: the consume schedules the check with it.
         window = settings.verify_window_default_seconds
+    generation = deployment.metadata.generation
+    changes_template = template_to != template_from
 
     plan = Plan(
         plan_id=plan_id,
@@ -626,7 +705,8 @@ def _plan(
         replicas_to=replicas_to,
         args_hash=plan_args_hash(action.name, request),
         resource_version=str(deployment.metadata.resource_version),
-        generation=int(deployment.metadata.generation),
+        # An HPA has no generation; its plan compares the spec hash instead.
+        generation=NO_GENERATION if generation is None else int(generation),
         uid=str(deployment.metadata.uid),
         created_at=now,
         expires_at=now + settings.plan_ttl_seconds,
@@ -642,7 +722,7 @@ def _plan(
         args=request,
         template_from=template_from,
         template_to=template_to,
-        revision_from=_revision(deployment) if template_to != template_from else None,
+        revision_from=_revision(deployment) if changes_template else None,
         verify_window_seconds=window,
         **resolved.record,
     )
@@ -687,7 +767,11 @@ def _verification(plan: Plan) -> dict[str, Any]:
         "revert_on_failure": plan.revert_on_failure,
     }
     if plan.revert_on_failure:
-        view["revert_to"] = plan.replicas_from
+        view["revert_to"] = (
+            plan.replicas_from
+            if plan.min_from is None
+            else {"min_replicas": plan.min_from, "max_replicas": plan.max_from}
+        )
     return view
 
 
@@ -712,15 +796,20 @@ def _validate_scale(args: Mapping[str, Any], settings: Settings) -> tuple[str, s
 def _check_scale(
     clients: Clients,
     settings: Settings,
-    deployment: Any,
+    target: Target,
     template: Mapping[str, Any],
     current: int,
     args: Mapping[str, Any],
 ) -> Resolved:
-    hpas = _targeting_hpas(clients.autoscaling, args["namespace"], args["name"])
+    deployment = target.obj
+    hpas = sorted(_targeting_hpas(clients.autoscaling, args["namespace"], args["name"]))
     if hpas:
+        # The HPA owns the count: its bounds are what can change (plan_adjust_hpa).
+        hint = f"use plan_adjust_hpa on {hpas[0]}"
         raise GuardError(
-            CONFLICT, f"HorizontalPodAutoscaler {', '.join(sorted(hpas))} targets this deployment"
+            CONFLICT,
+            f"HorizontalPodAutoscaler {', '.join(hpas)} targets this deployment; {hint}",
+            {"hpa": hpas, "hint": hint},
         )
     check_replica_step(current, args["replicas"], settings.max_replica_step_percent)
     if args.get("revert_on_failure") is not True:
@@ -740,12 +829,13 @@ def _check_scale(
 def _scale_breaker(
     clients: Clients,
     settings: Settings,
-    deployment: Any,
+    target: Target,
     template: Mapping[str, Any],
     current: int,
     args: Mapping[str, Any],
     now: int,
 ) -> bool:
+    deployment = target.obj
     last_applied = last_applied_plan(clients.store, deployment)
     overridden = check_manual_change(
         replica_baseline(clients.store, settings, last_applied, now),
@@ -819,11 +909,12 @@ def _validate_restart(
 def _check_restart(
     clients: Clients,
     settings: Settings,
-    deployment: Any,
+    target: Target,
     template: Mapping[str, Any],
     current: int,
     args: Mapping[str, Any],
 ) -> Resolved:
+    deployment = target.obj
     # No HPA check: a restart leaves spec.replicas, which an HPA owns, as it is.
     check_not_paused(deployment)
     return NOTHING
@@ -832,12 +923,13 @@ def _check_restart(
 def _restart_breaker(
     clients: Clients,
     settings: Settings,
-    deployment: Any,
+    target: Target,
     template: Mapping[str, Any],
     current: int,
     args: Mapping[str, Any],
     now: int,
 ) -> bool:
+    deployment = target.obj
     # No manual-change check: a restart undoes no change, and a later scale still compares
     # against the count kube-handrail set before it (replica_baseline). Replicas stay as
     # they are, so the change has no direction and is never flapping.
@@ -908,13 +1000,14 @@ def _validate_rollback(
 def _check_rollback(
     clients: Clients,
     settings: Settings,
-    deployment: Any,
+    target: Target,
     template: Mapping[str, Any],
     current: int,
     args: Mapping[str, Any],
 ) -> Resolved:
     """Resolve the revision to the one ReplicaSet the Deployment controls with it, and
     describe what rolling back to its template changes: images and field names only."""
+    deployment = target.obj
     # No HPA check: a rollback leaves spec.replicas, which an HPA owns, as it is.
     check_not_paused(deployment)
     revision = args["revision"]
@@ -944,12 +1037,13 @@ def _check_rollback(
 def _rollback_breaker(
     clients: Clients,
     settings: Settings,
-    deployment: Any,
+    target: Target,
     template: Mapping[str, Any],
     current: int,
     args: Mapping[str, Any],
     now: int,
 ) -> bool:
+    deployment = target.obj
     # Replicas stay as they are, so the replica rules (manual change, flapping) do not apply;
     # the template manual-change rule does.
     last_applied = last_applied_plan(clients.store, deployment)
@@ -1018,6 +1112,189 @@ def plan_rollback_deployment(
     return _plan(ROLLBACK, args, settings, clients, now)
 
 
+# --- adjust_hpa -----------------------------------------------------------------
+
+
+def _optional_count(args: Mapping[str, Any], key: str) -> int | None:
+    value = args.get(key)
+    return None if value is None else require_int(value, key)
+
+
+def _validate_adjust_hpa(
+    args: Mapping[str, Any], settings: Settings
+) -> tuple[str, str, dict[str, Any]]:
+    namespace, name = validate_target_args(
+        args, settings.allowed_namespaces, ADJUST_HPA, settings.actions_for
+    )
+    minimum = _optional_count(args, "min_replicas")
+    maximum = _optional_count(args, "max_replicas")
+    if minimum is None and maximum is None:
+        raise GuardError(INVALID_ARGUMENT, "give min_replicas, max_replicas or both")
+    override = require_override_flag(args)
+    window, revert = _verify_request(args, settings, revert_allowed=True)
+    return (
+        namespace,
+        name,
+        adjust_hpa_args(namespace, name, minimum, maximum, override, revert, window),
+    )
+
+
+def _read_hpa_target(clients: Clients, settings: Settings, namespace: str, name: str) -> Target:
+    """The HPA (model and raw JSON) and the Deployment it scales. The HPA's own GitOps
+    markers are checked by _plan; the Deployment's here: a GitOps-managed workload's
+    autoscaling belongs in Git too."""
+    try:
+        response = clients.autoscaling.read_namespaced_horizontal_pod_autoscaler(
+            name=name, namespace=namespace, _preload_content=False
+        )
+    except ApiException as exc:
+        raise _kubernetes_error(exc, f"horizontalpodautoscaler {namespace}/{name}") from None
+    hpa = _models().deserialize(response, "V2HorizontalPodAutoscaler")
+    raw = json.loads(response.data)
+    deployment, deployment_raw = _read_deployment_raw(
+        clients.apps, namespace, scale_target(hpa_spec(raw))
+    )
+    if is_gitops_managed(deployment, settings.markers_for(namespace)):
+        raise GuardError(
+            GITOPS_MANAGED,
+            "the Deployment this HorizontalPodAutoscaler scales is managed by GitOps; change it "
+            "in Git",
+        )
+    return Target(hpa, raw, deployment, deployment_raw)
+
+
+def _adjust(target: Target, args: Mapping[str, Any], settings: Settings) -> tuple[int, int]:
+    return resolve_bounds(
+        args, hpa_bounds(hpa_spec(target.raw)), settings.bounds_for(args["namespace"])
+    )
+
+
+def _check_adjust_hpa(
+    clients: Clients,
+    settings: Settings,
+    target: Target,
+    template: Mapping[str, Any],
+    current: int,
+    args: Mapping[str, Any],
+) -> Resolved:
+    """The new bounds, and the blast radius on the pods they move: the HPA controller first
+    clamps the current count to its bounds, with or without metrics, so that clamp is the
+    change of pods the plan makes (mcp/contract/adjust-hpa.md)."""
+    if current == 0:
+        # The HPA controller does not act on a target scaled to 0.
+        raise GuardError(
+            CONFLICT,
+            f"Deployment {target.pods.metadata.name} is scaled to 0, which turns the "
+            "HorizontalPodAutoscaler off; its bounds would change nothing",
+            {"reason": "scaling_disabled"},
+        )
+    spec = hpa_spec(target.raw)
+    min_from, max_from = hpa_bounds(spec)
+    min_to, max_to = _adjust(target, args, settings)
+    pods_to = clamp(current, min_to, max_to)
+    check_replica_step(current, pods_to, settings.max_replica_step_percent)
+    warnings = hpa_warnings(hpa_conditions(target.raw))
+    if args.get("revert_on_failure") is True:
+        # The revert restores the current bounds, so they must be bounds a plan could set.
+        minimum, maximum = settings.bounds_for(args["namespace"])
+        if not (minimum <= min_from and max_from <= maximum):
+            raise GuardError(
+                OUT_OF_BOUNDS,
+                f"the revert target, the current bounds {min_from} to {max_from}, is outside "
+                f"the bounds {minimum} to {maximum}; plan without revert_on_failure",
+            )
+        available = (target.pods.status.available_replicas if target.pods.status else None) or 0
+        warnings += revert_warnings(available, current)
+    return Resolved(
+        record={
+            "target_kind": HORIZONTAL_POD_AUTOSCALER,
+            "hpa_target": str(target.pods.metadata.name),
+            "min_from": min_from,
+            "min_to": min_to,
+            "max_from": max_from,
+            "max_to": max_to,
+            "spec_from": spec_hash(spec),
+            "spec_to": spec_hash(with_bounds(spec, min_to, max_to)),
+        },
+        warnings=tuple(warnings),
+        replicas_to=pods_to,
+    )
+
+
+def _hpa_breaker(
+    clients: Clients,
+    settings: Settings,
+    target: Target,
+    template: Mapping[str, Any],
+    current: int,
+    args: Mapping[str, Any],
+    now: int,
+) -> bool:
+    """The HPA's own history (its uid): bounds manual change, cooldown, flapping by the
+    direction of the bounds, object budget."""
+    hpa = target.obj
+    last_applied = last_applied_plan(clients.store, hpa)
+    bounds = hpa_bounds(hpa_spec(target.raw))
+    overridden = check_bounds_manual_change(
+        last_applied, bounds, args.get("override_manual_change", False) is True
+    )
+    min_to, max_to = _adjust(target, args, settings)
+    check_history(
+        clients.store,
+        object_key(args["namespace"], args["name"], str(hpa.metadata.uid)),
+        now,
+        settings,
+        current,
+        clamp(current, min_to, max_to),
+        last_applied=last_applied,
+        direction=bounds_direction(bounds[0], min_to, bounds[1], max_to),
+    )
+    return overridden
+
+
+ADJUST = PlanAction(
+    name=ADJUST_HPA,
+    validate=_validate_adjust_hpa,
+    replicas_to=lambda current, args: current,
+    checks=_check_adjust_hpa,
+    breaker=_hpa_breaker,
+    preflight=(
+        "arguments",
+        "namespace_allowed",
+        "action_allowed",
+        ADMISSION_POLICY_MATCH,
+        "not_gitops_managed",
+        "scale_target_supported",
+        "hpa_bounds",
+        "blast_radius",
+        "no_manual_change",
+        "cooldown",
+        "not_flapping",
+        "object_budget",
+        "global_budget",
+    ),
+    diff=lambda plan: {
+        "hpa": {
+            "min_replicas": {"from": plan.min_from, "to": plan.min_to},
+            "max_replicas": {"from": plan.max_from, "to": plan.max_to},
+            "scale_target": plan.hpa_target,
+        },
+        "replicas": {"from": plan.replicas_from, "to": plan.replicas_to},
+    },
+    template_to=lambda plan_id, template, resolved: {},
+    impact=SCALE.impact,
+    read=_read_hpa_target,
+    template=lambda target: None,
+    admission_policy=HPA_POLICY,
+)
+
+
+def plan_adjust_hpa(
+    args: dict[str, Any], settings: Settings, clients: Clients, now: int
+) -> Envelope:
+    return _plan(ADJUST, args, settings, clients, now)
+
+
 # request_approval in client mode: what to do first, then the earlier message, which the
 # guidance of earlier releases looks for (DevOps Agent can serve it for a while after an
 # upgrade). The code stays invalid_argument: an ok here could read as an approval.
@@ -1031,7 +1308,8 @@ def request_approval(
     args: dict[str, Any], settings: Settings, clients: Clients, now: int
 ) -> Envelope:
     """Ask the configured approvers to decide on a plan. Approves nothing; only the plan_id
-    is read from the arguments, so no agent text reaches the approvers."""
+    is read from the arguments; the only agent text approvers see is the plan's change_ref,
+    as untrusted text."""
     plan_id = require_plan_id(args.get("plan_id"))
     if not settings.approval_required:
         # A server approval would change nothing, and the wait would only keep the plan alive.
@@ -1111,6 +1389,9 @@ HANDLERS = {
         args, _settings(), Clients(_settings()), int(time.time())
     ),
     "get_plan_outcome": lambda args: get_plan_outcome(
+        args, _settings(), Clients(_settings()), int(time.time())
+    ),
+    "plan_adjust_hpa": lambda args: plan_adjust_hpa(
         args, _settings(), Clients(_settings()), int(time.time())
     ),
 }

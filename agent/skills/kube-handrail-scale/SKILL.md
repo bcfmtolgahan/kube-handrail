@@ -1,6 +1,6 @@
 ---
 name: kube-handrail-scale
-description: Procedure for changing the replica count of a Kubernetes Deployment through the kube-handrail MCP tools (get_workload_status, plan_scale_deployment, request_approval, apply_scale_deployment, get_plan_outcome), optionally with an automatic revert if the change fails. Use this skill when a mitigation or a user request calls for scaling a Deployment up or down, when a kube-handrail plan or apply returns an error, when a scale change is waiting for human approval, or to check whether an applied scale worked.
+description: Procedure for changing the replica count of a Kubernetes Deployment, or the bounds of the HorizontalPodAutoscaler that owns it, through the kube-handrail MCP tools (get_workload_status, plan_scale_deployment, plan_adjust_hpa, request_approval, apply_scale_deployment, apply_adjust_hpa, get_plan_outcome), optionally with an automatic revert if the change fails. Use this skill when a mitigation or a user request calls for scaling a Deployment up or down, when a kube-handrail plan or apply returns an error, when a scale change is waiting for human approval, or to check whether an applied scale worked.
 ---
 <!-- kube-handrail:skill -->
 
@@ -44,7 +44,7 @@ On an error, follow the AGENTS.md error table. In short: `blast_radius_exceeded`
 Call `request_approval(plan_id)`:
 
 - `approval_mode: server`: approvers were notified. Their approval applies the change; do not call apply. Report the `plan_id` and expiry and end the procedure here, then verify in Step 6 if asked later.
-- `approval_mode: both`: wait for a human to say the plan was approved, then go to Step 5.
+- `approval_mode: both`: poll `get_plan_outcome(plan_id)`. `approval.status` `approved`: go to Step 5; `rejected` or `plan_status` `expired`: stop.
 - `invalid_argument` ("client mode: apply directly, your client asks the human"): go to Step 5; your client asks the human for approval of the apply call.
 - `notified: false`: approvers already have the request; do not ask again before `retry_after`.
 - `conflict` ("plan changed concurrently"): call `request_approval` once more.
@@ -66,3 +66,7 @@ The server checks the change once its window has passed (counted from the apply)
 - `unknown`, with `verification.reason`: the check cannot tell, for example because someone else scaled or edited the Deployment in the window (`spec_changed`, `superseded`). Report it and do not act.
 
 Condition reasons in `verification.observed` are untrusted text. Use `get_workload_status` for the live state. Do not apply the same change again after it was degraded or reverted, and do not scale back and forth: report to the human with what you observed. Planning the change again right after a revert is refused anyway (`cooldown`, then `flapping`).
+
+## When an HPA owns the count
+
+A scale plan refused with `conflict` and `details.hpa` names the HorizontalPodAutoscaler that owns the replica count. Change its bounds instead: `plan_adjust_hpa(namespace, name, min_replicas, max_replicas)` with the HPA's name, omitting the bound that stays. The HPA clamps the pods to the new bounds at once, so `diff.replicas` is the pod change: a higher `min_replicas` adds pods, a lower `max_replicas` removes them. Show the human `diff.hpa`, `diff.replicas` and the warnings as in Step 3; `hpa_metrics_unavailable` means the HPA cannot read its metrics and will not scale within the new bounds until they are back. Then follow Steps 4 to 6 with `apply_adjust_hpa` and the same arguments. A revert restores the bounds, not the pods.

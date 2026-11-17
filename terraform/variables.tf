@@ -27,7 +27,7 @@ variable "name_prefix" {
 }
 
 variable "namespaces" {
-  description = "Namespaces the tools may plan and apply changes in, each with its replica bounds, the actions it allows (restart, rollback, scale), its own approvers (IAM user or role ARNs; when set, only they decide its plans, otherwise approver_principals) and GitOps marker keys checked in addition to gitops_markers. Empty (the default) derives one namespace from the deprecated sandbox_namespace, min_replicas and max_replicas, which is what earlier releases did."
+  description = "Namespaces the tools may plan and apply changes in, each with its replica bounds, the actions it allows (restart, rollback, scale by default; adjust_hpa only when listed, which lets the writer patch the namespace's HorizontalPodAutoscalers), its own approvers (IAM user or role ARNs; when set, only they decide its plans, otherwise approver_principals) and GitOps marker keys checked in addition to gitops_markers. Empty (the default) derives one namespace from the deprecated sandbox_namespace, min_replicas and max_replicas, which is what earlier releases did."
   type = map(object({
     min_replicas   = optional(number, 0)
     max_replicas   = optional(number, 5)
@@ -48,8 +48,8 @@ variable "namespaces" {
   }
 
   validation {
-    condition     = alltrue([for ns in values(var.namespaces) : length(setsubtract(ns.actions, ["restart", "rollback", "scale"])) == 0])
-    error_message = "A namespace's actions must be restart, rollback or scale."
+    condition     = alltrue([for ns in values(var.namespaces) : length(setsubtract(ns.actions, ["adjust_hpa", "restart", "rollback", "scale"])) == 0])
+    error_message = "A namespace's actions must be adjust_hpa, restart, rollback or scale."
   }
 
   validation {

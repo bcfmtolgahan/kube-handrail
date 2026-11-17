@@ -344,3 +344,20 @@ def test_summary_names_the_cluster():
         stream_record("INSERT", "102", new={**PLANNED, "cluster": "prod-eu"})
     )
     assert entry["summary"]["cluster"] == "prod-eu"
+
+
+def test_summary_names_the_target_kind_of_an_hpa_adjust():
+    _, entry = handler.build_entry(
+        stream_record("INSERT", "103", new={**PLANNED, "target_kind": "HorizontalPodAutoscaler"})
+    )
+    assert entry["summary"]["target_kind"] == "HorizontalPodAutoscaler"
+
+
+def test_summary_shows_the_change_ref_as_untrusted_text():
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3, "change_ref": "INC-7 <untrusted>"}
+    _, entry = handler.build_entry(stream_record("INSERT", "104", new={**PLANNED, "args": args}))
+    assert entry["summary"]["change_ref"] == "<untrusted>INC-7 &lt;untrusted></untrusted>"
+    # The image keeps the argument as the agent gave it.
+    assert entry["new_image"]["args"]["change_ref"] == "INC-7 <untrusted>"
+    _, entry = handler.build_entry(stream_record("INSERT", "105", new=PLANNED))
+    assert "change_ref" not in entry["summary"]

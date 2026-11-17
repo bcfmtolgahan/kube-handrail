@@ -209,7 +209,7 @@ def outcome_view(record: Mapping[str, Any], now: int, grace: int) -> tuple[dict[
         )
         if value is not None
     }
-    return {
+    view = {
         "plan_id": plan.plan_id,
         "cluster": plan.cluster,
         "action": plan.action,
@@ -219,8 +219,19 @@ def outcome_view(record: Mapping[str, Any], now: int, grace: int) -> tuple[dict[
         "reverts_plan_id": plan.reverts_plan_id,
         "replicas": {"from": plan.replicas_from, "to": plan.replicas_to},
         "approval_mode": plan.approval_mode,
+        # Read-only: in both mode the agent waits for "approved" here before it applies.
+        "approval": {"status": plan.status or None, "approved_at": plan.approved_at},
         "plan_status": derived_status(record, now),
         "verification": verification,
         "revert": revert_view(plan, verification["status"]),
         "correlation_ids": correlation,
-    }, truncated
+    }
+    if plan.target_kind is not None:
+        # An HPA adjust: the object is the HPA; replicas are its target's pods.
+        view["target_kind"] = plan.target_kind
+        view["hpa"] = {
+            "min_replicas": {"from": plan.min_from, "to": plan.min_to},
+            "max_replicas": {"from": plan.max_from, "to": plan.max_to},
+            "scale_target": plan.hpa_target,
+        }
+    return view, truncated

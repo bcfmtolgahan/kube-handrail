@@ -13,8 +13,9 @@ locals {
   # The alarms notify the alert topic, which the drift sentinel creates, so they need both.
   verifier_alarm_count = var.sentinel_enabled ? 1 : 0
 
-  # Written only by the write role: the schedule and the pinned revert target by the
-  # consume, the rest by the verifier channel. Denied to the read role with the approval
+  # Written only by the write role: the schedule and the pinned revert targets (revert_to,
+  # and revert_min_to and revert_max_to of an HPA adjust) by the consume, the rest by the
+  # verifier channel. Denied to the read role with the approval
   # attributes, so a changed record cannot trigger or redirect a revert.
   verify_attributes = [
     "verify_at",
@@ -22,6 +23,8 @@ locals {
     "verification",
     "revert",
     "revert_to",
+    "revert_min_to",
+    "revert_max_to",
     "kind",
     "reverts_plan_id",
   ]

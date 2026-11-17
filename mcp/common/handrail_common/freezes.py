@@ -25,6 +25,7 @@ ACTIONS = {
     "scale": "scale_deployment",
     "restart": "restart_deployment",
     "rollback": "rollback_deployment",
+    "adjust_hpa": "adjust_hpa",
 }
 ALL_NAMESPACES = "*"
 # A standard SSM parameter holds 4096 bytes, so long reasons fit fewer entries;

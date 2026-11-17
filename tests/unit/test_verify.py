@@ -297,7 +297,39 @@ def test_outcome_view_of_a_record():
     assert view["correlation_ids"] == {"plan": "plan-1", "apply": "apply-1", "verification": "v-1"}
 
 
+def test_outcome_view_of_an_hpa_adjust_names_its_bounds():
+    record = dataclasses.replace(
+        with_revert(),
+        target_kind="HorizontalPodAutoscaler",
+        hpa_target="web",
+        min_from=1,
+        min_to=2,
+        max_from=5,
+        max_to=5,
+    ).to_item()
+    view, _ = outcome_view(record, NOW + 60, 300)
+    assert view["target_kind"] == "HorizontalPodAutoscaler"
+    assert view["hpa"] == {
+        "min_replicas": {"from": 1, "to": 2},
+        "max_replicas": {"from": 5, "to": 5},
+        "scale_target": "web",
+    }
+    # A Deployment plan has neither.
+    plain, _ = outcome_view(with_revert().to_item(), NOW + 60, 300)
+    assert "target_kind" not in plain and "hpa" not in plain
+
+
 def test_outcome_view_reports_the_approval_mode():
     assert outcome_view(with_revert().to_item(), NOW, 300)[0]["approval_mode"] is None
     record = with_revert(approval_mode="server").to_item()
     assert outcome_view(record, NOW, 300)[0]["approval_mode"] == "server"
+
+
+def test_outcome_view_reports_the_approval_for_both_mode():
+    view = outcome_view(with_revert().to_item(), NOW, 300)[0]
+    assert view["approval"] == {"status": "planned", "approved_at": None}
+    record = with_revert(status="approved", approved_at=NOW - 30, approved_by="arn:x").to_item()
+    view = outcome_view(record, NOW, 300)[0]
+    assert view["approval"] == {"status": "approved", "approved_at": NOW - 30}
+    # Who approved stays with the approver's view, not the agent's.
+    assert "arn:x" not in str(view)

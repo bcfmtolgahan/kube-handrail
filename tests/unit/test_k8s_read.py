@@ -16,7 +16,7 @@ from kubernetes.client.rest import ApiException
 from moto import mock_aws
 
 from handrail_common.breaker import LAST_PLAN_ANNOTATION, retention_seconds
-from handrail_common.config import Agent, NamespacePolicy, Settings
+from handrail_common.config import ACTIONS, Agent, NamespacePolicy, Settings
 from handrail_common.freezes import format_time
 from handrail_common.observability import (
     bind_caller,
@@ -66,6 +66,8 @@ SETTINGS = Settings(
     region=REGION,
     agents={"client-a": SMOKE, "client-b": DEVOPS},
     agent_kill_switch_prefix=SWITCHES,
+    # Every action, adjust_hpa included, within the legacy bounds.
+    namespace_policy={"sandbox": NamespacePolicy(0, 5, frozenset(ACTIONS))},
 )
 
 
@@ -189,10 +191,12 @@ def clients(table):
 _RENDERED = Path(__file__).resolve().parents[1] / "k8s_render/golden/two-namespaces"
 
 
-def _rendered(kind: str) -> dict:
-    """The object of `kind` as terraform/modules/namespace-policy renders it."""
+def _rendered(kind: str, name: str = "kube-handrail-writer-bounds") -> dict:
+    """The object of `kind` and `name` as terraform/modules/namespace-policy renders it."""
     text = (_RENDERED / "admission-policy.yaml").read_text()
-    return next(d for d in yaml.safe_load_all(text) if d["kind"] == kind)
+    return next(
+        d for d in yaml.safe_load_all(text) if d["kind"] == kind and d["metadata"]["name"] == name
+    )
 
 
 def _selector(names: list[str]) -> dict:
@@ -203,10 +207,12 @@ def _selector(names: list[str]) -> dict:
     }
 
 
-def admission_policy(bounds: dict[str, tuple[int, int]]) -> dict:
+def admission_policy(
+    bounds: dict[str, tuple[int, int]], name: str = "kube-handrail-writer-bounds"
+) -> dict:
     """The rendered policy, with these bounds and their namespaces."""
     names = sorted(bounds)
-    policy = _rendered("ValidatingAdmissionPolicy")
+    policy = _rendered("ValidatingAdmissionPolicy", name)
     spec = policy["spec"]
     spec["matchConstraints"]["namespaceSelector"] = _selector(names)
     expressions = {
@@ -218,25 +224,33 @@ def admission_policy(bounds: dict[str, tuple[int, int]]) -> dict:
     return policy
 
 
-def admission_binding(namespaces: list[str], actions: list[str] | None = None) -> dict:
-    binding = _rendered("ValidatingAdmissionPolicyBinding")
+def admission_binding(
+    namespaces: list[str],
+    actions: list[str] | None = None,
+    name: str = "kube-handrail-writer-bounds",
+) -> dict:
+    binding = _rendered("ValidatingAdmissionPolicyBinding", name)
     binding["spec"]["validationActions"] = ["Deny"] if actions is None else actions
     binding["spec"]["matchResources"] = {"namespaceSelector": _selector(namespaces)}
     return binding
 
 
 def admission_api(policy: dict | None = None, binding: dict | None = None) -> MagicMock:
-    """An AdmissionregistrationV1Api serving a policy and binding that back the sandbox's
-    bounds (0 to 5); set api.objects["policy"] or ["binding"] to change or remove one."""
+    """An AdmissionregistrationV1Api serving the two policies and bindings that back the
+    sandbox's bounds (0 to 5); set api.objects["policy"] or ["binding"] (or "hpa_policy",
+    "hpa_binding") to change or remove one."""
     api = MagicMock()
+    hpa = "kube-handrail-writer-hpa-bounds"
     api.objects = {
         "policy": admission_policy({"sandbox": (0, 5)}) if policy is None else policy,
         "binding": admission_binding(["sandbox"]) if binding is None else binding,
+        "hpa_policy": admission_policy({"sandbox": (0, 5)}, hpa),
+        "hpa_binding": admission_binding(["sandbox"], name=hpa),
     }
 
     def serve(kind):
         def read(name, _preload_content=True):
-            value = api.objects.get(kind)
+            value = api.objects.get(f"hpa_{kind}" if name == hpa else kind)
             if value is None:
                 raise ApiException(status=404)
             return SimpleNamespace(data=json.dumps(value).encode())
@@ -388,6 +402,8 @@ def test_plan_rejects_deployment_targeted_by_hpa(clients, table):
         plan(clients)
     assert exc.value.code == "conflict"
     assert "HorizontalPodAutoscaler" in exc.value.message
+    assert exc.value.message.endswith("use plan_adjust_hpa on web-hpa")
+    assert exc.value.details == {"hpa": ["web-hpa"], "hint": "use plan_adjust_hpa on web-hpa"}
     assert table.scan()["Count"] == 0
     clients.autoscaling.list_namespaced_horizontal_pod_autoscaler.assert_called_once_with(
         namespace="sandbox"
@@ -2081,7 +2097,7 @@ def test_every_plan_tool_runs_the_agent_guard(wired, monkeypatch, tool):
         raise GuardError("forbidden", "guard ran", {"reason": "agent_unknown"})
 
     monkeypatch.setattr(handler, "guard_plan", refuse)
-    args = {"namespace": "sandbox", "name": "web", "replicas": 3, "revision": 5}
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3, "revision": 5, "min_replicas": 2}
     result = handler.lambda_handler(args, context(tool))
     assert result["error"]["message"] == "guard ran"
     wired.apps.read_namespaced_deployment.assert_not_called()
@@ -2335,7 +2351,9 @@ def test_plan_with_revert_on_a_healthy_deployment_has_no_warning(clients):
 
 
 def test_plan_with_revert_needs_a_revert_target_within_bounds(clients, table):
-    settings = dataclasses.replace(VERIFY_SETTINGS, min_replicas=3)
+    settings = dataclasses.replace(
+        VERIFY_SETTINGS, namespace_policy={"sandbox": NamespacePolicy(3, 5, frozenset(ACTIONS))}
+    )
     clients.admission.objects["policy"] = admission_policy({"sandbox": (3, 5)})
     with pytest.raises(GuardError) as exc:
         handler.plan_scale_deployment(
@@ -2567,3 +2585,358 @@ def test_the_plan_records_its_cluster(clients, table):
     assert table.get_item(Key={"plan_id": plan_id})["Item"]["cluster"] == "test-cluster"
     outcome = handler.get_plan_outcome({"plan_id": plan_id}, SETTINGS, clients, NOW)
     assert outcome["data"]["cluster"] == "test-cluster"
+
+
+# --- plan_adjust_hpa --------------------------------------------------------------------
+
+HPA_UID = "8f7c1a2e-0000-4000-8000-0000000000aa"
+
+
+def hpa_object(
+    minimum: int | None = 1,
+    maximum: int = 5,
+    target_kind: str = "Deployment",
+    annotations: dict[str, str] | None = None,
+    scaling_active: str = "True",
+) -> dict:
+    """An HPA as the API server returns it (raw JSON)."""
+    spec = {
+        "scaleTargetRef": {"apiVersion": "apps/v1", "kind": target_kind, "name": "web"},
+        "maxReplicas": maximum,
+        "metrics": [
+            {
+                "type": "Resource",
+                "resource": {
+                    "name": "cpu",
+                    "target": {"type": "Utilization", "averageUtilization": 80},
+                },
+            }
+        ],
+    }
+    if minimum is not None:
+        spec["minReplicas"] = minimum
+    return {
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": {
+            "name": "web-hpa",
+            "namespace": "sandbox",
+            "uid": HPA_UID,
+            "resourceVersion": "900",
+            "annotations": annotations or {},
+        },
+        "spec": spec,
+        "status": {
+            "currentReplicas": 2,
+            "desiredReplicas": 2,
+            "conditions": [
+                {"type": "AbleToScale", "status": "True", "reason": "ReadyForNewScale"},
+                {"type": "ScalingActive", "status": scaling_active, "reason": "<x>"},
+            ],
+        },
+    }
+
+
+def serve_hpa(clients, value: dict | None) -> None:
+    def read(name, namespace, _preload_content=True):
+        assert (name, namespace, _preload_content) == ("web-hpa", "sandbox", False)
+        if value is None:
+            raise ApiException(status=404, reason="Not Found")
+        return SimpleNamespace(data=json.dumps(value).encode())
+
+    clients.autoscaling.read_namespaced_horizontal_pod_autoscaler.side_effect = read
+
+
+def adjust(clients, settings=SETTINGS, **overrides):
+    args = {"namespace": "sandbox", "name": "web-hpa", **overrides}
+    return handler.plan_adjust_hpa(args, settings, clients, NOW)
+
+
+def adjust_error(clients, settings=SETTINGS, **overrides) -> GuardError:
+    with pytest.raises(GuardError) as exc:
+        adjust(clients, settings, **overrides)
+    return exc.value
+
+
+def test_adjust_hpa_plans_the_bounds_and_the_pods_they_move(clients, table):
+    serve_hpa(clients, hpa_object(1, 5))
+    data = adjust(clients, min_replicas=3)["data"]
+    # The Deployment has 2 replicas; the new minimum clamps them to 3.
+    assert data["diff"] == {
+        "hpa": {
+            "min_replicas": {"from": 1, "to": 3},
+            "max_replicas": {"from": 5, "to": 5},
+            "scale_target": "web",
+        },
+        "replicas": {"from": 2, "to": 3},
+    }
+    assert [c["check"] for c in data["preflight"]] == [
+        "arguments",
+        "agent_enabled",
+        "namespace_allowed",
+        "action_allowed",
+        "admission_policy_match",
+        "not_gitops_managed",
+        "scale_target_supported",
+        "hpa_bounds",
+        "blast_radius",
+        "no_manual_change",
+        "cooldown",
+        "not_flapping",
+        "object_budget",
+        "global_budget",
+        "agent_budget",
+    ]
+    assert data["impact"]["pods"]["added"] == 1
+    assert data["verification"] == {"window_seconds": 120, "revert_on_failure": False}
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["action"] == "adjust_hpa"
+    assert item["target_kind"] == "HorizontalPodAutoscaler"
+    assert item["args"] == {"namespace": "sandbox", "name": "web-hpa", "min_replicas": 3}
+    assert item["args_hash"] == plan_args_hash(
+        "adjust_hpa", {"namespace": "sandbox", "name": "web-hpa", "min_replicas": 3}
+    )
+    assert (item["uid"], item["resource_version"], item["generation"]) == (HPA_UID, "900", -1)
+    assert item["object_key"] == f"sandbox/web-hpa/{HPA_UID}"
+    assert (item["min_from"], item["min_to"], item["max_from"], item["max_to"]) == (1, 3, 5, 5)
+    assert item["hpa_target"] == "web"
+    assert item["spec_from"] != item["spec_to"]
+    assert "template_from" not in item and "template_to" not in item
+    # The HPA policy is the one checked.
+    names = {
+        c.kwargs["name"] for c in clients.admission.read_validating_admission_policy.mock_calls
+    }
+    assert names == {"kube-handrail-writer-hpa-bounds"}
+
+
+def test_adjust_hpa_spec_hashes_cover_the_whole_spec(clients, table):
+    serve_hpa(clients, hpa_object(1, 5))
+    item = table.get_item(Key={"plan_id": adjust(clients, max_replicas=4)["data"]["plan_id"]})[
+        "Item"
+    ]
+    spec = hpa_object(1, 5)["spec"]
+    assert item["spec_from"] == template_hash(spec)
+    assert item["spec_to"] == template_hash({**spec, "maxReplicas": 4})
+    # Lowering the maximum below the pods: 2 stay 2 (max 4), no pods move.
+    assert (item["replicas_from"], item["replicas_to"]) == (2, 2)
+
+
+def test_adjust_hpa_without_min_replicas_in_the_spec_starts_from_1(clients, table):
+    serve_hpa(clients, hpa_object(None, 5))
+    data = adjust(clients, min_replicas=2)["data"]
+    assert data["diff"]["hpa"]["min_replicas"] == {"from": 1, "to": 2}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "code"),
+    [
+        ({}, "invalid_argument"),
+        ({"min_replicas": "2"}, "invalid_argument"),
+        ({"min_replicas": 0}, "invalid_argument"),
+        ({"min_replicas": 6}, "invalid_argument"),
+        ({"max_replicas": 6}, "out_of_bounds"),
+        ({"min_replicas": 1, "max_replicas": 5}, "invalid_argument"),
+        ({"min_replicas": 2, "max_replicas": 4}, "invalid_argument"),
+        ({"min_replicas": 2, "revert_on_failure": True}, "invalid_argument"),
+    ],
+)
+def test_adjust_hpa_refuses_bad_bounds(clients, table, overrides, code):
+    serve_hpa(clients, hpa_object(1, 5))
+    assert adjust_error(clients, **overrides).code == code
+    assert table.scan()["Count"] == 0
+
+
+def test_adjust_hpa_needs_the_action_in_the_namespace(clients, table):
+    settings = dataclasses.replace(SETTINGS, namespace_policy={})
+    error = adjust_error(clients, settings, min_replicas=2)
+    assert error.code == "forbidden_namespace"
+    assert error.details["action"] == "adjust_hpa"
+    clients.autoscaling.read_namespaced_horizontal_pod_autoscaler.assert_not_called()
+
+
+def test_adjust_hpa_missing_hpa_is_not_found(clients):
+    serve_hpa(clients, None)
+    assert adjust_error(clients, min_replicas=2).code == "not_found"
+
+
+def test_adjust_hpa_refuses_a_target_that_is_not_a_deployment(clients):
+    serve_hpa(clients, hpa_object(1, 5, target_kind="StatefulSet"))
+    error = adjust_error(clients, min_replicas=2)
+    assert error.code == "invalid_argument" and "Deployment" in error.message
+
+
+def test_adjust_hpa_refuses_gitops_on_the_hpa_or_its_deployment(clients, table):
+    serve_hpa(clients, hpa_object(1, 5, annotations={"argocd.argoproj.io/tracking-id": "x"}))
+    assert adjust_error(clients, min_replicas=2).code == "gitops_managed"
+    serve_hpa(clients, hpa_object(1, 5))
+    clients.apps.read_namespaced_deployment.return_value = deployment(
+        annotations={"argocd.argoproj.io/tracking-id": "x"}
+    )
+    assert adjust_error(clients, min_replicas=2).code == "gitops_managed"
+    assert table.scan()["Count"] == 0
+
+
+def test_adjust_hpa_blast_radius_is_on_the_pods(clients):
+    serve_hpa(clients, hpa_object(1, 5))
+    clients.apps.read_namespaced_deployment.return_value = deployment(replicas=1)
+    error = adjust_error(clients, min_replicas=3)
+    assert error.code == "blast_radius_exceeded"
+    assert (error.details["from"], error.details["to"]) == (1, 3)
+
+
+def test_adjust_hpa_of_a_target_scaled_to_zero_is_a_conflict(clients):
+    serve_hpa(clients, hpa_object(1, 5))
+    clients.apps.read_namespaced_deployment.return_value = deployment(replicas=0)
+    error = adjust_error(clients, min_replicas=2)
+    assert (error.code, error.details) == ("conflict", {"reason": "scaling_disabled"})
+
+
+def test_adjust_hpa_warns_when_metrics_are_unavailable(clients):
+    serve_hpa(clients, hpa_object(1, 5, scaling_active="False"))
+    warnings = adjust(clients, min_replicas=2)["data"]["impact"]["warnings"]
+    assert [w["code"] for w in warnings] == ["hpa_metrics_unavailable"]
+    # The condition's reason is never returned.
+    assert "<x>" not in json.dumps(warnings)
+
+
+def test_adjust_hpa_with_revert_reverts_to_the_bounds(clients):
+    serve_hpa(clients, hpa_object(1, 5))
+    data = adjust(clients, min_replicas=2, verify_window_seconds=60, revert_on_failure=True)["data"]
+    assert data["verification"]["revert_to"] == {"min_replicas": 1, "max_replicas": 5}
+    assert "revert_target_in_bounds" in [c["check"] for c in data["preflight"]]
+
+
+def test_adjust_hpa_revert_target_must_be_within_bounds(clients):
+    settings = dataclasses.replace(
+        SETTINGS, namespace_policy={"sandbox": NamespacePolicy(1, 4, frozenset(ACTIONS))}
+    )
+    clients.admission.objects["hpa_policy"] = admission_policy(
+        {"sandbox": (1, 4)}, "kube-handrail-writer-hpa-bounds"
+    )
+    serve_hpa(clients, hpa_object(1, 5))
+    error = adjust_error(
+        clients, settings, max_replicas=4, verify_window_seconds=60, revert_on_failure=True
+    )
+    assert error.code == "out_of_bounds" and "revert target" in error.message
+
+
+def test_adjust_hpa_refuses_a_missing_hpa_policy(clients, table):
+    clients.admission.objects["hpa_policy"] = None
+    serve_hpa(clients, hpa_object(1, 5))
+    error = adjust_error(clients, min_replicas=2)
+    assert error.code == "conflict"
+    assert error.details["reason"] == "policy_missing"
+    assert error.details["policy"] == "kube-handrail-writer-hpa-bounds"
+
+
+def test_adjust_hpa_refuses_a_manual_change_of_the_bounds(clients, table):
+    last = str(uuid.uuid4())
+    table.put_item(
+        Item={
+            "plan_id": last,
+            "action": "adjust_hpa",
+            "namespace": "sandbox",
+            "name": "web-hpa",
+            "replicas_from": 2,
+            "replicas_to": 3,
+            "args_hash": "h",
+            "resource_version": "1",
+            "generation": -1,
+            "uid": HPA_UID,
+            "created_at": NOW - 4000,
+            "expires_at": NOW - 3700,
+            "used": True,
+            "min_from": 1,
+            "min_to": 3,
+            "max_from": 5,
+            "max_to": 5,
+        }
+    )
+    serve_hpa(clients, hpa_object(2, 5, annotations={"kube-handrail.io/last-plan-id": last}))
+    error = adjust_error(clients, max_replicas=4)
+    assert error.code == "manual_change"
+    assert error.details["last_applied_to"] == {"min_replicas": 3, "max_replicas": 5}
+    data = adjust(clients, max_replicas=4, override_manual_change=True)["data"]
+    assert data["override_manual_change"] is True
+
+
+def test_adjust_hpa_flapping_follows_the_bounds(clients, table):
+    key = f"sandbox/web-hpa/{HPA_UID}"
+    for i, (lo, hi) in enumerate(((1, 2), (2, 1))):
+        table.put_item(
+            Item={
+                "plan_id": str(uuid.uuid4()),
+                "action": "adjust_hpa",
+                "namespace": "sandbox",
+                "name": "web-hpa",
+                "replicas_from": 2,
+                "replicas_to": 2,
+                "args_hash": "h",
+                "resource_version": "1",
+                "generation": -1,
+                "uid": HPA_UID,
+                "created_at": NOW - 300 + i,
+                "expires_at": NOW,
+                "used": True,
+                "object_key": key,
+                "result": "applied",
+                "applied_at": NOW - 200 + i,
+                "min_from": lo,
+                "min_to": hi,
+                "max_from": 5,
+                "max_to": 5,
+            }
+        )
+    serve_hpa(clients, hpa_object(1, 5))
+    # Up, down, and now up again: the pods (2) never moved, the bounds did.
+    assert adjust_error(clients, min_replicas=2).code == "flapping"
+
+
+def test_change_ref_enters_the_payload_only_when_given(clients, table):
+    data = plan(clients, change_ref="INC-42 (ticket)")["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    args = {"namespace": "sandbox", "name": "web", "replicas": 3, "change_ref": "INC-42 (ticket)"}
+    assert item["args"] == args
+    assert item["args_hash"] == plan_args_hash("scale_deployment", args)
+    data = plan(clients)["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert "change_ref" not in item["args"]
+    assert item["args_hash"] == scale_args_hash("sandbox", "web", 3)
+
+
+def test_every_plan_takes_a_change_ref(clients, table):
+    data = handler.plan_restart_deployment(
+        {"namespace": "sandbox", "name": "web", "change_ref": "CHG-7"}, SETTINGS, clients, NOW
+    )["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["args"]["change_ref"] == "CHG-7"
+    serve_hpa(clients, hpa_object(1, 5))
+    data = adjust(clients, min_replicas=2, change_ref="CHG-8")["data"]
+    item = table.get_item(Key={"plan_id": data["plan_id"]})["Item"]
+    assert item["args"]["change_ref"] == "CHG-8"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        " ",
+        "x" * 129,
+        "a\tb",
+        "zero\u200bwidth",
+        "INC-42\u2028Requested by: oncall",
+        "INC-42\u2029x",
+        "INC\u00a042",
+        "INC\u300042",
+        7,
+        ["x"],
+    ],
+)
+def test_a_bad_change_ref_is_refused_before_any_api_call(clients, table, value):
+    assert plan_error(clients, change_ref=value) == "invalid_argument"
+    assert table.scan()["Count"] == 0
+    clients.apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_a_change_ref_of_128_characters_is_accepted(clients):
+    assert plan(clients, change_ref="x" * 128)["ok"] is True
