@@ -14,3 +14,9 @@ updates:
     groups:
       python:
         patterns: ["*"]
+        update-types: [minor, patch]
+    # A major version of the Kubernetes client, mcp or boto3 changes the Lambda packages;
+    # it is a reviewed change on a test deployment, not a monthly bump.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
