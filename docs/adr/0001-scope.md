@@ -64,7 +64,7 @@ Rejected for self-hosted Prometheus because it targets Amazon Managed Service fo
 
 ## Consequences
 
-- The project's value depends on the write path being usable from DevOps Agent end to end. Milestone 0 demonstrated it on a test cluster ([Milestone 0](../history/milestones.md#milestone-0-vertical-slice)); its findings led to [ADR 0002](0002-server-verified-approval.md).
+- The project's value depends on the write path being usable from DevOps Agent end to end. Milestone 0 demonstrated it ([Milestone 0](../history/milestones.md#milestone-0-vertical-slice)); its findings led to [ADR 0002](0002-server-verified-approval.md).
 - Read and write tools must be separate tools on separate gateway targets and Lambdas, because DevOps Agent classifies per tool and Cedar argument conditions need per-action policies.
 - Safety cannot rely on client classification alone. The server must reject writes without a valid plan, regardless of how the tool is classified.
 - Several integration details are unverified (inbound SigV4 to the gateway, `toolDetails` drift after IaC updates, how input-conditional Cedar policies affect `tools/list`, interceptor ordering). They are listed as open questions in the [roadmap](../roadmap.md) and may change the design.

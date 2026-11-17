@@ -136,7 +136,7 @@ On `destroy`, Lambda releases the network interfaces of VPC functions only some 
 1. **Namespaces.** Create them; for a test, the sandbox ([quickstart](quickstart.md#1-sandbox-namespace)).
 2. **Variables.** `terraform/terraform.tfvars` with at least `cluster_name`, `region`, `namespaces`, the network variables for a private endpoint, and `agents` if more than DevOps Agent and the tests call the gateway. Use `approval_mode = "client"` for the first tests.
 3. **Infrastructure.** `terraform init`, `plan`, `apply`, then apply `build/k8s` and run the label command ([quickstart](quickstart.md#2-infrastructure)). The plan fails early if the authentication mode, endpoint access and network variables do not fit.
-4. **Smoke and guard tests** ([quickstart](quickstart.md#3-smoke-test), [Testing](milestone-0.md#guard-tests)).
+4. **Smoke and guard tests** ([quickstart](quickstart.md#3-smoke-test), [Testing](testing.md#guard-tests)).
 5. **DevOps Agent:** `create-space`, `register-mcp`, `associate-read`, a check in chat, `enable-write`, `install-guidance` ([quickstart](quickstart.md#4-register-with-aws-devops-agent)).
 6. **Sentinel.** Set `devops_agent_space_id` and `devops_agent_association_id` and apply again.
 7. **Server-side approval.** Set `approval_mode` and the approvers, apply, attach `approver_policy_arn` ([quickstart](quickstart.md#5-server-side-approval)).

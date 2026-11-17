@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-06
 
-Implemented in [Milestone 2](../history/milestones.md#milestone-2-verified-changes-more-actions-accountable-agents) and tested on a test cluster; the policy's cases run in CI on kind. See [Admission policy](../../mcp/contract/admission-network.md#admission-policy) for the exact rules.
+Implemented in [Milestone 2](../history/milestones.md#milestone-2-verified-changes-more-actions-accountable-agents); the policy's cases run in CI on kind. See [Admission policy](../../mcp/contract/admission-network.md#admission-policy) for the exact rules.
 
 ## Context
 
@@ -45,7 +45,7 @@ RBAC already gives the writer neither. Left out to keep the policy to the one ru
 
 ## Update: rendered per namespace, checked at plan time
 
-Implemented with the namespace policy, not yet tested on a cluster. Three consequences above no longer hold, and the decision changes accordingly:
+Implemented with the namespace policy. Three consequences above no longer hold, and the decision changes accordingly:
 
 - **Rendered, not edited.** Terraform renders the policy from `namespaces` (`terraform/modules/namespace-policy`): one policy and one binding select every namespace of the policy by name, and the bounds are two CEL maps keyed by `request.namespace`. The `sed` recipes are gone, and the bounds no longer live in two places a human keeps equal. A `paramRef` ConfigMap was rejected again: a namespace admin who can edit it could widen the backstop, and its resolution adds behaviour to verify.
 - **The mode is rendered too.** `admission_mode` (default `Deny`) is part of the binding, so applying the manifests again keeps enforcement.

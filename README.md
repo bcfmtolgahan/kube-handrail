@@ -2,7 +2,7 @@
 
 Guarded remediation layer for AI agents on Kubernetes: **plan → policy → approve → apply → verify → audit**. MCP tools for Amazon EKS, built for AWS DevOps Agent and usable from other MCP clients.
 
-> **Status:** implemented and tested on test clusters: scale, restart, rollback by exact revision and HPA bounds, each through a single-use plan; server-verified approval; the oscillation breaker, blast-radius budget and impact preview; per-agent identity, budgets and kill switches; verification after every apply with an optional pre-approved revert; change freezes; a cluster admission policy for the bounds; a write-once audit record; and the drift sentinel. There is no release yet. Cedar at the gateway, break-glass and a signed audit ledger are not built. Details: [Milestones done](docs/history/milestones.md), [roadmap](docs/roadmap.md).
+> **Status:** 0.1.0. Scale, restart, rollback by exact revision and HPA bounds, each through a single-use plan; server-verified approval; the oscillation breaker, blast-radius budget and impact preview; per-agent identity, budgets and kill switches; verification after every apply with an optional pre-approved revert; change freezes; a cluster admission policy for the bounds; a write-once audit record; and the drift sentinel. Cedar at the gateway, break-glass and a signed audit ledger are on the roadmap. Details: [Milestones done](docs/history/milestones.md), [roadmap](docs/roadmap.md).
 
 ## Why
 
@@ -62,9 +62,9 @@ Why each check exists: [Guards](docs/guards.md). The exact rules: [`mcp/CONTRACT
 
 ## Get started
 
-1. [Quickstart](docs/quickstart.md): deploy to a test cluster, run the smoke test, connect DevOps Agent.
+1. [Quickstart](docs/quickstart.md): deploy, run the smoke test, connect DevOps Agent.
 2. [Deploying to a new account](docs/deploy.md): prerequisites, names, namespaces, agents, approval mode, network, upgrades.
-3. [Testing](docs/milestone-0.md): the integration suite, the end-to-end guard tests and the DevOps Agent checks.
+3. [Testing](docs/testing.md): the integration suite, the end-to-end guard tests and the DevOps Agent checks.
 
 Supported versions (Kubernetes 1.30 or later for the admission policy, Terraform 1.5 or later) and the release rules are in [Releasing](docs/releasing.md).
 
@@ -78,7 +78,7 @@ Supported versions (Kubernetes 1.30 or later for the admission policy, Terraform
 
 ## Contributing
 
-Issues and discussion are welcome, especially feedback on the safety model, the policy structure and the scope.
+Issues and discussion are welcome, especially feedback on the safety model, the policy structure and the scope. Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
 ## License
 

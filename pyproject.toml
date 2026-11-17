@@ -1,6 +1,6 @@
 [project]
 name = "kube-handrail"
-version = "0.0.0"
+version = "0.1.0"
 description = "Guarded Kubernetes remediation tools exposed over MCP."
 readme = "README.md"
 license = { file = "LICENSE" }
