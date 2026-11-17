@@ -34,7 +34,7 @@ If a warning makes the change unsafe, say so and do not continue without the hum
 
 ## Step 4: Approve, apply, verify
 
-Follow AGENTS.md Flow steps 3 to 5 with `apply_scale_deployment` and the plan's `replicas`, `override_manual_change`, `verify_window_seconds` and `revert_on_failure`. In `server` mode the approval applies the change and you stop; `notified: false` means approvers already have the request. A plan refused at apply with `change_frozen` is not consumed: after the freeze it can still be applied if it has not expired, but only when the human asks (in server mode through you, since the approval cannot run again).
+Follow AGENTS.md Flow steps 3 to 5 with `apply_scale_deployment` and exactly the plan's arguments (Flow step 4). A plan refused at apply with `change_frozen` is not consumed: after the freeze it can still be applied if it has not expired, but only when the human asks (in server mode through you, since the approval cannot run again).
 
 Reading the outcome:
 
