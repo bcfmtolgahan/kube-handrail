@@ -60,7 +60,7 @@ The end-to-end guard tests are in [Testing](milestone-0.md#guard-tests).
 
 ## 4. Register with AWS DevOps Agent
 
-DevOps Agent uses the `devops_agent` client:
+DevOps Agent uses the `devops_agent` client (same shell as step 3):
 
 ```sh
 export CLIENT_ID=$(out -json agent_client_ids | jq -r .devops_agent)

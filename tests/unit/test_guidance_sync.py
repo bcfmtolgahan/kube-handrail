@@ -28,16 +28,20 @@ WORD_CEILINGS = {
     SCALE_SKILL: 800,
     ROLLOUT_SKILL: 800,
     "mcp/CONTRACT.md": 6500,
-    "mcp/contract/adjust-hpa.md": 1560,
+    "mcp/contract/adjust-hpa.md": 1401,
     "README.md": 1162,
     "docs/guards.md": 1475,
     "docs/deploy.md": 2750,
-    "docs/roadmap.md": 643,
+    "docs/roadmap.md": 634,
     "docs/quickstart.md": 628,
     "docs/milestone-0.md": 1239,
     "docs/history/milestones.md": 1371,
     "docs/releasing.md": 677,
 }
+# The contract appendices together (17,708 words after Milestone 7): this text sat under the
+# contract's ceiling before Milestone 7 moved it out, so it must not grow unnoticed either.
+APPENDICES_CEILING = 18593
+
 # Everything an agent reads: AGENTS.md and the skills (4708 words at Milestone 3, 2779 after
 # Milestone 7).
 AGENT_CONTEXT = (AGENTS, SCALE_SKILL, ROLLOUT_SKILL)
@@ -55,6 +59,11 @@ def test_repository_guidance_is_in_sync():
 @pytest.mark.parametrize(("rel", "ceiling"), sorted(WORD_CEILINGS.items()))
 def test_word_ceiling(rel, ceiling):
     assert words(rel) <= ceiling, f"{rel} has {words(rel)} words; the ceiling is {ceiling}"
+
+
+def test_appendices_ceiling():
+    total = sum(words(str(p.relative_to(REPO))) for p in (REPO / "mcp/contract").glob("*.md"))
+    assert total <= APPENDICES_CEILING, f"mcp/contract/*.md has {total} words"
 
 
 def test_agent_context_ceiling():
@@ -183,10 +192,10 @@ def test_skill_sets_an_argument_the_tools_dropped(repo):
 
 
 def test_a_response_field_set_in_prose_is_not_an_argument(repo, monkeypatch):
-    assert "`notified: false`" in (repo / SCALE_SKILL).read_text()
+    assert "`notified: false`" in (repo / AGENTS).read_text()
     assert check_contract.check_skills(repo) == []
     monkeypatch.setattr(check_contract, "RESPONSE_FIELDS", frozenset())
-    assert f"{SCALE_SKILL}: sets notified, which no tool takes" in check_contract.check_skills(repo)
+    assert f"{AGENTS}: sets notified, which no tool takes" in check_contract.check_skills(repo)
 
 
 def test_contract_error_codes_line_matches_the_envelope(repo):
