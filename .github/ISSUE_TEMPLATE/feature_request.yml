@@ -1,0 +1,20 @@
+name: Feature request
+description: A new action, guard or integration.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What an agent or operator cannot do safely today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What the tool or guard would do, and how it stays bounded and approved.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
