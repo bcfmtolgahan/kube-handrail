@@ -34,7 +34,7 @@ WORD_CEILINGS = {
     "docs/deploy.md": 2750,
     "docs/roadmap.md": 634,
     "docs/quickstart.md": 628,
-    "docs/milestone-0.md": 1239,
+    "docs/testing.md": 1239,
     "docs/history/milestones.md": 1371,
     "docs/releasing.md": 677,
 }

@@ -56,7 +56,7 @@ It lists the tools (with gateway semantic search on, its search tool appears and
 kubectl -n kube-handrail-sandbox annotate deployment/web kube-handrail.io/last-plan-id-
 ```
 
-The end-to-end guard tests are in [Testing](milestone-0.md#guard-tests).
+The end-to-end guard tests are in [Testing](testing.md#guard-tests).
 
 ## 4. Register with AWS DevOps Agent
 

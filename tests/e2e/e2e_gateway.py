@@ -178,7 +178,7 @@ agent's budget. The writer's admission refusals are covered by tests/admission a
 tests/integration.
 
 --live-only runs only the cases the kind and moto integration suite (tests/integration)
-cannot cover, listed in LIVE_ONLY_CASES and docs/milestone-0.md: authentication, the
+cannot cover, listed in LIVE_ONLY_CASES and docs/testing.md: authentication, the
 gateway's schema check, one apply and concurrent applies through the gateway in client mode,
 every approval case in server mode (for the approval URL), and, with --with-identity and
 --with-audit, the identity and audit cases. --with-rollout, --with-freeze, --with-expiry,
@@ -2730,7 +2730,7 @@ async def guard_tests(
 # --live-only: the cases tests/integration cannot cover, because they need a real Cognito
 # user pool, the gateway with its request interceptor, the Lambdas' EKS access entries and
 # network path, the approval Function URL's IAM auth, or real DynamoDB conditional writes
-# (docs/milestone-0.md, Guard tests). Authentication always runs first; --with-identity
+# (docs/testing.md, Guard tests). Authentication always runs first; --with-identity
 # adds the identity cases (the real interceptor, and the per-agent budget counter on real
 # DynamoDB) and --with-audit the audit cases (the real stream and the bucket policy).
 LIVE_ONLY_CASES = (

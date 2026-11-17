@@ -47,5 +47,5 @@ Why: every schema change costs the operator a sequence that takes effect only in
 
 1. CI is green: `scripts/check_contract.py`, `ruff check`, `ruff format --check`, `pytest tests/unit`, `terraform fmt -check -recursive`, `terraform validate`, the admission job and the integration job.
 2. The changelog's Unreleased section lists every change, says whether `enable-write` and `install-guidance` are needed, and points to the upgrade notes in [deploy](deploy.md#upgrading).
-3. Behaviour changes have run on a test deployment (`terraform/test.tfvars.example`, `tests/e2e/e2e_gateway.py`, and a chat in `both` mode); until then the docs say "implemented, not yet tested on a cluster".
+3. Behaviour changes have run on a test deployment (`terraform/test.tfvars.example`, `tests/e2e/e2e_gateway.py`, and a chat in `both` mode).
 4. Rename Unreleased to the version and date, set `__version__` and `pyproject.toml` to it, tag `vX.Y.Z`, and reopen Unreleased.
