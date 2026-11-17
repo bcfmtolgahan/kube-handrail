@@ -4,7 +4,7 @@
 - Date: 2026-10-27
 - Amends: [ADR 0001](0001-scope.md)
 
-Accepted as the design for the write path, implemented in [Milestone 1](../roadmap.md#milestone-1-server-verified-write-path-done) (item 5) and tested on a test cluster in `server` and `client` mode; see [Server-side approval](../../mcp/CONTRACT.md#server-side-approval) for the exact rules.
+Accepted as the design for the write path, implemented in [Milestone 1](../history/milestones.md#milestone-1-server-verified-write-path) (item 5) and tested on a test cluster in `server` and `client` mode; see [Server-side approval](../../mcp/CONTRACT.md#server-side-approval) for the exact rules.
 
 Implementation notes:
 
@@ -15,7 +15,7 @@ Implementation notes:
 
 ## Context
 
-Milestone 0 deployed one guarded plan/apply pair to a test cluster and connected it to AWS DevOps Agent ([Milestone 0](../milestone-0.md)). The server-side guard behaved as designed, but testing showed that the human approval step exists only in the client:
+Milestone 0 deployed one guarded plan/apply pair to a test cluster and connected it to AWS DevOps Agent ([Milestone 0](../history/milestones.md#milestone-0-vertical-slice)). The server-side guard behaved as designed, but testing showed that the human approval step exists only in the client:
 
 - **Approval lives only in the client.** The server never sees an approval. `apply_scale_deployment` accepts any call that carries a valid, unused, unexpired plan with matching arguments, whoever or whatever made it.
 - **A misclassified write tool loses its approval.** With the write tool classified `READ_ONLY` by mistake, the agent planned and applied without asking anyone. The server-side limits (namespace allowlist, replica bounds, GitOps and HPA checks, single-use plans, kill switch) still held, but no human was involved.
@@ -23,7 +23,7 @@ Milestone 0 deployed one guarded plan/apply pair to a test cluster and connected
 - **Autonomous investigations cannot remediate.** Outside chat, DevOps Agent cancels a `MUTATIVE` call before it reaches the gateway ("an approval-ref header is required") and reports the change as a mitigation step. An investigation started from an alert can propose a change but has no path to get it approved and applied.
 - **DevOps Agent approvals are pinned to exact arguments.** The approval request carries `argument_pins` (plan ID, namespace, name, replica count), and the recorded decision is single-use and bound to those values. This is the property worth preserving; the problem is only that the server cannot verify it.
 
-A second constraint comes from the guard itself. Plans are pinned to `metadata.resourceVersion`, which the Deployment controller keeps changing while pods start ([Milestone 0](../milestone-0.md), smoke test). A plan that waits minutes for a human would almost always fail with `conflict`.
+A second constraint comes from the guard itself. Plans are pinned to `metadata.resourceVersion`, which the Deployment controller keeps changing while pods start ([Milestone 0](../history/milestones.md#milestone-0-vertical-slice), smoke test). A plan that waits minutes for a human would almost always fail with `conflict`.
 
 ## Decision
 
