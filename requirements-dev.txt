@@ -1,6 +1,6 @@
 -r requirements.txt
 boto3==1.43.119
 moto[dynamodb,s3,ssm]==5.1.22
-pytest==9.0.2
+pytest==9.0.3
 mcp==1.30.0
 ruff==0.14.3
