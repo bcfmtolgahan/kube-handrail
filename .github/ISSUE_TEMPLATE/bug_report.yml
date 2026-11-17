@@ -1,0 +1,33 @@
+name: Bug report
+description: Something does not work as the contract says.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "A way around a guard is a security issue: report it privately from the Security tab, not here."
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Approval mode
+      options: [server, both, client]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The tool calls, the response or error code, and what you expected. Remove account IDs and other values from your environment.
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Kubernetes version, Terraform and AWS provider versions, MCP client.

@@ -4,6 +4,10 @@ All notable changes to kube-handrail are listed here. The format follows [Keep a
 
 ## [Unreleased]
 
+### Added
+
+- README with an architecture diagram (`docs/diagrams/architecture.py`, drawn with the diagrams library) and a sequence diagram; `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue and pull request templates. No code, schema or guidance change.
+
 ## [0.1.0] - 2026-11-17
 
 First tagged release: Milestones 3 to 9. Tool schemas changed (HPA adjust, `change_ref`): run `enable-write` and `install-guidance` (`AGENTS.md` and both skills); `make upgrade` runs both, with one kill-switch outage. Upgrade notes in [docs/history/upgrading.md](docs/history/upgrading.md). The named health checks planned for Milestone 8 are deferred ([roadmap](docs/roadmap.md#later-ideas)).
