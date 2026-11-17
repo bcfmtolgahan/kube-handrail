@@ -36,8 +36,6 @@ A selector selects the namespace only if that follows from its name label alone 
 - **Warn.** With the binding in `Warn` every plan is refused with `binding_not_deny`; Terraform warns (check `admission_mode_and_check`) when `admission_mode = "Warn"` and `admission_check` is on.
 - **Apply.** Apply does not read the policy again; the policy itself refuses an out-of-bounds patch.
 
-`tests/admission/run.sh` runs server-side dry runs against the rendered manifests, impersonating the writer group, in `NAMESPACE` and `NAMESPACE_2` (other bounds): within the bounds is admitted; over the maximum is warned in `Warn` and refused in `Deny`, also past RBAC and through `deployments/scale`; below a minimum above 0 is refused; a restart and another user are admitted; a count within one namespace's bounds but not the other's is admitted only there. The writer's RBAC per namespace follows `ACTIONS` and `ACTIONS_2`. The reader group may `get` the two objects and nothing else; with `OTHER_NAMESPACE`, another namespace is untouched. It switches the binding to `Deny` and back. The CI job `admission` runs it on kind for the two-namespace fixture.
-
 ## Network
 
 Only the two tool Lambdas talk to the cluster. At runtime they make these calls, all HTTPS on port 443:

@@ -48,7 +48,7 @@ Namespace policy with bounds, actions, approvers and GitOps markers per namespac
 
 ## Milestone 8: Tool schema release #1
 
-HPA adjust, `change_ref`, the approval in `get_plan_outcome`. Tested on kind with metrics-server and on a test cluster without metrics-server (`make upgrade` with one `enable-write`, the admission cases, the end-to-end run with `--with-hpa`). The live `both`-mode chat test is not done. The kind findings are in [Adjust HPA](../../mcp/contract/adjust-hpa.md#findings-on-kind).
+HPA adjust, `change_ref`, the approval in `get_plan_outcome`. Tested on kind with metrics-server and on a test cluster without metrics-server (`make upgrade` with one `enable-write`, the admission cases, the end-to-end run with `--with-hpa`). The live `both`-mode chat test is not done. On kind (Kubernetes 1.31.4, metrics-server v0.7.2): HPAs have no `metadata.generation`, and `resourceVersion` changes on every status write; without a metrics API, raising `minReplicas` from 1 to 2 scaled the Deployment to 2 while `ScalingActive` stayed `False`; `desiredReplicas` was 0 until the first rescale; `status.currentReplicas` trailed a patch by about 15 seconds. The rules these led to are in [Adjust HPA](../../mcp/contract/adjust-hpa.md).
 
 ## Milestone 9: Approver and executor identity
 

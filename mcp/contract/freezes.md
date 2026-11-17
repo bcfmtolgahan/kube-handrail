@@ -20,7 +20,7 @@ One SSM `String` parameter, `FREEZES_PARAM` (Terraform: `/<name_prefix>/freezes`
 - `namespaces`: a non-empty list of distinct DNS-1123 labels, or `"*"` for every namespace. They are not checked against `ALLOWED_NAMESPACES`.
 - `start`, `until`: RFC 3339 in UTC to the second (`YYYY-MM-DDTHH:MM:SSZ`, no other offset, no fraction); `until` later than `start`. The window includes `start` and excludes `until`. An entry whose window has passed is valid and simply inactive.
 - `reason`: printable text, 1 to 200 characters, returned to agents as is.
-- `actions` (optional): a non-empty list of distinct `scale`, `restart`, `rollback`; without it the freeze covers every action.
+- `actions` (optional): a non-empty list of distinct `scale`, `restart`, `rollback`, `adjust_hpa`; without it the freeze covers every action.
 - No other fields.
 
 `scripts/freeze.py` (`list`, `add`, `remove INDEX...`, `remove --expired`, `remove --all`) reads and writes the parameter and validates every write with the Lambdas' own parser (`handrail_common.freezes`). Without `FREEZES_PARAM` no freeze is checked; Terraform always sets it.

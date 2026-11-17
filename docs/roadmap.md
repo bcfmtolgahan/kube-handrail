@@ -9,7 +9,7 @@ What comes next. Milestones 0 to 6, 8 and 9 are done; what they built and how th
 - `mcp/CONTRACT.md` at most 6,500 words, with the details in appendices under `mcp/contract/`; `AGENTS.md` at most 1,200 words with every "Never" rule kept; each skill at most 800 words; a [quickstart](quickstart.md); test and status logs under `docs/history/`.
 - The word-count ceilings of the sync tests lowered to the new sizes.
 
-**Done when:** the sync tests pass with the new ceilings (done); a before/after live comparison with `scripts/devops_agent_chat.py`, each scenario in a new chat (approved scale, rejected approval, `manual_change`, `change_frozen`, an instruction injected in an event message, a rollback with an image diff), shows the same behaviour; and the quickstart has been timed with a new prefix. The last two are still to do.
+**Done when:** the sync tests pass with the new ceilings; a before/after live comparison with `scripts/devops_agent_chat.py`, each scenario in a new chat (approved scale, rejected approval, `manual_change`, `change_frozen`, an instruction injected in an event message, a rollback with an image diff), shows the same behaviour; and the quickstart has been timed with a new prefix.
 
 ## Later ideas
 
