@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-06
 
-Implemented in [Milestone 2](../roadmap.md#milestone-2-verified-changes-more-actions-accountable-agents) (item 6) and tested on a test cluster; see [Audit record](../../mcp/CONTRACT.md#audit-record) for the exact rules.
+Implemented in [Milestone 2](../roadmap.md#milestone-2-verified-changes-more-actions-accountable-agents) (item 6) and tested on a test cluster; see [Audit record](../../mcp/contract/audit.md#audit-record) for the exact rules.
 
 ## Context
 

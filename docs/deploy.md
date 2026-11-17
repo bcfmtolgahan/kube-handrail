@@ -1,6 +1,6 @@
 # Deploying to a new account
 
-What a deployment needs from the account, the cluster and the network, and the order of the steps. The commands for each step, and what the tests check, are in [Milestone 0](milestone-0.md). The runtime calls and IAM permissions are in the [contract](../mcp/CONTRACT.md#network).
+What a deployment needs from the account, the cluster and the network, and the order of the steps. The commands for each step, and what the tests check, are in [Milestone 0](milestone-0.md). The runtime calls and IAM permissions are in the [contract](../mcp/contract/admission-network.md#network).
 
 Status: implemented and tested. A fresh deployment with its own prefix and state ran against a test cluster with only a private endpoint, with the Lambdas in subnets without a route out of the VPC and `create_vpc_endpoints` in a VPC shared with other workloads; `lambda_subnet_ids` with a NAT gateway and moving the Lambdas into and out of a VPC were tested on another deployment. A brand-new AWS account has not been used: the fresh deployment shared its account with another one.
 
@@ -48,7 +48,7 @@ namespaces = {
 }
 ```
 
-`adjust_hpa` (change a HorizontalPodAutoscaler's `minReplicas` and `maxReplicas`; implemented, not yet tested on a cluster; [Adjust HPA](../mcp/CONTRACT.md#adjust-hpa)) is never a default: list it to give the writer `get` and `patch` on the namespace's HPAs. A namespace that lists only `adjust_hpa` gives the writer `get` on Deployments, no `patch`.
+`adjust_hpa` (change a HorizontalPodAutoscaler's `minReplicas` and `maxReplicas`; implemented, not yet tested on a cluster; [Adjust HPA](../mcp/contract/adjust-hpa.md#adjust-hpa)) is never a default: list it to give the writer `get` and `patch` on the namespace's HPAs. A namespace that lists only `adjust_hpa` gives the writer `get` on Deployments, no `patch`.
 
 A namespace's `approvers` take effect only with `approval_mode` `server` or `both`; in `client` mode Terraform warns that they are unused.
 
@@ -67,7 +67,7 @@ For the test namespace, `kubectl apply -f k8s/sandbox/namespace.yaml -f k8s/sand
 
 ### Admission policy
 
-The policy is a second check of the replica bounds in the cluster, for the writer group in the policy's namespaces only ([Admission policy](../mcp/CONTRACT.md#admission-policy)). It needs **Kubernetes 1.30 or later**.
+The policy is a second check of the replica bounds in the cluster, for the writer group in the policy's namespaces only ([Admission policy](../mcp/contract/admission-network.md#admission-policy)). It needs **Kubernetes 1.30 or later**.
 
 - **Mode.** `admission_mode` (default `Deny`) is rendered into the binding, so applying `build/k8s` again never turns enforcement off silently; change it in Terraform, not with `kubectl patch`.
 - **Plan-time check.** Before every plan the read Lambda reads the policy and the binding and refuses the plan with `conflict` (`details.check = "admission_policy_match"`, `details.reason` saying what) unless the binding is in `Deny`, both select the namespace, the bounds equal Terraform's and the enforcing parts are as rendered (a policy switched off by hand with its bounds intact is `policy_modified` or `binding_modified`). It fails closed: if it cannot read them (no ClusterRole, an API error), plans are refused too. So after an apply that changes bounds or namespaces, plans are refused until `build/k8s` is applied, and a binding switched to `Warn` by hand stops all plans.
@@ -78,7 +78,7 @@ The policy is a second check of the replica bounds in the cluster, for the write
 
 ## Agents
 
-Each agent is one OAuth client ([Agent identity](../mcp/CONTRACT.md#agent-identity)). The `agents` variable maps agent names (`^[a-z][a-z0-9_]{0,31}$`) to `{client_id = optional(string), hourly_apply_budget = optional(number)}`. An entry without `client_id` gets a Cognito app client with the `read` and `remediate` scopes; with `client_id`, that existing client of the user pool is allowed instead. The default is `{devops_agent = {}, smoke_test = { hourly_apply_budget = 30 }}`: one client for DevOps Agent and one for the smoke and end-to-end tests, whose runs apply more than the default budget of 10 in an hour. If you set `agents` yourself, keep that budget for `smoke_test`, or the smoke test followed by the end-to-end suite is refused with `agent_budget_exceeded`. The gateway allows exactly the agents' clients, and the drift sentinel reports any other.
+Each agent is one OAuth client ([Agent identity](../mcp/contract/identity.md#agent-identity)). The `agents` variable maps agent names (`^[a-z][a-z0-9_]{0,31}$`) to `{client_id = optional(string), hourly_apply_budget = optional(number)}`. An entry without `client_id` gets a Cognito app client with the `read` and `remediate` scopes; with `client_id`, that existing client of the user pool is allowed instead. The default is `{devops_agent = {}, smoke_test = { hourly_apply_budget = 30 }}`: one client for DevOps Agent and one for the smoke and end-to-end tests, whose runs apply more than the default budget of 10 in an hour. If you set `agents` yourself, keep that budget for `smoke_test`, or the smoke test followed by the end-to-end suite is refused with `agent_budget_exceeded`. The gateway allows exactly the agents' clients, and the drift sentinel reports any other.
 
 - **Add an agent.** Add a key, apply, read the new client's ID from the `agent_client_ids` output and its secret from Cognito (`aws cognito-idp describe-user-pool-client`), and give both only to that agent. To register it in DevOps Agent, run `scripts/devops_agent_register.py register-mcp` with its `CLIENT_ID` and `CLIENT_SECRET`. Give each agent its own client: two agents sharing one are one agent to the server.
 - **Budgets.** `hourly_apply_budget` on an entry, otherwise `agent_hourly_apply_budget` (default 10), is the agent's apply budget per clock hour; `global_hourly_apply_budget` still caps all agents together.
@@ -131,11 +131,11 @@ Leave the kill switch on: it only matters for applies, which `server` mode refus
 
 ### Dashboard
 
-With `sentinel_enabled` (like the alarms), Terraform creates a CloudWatch dashboard named after `name_prefix`. It shows plan and apply calls per tool, guard rejections by code, tool errors, the sentinel's drift and unknown results and, when enabled, the verifier's runs, backlog, degraded changes and reverts and the audit record's dead letters, write failures and stream lag. It reads only the metrics the Lambdas already emit ([Observability](../mcp/CONTRACT.md#observability)). Tested on a test cluster: the dashboard is created and its body is accepted.
+With `sentinel_enabled` (like the alarms), Terraform creates a CloudWatch dashboard named after `name_prefix`. It shows plan and apply calls per tool, guard rejections by code, tool errors, the sentinel's drift and unknown results and, when enabled, the verifier's runs, backlog, degraded changes and reverts and the audit record's dead letters, write failures and stream lag. It reads only the metrics the Lambdas already emit ([Observability](../mcp/contract/observability.md#observability)). Tested on a test cluster: the dashboard is created and its body is accepted.
 
 ## Audit record retention
 
-Every change to a plan record is written once to the audit bucket, under the default Object Lock retention `audit_object_lock_mode` for `audit_retention_days` ([Bucket](../mcp/CONTRACT.md#bucket)).
+Every change to a plan record is written once to the audit bucket, under the default Object Lock retention `audit_object_lock_mode` for `audit_retention_days` ([Bucket](../mcp/contract/audit.md#bucket)).
 
 - **Production: `COMPLIANCE`.** Set `audit_object_lock_mode = "COMPLIANCE"` and `audit_retention_days` to what your retention policy requires. Under `GOVERNANCE`, the default, any principal allowed `s3:BypassGovernanceRetention` (an account administrator, for example) can delete entries or shorten their retention, so the record holds only against the roles kube-handrail creates. Under `COMPLIANCE` nobody can, the account's root user included, until each entry's retention ends.
 - **`COMPLIANCE` cannot be taken back.** An entry written under it keeps its retention: switching back to `GOVERNANCE` changes only entries written afterwards, and a retention can be extended but never shortened. A mistyped `audit_retention_days` is paid for in storage for that long. On an existing deployment the switch is one in-place update of `aws_s3_bucket_object_lock_configuration.audit[0]`, and earlier entries keep `GOVERNANCE`. Try it on a test deployment first.
@@ -143,7 +143,7 @@ Every change to a plan record is written once to the audit bucket, under the def
 
 ## Network
 
-The tool Lambdas (`k8s_read` and `k8s_write`) call the cluster's API server, `eks:DescribeCluster`, DynamoDB, SSM (the kill switches) and SNS (read), all over HTTPS. They never call STS or CloudWatch Logs. The approver, sentinel, interceptor and verifier Lambdas do not talk to the cluster and always run outside any VPC; a verification runs inside the write Lambda. Details are in the [contract](../mcp/CONTRACT.md#network).
+The tool Lambdas (`k8s_read` and `k8s_write`) call the cluster's API server, `eks:DescribeCluster`, DynamoDB, SSM (the kill switches) and SNS (read), all over HTTPS. They never call STS or CloudWatch Logs. The approver, sentinel, interceptor and verifier Lambdas do not talk to the cluster and always run outside any VPC; a verification runs inside the write Lambda. Details are in the [contract](../mcp/contract/admission-network.md#network).
 
 | Cluster endpoint | Setting |
 |---|---|

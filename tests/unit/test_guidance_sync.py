@@ -72,7 +72,7 @@ def repo(tmp_path):
     for rel in ["AGENTS.md", "README.md", "CHANGELOG.md", "mcp/CONTRACT.md", "terraform/main.tf"]:
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO / rel, tmp_path / rel)
-    for rel in ["docs", "agent/skills", "mcp/k8s_read", "mcp/k8s_write"]:
+    for rel in ["docs", "agent/skills", "mcp/contract", "mcp/k8s_read", "mcp/k8s_write"]:
         shutil.copytree(REPO / rel, tmp_path / rel, ignore=shutil.ignore_patterns("*.py*"))
     common = tmp_path / "mcp/common/handrail_common"
     common.mkdir(parents=True)

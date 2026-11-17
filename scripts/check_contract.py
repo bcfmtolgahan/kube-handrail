@@ -13,7 +13,8 @@ The guidance checks (check_guidance) keep the agent guidance in sync with the co
 AGENTS.md tool table lists exactly the served tools, its error table exactly the error
 codes minus the deprecated ones, every tool the skills name exists and every argument
 they pass in a call exists for that tool, every impact warning code appears in a skill,
-and every relative Markdown link with an anchor resolves to a heading.
+and every relative Markdown link with an anchor, in the guidance, the docs, the contract
+and its appendices (mcp/contract), resolves to a heading.
 Standard library only, so it runs before any dependency is installed.
 """
 
@@ -319,7 +320,7 @@ def anchors(text: str) -> set[str]:
 def guidance_files(root: Path) -> list[Path]:
     files = [root / name for name in GUIDANCE_DOCS if (root / name).is_file()]
     files += sorted((root / "docs").rglob("*.md")) + sorted((root / "agent/skills").glob("*/*.md"))
-    return files + [root / "mcp/CONTRACT.md"]
+    return files + [root / "mcp/CONTRACT.md"] + sorted((root / "mcp/contract").glob("*.md"))
 
 
 def check_links(root: Path) -> list[str]:

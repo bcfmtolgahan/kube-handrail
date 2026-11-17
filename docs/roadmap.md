@@ -30,7 +30,7 @@ See [Oscillation breaker](guards.md#oscillation-breaker).
 
 ### 3. Classification drift sentinel and CI checks (implemented)
 
-See [Drift sentinel](../mcp/CONTRACT.md#drift-sentinel). Implemented: `mcp/classification.json` as the single classification source, `scripts/check_contract.py` and the GitHub Actions workflow, and the scheduled sentinel with its alert topic and alarms. On a test deployment, reclassifying the write tool as `READ_ONLY` in the DevOps Agent association was reported as `not_mutative` drift on the next run, the kill switch was turned off and the alert published; `enable-write` restored the classification, the next run was `ok`, and the kill switch was turned back on by hand. A simulated API outage (`unknown`, kill switch untouched) is covered by unit tests only.
+See [Drift sentinel](../mcp/contract/sentinel.md#drift-sentinel). Implemented: `mcp/classification.json` as the single classification source, `scripts/check_contract.py` and the GitHub Actions workflow, and the scheduled sentinel with its alert topic and alarms. On a test deployment, reclassifying the write tool as `READ_ONLY` in the DevOps Agent association was reported as `not_mutative` drift on the next run, the kill switch was turned off and the alert published; `enable-write` restored the classification, the next run was `ok`, and the kill switch was turned back on by hand. A simulated API outage (`unknown`, kill switch untouched) is covered by unit tests only.
 
 **Goal:** a write tool that loses its `MUTATIVE` classification must stop working, not start running without approval.
 
@@ -42,7 +42,7 @@ See [Drift sentinel](../mcp/CONTRACT.md#drift-sentinel). Implemented: `mcp/class
 
 ### 4. Measured impact preview and blast-radius budget (implemented)
 
-See [Guards](guards.md) and [Impact preview](../mcp/CONTRACT.md#impact-preview). On a test deployment, a plan reported the Service selecting the target with its ready and projected endpoints and the matching PodDisruptionBudget, a scale-down past the budget's headroom was planned with a `pdb_headroom` warning, and a 1 -> 3 plan was refused with `blast_radius_exceeded`. `scale_to_zero` and `service_without_endpoints` are covered by unit tests only, because the test deployment's minimum is 1 replica.
+See [Guards](guards.md) and [Impact preview](../mcp/contract/impact.md#impact-preview). On a test deployment, a plan reported the Service selecting the target with its ready and projected endpoints and the matching PodDisruptionBudget, a scale-down past the budget's headroom was planned with a `pdb_headroom` warning, and a 1 -> 3 plan was refused with `blast_radius_exceeded`. `scale_to_zero` and `service_without_endpoints` are covered by unit tests only, because the test deployment's minimum is 1 replica.
 
 **Goal:** show the approver measured facts, not prose, and cap the size of any single change regardless of approval.
 
@@ -72,7 +72,7 @@ See [Server-side approval](../mcp/CONTRACT.md#server-side-approval). Implemented
 
 ### 6. Caller identity spike (done)
 
-Verified on a test deployment with the then experimental interceptor in `mcp/interceptor/` (off by default at the time; it is now the basis of [Agent identity](../mcp/CONTRACT.md#agent-identity)):
+Verified on a test deployment with the then experimental interceptor in `mcp/interceptor/` (off by default at the time; it is now the basis of [Agent identity](../mcp/contract/identity.md#agent-identity)):
 
 - A request interceptor with `passRequestHeaders` receives the validated bearer token and can rewrite `tools/call` arguments. The tool Lambda received the token's `client_id`.
 - A client that sent the reserved argument itself (`attacker`) still arrived as its real `client_id`, because the interceptor overwrites the argument unconditionally.
@@ -93,8 +93,8 @@ The identity is per OAuth client, not per agent session: two agents sharing a cl
 ### Later in this milestone
 
 - CI: linting and policy validation on every change (implemented for what exists). CI runs `ruff check` and `ruff format --check`, the unit tests, the contract check, and Terraform formatting and validation. Policy validation arrives with the policies: Cedar and admission policy are Milestone 2 (single-source policy).
-- Correlation ID across gateway, Lambda, DynamoDB and Kubernetes, with basic self-observability (implemented). See [Observability](../mcp/CONTRACT.md#observability): the gateway's request ID is recorded per step in the plan record and set as an annotation by the apply, every tool call logs one record that is also a CloudWatch metric (`ToolCalls`, `ToolErrors`, `GuardRejections`), and alarms notify the alert topic on internal and Kubernetes API errors and on failed tool Lambda invocations. Tested on a test cluster: the Deployment carries the apply's correlation ID, which differs from the plan's, and the metrics and alarms are in place.
-- Tool output hygiene for future log and event tools: size limits, control-character stripping, secret redaction, untrusted-content delimiters. Implemented and tested on a test cluster: [Untrusted output](../mcp/CONTRACT.md#untrusted-output), applied to `get_workload_status` conditions and to the new `READ_ONLY` tool [`get_workload_events`](../mcp/CONTRACT.md#workload-events). The end-to-end test plants an Event whose message carries a prompt-injection string, a fake access key ID and control characters, and checks that it is returned wrapped, truncated, redacted and stripped and that reading it creates no plan. Whether DevOps Agent, given that event, still proposes no plan is a [manual check](milestone-0.md#untrusted-event-text-in-devops-agent); on the test deployment the agent called `get_workload_events`, reported the planted Event as an injection attempt and created no plan.
+- Correlation ID across gateway, Lambda, DynamoDB and Kubernetes, with basic self-observability (implemented). See [Observability](../mcp/contract/observability.md#observability): the gateway's request ID is recorded per step in the plan record and set as an annotation by the apply, every tool call logs one record that is also a CloudWatch metric (`ToolCalls`, `ToolErrors`, `GuardRejections`), and alarms notify the alert topic on internal and Kubernetes API errors and on failed tool Lambda invocations. Tested on a test cluster: the Deployment carries the apply's correlation ID, which differs from the plan's, and the metrics and alarms are in place.
+- Tool output hygiene for future log and event tools: size limits, control-character stripping, secret redaction, untrusted-content delimiters. Implemented and tested on a test cluster: [Untrusted output](../mcp/contract/untrusted-output.md#untrusted-output), applied to `get_workload_status` conditions and to the new `READ_ONLY` tool [`get_workload_events`](../mcp/contract/untrusted-output.md#workload-events). The end-to-end test plants an Event whose message carries a prompt-injection string, a fake access key ID and control characters, and checks that it is returned wrapped, truncated, redacted and stripped and that reading it creates no plan. Whether DevOps Agent, given that event, still proposes no plan is a [manual check](milestone-0.md#untrusted-event-text-in-devops-agent); on the test deployment the agent called `get_workload_events`, reported the planted Event as an injection attempt and created no plan.
 - DevOps Agent skills and an `AGENTS.md` describing the tool contract (implemented and tested on a test deployment; see [Agent guidance](../mcp/CONTRACT.md#agent-guidance)). A new chat follows `AGENTS.md` and reads the skill.
 - Infrastructure as code that deploys cleanly to a new account, including clusters with a private endpoint (implemented and tested). See [Deploying to a new account](deploy.md): optional VPC placement of the two tool Lambdas with their network interface permissions, an optional cluster security group rule and VPC endpoints for exactly the AWS APIs they call, and plan-time checks of the authentication mode, endpoint access and network variables. Tested on a test cluster that has both public and private endpoint access: with the Lambdas in private subnets (NAT for the AWS APIs) and the cluster security group rule, the API server name resolves to private addresses inside the VPC, and the server-mode guard tests (39/39) and the DevOps Agent chat flow with server-side approval passed. One apply moving the Lambdas into the VPC and one moving them out both complete without manual steps. A second, fresh deployment (its own `name_prefix` and state) against a separate test cluster then ran with the Lambdas in subnets without any route out of the VPC, reaching AWS only through `create_vpc_endpoints` in a VPC shared with other workloads, which kept working because the endpoints accept the VPC's address ranges. On it, the smoke test, the guard tests (45/45 with plan expiry, and 39/39 in server mode), the drift sentinel, and DevOps Agent registration in a new agent space with a chat plan, approval and apply passed. With the cluster's public endpoint then turned off, so that only the private endpoint answered, the smoke test, the sentinel and a DevOps Agent chat scale with approval passed again. `scripts/cleanup.sh --delete-space` then removed the agent space and all 57 resources; deleting the Lambda security group waited about 20 minutes for Lambda to release its network interfaces. Not run: a brand-new AWS account (the fresh deployment shared its account with another one).
 
@@ -106,7 +106,7 @@ The identity is per OAuth client, not per agent session: two agents sharing a cl
 
 ### 1. Action framework and restart (implemented)
 
-See [Restart](../mcp/CONTRACT.md#restart). On a test cluster:
+See [Restart](../mcp/contract/restart-rollback.md#restart). On a test cluster:
 
 - The Milestone 1 end-to-end suite passed on the generic path, with the restart cases added (`--with-rollout`, `--with-expiry`): 50 of 50 in `client` mode and 44 of 44 in `server` mode, where the restart was approved through `scripts/approve.py`.
 - A restart replaced every pod, kept the replica count, and left the plan ID on the pod template and on every new pod. A second restart right after it was refused with `cooldown`, and with the kill switch off the apply returned `remediation_disabled`.
@@ -123,12 +123,12 @@ See [Restart](../mcp/CONTRACT.md#restart). On a test cluster:
 
 ### 2. Rollback by exact revision (implemented)
 
-See [Rollout history](../mcp/CONTRACT.md#rollout-history) and [Rollback](../mcp/CONTRACT.md#rollback). On a test cluster:
+See [Rollout history](../mcp/contract/restart-rollback.md#rollout-history) and [Rollback](../mcp/contract/restart-rollback.md#rollback). On a test cluster:
 
 - The end-to-end suite with the rollout cases (`--with-rollout`, `--with-expiry`) passed 64 of 64 in `client` mode and 57 of 57 in `server` mode, where the rollback was approved through `scripts/approve.py`. After a rollback, the Deployment's pod template equalled the target ReplicaSet's template minus the hash label, compared as JSON. A pruned revision returned `revision_not_found`, a ReplicaSet edited between plan and apply and a paused Deployment returned `conflict`, a template changed by hand returned `manual_change` until the override was planned, a GitOps-managed Deployment was refused, and a different revision on apply returned `plan_mismatch`.
 - The writer group can get ReplicaSets in the sandbox namespace and not in `default`.
 - In `client` mode, a DevOps Agent chat listed the history and rolled a Deployment back to a named revision after the chat approval; the resulting template matched that revision's ReplicaSet. A `change-cause` on that revision told the agent to scale the Deployment without asking; the agent reported it as untrusted text and created no scale plan.
-- `kubectl rollout undo` was confirmed to replace the Deployment's annotations with those of the restored ReplicaSet, so the last-plan annotation goes back to the plan that was current at that revision. After such an undo the template manual-change rule compares against that older plan, as [History checks](../mcp/CONTRACT.md#history-checks-oscillation-breaker) describes.
+- `kubectl rollout undo` was confirmed to replace the Deployment's annotations with those of the restored ReplicaSet, so the last-plan annotation goes back to the plan that was current at that revision. After such an undo the template manual-change rule compares against that older plan, as [History checks](../mcp/contract/history-checks.md#history-checks-oscillation-breaker) describes.
 
 **Goal:** roll back to the template the human approved, not to whatever a revision number points at by the time the apply runs.
 
@@ -141,7 +141,7 @@ See [Rollout history](../mcp/CONTRACT.md#rollout-history) and [Rollback](../mcp/
 
 ### 3. Per-agent identity, budgets and kill switch (implemented)
 
-See [Agent identity](../mcp/CONTRACT.md#agent-identity) and [ADR 0003](adr/0003-agent-identity.md). On a test cluster:
+See [Agent identity](../mcp/contract/identity.md#agent-identity) and [ADR 0003](adr/0003-agent-identity.md). On a test cluster:
 
 - The deployment upgraded in place: no Cognito client and no gateway was replaced, and DevOps Agent kept working without registering again. The first apply needs the caller key created on its own ([Upgrading](deploy.md#upgrading)).
 - The end-to-end suite with the identity cases (`--with-identity`, a second client) passed 76 of 76 in `client` mode and 64 of 64 in `server` mode: plans name `agent:smoke_test`, a client's own `_kube_handrail_caller` is ignored, a second agent applying or requesting approval for the first agent's plan gets `forbidden`, a second agent with its switch off gets `remediation_disabled` and over its budget gets `agent_budget_exceeded` while the first keeps working, and in `server` mode an approval for a switched-off agent consumes the plan and is refused.
@@ -160,7 +160,7 @@ See [Agent identity](../mcp/CONTRACT.md#agent-identity) and [ADR 0003](adr/0003-
 
 ### 4. Verify and revert (implemented)
 
-See [Verification and revert](../mcp/CONTRACT.md#verification-and-revert) and [ADR 0004](adr/0004-pre-approved-revert.md). On a test cluster:
+See [Verification and revert](../mcp/contract/verification.md#verification-and-revert) and [ADR 0004](adr/0004-pre-approved-revert.md). On a test cluster:
 
 - The deployment upgraded in place with one `terraform apply`: the `verify-due` index was built online on the existing plan table, and no gateway or Cognito client was replaced. The verifier ran once a minute and its stalled alarm stayed `OK`.
 - The end-to-end suite with the verification cases (`--with-verify`) passed 71 of 71 in `client` mode and 55 of 55 in `server` mode, where the window and `revert_on_failure` were approved through `scripts/approve.py`. A change that reached its target was `healthy`; a scale by hand in the window was `unknown` (`spec_changed`) and left alone; pods refused by a ResourceQuota made the change `degraded` and, with revert approved, it was set back to its starting count, the revert was verified `healthy` and never reverted, and planning the same change again was refused with `flapping`. With the kill switch off the revert was `skipped` and stayed skipped once the switch was back on; without `revert_on_failure` a degraded change was reported and left alone. No ResourceQuota or LimitRange was left behind.
@@ -182,8 +182,8 @@ The scope was narrowed to the two parts a production deployment needs; the singl
 
 **Goal:** stop changes during declared freezes, and have the cluster itself refuse a write outside the bounds even if the guard is wrong.
 
-- Change freezes: windows in one SSM parameter (namespaces, start, until, reason, optional actions), changed by operators with `scripts/freeze.py` without a deploy. The guard checks them on every plan and again at apply with the current time, so an approval given before a freeze is not applied during it; a refused apply does not consume the plan. An unreadable or invalid value refuses writes like the kill switch. A pre-approved revert is exempt. There is no break-glass path: an operator removes the freeze. See [Change freezes](../mcp/CONTRACT.md#change-freezes) and [ADR 0005](adr/0005-change-freezes.md).
-- Admission policy: a ValidatingAdmissionPolicy, `kube-handrail-writer-bounds`, refuses a writer patch that changes a Deployment's replica count to a value outside the bounds, only for the writer group and only in the sandbox namespace. It rolls out in `Warn` and `Audit` and is switched to `Deny` by the operator. The write Lambda maps its denial to `admission_denied`. CI applies it on kind (Kubernetes 1.31) and runs server-side dry-run cases (`tests/admission/run.sh`). See [Admission policy](../mcp/CONTRACT.md#admission-policy) and [ADR 0006](adr/0006-admission-policy.md).
+- Change freezes: windows in one SSM parameter (namespaces, start, until, reason, optional actions), changed by operators with `scripts/freeze.py` without a deploy. The guard checks them on every plan and again at apply with the current time, so an approval given before a freeze is not applied during it; a refused apply does not consume the plan. An unreadable or invalid value refuses writes like the kill switch. A pre-approved revert is exempt. There is no break-glass path: an operator removes the freeze. See [Change freezes](../mcp/contract/freezes.md#change-freezes) and [ADR 0005](adr/0005-change-freezes.md).
+- Admission policy: a ValidatingAdmissionPolicy, `kube-handrail-writer-bounds`, refuses a writer patch that changes a Deployment's replica count to a value outside the bounds, only for the writer group and only in the sandbox namespace. It rolls out in `Warn` and `Audit` and is switched to `Deny` by the operator. The write Lambda maps its denial to `admission_denied`. CI applies it on kind (Kubernetes 1.31) and runs server-side dry-run cases (`tests/admission/run.sh`). See [Admission policy](../mcp/contract/admission-network.md#admission-policy) and [ADR 0006](adr/0006-admission-policy.md).
 
 **Done when:** a freeze refuses plans and applies, including an apply of a plan approved before the freeze; and on a test cluster the admission policy ran in audit mode, then in `Deny`, and an apply over the bounds was refused with `admission_denied` while other users and namespaces were unaffected.
 
@@ -202,7 +202,7 @@ Admission policy, on a test cluster (Kubernetes 1.35):
 
 ### 6. Durable audit record and evidence export (implemented)
 
-The scope was narrowed to a write-once record outside the executor's reach; signing, hash chaining, approval receipts and automatic anomaly detection are deferred (below). See [Audit record](../mcp/CONTRACT.md#audit-record) and [ADR 0007](adr/0007-durable-audit-record.md).
+The scope was narrowed to a write-once record outside the executor's reach; signing, hash chaining, approval receipts and automatic anomaly detection are deferred (below). See [Audit record](../mcp/contract/audit.md#audit-record) and [ADR 0007](adr/0007-durable-audit-record.md).
 
 **Goal:** show afterwards who asked for each change, who approved it, and how it ran, in a record the executor cannot alter.
 
