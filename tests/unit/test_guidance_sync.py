@@ -3,7 +3,6 @@ check_guidance), and the guidance does not grow past its word-count ceilings."""
 
 import importlib.util
 import json
-import math
 import shutil
 from pathlib import Path
 
@@ -20,30 +19,33 @@ AGENTS = "AGENTS.md"
 SCALE_SKILL = "agent/skills/kube-handrail-scale/SKILL.md"
 ROLLOUT_SKILL = "agent/skills/kube-handrail-rollout/SKILL.md"
 
-# Word counts (whitespace-separated) at the end of Milestone 3 plus 5 % slack. They stop the
-# guidance from growing unnoticed; Milestone 7 lowers them to its targets. Raise one only
-# with a reason in the commit message. Milestone 8 (HPA adjust, a new action) raised AGENTS
-# by the 80 words it may add to 1981 and the scale skill, where the HPA procedure lives, by
-# its new section; the contract by the HPA adjust entries and a short section (the
-# definition is in the appendix mcp/contract/adjust-hpa.md).
-M8_AGENTS_WORDS = 80
-M8_SCALE_SKILL_WORDS = 130
-M8_CONTRACT_WORDS = 260
+# Word counts (whitespace-separated) after Milestone 7, which cut the docs down: each ceiling
+# is the final size plus 5 %, capped at the Milestone 7 target where one exists (AGENTS.md
+# 1,200, each skill 800, the contract 6,500). They stop the guidance from growing unnoticed.
+# Lower one freely; raise one only with a reason in the commit message.
 WORD_CEILINGS = {
-    AGENTS: 1981 + M8_AGENTS_WORDS,
-    SCALE_SKILL: 1224 + M8_SCALE_SKILL_WORDS,
-    ROLLOUT_SKILL: 1671,
-    "mcp/CONTRACT.md": 22012 + M8_CONTRACT_WORDS,
-    "README.md": 3163,
-    "docs/guards.md": 3270,
-    "docs/deploy.md": 5799,
-    "docs/roadmap.md": 6956,
-    "docs/milestone-0.md": 4245,
+    AGENTS: 1200,
+    SCALE_SKILL: 800,
+    ROLLOUT_SKILL: 800,
+    "mcp/CONTRACT.md": 6500,
+    "mcp/contract/adjust-hpa.md": 1401,
+    "README.md": 1162,
+    "docs/guards.md": 1475,
+    "docs/deploy.md": 2750,
+    "docs/roadmap.md": 634,
+    "docs/quickstart.md": 628,
+    "docs/milestone-0.md": 1239,
+    "docs/history/milestones.md": 1371,
     "docs/releasing.md": 677,
 }
-# Everything an agent reads: AGENTS.md and the skills (4708 words at Milestone 3).
+# The contract appendices together (17,708 words after Milestone 7): this text sat under the
+# contract's ceiling before Milestone 7 moved it out, so it must not grow unnoticed either.
+APPENDICES_CEILING = 18593
+
+# Everything an agent reads: AGENTS.md and the skills (4708 words at Milestone 3, 2779 after
+# Milestone 7).
 AGENT_CONTEXT = (AGENTS, SCALE_SKILL, ROLLOUT_SKILL)
-AGENT_CONTEXT_CEILING = math.ceil(4708 * 1.05) + M8_AGENTS_WORDS + M8_SCALE_SKILL_WORDS
+AGENT_CONTEXT_CEILING = 2800
 
 
 def words(rel: str) -> int:
@@ -59,6 +61,11 @@ def test_word_ceiling(rel, ceiling):
     assert words(rel) <= ceiling, f"{rel} has {words(rel)} words; the ceiling is {ceiling}"
 
 
+def test_appendices_ceiling():
+    total = sum(words(str(p.relative_to(REPO))) for p in (REPO / "mcp/contract").glob("*.md"))
+    assert total <= APPENDICES_CEILING, f"mcp/contract/*.md has {total} words"
+
+
 def test_agent_context_ceiling():
     assert sum(words(rel) for rel in AGENT_CONTEXT) <= AGENT_CONTEXT_CEILING
 
@@ -72,7 +79,7 @@ def repo(tmp_path):
     for rel in ["AGENTS.md", "README.md", "CHANGELOG.md", "mcp/CONTRACT.md", "terraform/main.tf"]:
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO / rel, tmp_path / rel)
-    for rel in ["docs", "agent/skills", "mcp/k8s_read", "mcp/k8s_write"]:
+    for rel in ["docs", "agent/skills", "mcp/contract", "mcp/k8s_read", "mcp/k8s_write"]:
         shutil.copytree(REPO / rel, tmp_path / rel, ignore=shutil.ignore_patterns("*.py*"))
     common = tmp_path / "mcp/common/handrail_common"
     common.mkdir(parents=True)
@@ -185,10 +192,10 @@ def test_skill_sets_an_argument_the_tools_dropped(repo):
 
 
 def test_a_response_field_set_in_prose_is_not_an_argument(repo, monkeypatch):
-    assert "`notified: false`" in (repo / SCALE_SKILL).read_text()
+    assert "`notified: false`" in (repo / AGENTS).read_text()
     assert check_contract.check_skills(repo) == []
     monkeypatch.setattr(check_contract, "RESPONSE_FIELDS", frozenset())
-    assert f"{SCALE_SKILL}: sets notified, which no tool takes" in check_contract.check_skills(repo)
+    assert f"{AGENTS}: sets notified, which no tool takes" in check_contract.check_skills(repo)
 
 
 def test_contract_error_codes_line_matches_the_envelope(repo):

@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-06
 
-Implemented in [Milestone 2](../roadmap.md#milestone-2-verified-changes-more-actions-accountable-agents) and tested on a test cluster; the policy's cases run in CI on kind. See [Admission policy](../../mcp/CONTRACT.md#admission-policy) for the exact rules.
+Implemented in [Milestone 2](../history/milestones.md#milestone-2-verified-changes-more-actions-accountable-agents) and tested on a test cluster; the policy's cases run in CI on kind. See [Admission policy](../../mcp/contract/admission-network.md#admission-policy) for the exact rules.
 
 ## Context
 
